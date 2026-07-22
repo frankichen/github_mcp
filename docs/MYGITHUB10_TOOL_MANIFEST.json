@@ -1,6 +1,6 @@
 {
   "service_name": "MyGithub10",
-  "source_commit": "3fe919ba32f8b1bf09a706bc9d8db6422bca5438",
+  "source_commit": "d1cb153db27791ba1451c26f45504b94ed49c453",
   "controller_image": "not-read-from-runtime",
   "pygithub_version": "2.5.0",
   "mcp_sdk_version": "mcp>=1.7.0 (requirements baseline)",
