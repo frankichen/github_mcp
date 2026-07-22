@@ -29,6 +29,19 @@ def test_rootless_command_does_not_use_env_host_or_forward_tokens(monkeypatch, t
     assert "--network=none" in command
 
 
+def test_image_available_refreshes_tag_for_amd64(monkeypatch):
+    captured = []
+
+    def fake_run(command, **_kwargs):
+        captured.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    assert PodmanRunner("podman").image_available("100.118.124.97:5555/library/golang:1.26.4")
+    assert captured[0][:5] == ["podman", "pull", "--platform", "linux/amd64", "--tls-verify=false"]
+    assert captured[0][-1].endswith("golang:1.26.4")
+
+
 def test_go_uses_read_write_job_cache_and_controlled_environment(monkeypatch, tmp_path):
     captured = []
 

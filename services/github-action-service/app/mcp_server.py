@@ -87,6 +87,20 @@ def _deployment_policy_denied(deployment_id: str, operation: str) -> str | None:
     return None
 
 
+def _authorize_repository_list(repositories_json: str, operation: str = "read") -> tuple[list[str] | None, str | None]:
+    try:
+        repositories = json.loads(repositories_json or "")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None, json.dumps({"ok": False, "error_code": "INVALID_ARGUMENT", "message": "repositories_json must be a non-empty JSON array"}, ensure_ascii=False)
+    if not isinstance(repositories, list) or not repositories or any(not isinstance(repo, str) or not repo.strip() for repo in repositories):
+        return None, json.dumps({"ok": False, "error_code": "INVALID_ARGUMENT", "message": "repositories_json must be a non-empty JSON array"}, ensure_ascii=False)
+    repositories = list(dict.fromkeys(repositories))
+    for repository in repositories:
+        if denied := _policy_denied(repository, operation):
+            return None, denied
+    return repositories, None
+
+
 def _install_repository_policy_guards() -> None:
     """Guard every registered repository-bearing tool from one server-owned map."""
     tools = getattr(getattr(mcp, "_tool_manager", None), "_tools", {})
@@ -755,7 +769,8 @@ async def search_github_pull_request_history_tool(
     include_drafts: bool = True, limit: int = 100, offset: int = 0,
 ) -> str:
     try:
-        repos = json.loads(repositories_json) if repositories_json else []
+        repos, denied = _authorize_repository_list(repositories_json)
+        if denied: return denied
         return json.dumps(github_utils.search_github_pull_request_history(repos, identity, activity, since, until, state, include_drafts, limit, offset), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
@@ -770,7 +785,8 @@ async def list_github_review_history_tool(
     states_json: str = '["APPROVED","CHANGES_REQUESTED","COMMENTED"]', limit: int = 100, offset: int = 0,
 ) -> str:
     try:
-        repos = json.loads(repositories_json) if repositories_json else []
+        repos, denied = _authorize_repository_list(repositories_json)
+        if denied: return denied
         states = json.loads(states_json) if states_json else None
         return json.dumps(github_utils.list_github_review_history(repos, identity, since, until, states, limit, offset), ensure_ascii=False)
     except Exception as e:
@@ -787,7 +803,8 @@ async def list_github_issue_history_tool(
     limit: int = 100, offset: int = 0,
 ) -> str:
     try:
-        repos = json.loads(repositories_json) if repositories_json else []
+        repos, denied = _authorize_repository_list(repositories_json)
+        if denied: return denied
         return json.dumps(github_utils.list_github_issue_history(repos, identity, activity, since, until, state, limit, offset), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
@@ -803,7 +820,8 @@ async def get_github_development_history_tool(
     include_details: bool = True, max_items_per_section: int = 100,
 ) -> str:
     try:
-        repos = json.loads(repositories_json) if repositories_json else None
+        repos, denied = _authorize_repository_list(repositories_json)
+        if denied: return denied
         include = json.loads(include_json) if include_json else None
         result = github_utils.get_github_development_history(identity, repos, since, until, include, include_details, max_items_per_section)
         return json.dumps(result, ensure_ascii=False)
@@ -823,7 +841,8 @@ async def get_github_weekly_report_data_tool(
     since: str = "", until: str = "",
 ) -> str:
     try:
-        repos = json.loads(repositories_json) if repositories_json else None
+        repos, denied = _authorize_repository_list(repositories_json)
+        if denied: return denied
         result = github_utils.get_github_weekly_report_data(
             identity, repos, week, week_start, timezone,
             include_weekend, include_open_work, include_ci_failures, include_code_statistics, since, until
@@ -847,7 +866,7 @@ def _mygithub10_error(exc: Exception) -> str:
 
 @mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithub10 capability and compatibility contract.")
 async def get_mygithub_capabilities() -> str:
-    return json.dumps(mygithub10.capabilities(os.environ.get("MYGITHUB10_BUILD_SHA", "unknown")), ensure_ascii=False)
+    return json.dumps(mygithub10.capabilities(os.environ.get("MYGITHUB10_BUILD_SHA", "unknown"), app_settings.MYGITHUB10_RESOURCE_TOKEN_SECRET.get_secret_value()), ensure_ascii=False)
 
 
 @mcp.tool(name="get_github_file_manifest", description="Return exact Git Blob metadata for a file without returning file content.")
@@ -873,7 +892,7 @@ async def open_github_file_resource(repository: str, path: str, ref: str = "") -
     try:
         if denied := _policy_denied(repository, "read"): return denied
         manifest = mygithub10.file_manifest(_service, repository, path, ref)
-        if not _resource_secret(): return _resource_error("RESOURCE_TOKEN_INVALID")
+        if len(_resource_secret()) < 32: return _resource_error("RESOURCE_TOKEN_NOT_CONFIGURED")
         payload = {"repository": repository, "path": path, "commit": manifest["resolved_commit_sha"], "expires_at": int(time.time()) + 900}
         token = _resource_token(payload)
         return json.dumps({"resource_uri": f"mygithub10://blob/{token}", **{key: manifest[key] for key in ("repository", "path", "resolved_commit_sha", "blob_sha", "size_bytes", "content_sha256")}}, ensure_ascii=False)
@@ -887,7 +906,7 @@ async def read_github_file_resource(resource_uri: str, offset_bytes: int = 0, li
         token = resource_uri.rsplit("/", 1)[-1]
         encoded, supplied_signature = token.rsplit(".", 1)
         expected_signature = hmac.new(_resource_secret(), encoded.encode(), hashlib.sha256).hexdigest()
-        if not _resource_secret() or not hmac.compare_digest(supplied_signature, expected_signature): return _resource_error("RESOURCE_TOKEN_INVALID")
+        if len(_resource_secret()) < 32 or not hmac.compare_digest(supplied_signature, expected_signature): return _resource_error("RESOURCE_TOKEN_INVALID")
         encoded += "=" * (-len(encoded) % 4)
         item = json.loads(base64.urlsafe_b64decode(encoded).decode())
         if int(item.get("expires_at", 0)) <= int(time.time()): return _resource_error("RESOURCE_TOKEN_EXPIRED")

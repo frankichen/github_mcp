@@ -1,9 +1,12 @@
 FROM python:3.12-slim
 
+ARG MYGITHUB10_BUILD_SHA=unknown
+
 WORKDIR /app
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    MYGITHUB10_BUILD_SHA=${MYGITHUB10_BUILD_SHA}
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \

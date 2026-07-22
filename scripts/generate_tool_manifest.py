@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -30,6 +31,10 @@ def git_value(path: Path, *args: str) -> str:
         return subprocess.check_output(["git", "-C", str(path), *args], text=True).strip()
     except Exception:
         return "unknown"
+
+
+def source_tree(path: Path, commit: str) -> str:
+    return git_value(path, "rev-parse", f"{commit}^{{tree}}")
 
 
 async def build_manifest(source: Path, source_commit: str | None = None, service_name: str = "MyGithub09") -> dict:
@@ -64,7 +69,9 @@ async def build_manifest(source: Path, source_commit: str | None = None, service
         )
     return {
         "service_name": service_name,
-        "source_commit": source_commit or git_value(source, "rev-parse", "HEAD"),
+        "source_tree_sha": source_tree(source, source_commit or git_value(source, "rev-parse", "HEAD")),
+        "generated_from_commit": source_commit or git_value(source, "rev-parse", "HEAD"),
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "controller_image": os.environ.get("MYGITHUB09_CONTROLLER_IMAGE", "not-read-from-runtime"),
         "pygithub_version": "2.5.0",
         "mcp_sdk_version": "mcp>=1.7.0 (requirements baseline)",

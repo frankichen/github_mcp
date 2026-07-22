@@ -14,8 +14,15 @@ class PodmanRunner:
         self.podman = podman_binary
 
     def image_available(self, image: str) -> bool:
-        """Return whether a pre-approved image is already available locally."""
+        """Refresh and verify the selected image instead of trusting a stale tag."""
         try:
+            pull = [self.podman, "pull", "--platform", "linux/amd64"]
+            if image.startswith("100.118.124.97:5555/"):
+                pull.extend(["--tls-verify=false"])
+            pull.append(image)
+            refreshed = subprocess.run(pull, capture_output=True, text=True, timeout=180)
+            if refreshed.returncode != 0:
+                return False
             result = subprocess.run(
                 [self.podman, "image", "exists", image],
                 capture_output=True,

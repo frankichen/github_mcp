@@ -100,6 +100,11 @@ This is for the private CI system. NOT for GitHub Actions workflows (use list_ci
     )
     async def list_private_ci_profiles(repository: str = "") -> str:
         try:
+            from app.repository_policy import require_operation
+            if not repository:
+                return _error_response("INVALID_ARGUMENT", "repository is required")
+            if denial := require_operation(repository, "private_ci"):
+                return json.dumps(denial, ensure_ascii=False)
             profiles = get_allowed_profiles(repository or None)
             result = {
                 "ok": True,
@@ -127,6 +132,11 @@ This is for the private CI system. NOT for GitHub Actions runs (use list_ci_jobs
         offset: int = 0,
     ) -> str:
         try:
+            from app.repository_policy import require_operation
+            if not repository:
+                return _error_response("INVALID_ARGUMENT", "repository is required")
+            if denial := require_operation(repository, "private_ci"):
+                return json.dumps(denial, ensure_ascii=False)
             jobs = db_list_jobs(
                 repository=repository if repository else None,
                 branch=branch if branch else None,

@@ -57,12 +57,14 @@ def simulated(manifest_path: Path) -> None:
     report("feature_flags_loaded", flags == {"artifact_build": False, "artifact_deploy": False, "attestation_reuse": False})
 
 
-async def live(base_url: str, api_key: str, manifest_path: Path, strict: bool = False) -> None:
+async def live(base_url: str, api_key: str, manifest_path: Path, strict: bool = False, expected_build_sha: str = "") -> None:
     required = ("MYGITHUB10_TEST_JOB_ID", "MYGITHUB10_TEST_ATTESTATION_ID", "MYGITHUB10_TEST_LARGE_FILE_PATH")
     if strict:
         missing = [name for name in required if not os.environ.get(name, "").strip()]
         if missing:
             raise RuntimeError("strict mode requires: " + ", ".join(missing))
+        if not re.fullmatch(r"[0-9a-f]{40}", expected_build_sha or ""):
+            raise RuntimeError("strict mode requires --expected-build-sha or MYGITHUB10_EXPECTED_BUILD_SHA")
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     async with httpx.AsyncClient(base_url=base_url.rstrip("/"), headers=headers, trust_env=False, timeout=45) as client:
         health = await client.get("/health")
@@ -79,6 +81,8 @@ async def live(base_url: str, api_key: str, manifest_path: Path, strict: bool = 
 
                 capabilities = await call("get_mygithub_capabilities", {})
                 report("capabilities_build_sha", bool(re.fullmatch(r"[0-9a-f]{40}", capabilities.get("build_sha", ""))))
+                if strict:
+                    report("capabilities_expected_build_sha", capabilities.get("build_sha") == expected_build_sha)
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 report("manifest_tool_count", manifest["tool_count"] == len(names))
                 report("tool_names", set(names) == {tool["name"] for tool in manifest["tools"]})
@@ -164,10 +168,11 @@ def main() -> int:
     parser.add_argument("--base-url", default=os.environ.get("CONTROLLER_URL", ""))
     parser.add_argument("--simulate", action="store_true")
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--expected-build-sha", default=os.environ.get("MYGITHUB10_EXPECTED_BUILD_SHA", ""))
     args = parser.parse_args(); path = Path(args.manifest)
     try:
         if args.simulate or not args.base_url: simulated(path)
-        else: asyncio.run(live(args.base_url, os.environ.get("ACTION_API_KEY", ""), path, args.strict))
+        else: asyncio.run(live(args.base_url, os.environ.get("ACTION_API_KEY", ""), path, args.strict, args.expected_build_sha))
         print(json.dumps({"ok": True, "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}))
         return 0
     except (OSError, ValueError, KeyError, RuntimeError, httpx.HTTPError) as exc:

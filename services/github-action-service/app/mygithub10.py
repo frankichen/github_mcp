@@ -296,12 +296,12 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
 
 
 def apply_patch(client, repository: str, branch: str, expected_head_sha: str, expected_blob_shas_json: str, patch: str, commit_message: str, dry_run: bool, idempotency_key: str = "") -> dict[str, Any]:
+    parsed = _parse_patch(patch)
+    expected = json.loads(expected_blob_shas_json or "{}")
     repo = _repo(client, repository)
     actual_head = repo.get_git_ref(f"heads/{branch}").object.sha if hasattr(repo, "get_git_ref") else repo.get_commit(branch).sha
     if expected_head_sha and actual_head != expected_head_sha:
         raise MyGithub10Error("PATCH_HEAD_CHANGED", "branch HEAD changed", {"expected": expected_head_sha, "actual": actual_head})
-    parsed = _parse_patch(patch)
-    expected = json.loads(expected_blob_shas_json or "{}")
     changed: dict[str, bytes | None] = {}
     previews = []
     for path, operation, hunks in parsed:
@@ -395,13 +395,14 @@ def autofix_gofmt(client, repository: str, branch: str, expected_head_sha: str, 
     return {"ok": True, **_commit_files(client, repository, branch, expected_head_sha, changed, expected, commit_message), "changed_files": sorted(changed)}
 
 
-def capabilities(build_sha: str = "unknown") -> dict[str, Any]:
+def capabilities(build_sha: str = "unknown", resource_token_secret: str | None = None) -> dict[str, Any]:
     if not re.fullmatch(r"[0-9a-f]{40}", build_sha or ""):
         try:
             build_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[3], text=True, stderr=subprocess.DEVNULL).strip()
         except (OSError, subprocess.CalledProcessError):
             build_sha = "unknown"
-    return {"name": "MyGithub10", "version": "10.0.0", "build_sha": build_sha, "source_repository": "frankichen/github_mcp", "max_inline_response_bytes": MAX_INLINE_RESPONSE_BYTES, "max_file_chunk_bytes": MAX_FILE_CHUNK_BYTES, "max_patch_bytes": MAX_PATCH_BYTES, "max_upload_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES, "supports_file_manifest": True, "supports_byte_chunks": True, "supports_mcp_resources": True, "supports_incremental_patch": True, "supports_range_edit": True, "supports_chunked_upload": True, "supports_dry_run": True, "supports_expected_head_sha": True, "supports_expected_blob_sha": True, "supports_idempotency_key": True, "supports_operation_audit": True, "supports_tree_attestation": True, "supports_artifact_deployment": False, "supports_gofmt_autofix": False, "supports_real_ci_performance_validation": False, "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}]}
+    secret = resource_token_secret if resource_token_secret is not None else os.environ.get("MYGITHUB10_RESOURCE_TOKEN_SECRET", "")
+    return {"name": "MyGithub10", "version": "10.0.0", "build_sha": build_sha, "source_repository": "frankichen/github_mcp", "max_inline_response_bytes": MAX_INLINE_RESPONSE_BYTES, "max_file_chunk_bytes": MAX_FILE_CHUNK_BYTES, "max_patch_bytes": MAX_PATCH_BYTES, "max_upload_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES, "supports_file_manifest": True, "supports_byte_chunks": True, "supports_mcp_resources": len(secret.encode("utf-8")) >= 32, "supports_incremental_patch": True, "supports_range_edit": True, "supports_chunked_upload": True, "supports_dry_run": True, "supports_expected_head_sha": True, "supports_expected_blob_sha": True, "supports_idempotency_key": True, "supports_operation_audit": True, "supports_tree_attestation": True, "supports_artifact_deployment": False, "supports_gofmt_autofix": False, "supports_real_ci_performance_validation": False, "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}]}
 
 
 _UPLOAD_ROOT = Path(os.environ.get("MYGITHUB10_UPLOAD_DIR", tempfile.gettempdir())) / "mygithub10-uploads"
