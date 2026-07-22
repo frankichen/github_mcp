@@ -1,10 +1,10 @@
 {
   "service_name": "MyGithub10",
-  "source_commit": "9bed435",
+  "source_commit": "25f786c5f7fe375b87387c3c341e14a90728304c",
   "controller_image": "not-read-from-runtime",
   "pygithub_version": "2.5.0",
   "mcp_sdk_version": "mcp>=1.7.0 (requirements baseline)",
-  "tool_count": 74,
+  "tool_count": 83,
   "tools": [
     {
       "name": "get_github_file",
@@ -1314,6 +1314,11 @@
             "default": false,
             "title": "Allow Deploy Infrastructure Changes",
             "type": "boolean"
+          },
+          "artifact_id": {
+            "default": "",
+            "title": "Artifact Id",
+            "type": "string"
           }
         },
         "required": [
@@ -1374,6 +1379,11 @@
             "default": false,
             "title": "Confirm",
             "type": "boolean"
+          },
+          "artifact_id": {
+            "default": "",
+            "title": "Artifact Id",
+            "type": "string"
           }
         },
         "required": [
@@ -2430,6 +2440,364 @@
           "upload_id"
         ],
         "title": "abort_github_file_uploadArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "create_attestation_for_passed_job",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Persist a Tree SHA attestation only for an exact passed, non-superseded repo-auto-check job.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "tested_commit_sha": {
+            "title": "Tested Commit Sha",
+            "type": "string"
+          },
+          "tested_tree_sha": {
+            "title": "Tested Tree Sha",
+            "type": "string"
+          },
+          "base_sha": {
+            "title": "Base Sha",
+            "type": "string"
+          },
+          "profile": {
+            "title": "Profile",
+            "type": "string"
+          },
+          "ci_image_digest": {
+            "title": "Ci Image Digest",
+            "type": "string"
+          },
+          "go_version": {
+            "title": "Go Version",
+            "type": "string"
+          },
+          "node_version": {
+            "title": "Node Version",
+            "type": "string"
+          },
+          "npm_version": {
+            "title": "Npm Version",
+            "type": "string"
+          },
+          "go_sum_sha256": {
+            "title": "Go Sum Sha256",
+            "type": "string"
+          },
+          "admin_lock_sha256": {
+            "title": "Admin Lock Sha256",
+            "type": "string"
+          },
+          "console_lock_sha256": {
+            "title": "Console Lock Sha256",
+            "type": "string"
+          },
+          "test_config_sha256": {
+            "title": "Test Config Sha256",
+            "type": "string"
+          },
+          "changed_files_json": {
+            "default": "[]",
+            "title": "Changed Files Json",
+            "type": "string"
+          },
+          "expires_at": {
+            "default": 0,
+            "title": "Expires At",
+            "type": "number"
+          }
+        },
+        "required": [
+          "repository",
+          "job_id",
+          "tested_commit_sha",
+          "tested_tree_sha",
+          "base_sha",
+          "profile",
+          "ci_image_digest",
+          "go_version",
+          "node_version",
+          "npm_version",
+          "go_sum_sha256",
+          "admin_lock_sha256",
+          "console_lock_sha256",
+          "test_config_sha256"
+        ],
+        "title": "create_attestation_for_passed_jobArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_attestation",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Read a persisted Tree SHA attestation by id.",
+      "input_schema": {
+        "properties": {
+          "attestation_id": {
+            "title": "Attestation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attestation_id"
+        ],
+        "title": "get_attestationArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "validate_attestation",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Validate every identity, job, toolchain, dependency, config, expiry and revocation gate before CI reuse.",
+      "input_schema": {
+        "properties": {
+          "attestation_id": {
+            "title": "Attestation Id",
+            "type": "string"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "tested_commit_sha": {
+            "title": "Tested Commit Sha",
+            "type": "string"
+          },
+          "tested_tree_sha": {
+            "title": "Tested Tree Sha",
+            "type": "string"
+          },
+          "base_sha": {
+            "title": "Base Sha",
+            "type": "string"
+          },
+          "profile": {
+            "title": "Profile",
+            "type": "string"
+          },
+          "ci_image_digest": {
+            "title": "Ci Image Digest",
+            "type": "string"
+          },
+          "go_version": {
+            "title": "Go Version",
+            "type": "string"
+          },
+          "node_version": {
+            "title": "Node Version",
+            "type": "string"
+          },
+          "npm_version": {
+            "title": "Npm Version",
+            "type": "string"
+          },
+          "go_sum_sha256": {
+            "title": "Go Sum Sha256",
+            "type": "string"
+          },
+          "admin_lock_sha256": {
+            "title": "Admin Lock Sha256",
+            "type": "string"
+          },
+          "console_lock_sha256": {
+            "title": "Console Lock Sha256",
+            "type": "string"
+          },
+          "test_config_sha256": {
+            "title": "Test Config Sha256",
+            "type": "string"
+          },
+          "changed_files_json": {
+            "default": "[]",
+            "title": "Changed Files Json",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attestation_id",
+          "repository",
+          "tested_commit_sha",
+          "tested_tree_sha",
+          "base_sha",
+          "profile",
+          "ci_image_digest",
+          "go_version",
+          "node_version",
+          "npm_version",
+          "go_sum_sha256",
+          "admin_lock_sha256",
+          "console_lock_sha256",
+          "test_config_sha256"
+        ],
+        "title": "validate_attestationArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "revoke_attestation",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Revoke one persisted attestation so it can never be reused.",
+      "input_schema": {
+        "properties": {
+          "attestation_id": {
+            "title": "Attestation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attestation_id"
+        ],
+        "title": "revoke_attestationArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "register_release_artifact",
+      "read_only": false,
+      "consequential": true,
+      "category": "release",
+      "description": "Register a ready artifact using server-controlled storage metadata and immutable provenance.",
+      "input_schema": {
+        "properties": {
+          "metadata_json": {
+            "title": "Metadata Json",
+            "type": "string"
+          }
+        },
+        "required": [
+          "metadata_json"
+        ],
+        "title": "register_release_artifactArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_release_artifact",
+      "read_only": true,
+      "consequential": false,
+      "category": "release",
+      "description": "Read one registered artifact without exposing arbitrary filesystem contents.",
+      "input_schema": {
+        "properties": {
+          "artifact_id": {
+            "title": "Artifact Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_id"
+        ],
+        "title": "get_release_artifactArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_release_artifacts",
+      "read_only": true,
+      "consequential": false,
+      "category": "release",
+      "description": "List registered artifact metadata by repository and status.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "default": "",
+            "title": "Repository",
+            "type": "string"
+          },
+          "status": {
+            "default": "",
+            "title": "Status",
+            "type": "string"
+          },
+          "limit": {
+            "default": 50,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "list_release_artifactsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "validate_release_artifact",
+      "read_only": false,
+      "consequential": true,
+      "category": "release",
+      "description": "Validate artifact readiness, expiry, provenance, exact main identity and current private CI status.",
+      "input_schema": {
+        "properties": {
+          "artifact_id": {
+            "title": "Artifact Id",
+            "type": "string"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "commit_sha": {
+            "title": "Commit Sha",
+            "type": "string"
+          },
+          "tree_sha": {
+            "title": "Tree Sha",
+            "type": "string"
+          },
+          "private_ci_job_id": {
+            "title": "Private Ci Job Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "repository",
+          "branch",
+          "commit_sha",
+          "tree_sha",
+          "private_ci_job_id"
+        ],
+        "title": "validate_release_artifactArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "revoke_release_artifact",
+      "read_only": false,
+      "consequential": true,
+      "category": "release",
+      "description": "Revoke a registered artifact; revoked artifacts cannot be deployed.",
+      "input_schema": {
+        "properties": {
+          "artifact_id": {
+            "title": "Artifact Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_id"
+        ],
+        "title": "revoke_release_artifactArguments",
         "type": "object"
       }
     },
