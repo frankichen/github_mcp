@@ -14,4 +14,6 @@ def execute_verified_artifact(row, artifact: dict) -> dict:
     module = module_from_spec(spec); spec.loader.exec_module(module)
     incoming = Path(os.environ.get("DEPLOY_ARTIFACT_INCOMING_ROOT", "/srv/private-ci/deploy-incoming")) / row["deployment_id"]
     current = Path(os.environ.get("DEPLOY_CURRENT_LINK", "/srv/private-ci/current"))
-    return module.deploy_artifact(artifact["storage_path"], incoming, current, migration_required=artifact["migration_required"], migration_runner=lambda: True, healthcheck=lambda: True)
+    def unavailable():
+        return False
+    return module.deploy_artifact(artifact["storage_dir"], incoming, current, migration_required=artifact["migration_required"], migration_runner=unavailable, healthcheck=unavailable, restart_services=unavailable)

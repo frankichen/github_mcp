@@ -103,8 +103,12 @@ def process_once() -> bool:
     # verified current release untouched until the complete callback proves a
     # successful symlink switch and health check.
     write_status("busy", "claimed", retained_release, retained_previous, f"claimed deployment {dep_id}")
-    if row["artifact_id"]:
+    if row["artifact_id"] and os.environ.get("MYGITHUB10_ARTIFACT_DEPLOY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}:
         return _process_artifact(db, row, retained_release, retained_previous)
+    if row["artifact_id"]:
+        db.execute("UPDATE deployments SET status='failed',current_step='artifact_feature_disabled',error_code='FEATURE_DISABLED',error_message='artifact deployment is disabled',exit_code=1,finished_at=?,updated_at=? WHERE deployment_id=?", (time.time(), time.time(), dep_id)); db.commit()
+        write_status("online", "idle", retained_release, retained_previous, f"artifact deployment disabled for {dep_id}")
+        return True
     if os.environ.get("DEPLOY_EXECUTION_MODE") == "claim_only":
         prior_log = row["log_text"] or ""
         log_text = (prior_log + ("\n" if prior_log else "") + f"agent claimed deployment {dep_id}; execution delegated to WSL")[-200000:]

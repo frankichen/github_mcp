@@ -274,6 +274,7 @@ def _ci_gate(job_id, commit_sha):
 
 
 def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope=SCOPE, expected_current_release_id="", allow_deploy_infrastructure_changes=False, artifact_id=""):
+    if artifact_id and os.environ.get("MYGITHUB10_ARTIFACT_DEPLOY_ENABLED", "false").lower() not in {"1", "true", "yes", "on"}: return {"ok": False, "error_code": "FEATURE_DISABLED", "ready": False}
     reason = _validate_common(repository, environment, scope, commit_sha)
     if reason: return {"ok": True, "ready": False, "reasons": [reason]}
     reasons = []
@@ -313,6 +314,7 @@ def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id,
 
 
 def start_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope=SCOPE, expected_current_release_id="", allow_deploy_infrastructure_changes=False, force_redeploy=False, confirm=False, requested_by="mcp", artifact_id=""):
+    if artifact_id and os.environ.get("MYGITHUB10_ARTIFACT_DEPLOY_ENABLED", "false").lower() not in {"1", "true", "yes", "on"}: return _error_response("FEATURE_DISABLED", "artifact deployment is disabled")
     if not confirm: return _error_response("CONFIRM_REQUIRED", "confirm must be true")
     plan = plan_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes, artifact_id)
     if not plan.get("ready"): return {**plan, "error": {"code": plan.get("reasons", ["NOT_READY"])[0]}}

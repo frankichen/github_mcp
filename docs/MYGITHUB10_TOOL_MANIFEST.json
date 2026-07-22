@@ -1,6 +1,6 @@
 {
   "service_name": "MyGithub10",
-  "source_commit": "3318d5075786bd47c49dc3a5cc78e127473eb885",
+  "source_commit": "d7c2a37d3823fd13e443bdc196c3236f3af37cc2",
   "controller_image": "not-read-from-runtime",
   "pygithub_version": "2.5.0",
   "mcp_sdk_version": "mcp>=1.7.0 (requirements baseline)",
@@ -2499,80 +2499,10 @@
           "attestation_id": {
             "title": "Attestation Id",
             "type": "string"
-          },
-          "repository": {
-            "title": "Repository",
-            "type": "string"
-          },
-          "tested_commit_sha": {
-            "title": "Tested Commit Sha",
-            "type": "string"
-          },
-          "tested_tree_sha": {
-            "title": "Tested Tree Sha",
-            "type": "string"
-          },
-          "base_sha": {
-            "title": "Base Sha",
-            "type": "string"
-          },
-          "profile": {
-            "title": "Profile",
-            "type": "string"
-          },
-          "ci_image_digest": {
-            "title": "Ci Image Digest",
-            "type": "string"
-          },
-          "go_version": {
-            "title": "Go Version",
-            "type": "string"
-          },
-          "node_version": {
-            "title": "Node Version",
-            "type": "string"
-          },
-          "npm_version": {
-            "title": "Npm Version",
-            "type": "string"
-          },
-          "go_sum_sha256": {
-            "title": "Go Sum Sha256",
-            "type": "string"
-          },
-          "admin_lock_sha256": {
-            "title": "Admin Lock Sha256",
-            "type": "string"
-          },
-          "console_lock_sha256": {
-            "title": "Console Lock Sha256",
-            "type": "string"
-          },
-          "test_config_sha256": {
-            "title": "Test Config Sha256",
-            "type": "string"
-          },
-          "changed_files_json": {
-            "default": "[]",
-            "title": "Changed Files Json",
-            "type": "string"
           }
         },
         "required": [
-          "attestation_id",
-          "repository",
-          "tested_commit_sha",
-          "tested_tree_sha",
-          "base_sha",
-          "profile",
-          "ci_image_digest",
-          "go_version",
-          "node_version",
-          "npm_version",
-          "go_sum_sha256",
-          "admin_lock_sha256",
-          "console_lock_sha256",
-          "test_config_sha256"
+          "attestation_id"
         ],
         "title": "validate_attestationArguments",
         "type": "object"

@@ -24,9 +24,10 @@ def test_attestation_persists_and_rejects_tree_mismatch(tmp_path, monkeypatch):
     monkeypatch.setenv("CI_DB_PATH", str(tmp_path / "ci.db")); monkeypatch.setattr(registry, "get_job", lambda _: _job())
     item = registry.create_attestation_for_passed_job(job_id="job")
     assert len(item["attestation_id"]) == 36
-    good = registry.validate_attestation(item["attestation_id"], repository="owner/repo", tested_commit_sha="c" * 40, tested_tree_sha="t" * 40, base_sha="b" * 40, profile="repo-auto-check", ci_image_digest="sha256:image", go_version="go1.25", node_version="node22", npm_version="11", go_sum_sha256="g", admin_lock_sha256="a", console_lock_sha256="c", test_config_sha256="x", changed_files=["a.go"])
+    good = registry.validate_attestation(item["attestation_id"])
     assert good["ok"] is True
-    bad = registry.validate_attestation(item["attestation_id"], repository="owner/repo", tested_commit_sha="c" * 40, tested_tree_sha="x" * 40, base_sha="b" * 40, profile="repo-auto-check", ci_image_digest="sha256:image", go_version="go1.25", node_version="node22", npm_version="11", go_sum_sha256="g", admin_lock_sha256="a", console_lock_sha256="c", test_config_sha256="x", changed_files=["a.go"])
+    monkeypatch.setattr(registry, "get_job", lambda _: {**_job(), "summary": {**_job()["summary"], "git_tree_sha": "x" * 40}})
+    bad = registry.validate_attestation(item["attestation_id"])
     assert bad["error_code"] == "ATTESTATION_TREE_MISMATCH"
     assert registry.revoke_attestation(item["attestation_id"])["status"] == "revoked"
 

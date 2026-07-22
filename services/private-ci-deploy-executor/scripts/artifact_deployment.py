@@ -26,16 +26,19 @@ def deploy_artifact(artifact_dir: str | Path, incoming_root: str | Path, current
         previous = os.readlink(current_link) if current_link.is_symlink() else None
         if migration_required:
             if not migration_runner or migration_runner() is not True: raise RuntimeError("MIGRATION_FAILED")
-        if restart_services: restart_services()
-        if healthcheck and healthcheck() is not True: raise RuntimeError("HEALTH_CHECK_FAILED")
         tmp_link = current_link.with_name(current_link.name + ".next")
         if tmp_link.exists() or tmp_link.is_symlink(): tmp_link.unlink()
         tmp_link.symlink_to(release_dir)
         os.replace(tmp_link, current_link)
+        if restart_services and restart_services() is not True: raise RuntimeError("RESTART_FAILED")
+        if not healthcheck or healthcheck() is not True: raise RuntimeError("HEALTH_CHECK_FAILED")
         return {"ok": True, "release_path": str(release_dir), "previous": previous, "rolled_back": False}
     except Exception as exc:
         if current_link.is_symlink():
             current_link.unlink()
         if 'previous' in locals() and previous:
             current_link.symlink_to(previous)
+        if 'previous' in locals() and previous and restart_services:
+            restart_services()
+            if healthcheck: healthcheck()
         return {"ok": False, "error_code": str(exc), "rolled_back": bool('previous' in locals() and previous)}

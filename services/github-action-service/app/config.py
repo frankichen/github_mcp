@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     DEPLOY_CALLBACK_API_KEY: SecretStr = SecretStr("")
     DEPLOY_CALLBACK_API_KEY_FILE: Optional[str] = None
     DIAGNOSTIC_MODE: bool = False
+    MYGITHUB10_ARTIFACT_BUILD_ENABLED: bool = False
+    MYGITHUB10_ARTIFACT_DEPLOY_ENABLED: bool = False
+    MYGITHUB10_ATTESTATION_REUSE_ENABLED: bool = False
 
     model_config = {
         "env_file": ".env",

@@ -6,6 +6,8 @@ import hashlib
 import json
 import subprocess
 import tempfile
+import tarfile
+import shutil
 from pathlib import Path
 
 
@@ -56,6 +58,35 @@ def _safe_member(name: str) -> bool:
     return not path.is_absolute() and ".." not in path.parts and not name.startswith("./")
 
 
+def _extract_zstd_safely(archive: Path, destination: Path, max_files: int = 100000, max_bytes: int = 2 * 1024 * 1024 * 1024) -> set[str]:
+    import subprocess
+    process = subprocess.Popen(["zstd", "-d", "-q", "-c", str(archive)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    names = set(); total = 0
+    try:
+        with tarfile.open(fileobj=process.stdout, mode="r|") as tar:
+            for member in tar:
+                if len(names) >= max_files or not _safe_member(member.name) or member.name in names:
+                    raise ValueError("ARTIFACT_UNSAFE_ARCHIVE_ENTRY")
+                if not (member.isdir() or member.isreg()):
+                    raise ValueError("ARTIFACT_NON_REGULAR_ENTRY")
+                names.add(member.name)
+                target = destination / member.name
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True); continue
+                total += member.size
+                if total > max_bytes: raise ValueError("ARTIFACT_SIZE_LIMIT")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = tar.extractfile(member)
+                if source is None: raise ValueError("ARTIFACT_MEMBER_READ_FAILED")
+                with target.open("xb") as output:
+                    shutil.copyfileobj(source, output)
+        return names
+    finally:
+        if process.stdout: process.stdout.close()
+        process.wait(timeout=30)
+        if process.returncode != 0: raise ValueError("ARTIFACT_ZSTD_INVALID")
+
+
 def build_release_artifact(root: str | Path, output_dir: str | Path, metadata: dict) -> dict:
     """Create the complete release bundle using the pinned tar/zstd toolchain."""
     root = Path(root).resolve(); output_dir = Path(output_dir).resolve()
@@ -79,7 +110,7 @@ def build_release_artifact(root: str | Path, output_dir: str | Path, metadata: d
         destination = output_dir / "release.tar.zst"; destination.write_bytes(archive.read_bytes())
         for name in ("manifest.json", "checksums.sha256", "provenance.json"):
             (output_dir / name).write_bytes((staging / name).read_bytes())
-        result["storage_path"] = str(destination); result["manifest_sha256"] = _sha256(output_dir / "manifest.json"); result["checksums_sha256"] = _sha256(output_dir / "checksums.sha256")
+        result["storage_path"] = str(destination); result["archive_path"] = str(destination); result["storage_dir"] = str(output_dir); result["manifest_sha256"] = _sha256(output_dir / "manifest.json"); result["checksums_sha256"] = _sha256(output_dir / "checksums.sha256"); result["provenance_sha256"] = _sha256(output_dir / "provenance.json")
         return result
 
 
@@ -88,18 +119,11 @@ def verify_release_artifact(artifact_dir: str | Path) -> dict:
     manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
     checksums = (directory / "checksums.sha256").read_text(encoding="utf-8").splitlines()
     expected = {line.split("  ", 1)[1]: line.split("  ", 1)[0] for line in checksums if "  " in line}
-    listing = subprocess.run(["tar", "--zstd", "-tf", str(archive)], check=True, capture_output=True, text=True).stdout.splitlines()
-    names = set()
-    for line in listing:
-        if not line: continue
-        name = line
-        if not _safe_member(name): raise ValueError("ARTIFACT_UNSAFE_ARCHIVE_ENTRY")
-        names.add(name)
-    listed = {item["path"] for item in manifest.get("files", [])}
-    if names != listed: raise ValueError("ARTIFACT_ARCHIVE_EXTRA_OR_MISSING_ENTRY")
     with tempfile.TemporaryDirectory(prefix="verify-") as tmp:
-        subprocess.run(["tar", "--zstd", "--extract", "--no-same-owner", "--no-same-permissions", "-f", str(archive), "-C", tmp], check=True)
-        if any(path.is_symlink() for path in Path(tmp).rglob("*")): raise ValueError("ARTIFACT_UNSAFE_ARCHIVE_ENTRY")
+        names = _extract_zstd_safely(archive, Path(tmp))
+        listed = {item["path"] for item in manifest.get("files", [])}
+        names -= {name for name in names if (Path(tmp) / name).is_dir()}
+        if names != listed: raise ValueError("ARTIFACT_ARCHIVE_EXTRA_OR_MISSING_ENTRY")
         verify_manifest(tmp, manifest)
         if any(expected.get(item["path"]) != item["sha256"] for item in manifest.get("files", [])): raise ValueError("ARTIFACT_CHECKSUM_FILE_MISMATCH")
     return {"ok": True, "archive_sha256": _sha256(archive), "files": len(manifest.get("files", []))}
