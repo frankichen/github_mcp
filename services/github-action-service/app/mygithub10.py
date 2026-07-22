@@ -28,6 +28,11 @@ MAX_INLINE_RESPONSE_BYTES = 65536
 MAX_FILE_CHUNK_BYTES = 65536
 MAX_PATCH_BYTES = 262144
 MAX_UPLOAD_CHUNK_BYTES = 131072
+GOFMT_FORBIDDEN = ("vendor/", "generated/", "db/migrations/", "go.mod", "go.sum")
+
+
+def gofmt_allowed_path(path: str) -> bool:
+    return path.endswith(".go") and not any(path == item or path.startswith(item) for item in GOFMT_FORBIDDEN) and not path.endswith("_generated.go") and not path.endswith(".pb.go")
 MAX_UPLOAD_BYTES = 1048576
 UPLOAD_TTL_SECONDS = 3600
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -363,6 +368,25 @@ def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, op
     except MyGithub10Error as exc:
         _idempotent_finish(operation_id, "failed", error_code=exc.code)
         raise
+
+
+def autofix_gofmt(client, repository: str, branch: str, expected_head_sha: str, changed_files: list[str], commit_message: str) -> dict[str, Any]:
+    if branch in ("main", "master"):
+        raise MyGithub10Error("GOFMT_MAIN_DENIED", "gofmt auto-fix cannot target the default branch")
+    files = sorted(set(changed_files))
+    if not files or any(not gofmt_allowed_path(path) for path in files):
+        raise MyGithub10Error("GOFMT_FILE_DENIED", "changed files contain a non-allowlisted Go path")
+    repo = _repo(client, repository); changed = {}; expected = {}
+    for path in files:
+        data, blob_sha, _ = _read_blob(repo, path, branch); expected[path] = blob_sha
+        with tempfile.TemporaryDirectory(prefix="gofmt-") as temp:
+            source = Path(temp) / Path(path).name; source.write_bytes(data)
+            result = subprocess.run(["gofmt", "-w", str(source)], capture_output=True, text=True, timeout=30)
+            if result.returncode != 0: raise MyGithub10Error("GOFMT_FAILED", "gofmt failed")
+            new = source.read_bytes()
+        if new != data: changed[path] = new
+    if not changed: return {"ok": True, "changed_files": [], "message": "already formatted"}
+    return {"ok": True, **_commit_files(client, repository, branch, expected_head_sha, changed, expected, commit_message), "changed_files": sorted(changed)}
 
 
 def capabilities(build_sha: str = "unknown") -> dict[str, Any]:

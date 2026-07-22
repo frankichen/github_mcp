@@ -1,10 +1,10 @@
 {
   "service_name": "MyGithub10",
-  "source_commit": "d7c2a37d3823fd13e443bdc196c3236f3af37cc2",
+  "source_commit": "823a9196b521fcdf4cfe837520ee01ec22e8e77f",
   "controller_image": "not-read-from-runtime",
   "pygithub_version": "2.5.0",
   "mcp_sdk_version": "mcp>=1.7.0 (requirements baseline)",
-  "tool_count": 83,
+  "tool_count": 84,
   "tools": [
     {
       "name": "get_github_file",
@@ -2673,6 +2673,26 @@
           "artifact_id"
         ],
         "title": "revoke_release_artifactArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_repository_operation_policy",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Read the server-owned allowlist for a repository; it cannot be widened by MCP parameters.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "get_repository_operation_policyArguments",
         "type": "object"
       }
     },

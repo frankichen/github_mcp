@@ -925,6 +925,12 @@ async def validate_release_artifact(artifact_id: str, repository: str, branch: s
 async def revoke_release_artifact(artifact_id: str) -> str:
     return json.dumps({"ok": True, "artifact": attestation_registry.revoke_artifact(artifact_id)}, ensure_ascii=False)
 
+
+@mcp.tool(name="get_repository_operation_policy", description="Read the server-owned allowlist for a repository; it cannot be widened by MCP parameters.")
+async def get_repository_operation_policy(repository: str) -> str:
+    from app.repository_policy import get_policy
+    return json.dumps({"ok": True, "repository": repository, "policy": get_policy(repository)}, ensure_ascii=False)
+
 register_private_ci_mcp_tools(mcp)
 
 
