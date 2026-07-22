@@ -78,7 +78,6 @@ class JobExecutor:
                 metadata["selected_go_version"] = go_commands["selected_go_version"]
                 metadata["source_image"] = go_commands["source_image"]
                 metadata["selected_image"] = go_commands["selected_image"]
-                metadata["image_digest"] = self.podman.image_digest(go_commands["selected_image"])
         self.log_manager.upload(job_id, f"detected_stacks={metadata['detected_stacks']}\n")
         self.log_manager.upload(job_id, f"selected_profiles={metadata['selected_profiles']}\n")
         self.log_manager.upload(job_id, f"workspaces={metadata['workspaces']}\n")
@@ -109,6 +108,8 @@ class JobExecutor:
                     metadata["go_version"] = metadata["go_version"] or result.get("go_version")
                     metadata["node_version"] = metadata["node_version"] or result.get("node_version")
                     metadata["npm_version"] = metadata["npm_version"] or result.get("npm_version")
+                    if result.get("image_digest"):
+                        metadata["image_digest"] = result["image_digest"]
                     if not result["passed"]:
                         all_passed = False
                         final_exit_code = final_exit_code or result["exit_code"]
@@ -238,6 +239,9 @@ class JobExecutor:
                 "exit_code": 2,
                 "steps": [{"step_name": label, "status": "configuration_error", "exit_code": 2, "message": message}],
             }
+        # Capture the immutable digest only after image_available() has
+        # refreshed the tag and before the first container is started.
+        image_digest = getattr(self.podman, "image_digest", lambda _image: None)(image) if workspace["stack"] == "go" else None
         if workspace["stack"] == "go":
             # Go 缓存必须和源码目录分离，并按 job 隔离，避免第三方模块进入 gofmt 的源码扫描范围。
             cache_root = os.path.join(job.workspace or os.path.dirname(job.source_dir), "go-cache")
@@ -256,7 +260,7 @@ class JobExecutor:
                 self.log_manager.upload(job.job_id, f"[services:ready] {service_env.public_summary()}\n")
             except ServiceSetupError as exc:
                 self.log_manager.upload(job.job_id, f"[services:failed] {exc.code}\n")
-                return {"passed": False, "exit_code": 1, "steps": [{"step_name": "services:prepare", "status": "failed", "exit_code": 1, "error_code": exc.code}]}
+                return {"passed": False, "exit_code": 1, "steps": [{"step_name": "services:prepare", "status": "failed", "exit_code": 1, "error_code": exc.code}], "image_digest": image_digest}
         passed = True
         exit_code = 0
 
@@ -276,7 +280,7 @@ class JobExecutor:
                     message = f"requested Go {expected}, isolated runtime reported {actual or 'unavailable'}"
                     self.log_manager.upload(job.job_id, f"CI_TOOLCHAIN_MISMATCH: {message}\n")
                     step.update({"status": "infrastructure_error", "error_code": "CI_TOOLCHAIN_MISMATCH", "message": message})
-                    return {"passed": False, "exit_code": 2, "steps": steps, **runtime_versions}
+                    return {"passed": False, "exit_code": 2, "steps": steps, "image_digest": image_digest, **runtime_versions}
             if step["exit_code"] != 0:
                 setup_failed = True
                 passed = False
@@ -308,7 +312,7 @@ class JobExecutor:
                 passed = False
                 exit_code = exit_code or step["exit_code"]
 
-        return {"passed": passed, "exit_code": exit_code, "steps": steps, **runtime_versions}
+        return {"passed": passed, "exit_code": exit_code, "steps": steps, "image_digest": image_digest, **runtime_versions}
 
     def _run_setup(self, job, label, image, source_dir, caches, step_name, command, service_env=None):
         name = f"{label}:{step_name}"

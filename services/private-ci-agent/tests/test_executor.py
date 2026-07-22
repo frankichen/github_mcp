@@ -28,6 +28,9 @@ class FakePodman:
         self.commands = []
         self.caches = []
 
+    def image_digest(self, _image):
+        return "sha256:runtime-image-b"
+
     def image_available(self, _image):
         return True
 
@@ -99,6 +102,13 @@ def test_go_runtime_version_mismatch_fails_closed(tmp_path):
     assert result["exit_code"] == 2
     assert any(step.get("error_code") == "CI_TOOLCHAIN_MISMATCH" for step in result["steps"])
     assert not any("go test" in command or "go build" in command for command, _ in podman.commands)
+
+
+def test_summary_uses_digest_after_refreshed_image(tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    result = make_executor(FakePodman())._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
+
+    assert result["image_digest"] == "sha256:runtime-image-b"
 
 
 def test_go_cache_is_job_scoped_and_outside_source(tmp_path):
