@@ -6,11 +6,13 @@ set -euo pipefail
 : "${CONTROLLER_URL:?set CONTROLLER_URL to the private CI MCP endpoint}"
 : "${ACTION_API_KEY:?set ACTION_API_KEY in the caller environment, never in a file}"
 : "${STABLE_SXT_SHA:?set STABLE_SXT_SHA to a known 40-character sxt commit}"
+: "${STABLE_SXT_BASE_SHA:?set STABLE_SXT_BASE_SHA to the stable commit parent}"
 out="${1:-artifacts/sxt-repo-auto-check-5x.jsonl}"
 mkdir -p "$(dirname "$out")"
 CONTROLLER_URL="$CONTROLLER_URL" ACTION_API_KEY="$ACTION_API_KEY" STABLE_SXT_SHA="$STABLE_SXT_SHA" OUTPUT="$out" \
 python3 - <<'PY'
 import asyncio, json, os, time
+import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
@@ -18,12 +20,13 @@ async def main():
     headers = {"Authorization": "Bearer " + os.environ["ACTION_API_KEY"]}
     url = os.environ["CONTROLLER_URL"].rstrip("/")
     rows = []
-    async with streamable_http_client(url, headers=headers) as (read, write, _):
+    async with httpx.AsyncClient(headers=headers, trust_env=False) as http_client:
+      async with streamable_http_client(url, http_client=http_client) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             for run in range(1, 6):
                 started = time.time()
-                result = await session.call_tool("start_private_ci_job", {"repository": "frankichen/sxt", "branch": "main", "commit_sha": os.environ["STABLE_SXT_SHA"], "profile": "repo-auto-check", "force_rerun": True, "supersede_previous": False})
+                result = await session.call_tool("start_private_ci_job", {"repository": "frankichen/sxt", "branch": "main", "commit_sha": os.environ["STABLE_SXT_SHA"], "base_sha": os.environ["STABLE_SXT_BASE_SHA"], "changed_files_json": "[]", "profile": "repo-auto-check", "force_rerun": True, "supersede_previous": False})
                 payload = json.loads(result.content[0].text)
                 job_id = payload.get("job_id") or payload.get("job", {}).get("job_id")
                 if not job_id: raise RuntimeError("private CI did not return job_id")
