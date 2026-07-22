@@ -95,6 +95,7 @@ class ValidationError(AppError):
 
 class GitHubApiError(AppError):
     def __init__(self, status_code: int, message: str):
+        self.github_status = status_code
         super().__init__(
             error="github_api_error",
             message=message,

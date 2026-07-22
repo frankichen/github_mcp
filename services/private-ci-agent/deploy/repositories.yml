@@ -1,0 +1,29 @@
+repositories:
+  frankichen/ai_war:
+    enabled: true
+    auto_detect: true
+    allowed_profiles:
+      - repo-auto-check
+      - python-check
+    max_timeout_seconds: 900
+
+  frankichen/sxt:
+    enabled: true
+    auto_detect: true
+    allowed_profiles:
+      - repo-auto-check
+      - go-check
+      - node-check
+    max_timeout_seconds: 900
+    workspaces:
+      - path: .
+        type: auto
+      - path: h5/lenshub-console
+        type: node
+        package_manager: npm
+        required_scripts:
+          - test:run
+          - typecheck
+          - build
+        optional_scripts:
+          - lint

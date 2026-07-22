@@ -1,9 +1,11 @@
 # MCP 与 CI 部署服务
 
-本仓库包含两个端：
+本仓库包含四个相互独立的服务边界：
 
-- `services/github-action-service`：本地或 CI 环境使用的 GitHub/MCP 控制端，负责 GitHub API、CI 查询、提交和部署意图编排。
-- `services/private-deploy-agent`：服务器 `root@de` 上运行的私有部署 Worker，负责领取部署队列、记录状态，并按受控策略执行测试环境部署。
+- `services/github-action-service`：现网 MyGithub09 Controller 源码，负责 GitHub API、MCP 工具、CI 查询和部署意图编排。
+- `services/private-ci-agent`：Private CI 执行 Agent，负责受控容器任务、日志和源码镜像。
+- `services/private-deploy-agent`：服务器 `root@de` 上运行的私有部署 Worker，负责领取部署队列、记录状态并按受控策略执行测试环境部署。
+- `services/private-ci-deploy-executor`：WSL/发布 Executor 的脚本、测试和 systemd 模板。
 
 股票选股和股票 MCP 服务已经从仓库移除。
 
@@ -14,8 +16,11 @@ AI / MCP 客户端
         │
         ▼
 github-action-service
-  GitHub API / CI / 部署编排
+  GitHub API / MCP / CI / 部署编排
         │ 受控部署队列
+        ▼
+private-ci-agent（CI 执行端）
+        │ 私有 CI 结果
         ▼
 private-deploy-agent（服务器端）
   claim_only 或受控执行
@@ -32,7 +37,9 @@ private-deploy-agent（服务器端）
 - 迁移与部署说明：[`docs/迁移与部署说明.md`](docs/迁移与部署说明.md)
 - 安全说明：[`SECURITY.md`](SECURITY.md)
 - GitHub/MCP 服务：[`services/github-action-service`](services/github-action-service)
+- Private CI Agent：[`services/private-ci-agent`](services/private-ci-agent)
 - 私有部署 Worker：[`services/private-deploy-agent`](services/private-deploy-agent)
+- WSL Executor：[`services/private-ci-deploy-executor`](services/private-ci-deploy-executor)
 
 ## GitHub Action Service
 

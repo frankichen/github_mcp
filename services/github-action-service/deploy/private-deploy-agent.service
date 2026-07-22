@@ -1,0 +1,23 @@
+[Unit]
+Description=Private CI Test Environment Deploy Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deployworker
+WorkingDirectory=/opt/private-deploy-agent
+EnvironmentFile=/etc/private-ci/deploy-worker.env
+Environment=DEPLOY_STATUS_FILE=/var/lib/private-ci/gongshi-test-status.json
+Environment=ENVIRONMENT_URL=http://gongshi-test
+ExecStart=/opt/private-deploy-agent/venv/bin/python -m app.deploy_worker
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/private-deploy-agent /var/lib/private-ci
+
+[Install]
+WantedBy=multi-user.target

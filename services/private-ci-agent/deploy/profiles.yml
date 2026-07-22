@@ -1,0 +1,37 @@
+profiles:
+  repo-auto-check:
+    description: "Scan controlled Manifest workspaces and orchestrate approved checks"
+    execution_mode: sequential
+
+  go-check:
+    description: "Go version-aware format, vet, test, build"
+    language: go
+    base_image: derived-from-go.mod
+    toolchain_policy: "select at least the go.mod go/toolchain directive"
+    checks:
+      - gofmt
+      - govet
+      - gotest
+      - gobuild
+
+  python-check:
+    description: "Python lint, compile, test"
+    language: python
+    base_image: docker.io/library/python:3.12-slim
+
+  node-check:
+    description: "Node.js workspace checks from package.json scripts"
+    language: node
+    base_image: docker.io/library/node:22
+    package_managers:
+      package-lock.json: npm
+      pnpm-lock.yaml: pnpm
+      yarn.lock: yarn
+      bun.lock: bun
+    allowed_scripts:
+      - lint
+      - typecheck
+      - test:run
+      - test:ci
+      - test
+      - build
