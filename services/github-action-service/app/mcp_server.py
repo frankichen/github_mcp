@@ -1,6 +1,8 @@
 import hmac
 import json
 import logging
+import base64
+import os
 from typing import Optional
 
 import httpx
@@ -15,6 +17,7 @@ from app.services.github_service import GitHubService
 from app.services.ci_service import get_ci_service
 from app.ci_mcp import register_private_ci_mcp_tools
 from app import github_utils
+from app import mygithub10
 
 logger = logging.getLogger(__name__)
 
@@ -732,6 +735,103 @@ async def get_github_weekly_report_data_tool(
 # ========================================================================
 # Register Private CI MCP Tools
 # ========================================================================
+
+
+def _mygithub10_error(exc: Exception) -> str:
+    if isinstance(exc, mygithub10.MyGithub10Error):
+        return json.dumps({"ok": False, "error": {"code": exc.code, "message": exc.message, "details": exc.details}}, ensure_ascii=False)
+    logger.exception("MyGithub10 tool failed")
+    return json.dumps({"ok": False, "error": {"code": "INTERNAL_ERROR", "message": "MyGithub10 operation failed", "details": {}}}, ensure_ascii=False)
+
+
+@mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithub10 capability and compatibility contract.")
+async def get_mygithub_capabilities() -> str:
+    return json.dumps(mygithub10.capabilities(os.environ.get("MYGITHUB10_BUILD_SHA", "unknown")), ensure_ascii=False)
+
+
+@mcp.tool(name="get_github_file_manifest", description="Return exact Git Blob metadata for a file without returning file content.")
+async def get_github_file_manifest(repository: str, path: str, ref: str = "") -> str:
+    try:
+        return json.dumps(mygithub10.file_manifest(_service, repository, path, ref), ensure_ascii=False)
+    except Exception as exc:
+        return _mygithub10_error(exc)
+
+
+@mcp.tool(name="read_github_file_chunk", description="Read an exact UTF-8 byte chunk with SHA and continuation metadata.")
+async def read_github_file_chunk(repository: str, path: str, ref: str = "", offset_bytes: int = 0, limit_bytes: int = mygithub10.MAX_FILE_CHUNK_BYTES, expected_blob_sha: str = "") -> str:
+    try:
+        return json.dumps(mygithub10.file_chunk(_service, repository, path, ref, offset_bytes, limit_bytes, expected_blob_sha), ensure_ascii=False)
+    except Exception as exc:
+        return _mygithub10_error(exc)
+
+
+@mcp.tool(name="open_github_file_resource", description="Open a file resource handle for paginated reads instead of returning a large JSON body.")
+async def open_github_file_resource(repository: str, path: str, ref: str = "") -> str:
+    try:
+        manifest = mygithub10.file_manifest(_service, repository, path, ref)
+        token = base64.urlsafe_b64encode(json.dumps({"repository": repository, "path": path, "commit": manifest["resolved_commit_sha"]}, separators=(",", ":")).encode()).decode().rstrip("=")
+        return json.dumps({"resource_uri": f"mygithub10://blob/{token}", **{key: manifest[key] for key in ("repository", "path", "resolved_commit_sha", "blob_sha", "size_bytes", "content_sha256")}}, ensure_ascii=False)
+    except Exception as exc:
+        return _mygithub10_error(exc)
+
+
+@mcp.tool(name="read_github_file_resource", description="Read a bounded page from an opened MyGithub10 file resource.")
+async def read_github_file_resource(resource_uri: str, offset_bytes: int = 0, limit_bytes: int = mygithub10.MAX_FILE_CHUNK_BYTES) -> str:
+    try:
+        token = resource_uri.rsplit("/", 1)[-1]
+        token += "=" * (-len(token) % 4)
+        item = json.loads(base64.urlsafe_b64decode(token).decode())
+        return json.dumps(mygithub10.file_chunk(_service, item["repository"], item["path"], item["commit"], offset_bytes, limit_bytes), ensure_ascii=False)
+    except Exception as exc:
+        return _mygithub10_error(exc)
+
+
+@mcp.tool(name="apply_github_patch", description="Apply a strict unified diff atomically with exact HEAD/blob checks and optional dry-run/idempotency.")
+async def apply_github_patch(repository: str, branch: str, expected_head_sha: str, expected_blob_shas_json: str, patch: str, commit_message: str, dry_run: bool = True, idempotency_key: str = "", create_pull_request: bool = False, pull_request_json: str = "{}") -> str:
+    try:
+        return json.dumps(mygithub10.apply_patch(_service, repository, branch, expected_head_sha, expected_blob_shas_json, patch, commit_message, dry_run, idempotency_key), ensure_ascii=False)
+    except Exception as exc:
+        return _mygithub10_error(exc)
+
+
+@mcp.tool(name="edit_github_file_ranges", description="Apply non-overlapping, hash-checked line range edits as one atomic commit.")
+async def edit_github_file_ranges(repository: str, branch: str, expected_head_sha: str, operations_json: str, commit_message: str, dry_run: bool = True, idempotency_key: str = "") -> str:
+    try:
+        return json.dumps(mygithub10.edit_ranges(_service, repository, branch, expected_head_sha, operations_json, commit_message, dry_run, idempotency_key), ensure_ascii=False)
+    except Exception as exc:
+        return _mygithub10_error(exc)
+
+
+@mcp.tool(name="begin_github_file_upload", description="Begin a bounded, permission-0600 chunked file upload.")
+async def begin_github_file_upload() -> str:
+    try: return json.dumps(mygithub10.begin_upload(), ensure_ascii=False)
+    except Exception as exc: return _mygithub10_error(exc)
+
+
+@mcp.tool(name="append_github_file_upload_chunk", description="Append one contiguous SHA-checked upload chunk.")
+async def append_github_file_upload_chunk(upload_id: str, offset: int, content_base64: str = "", text: str = "", chunk_sha256: str = "", idempotency_key: str = "") -> str:
+    try:
+        content = base64.b64decode(content_base64) if content_base64 else text.encode("utf-8")
+        return json.dumps(mygithub10.append_upload(upload_id, offset, content, chunk_sha256, idempotency_key), ensure_ascii=False)
+    except Exception as exc: return _mygithub10_error(exc)
+
+
+@mcp.tool(name="finalize_github_file_upload", description="Finalize an upload only after exact size and SHA256 validation.")
+async def finalize_github_file_upload(upload_id: str, expected_size_bytes: int, expected_sha256: str) -> str:
+    try: return json.dumps(mygithub10.finalize_upload(upload_id, expected_size_bytes, expected_sha256), ensure_ascii=False)
+    except Exception as exc: return _mygithub10_error(exc)
+
+
+@mcp.tool(name="commit_github_uploaded_files", description="Commit one finalized upload to a branch with exact HEAD/blob checks.")
+async def commit_github_uploaded_files(repository: str, branch: str, expected_head_sha: str, path: str, expected_blob_sha: str, upload_id: str, commit_message: str, idempotency_key: str = "") -> str:
+    try: return json.dumps(mygithub10.commit_upload(_service, repository, branch, expected_head_sha, path, expected_blob_sha, upload_id, commit_message, idempotency_key), ensure_ascii=False)
+    except Exception as exc: return _mygithub10_error(exc)
+
+
+@mcp.tool(name="abort_github_file_upload", description="Abort and remove only the selected temporary upload.")
+async def abort_github_file_upload(upload_id: str) -> str:
+    try: return json.dumps(mygithub10.abort_upload(upload_id), ensure_ascii=False)
+    except Exception as exc: return _mygithub10_error(exc)
 
 register_private_ci_mcp_tools(mcp)
 
