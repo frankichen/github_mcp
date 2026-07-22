@@ -23,7 +23,9 @@
 - 容器内 Controller：157 passed；容器内 compileall、工具清单生成（84 tools）和 `verify_mygithub10_live.py --simulate`：通过。
 - 本地/模拟在线验收：通过 7 项核心检查；真实公网验收仍需部署后由人工执行，当前不伪造 live 结果。
 - `compileall/py_compile`、`bash -n`、`git diff --check`：通过。
-- 真实 sxt 5x：正在/已由外部队列执行；只有 5/5 passed 才会把 `supports_real_ci_performance_validation` 改为 true。最终报告将列出 5 个 job_id、耗时、中位数/P90；未完成前该 capability 保持 false。
+- 真实 sxt 5x：已取得五个历史 passed Job 的完整证据；由于修正脚本无法在未部署的旧 Controller 上完成 schema/stream 验证，`supports_real_ci_performance_validation` 仍保持 false。
+- 同一稳定 SHA 的五个真实历史 passed Job 证据：`6545eed41839439e`、`b45c084921534e7a`、`2332022c22624c53`、`8f35c5ee22534e38`、`600398a63b9a45b5`；五次 commit 均为 `f1a9368e649e47eeb3481474b31f8c51580fa955`，tree 均为 `8a31b7620acd8ed97e53b110f421e7328448ea01`，耗时依次为 237.715/253.651/230.566/206.051/200.119 秒，median=230.566 秒，nearest-rank P90=253.651 秒。Migration=74.834/77.793/71.156/69.364/64.552 秒；Go test=72.419/74.449/68.216/60.352/63.569 秒；Admin test=13.172/10.982/9.250/8.364/9.208 秒；Console test=146.634/158.783/148.057/114.041/101.124 秒；build=57.256/61.838/52.425/48.127/51.709 秒。镜像 digest 均为 `sha256:f92b729f5f76b045df75ee1cb324ea68658bbc82feecd286c6ce08bf339fd74d`，Go=`go1.26.0`、Node=`v22.22.1`、npm=`10.9.2`。
+- 修正后的脚本对当前仍运行 MyGithub09 的旧 Controller 在 `initialize/list_tools` 阶段遇到 stream 读取失败后立即退出；因此未把这次重新执行计入 5x capability，能力值仍保持 false。
 - Docker 新镜像已用临时 `DOCKER_CONFIG` 构建，未修改全局配置；当前完整 image ID：`sha256:17b7a630a015b30222d3af1c57c96f01fb5e81214dc8cafe36aa4eaf9fc9a106`。旧镜像未覆盖。
 
 ## 尚未打开的能力
