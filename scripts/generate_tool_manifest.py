@@ -32,7 +32,7 @@ def git_value(path: Path, *args: str) -> str:
         return "unknown"
 
 
-async def build_manifest(source: Path, source_commit: str | None = None) -> dict:
+async def build_manifest(source: Path, source_commit: str | None = None, service_name: str = "MyGithub09") -> dict:
     os.environ.setdefault("GITHUB_TOKEN", "test_token_value")
     os.environ.setdefault("ACTION_API_KEY", "test_action_key")
     os.environ.setdefault("IDEMPOTENCY_DB_PATH", "/tmp/mygithub09-idempotency.db")
@@ -63,7 +63,7 @@ async def build_manifest(source: Path, source_commit: str | None = None) -> dict
             }
         )
     return {
-        "service_name": "MyGithub09",
+        "service_name": service_name,
         "source_commit": source_commit or git_value(source, "rev-parse", "HEAD"),
         "controller_image": os.environ.get("MYGITHUB09_CONTROLLER_IMAGE", "not-read-from-runtime"),
         "pygithub_version": "2.5.0",
@@ -77,9 +77,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, default=Path(__file__).parents[1])
     parser.add_argument("--source-commit", default=None)
+    parser.add_argument("--service-name", default="MyGithub09")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    manifest = asyncio.run(build_manifest(args.source.resolve(), args.source_commit))
+    manifest = asyncio.run(build_manifest(args.source.resolve(), args.source_commit, args.service_name))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 

@@ -1,0 +1,2686 @@
+{
+  "service_name": "MyGithub10",
+  "source_commit": "3aa235ea288560a8ceade982fe8921e0129be3e9",
+  "controller_image": "not-read-from-runtime",
+  "pygithub_version": "2.5.0",
+  "mcp_sdk_version": "mcp>=1.7.0 (requirements baseline)",
+  "tool_count": 73,
+  "tools": [
+    {
+      "name": "get_github_file",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Get file content from a GitHub repository. Returns the file content with metadata including SHA, size, and line range.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "ref": {
+            "default": "",
+            "title": "Ref",
+            "type": "string"
+          },
+          "start_line": {
+            "default": 0,
+            "title": "Start Line",
+            "type": "integer"
+          },
+          "end_line": {
+            "default": 0,
+            "title": "End Line",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "path"
+        ],
+        "title": "get_github_fileArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_directory",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List directory contents in a GitHub repository. Returns files and subdirectories with their metadata.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "ref": {
+            "default": "",
+            "title": "Ref",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "path"
+        ],
+        "title": "list_github_directoryArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "create_github_branch",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Create a new branch in a GitHub repository. Fails if the branch already exists.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "base_branch": {
+            "default": "main",
+            "title": "Base Branch",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "branch"
+        ],
+        "title": "create_github_branchArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "diagnose_text_payload",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Diagnostic: reports metadata of a received text payload (character_count, utf8_byte_count, sha256, marker checks). Use this to verify ChatGPT is not truncating tool call arguments when committing large files.",
+      "input_schema": {
+        "properties": {
+          "payload": {
+            "title": "Payload",
+            "type": "string"
+          },
+          "label": {
+            "default": "",
+            "title": "Label",
+            "type": "string"
+          },
+          "start_marker": {
+            "default": "",
+            "title": "Start Marker",
+            "type": "string"
+          },
+          "end_marker": {
+            "default": "",
+            "title": "End Marker",
+            "type": "string"
+          }
+        },
+        "required": [
+          "payload"
+        ],
+        "title": "diagnose_text_payloadArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "commit_github_files",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Commit one or more files to a GitHub repository. All files go into a single commit.\nEach file must have: path, operation (upsert/delete), content, optional expected_sha.\nOptional pull_request object: create, base_branch, title, body.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "commit_message": {
+            "title": "Commit Message",
+            "type": "string"
+          },
+          "files_json": {
+            "title": "Files Json",
+            "type": "string"
+          },
+          "base_branch": {
+            "default": "main",
+            "title": "Base Branch",
+            "type": "string"
+          },
+          "create_branch_if_missing": {
+            "default": false,
+            "title": "Create Branch If Missing",
+            "type": "boolean"
+          },
+          "expected_head_sha": {
+            "default": "",
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "pull_request_json": {
+            "default": "{}",
+            "title": "Pull Request Json",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "branch",
+          "commit_message",
+          "files_json"
+        ],
+        "title": "commit_github_filesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "create_github_pull_request",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Create a pull request on GitHub between two branches.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "head_branch": {
+            "title": "Head Branch",
+            "type": "string"
+          },
+          "base_branch": {
+            "default": "main",
+            "title": "Base Branch",
+            "type": "string"
+          },
+          "title": {
+            "default": "",
+            "title": "Title",
+            "type": "string"
+          },
+          "body": {
+            "default": "",
+            "title": "Body",
+            "type": "string"
+          },
+          "draft": {
+            "default": true,
+            "title": "Draft",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "head_branch"
+        ],
+        "title": "create_github_pull_requestArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_ci_workers",
+      "read_only": true,
+      "consequential": false,
+      "category": "private_ci",
+      "description": "List GitHub repository self-hosted Actions runners. Returns runner name, status, OS, and labels. NOT for private CI workers (use list_private_ci_workers).",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "list_ci_workersArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_ci_profiles",
+      "read_only": true,
+      "consequential": false,
+      "category": "private_ci",
+      "description": "List GitHub Actions workflow definitions. Returns workflow name, state, and URL. NOT for private CI profiles (use list_private_ci_profiles).",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "list_ci_profilesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_ci_jobs",
+      "read_only": true,
+      "consequential": false,
+      "category": "private_ci",
+      "description": "List GitHub Actions workflow runs. Can filter by workflow_id, branch, or status. NOT for private CI jobs (use list_private_ci_jobs).",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "workflow_id": {
+            "default": "",
+            "title": "Workflow Id",
+            "type": "string"
+          },
+          "branch": {
+            "default": "",
+            "title": "Branch",
+            "type": "string"
+          },
+          "status": {
+            "default": "",
+            "title": "Status",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "list_ci_jobsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "start_ci_job",
+      "read_only": false,
+      "consequential": true,
+      "category": "private_ci",
+      "description": "Trigger a GitHub Actions workflow_dispatch workflow. Requires workflow_id and a ref (branch/tag). NOT for private CI (use start_private_ci_job).",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "workflow_id": {
+            "title": "Workflow Id",
+            "type": "string"
+          },
+          "ref": {
+            "default": "main",
+            "title": "Ref",
+            "type": "string"
+          },
+          "inputs_json": {
+            "default": "{}",
+            "title": "Inputs Json",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "workflow_id"
+        ],
+        "title": "start_ci_jobArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_ci_job",
+      "read_only": true,
+      "consequential": false,
+      "category": "private_ci",
+      "description": "Get details of a GitHub Actions workflow run by run_id. NOT for private CI jobs (use get_private_ci_job).",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "run_id"
+        ],
+        "title": "get_ci_jobArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_ci_logs",
+      "read_only": true,
+      "consequential": false,
+      "category": "private_ci",
+      "description": "Get GitHub Actions workflow run logs. NOT for private CI logs (use get_private_ci_logs).",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "job_id": {
+            "default": "",
+            "title": "Job Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "run_id"
+        ],
+        "title": "get_ci_logsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "cancel_ci_job",
+      "read_only": false,
+      "consequential": true,
+      "category": "private_ci",
+      "description": "Cancel a GitHub Actions workflow run by run_id. NOT for private CI jobs (use cancel_private_ci_job).",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "run_id"
+        ],
+        "title": "cancel_ci_jobArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_repository",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Get metadata about a GitHub repository including default branch, language, stars, and merge settings.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "get_github_repositoryArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_branches",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List branches in a GitHub repository with optional protected_only filter, pagination support.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "protected_only": {
+            "default": false,
+            "title": "Protected Only",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 100,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "list_github_branchesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_branch",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Get details of a specific branch including commit SHA and optional comparison with base branch.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "base_branch": {
+            "default": "",
+            "title": "Base Branch",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "branch"
+        ],
+        "title": "get_github_branchArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_commit",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Get details of a specific commit by SHA including author, stats, changed files, and verification status.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "commit_sha": {
+            "title": "Commit Sha",
+            "type": "string"
+          },
+          "file_limit": {
+            "default": 100,
+            "title": "File Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "commit_sha"
+        ],
+        "title": "get_github_commitArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "compare_github_commits",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Compare two commits, branches, or tags showing ahead/behind, changed files, and commit list.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "base": {
+            "title": "Base",
+            "type": "string"
+          },
+          "head": {
+            "title": "Head",
+            "type": "string"
+          },
+          "file_limit": {
+            "default": 100,
+            "title": "File Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "base",
+          "head"
+        ],
+        "title": "compare_github_commitsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_pull_requests",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List pull requests in a repository with filters for state, branch, sort order, and pagination.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "state": {
+            "default": "open",
+            "title": "State",
+            "type": "string"
+          },
+          "head_branch": {
+            "default": "",
+            "title": "Head Branch",
+            "type": "string"
+          },
+          "base_branch": {
+            "default": "",
+            "title": "Base Branch",
+            "type": "string"
+          },
+          "sort": {
+            "default": "updated",
+            "title": "Sort",
+            "type": "string"
+          },
+          "direction": {
+            "default": "desc",
+            "title": "Direction",
+            "type": "string"
+          },
+          "limit": {
+            "default": 30,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "list_github_pull_requestsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_pull_request",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Get detailed information about a specific pull request including mergeability, reviews, and stats.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "get_github_pull_requestArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_pull_request_files",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List files changed in a pull request with optional patch content and pagination.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 100,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          },
+          "include_patch": {
+            "default": true,
+            "title": "Include Patch",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "list_github_pull_request_filesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "update_github_pull_request",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Update a PR's title, body, state, or base branch. Supports expected_head_sha for concurrency protection. Cannot merge PRs.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "title": {
+            "default": "",
+            "title": "Title",
+            "type": "string"
+          },
+          "body": {
+            "default": "",
+            "title": "Body",
+            "type": "string"
+          },
+          "state": {
+            "default": "",
+            "title": "State",
+            "type": "string"
+          },
+          "base_branch": {
+            "default": "",
+            "title": "Base Branch",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "default": "",
+            "title": "Expected Head Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "update_github_pull_requestArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_pull_request_checks",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Get check runs and commit statuses for the PR's current head SHA. Returns overall conclusion and per-check details.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "get_github_pull_request_checksArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_pull_request_comments",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List comments on a pull request (issue comments and review comments) with pagination.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "comment_type": {
+            "default": "all",
+            "title": "Comment Type",
+            "type": "string"
+          },
+          "limit": {
+            "default": 100,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "list_github_pull_request_commentsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "create_github_pull_request_comment",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Create a comment on a pull request. Supports expected_head_sha for concurrency protection.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "default": "",
+            "title": "Expected Head Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number",
+          "body"
+        ],
+        "title": "create_github_pull_request_commentArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_pull_request_merge_readiness",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Aggregate safe PR merge readiness: exact head SHA, reviews, GitHub Checks, repository merge methods, and private CI gate.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "expected_head_sha": {
+            "default": "",
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "required_private_ci_job_id": {
+            "default": "",
+            "title": "Required Private Ci Job Id",
+            "type": "string"
+          },
+          "expected_base_branch": {
+            "default": "main",
+            "title": "Expected Base Branch",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "get_github_pull_request_merge_readinessArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_pull_request_conflicts",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Read-only PR conflict diagnosis. Never updates the branch or force-pushes.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "expected_head_sha": {
+            "default": "",
+            "title": "Expected Head Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "get_github_pull_request_conflictsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "plan_github_pull_request_merge",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Read-only merge preflight with exact SHA, review, Checks, private CI, and merge-method gates. Never merges.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "merge_method": {
+            "default": "squash",
+            "title": "Merge Method",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "default": "",
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "required_private_ci_job_id": {
+            "default": "",
+            "title": "Required Private Ci Job Id",
+            "type": "string"
+          },
+          "expected_base_branch": {
+            "default": "main",
+            "title": "Expected Base Branch",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "plan_github_pull_request_mergeArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "merge_github_pull_request",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Safely merge a PR only after readiness gates, exact SHA, passed private CI, and explicit confirm=true. Never deploys.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "merge_method": {
+            "default": "squash",
+            "title": "Merge Method",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "default": "",
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "required_private_ci_job_id": {
+            "default": "",
+            "title": "Required Private Ci Job Id",
+            "type": "string"
+          },
+          "expected_base_branch": {
+            "default": "main",
+            "title": "Expected Base Branch",
+            "type": "string"
+          },
+          "commit_title": {
+            "default": "",
+            "title": "Commit Title",
+            "type": "string"
+          },
+          "commit_message": {
+            "default": "",
+            "title": "Commit Message",
+            "type": "string"
+          },
+          "delete_head_branch": {
+            "default": false,
+            "title": "Delete Head Branch",
+            "type": "boolean"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "merge_github_pull_requestArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "mark_github_pull_request_ready",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Convert a draft PR to ready-for-review with exact head SHA protection.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "expected_head_sha": {
+            "title": "Expected Head Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number",
+          "expected_head_sha"
+        ],
+        "title": "mark_github_pull_request_readyArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "convert_github_pull_request_to_draft",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Convert an open PR to draft with exact head SHA protection.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "expected_head_sha": {
+            "title": "Expected Head Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number",
+          "expected_head_sha"
+        ],
+        "title": "convert_github_pull_request_to_draftArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "update_github_pull_request_branch",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Request GitHub's official update-branch operation; never force-pushes locally.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "expected_head_sha": {
+            "title": "Expected Head Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number",
+          "expected_head_sha"
+        ],
+        "title": "update_github_pull_request_branchArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_pull_request_reviews",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List submitted PR reviews, distinct from requested reviewers.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 100,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "list_github_pull_request_reviewsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "request_github_pull_request_reviewers",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Request user and team reviewers with exact head SHA protection.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "reviewers_json": {
+            "default": "[]",
+            "title": "Reviewers Json",
+            "type": "string"
+          },
+          "team_reviewers_json": {
+            "default": "[]",
+            "title": "Team Reviewers Json",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "default": "",
+            "title": "Expected Head Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "request_github_pull_request_reviewersArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "remove_github_pull_request_reviewers",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Remove requested user and team reviewers with exact head SHA protection.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "reviewers_json": {
+            "default": "[]",
+            "title": "Reviewers Json",
+            "type": "string"
+          },
+          "team_reviewers_json": {
+            "default": "[]",
+            "title": "Team Reviewers Json",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "default": "",
+            "title": "Expected Head Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "remove_github_pull_request_reviewersArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "delete_github_branch",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Delete a non-default, non-protected branch only with exact SHA and confirm=true. Never follows merge automatically.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "branch",
+          "expected_head_sha"
+        ],
+        "title": "delete_github_branchArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "plan_test_deployment",
+      "read_only": true,
+      "consequential": false,
+      "category": "deployment",
+      "description": "Plan only a fullstack frankichen/sxt gongshi-test deployment; validates exact main SHA, private CI, changed files, migrations, and infrastructure changes.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "environment": {
+            "title": "Environment",
+            "type": "string"
+          },
+          "commit_sha": {
+            "title": "Commit Sha",
+            "type": "string"
+          },
+          "private_ci_job_id": {
+            "title": "Private Ci Job Id",
+            "type": "string"
+          },
+          "scope": {
+            "default": "fullstack",
+            "title": "Scope",
+            "type": "string"
+          },
+          "expected_current_release_id": {
+            "default": "",
+            "title": "Expected Current Release Id",
+            "type": "string"
+          },
+          "allow_deploy_infrastructure_changes": {
+            "default": false,
+            "title": "Allow Deploy Infrastructure Changes",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "environment",
+          "commit_sha",
+          "private_ci_job_id"
+        ],
+        "title": "plan_test_deploymentArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "start_test_deployment",
+      "read_only": false,
+      "consequential": true,
+      "category": "deployment",
+      "description": "Queue a whitelist-only fullstack gongshi-test deployment after exact main SHA and passed main private CI gates. Requires confirm=true; never accepts host or shell input.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "environment": {
+            "title": "Environment",
+            "type": "string"
+          },
+          "commit_sha": {
+            "title": "Commit Sha",
+            "type": "string"
+          },
+          "private_ci_job_id": {
+            "title": "Private Ci Job Id",
+            "type": "string"
+          },
+          "scope": {
+            "default": "fullstack",
+            "title": "Scope",
+            "type": "string"
+          },
+          "expected_current_release_id": {
+            "default": "",
+            "title": "Expected Current Release Id",
+            "type": "string"
+          },
+          "allow_deploy_infrastructure_changes": {
+            "default": false,
+            "title": "Allow Deploy Infrastructure Changes",
+            "type": "boolean"
+          },
+          "force_redeploy": {
+            "default": false,
+            "title": "Force Redeploy",
+            "type": "boolean"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "environment",
+          "commit_sha",
+          "private_ci_job_id"
+        ],
+        "title": "start_test_deploymentArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_test_deployment",
+      "read_only": true,
+      "consequential": false,
+      "category": "deployment",
+      "description": "Get a deployment status by deployment_id; deployment_id is distinct from CI job_id and GitHub Actions run_id.",
+      "input_schema": {
+        "properties": {
+          "deployment_id": {
+            "title": "Deployment Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "deployment_id"
+        ],
+        "title": "get_test_deploymentArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_test_deployment_logs",
+      "read_only": true,
+      "consequential": false,
+      "category": "deployment",
+      "description": "Read redacted paginated deployment logs by deployment_id.",
+      "input_schema": {
+        "properties": {
+          "deployment_id": {
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "offset": {
+            "default": 0,
+            "title": "Offset",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 200,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "deployment_id"
+        ],
+        "title": "get_test_deployment_logsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "wait_test_deployment",
+      "read_only": false,
+      "consequential": true,
+      "category": "deployment",
+      "description": "Long-poll deployment metadata for up to 55 seconds without returning logs or lease tokens.",
+      "input_schema": {
+        "properties": {
+          "deployment_id": {
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "default": 55,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "last_known_status": {
+            "default": "",
+            "title": "Last Known Status",
+            "type": "string"
+          },
+          "last_known_step": {
+            "default": "",
+            "title": "Last Known Step",
+            "type": "string"
+          },
+          "last_known_revision": {
+            "default": 0,
+            "title": "Last Known Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "deployment_id"
+        ],
+        "title": "wait_test_deploymentArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_test_deployment_log_tail",
+      "read_only": true,
+      "consequential": false,
+      "category": "deployment",
+      "description": "Read a redacted deployment log tail without returning lease tokens.",
+      "input_schema": {
+        "properties": {
+          "deployment_id": {
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "lines": {
+            "default": 100,
+            "title": "Lines",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "deployment_id"
+        ],
+        "title": "get_test_deployment_log_tailArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_test_deployments",
+      "read_only": true,
+      "consequential": false,
+      "category": "deployment",
+      "description": "List whitelist-only gongshi-test deployments with filters and pagination.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "default": "",
+            "title": "Repository",
+            "type": "string"
+          },
+          "environment": {
+            "default": "",
+            "title": "Environment",
+            "type": "string"
+          },
+          "commit_sha": {
+            "default": "",
+            "title": "Commit Sha",
+            "type": "string"
+          },
+          "status": {
+            "default": "",
+            "title": "Status",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "title": "Offset",
+            "type": "integer"
+          }
+        },
+        "title": "list_test_deploymentsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "cancel_test_deployment",
+      "read_only": false,
+      "consequential": true,
+      "category": "deployment",
+      "description": "Cancel a queued deployment immediately or request safe cancellation at a worker boundary.",
+      "input_schema": {
+        "properties": {
+          "deployment_id": {
+            "title": "Deployment Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "deployment_id"
+        ],
+        "title": "cancel_test_deploymentArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_test_environment_status",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Get redacted gongshi-test environment and health summary; never returns env values or credentials.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "environment": {
+            "title": "Environment",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "environment"
+        ],
+        "title": "get_test_environment_statusArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_test_releases",
+      "read_only": true,
+      "consequential": false,
+      "category": "release",
+      "description": "List verified gongshi-test release summaries without reading env files.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "environment": {
+            "title": "Environment",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "environment"
+        ],
+        "title": "list_test_releasesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "rollback_test_deployment",
+      "read_only": false,
+      "consequential": true,
+      "category": "deployment",
+      "description": "Queue a whitelist-only rollback after current-release and checksum gates. Never runs goose down or deletes data/releases.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "environment": {
+            "title": "Environment",
+            "type": "string"
+          },
+          "target_release_id": {
+            "title": "Target Release Id",
+            "type": "string"
+          },
+          "expected_current_release_id": {
+            "title": "Expected Current Release Id",
+            "type": "string"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "environment",
+          "target_release_id",
+          "expected_current_release_id"
+        ],
+        "title": "rollback_test_deploymentArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_commits",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Query commit history in a repository by time range. Filters by author/identity, excludes bots and merge commits by default. Supports pagination.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "default": "",
+            "title": "Branch",
+            "type": "string"
+          },
+          "author": {
+            "default": "",
+            "title": "Author",
+            "type": "string"
+          },
+          "identity": {
+            "default": "",
+            "title": "Identity",
+            "type": "string"
+          },
+          "since": {
+            "default": "",
+            "title": "Since",
+            "type": "string"
+          },
+          "until": {
+            "default": "",
+            "title": "Until",
+            "type": "string"
+          },
+          "path": {
+            "default": "",
+            "title": "Path",
+            "type": "string"
+          },
+          "include_merge_commits": {
+            "default": false,
+            "title": "Include Merge Commits",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 100,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "list_github_commits_toolArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "search_github_pull_request_history",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Search PR history across repositories by identity, time range, and activity type (authored/updated/merged/reviewed/commented).",
+      "input_schema": {
+        "properties": {
+          "repositories_json": {
+            "title": "Repositories Json",
+            "type": "string"
+          },
+          "identity": {
+            "title": "Identity",
+            "type": "string"
+          },
+          "activity": {
+            "default": "all",
+            "title": "Activity",
+            "type": "string"
+          },
+          "since": {
+            "default": "",
+            "title": "Since",
+            "type": "string"
+          },
+          "until": {
+            "default": "",
+            "title": "Until",
+            "type": "string"
+          },
+          "state": {
+            "default": "all",
+            "title": "State",
+            "type": "string"
+          },
+          "include_drafts": {
+            "default": true,
+            "title": "Include Drafts",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 100,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "title": "Offset",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repositories_json",
+          "identity"
+        ],
+        "title": "search_github_pull_request_history_toolArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_review_history",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List code reviews performed by an identity across repositories in a time range.",
+      "input_schema": {
+        "properties": {
+          "repositories_json": {
+            "title": "Repositories Json",
+            "type": "string"
+          },
+          "identity": {
+            "title": "Identity",
+            "type": "string"
+          },
+          "since": {
+            "default": "",
+            "title": "Since",
+            "type": "string"
+          },
+          "until": {
+            "default": "",
+            "title": "Until",
+            "type": "string"
+          },
+          "states_json": {
+            "default": "[\"APPROVED\",\"CHANGES_REQUESTED\",\"COMMENTED\"]",
+            "title": "States Json",
+            "type": "string"
+          },
+          "limit": {
+            "default": 100,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "title": "Offset",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repositories_json",
+          "identity"
+        ],
+        "title": "list_github_review_history_toolArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_issue_history",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List issues an identity participated in across repositories. Excludes pull requests from results.",
+      "input_schema": {
+        "properties": {
+          "repositories_json": {
+            "title": "Repositories Json",
+            "type": "string"
+          },
+          "identity": {
+            "title": "Identity",
+            "type": "string"
+          },
+          "activity": {
+            "default": "all",
+            "title": "Activity",
+            "type": "string"
+          },
+          "since": {
+            "default": "",
+            "title": "Since",
+            "type": "string"
+          },
+          "until": {
+            "default": "",
+            "title": "Until",
+            "type": "string"
+          },
+          "state": {
+            "default": "all",
+            "title": "State",
+            "type": "string"
+          },
+          "limit": {
+            "default": 100,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "title": "Offset",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repositories_json",
+          "identity"
+        ],
+        "title": "list_github_issue_history_toolArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_development_history",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Get aggregated development history (commits, PRs, reviews, issues, CI runs, open work) for an identity across repositories in a time range. Ideal for daily/weekly/monthly reports.",
+      "input_schema": {
+        "properties": {
+          "identity": {
+            "title": "Identity",
+            "type": "string"
+          },
+          "repositories_json": {
+            "default": "[]",
+            "title": "Repositories Json",
+            "type": "string"
+          },
+          "since": {
+            "default": "",
+            "title": "Since",
+            "type": "string"
+          },
+          "until": {
+            "default": "",
+            "title": "Until",
+            "type": "string"
+          },
+          "include_json": {
+            "default": "[\"commits\",\"pull_requests\",\"reviews\",\"issues\",\"github_actions\",\"private_ci\",\"open_work\"]",
+            "title": "Include Json",
+            "type": "string"
+          },
+          "include_details": {
+            "default": true,
+            "title": "Include Details",
+            "type": "boolean"
+          },
+          "max_items_per_section": {
+            "default": 100,
+            "title": "Max Items Per Section",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "identity"
+        ],
+        "title": "get_github_development_history_toolArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_weekly_report_data",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Get structured data for a weekly development report. Includes completed work, work in progress, code reviews, CI quality, risks, and next-week candidates.",
+      "input_schema": {
+        "properties": {
+          "identity": {
+            "title": "Identity",
+            "type": "string"
+          },
+          "repositories_json": {
+            "default": "[]",
+            "title": "Repositories Json",
+            "type": "string"
+          },
+          "week": {
+            "default": "current",
+            "title": "Week",
+            "type": "string"
+          },
+          "week_start": {
+            "default": "monday",
+            "title": "Week Start",
+            "type": "string"
+          },
+          "timezone": {
+            "default": "Asia/Shanghai",
+            "title": "Timezone",
+            "type": "string"
+          },
+          "include_weekend": {
+            "default": true,
+            "title": "Include Weekend",
+            "type": "boolean"
+          },
+          "include_open_work": {
+            "default": true,
+            "title": "Include Open Work",
+            "type": "boolean"
+          },
+          "include_ci_failures": {
+            "default": true,
+            "title": "Include Ci Failures",
+            "type": "boolean"
+          },
+          "include_code_statistics": {
+            "default": true,
+            "title": "Include Code Statistics",
+            "type": "boolean"
+          },
+          "since": {
+            "default": "",
+            "title": "Since",
+            "type": "string"
+          },
+          "until": {
+            "default": "",
+            "title": "Until",
+            "type": "string"
+          }
+        },
+        "required": [
+          "identity"
+        ],
+        "title": "get_github_weekly_report_data_toolArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_mygithub_capabilities",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Return the explicit MyGithub10 capability and compatibility contract.",
+      "input_schema": {
+        "properties": {},
+        "title": "get_mygithub_capabilitiesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_file_manifest",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Return exact Git Blob metadata for a file without returning file content.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "ref": {
+            "default": "",
+            "title": "Ref",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "path"
+        ],
+        "title": "get_github_file_manifestArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "read_github_file_chunk",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Read an exact UTF-8 byte chunk with SHA and continuation metadata.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "ref": {
+            "default": "",
+            "title": "Ref",
+            "type": "string"
+          },
+          "offset_bytes": {
+            "default": 0,
+            "title": "Offset Bytes",
+            "type": "integer"
+          },
+          "limit_bytes": {
+            "default": 65536,
+            "title": "Limit Bytes",
+            "type": "integer"
+          },
+          "expected_blob_sha": {
+            "default": "",
+            "title": "Expected Blob Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "path"
+        ],
+        "title": "read_github_file_chunkArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "open_github_file_resource",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Open a file resource handle for paginated reads instead of returning a large JSON body.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "ref": {
+            "default": "",
+            "title": "Ref",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "path"
+        ],
+        "title": "open_github_file_resourceArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "read_github_file_resource",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Read a bounded page from an opened MyGithub10 file resource.",
+      "input_schema": {
+        "properties": {
+          "resource_uri": {
+            "title": "Resource Uri",
+            "type": "string"
+          },
+          "offset_bytes": {
+            "default": 0,
+            "title": "Offset Bytes",
+            "type": "integer"
+          },
+          "limit_bytes": {
+            "default": 65536,
+            "title": "Limit Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "resource_uri"
+        ],
+        "title": "read_github_file_resourceArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "apply_github_patch",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Apply a strict unified diff atomically with exact HEAD/blob checks and optional dry-run/idempotency.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "expected_blob_shas_json": {
+            "title": "Expected Blob Shas Json",
+            "type": "string"
+          },
+          "patch": {
+            "title": "Patch",
+            "type": "string"
+          },
+          "commit_message": {
+            "title": "Commit Message",
+            "type": "string"
+          },
+          "dry_run": {
+            "default": true,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "idempotency_key": {
+            "default": "",
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "create_pull_request": {
+            "default": false,
+            "title": "Create Pull Request",
+            "type": "boolean"
+          },
+          "pull_request_json": {
+            "default": "{}",
+            "title": "Pull Request Json",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "branch",
+          "expected_head_sha",
+          "expected_blob_shas_json",
+          "patch",
+          "commit_message"
+        ],
+        "title": "apply_github_patchArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "edit_github_file_ranges",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Apply non-overlapping, hash-checked line range edits as one atomic commit.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "operations_json": {
+            "title": "Operations Json",
+            "type": "string"
+          },
+          "commit_message": {
+            "title": "Commit Message",
+            "type": "string"
+          },
+          "dry_run": {
+            "default": true,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "idempotency_key": {
+            "default": "",
+            "title": "Idempotency Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "branch",
+          "expected_head_sha",
+          "operations_json",
+          "commit_message"
+        ],
+        "title": "edit_github_file_rangesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "begin_github_file_upload",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Begin a bounded, permission-0600 chunked file upload.",
+      "input_schema": {
+        "properties": {},
+        "title": "begin_github_file_uploadArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "append_github_file_upload_chunk",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Append one contiguous SHA-checked upload chunk.",
+      "input_schema": {
+        "properties": {
+          "upload_id": {
+            "title": "Upload Id",
+            "type": "string"
+          },
+          "offset": {
+            "title": "Offset",
+            "type": "integer"
+          },
+          "content_base64": {
+            "default": "",
+            "title": "Content Base64",
+            "type": "string"
+          },
+          "text": {
+            "default": "",
+            "title": "Text",
+            "type": "string"
+          },
+          "chunk_sha256": {
+            "default": "",
+            "title": "Chunk Sha256",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "default": "",
+            "title": "Idempotency Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "upload_id",
+          "offset"
+        ],
+        "title": "append_github_file_upload_chunkArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "finalize_github_file_upload",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Finalize an upload only after exact size and SHA256 validation.",
+      "input_schema": {
+        "properties": {
+          "upload_id": {
+            "title": "Upload Id",
+            "type": "string"
+          },
+          "expected_size_bytes": {
+            "title": "Expected Size Bytes",
+            "type": "integer"
+          },
+          "expected_sha256": {
+            "title": "Expected Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "upload_id",
+          "expected_size_bytes",
+          "expected_sha256"
+        ],
+        "title": "finalize_github_file_uploadArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "commit_github_uploaded_files",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Commit one finalized upload to a branch with exact HEAD/blob checks.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "expected_blob_sha": {
+            "title": "Expected Blob Sha",
+            "type": "string"
+          },
+          "upload_id": {
+            "title": "Upload Id",
+            "type": "string"
+          },
+          "commit_message": {
+            "title": "Commit Message",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "default": "",
+            "title": "Idempotency Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "branch",
+          "expected_head_sha",
+          "path",
+          "expected_blob_sha",
+          "upload_id",
+          "commit_message"
+        ],
+        "title": "commit_github_uploaded_filesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "abort_github_file_upload",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Abort and remove only the selected temporary upload.",
+      "input_schema": {
+        "properties": {
+          "upload_id": {
+            "title": "Upload Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "upload_id"
+        ],
+        "title": "abort_github_file_uploadArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_private_ci_workers",
+      "read_only": true,
+      "consequential": false,
+      "category": "private_ci",
+      "description": "List workers registered with the private CI controller, including wsl-ci-01.\n\nReturns each worker's ID, online status, supported profiles, max concurrency, and current job.\n\nThis is for the private German-controller + WSL-Podman CI system.\nNOT for GitHub Actions self-hosted runners (use list_ci_workers for that).",
+      "input_schema": {
+        "properties": {
+          "online_only": {
+            "default": false,
+            "title": "Online Only",
+            "type": "boolean"
+          }
+        },
+        "title": "list_private_ci_workersArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_private_ci_profiles",
+      "read_only": true,
+      "consequential": false,
+      "category": "private_ci",
+      "description": "List available CI profiles for the private CI system.\n\nReturns profiles like repo-auto-check, python-check, etc.\nUse these profile names with start_private_ci_job.\n\nThis is for the private CI system. NOT for GitHub Actions workflows (use list_ci_profiles for that).",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "default": "",
+            "title": "Repository",
+            "type": "string"
+          }
+        },
+        "title": "list_private_ci_profilesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_private_ci_jobs",
+      "read_only": true,
+      "consequential": false,
+      "category": "private_ci",
+      "description": "List private CI jobs with optional filters.\n\nUse this to find jobs for a specific repository, branch, commit SHA, or status.\nJobs are executed by wsl-ci-01 on the WSL machine with Rootless Podman.\n\nThis is for the private CI system. NOT for GitHub Actions runs (use list_ci_jobs for that).",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "default": "",
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "default": "",
+            "title": "Branch",
+            "type": "string"
+          },
+          "commit_sha": {
+            "default": "",
+            "title": "Commit Sha",
+            "type": "string"
+          },
+          "status": {
+            "default": "",
+            "title": "Status",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "title": "Offset",
+            "type": "integer"
+          }
+        },
+        "title": "list_private_ci_jobsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "start_private_ci_job",
+      "read_only": false,
+      "consequential": true,
+      "category": "private_ci",
+      "description": "Start a job in the private German-controller and WSL-Podman CI system for an exact Git commit SHA.\n\nCRITICAL WORKFLOW:\n1. After committing code via commit_github_files, save the commit_sha\n2. Call start_private_ci_job with the FULL 40-character commit_sha\n3. Save the returned job_id\n4. Use get_private_ci_job to check the job status\n5. Use get_private_ci_logs to read logs if the job failed\n\nThis is for the private WSL CI system. NOT for GitHub Actions dispatch (use start_ci_job for that).",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "commit_sha": {
+            "title": "Commit Sha",
+            "type": "string"
+          },
+          "profile": {
+            "default": "repo-auto-check",
+            "title": "Profile",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "default": 900,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "priority": {
+            "default": "normal",
+            "title": "Priority",
+            "type": "string"
+          },
+          "force_rerun": {
+            "default": false,
+            "title": "Force Rerun",
+            "type": "boolean"
+          },
+          "supersede_previous": {
+            "default": false,
+            "title": "Supersede Previous",
+            "type": "boolean"
+          },
+          "base_sha": {
+            "default": "",
+            "title": "Base Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "branch",
+          "commit_sha"
+        ],
+        "title": "start_private_ci_jobArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_private_ci_job",
+      "read_only": true,
+      "consequential": false,
+      "category": "private_ci",
+      "description": "Get the current status and details of a specific private CI job by job_id.\n\nReturns complete job information including status, queue_position, current_step, exit_code, steps array, and timestamps.\n\nThis is for the private CI system. NOT for GitHub Actions runs (use get_ci_job for that).",
+      "input_schema": {
+        "properties": {
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "title": "get_private_ci_jobArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "wait_private_ci_job",
+      "read_only": false,
+      "consequential": true,
+      "category": "private_ci",
+      "description": "Long-poll one private CI job for up to 55 seconds. Returns on status, step, log revision, terminal, or timeout; use instead of repeated polling.",
+      "input_schema": {
+        "properties": {
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "default": 55,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "last_known_status": {
+            "default": "",
+            "title": "Last Known Status",
+            "type": "string"
+          },
+          "last_known_step": {
+            "default": "",
+            "title": "Last Known Step",
+            "type": "string"
+          },
+          "last_known_revision": {
+            "default": 0,
+            "title": "Last Known Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "title": "wait_private_ci_jobArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_private_ci_logs",
+      "read_only": true,
+      "consequential": false,
+      "category": "private_ci",
+      "description": "Get private CI job execution logs by job_id. Supports pagination for large logs.\n\nUse the exact job_id from start_private_ci_job. Do NOT assume the latest job's logs.\n\nThis is for the private CI system. NOT for GitHub Actions logs (use get_ci_logs for that).",
+      "input_schema": {
+        "properties": {
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "offset": {
+            "default": 0,
+            "title": "Offset",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 200,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "title": "get_private_ci_logsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "cancel_private_ci_job",
+      "read_only": false,
+      "consequential": true,
+      "category": "private_ci",
+      "description": "Cancel a private CI job by job_id.\n\n- For queued jobs: immediately cancels\n- For running jobs: sends cancel signal to the worker\n- For completed jobs: returns current status (cannot cancel)\n\nThis is for the private CI system. NOT for GitHub Actions (use cancel_ci_job for that).",
+      "input_schema": {
+        "properties": {
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "title": "cancel_private_ci_jobArguments",
+        "type": "object"
+      }
+    }
+  ]
+}
