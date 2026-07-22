@@ -24,7 +24,7 @@
 - 本地/模拟在线验收：通过 7 项核心检查；真实公网验收仍需部署后由人工执行，当前不伪造 live 结果。
 - `compileall/py_compile`、`bash -n`、`git diff --check`：通过。
 - 真实 sxt 5x：正在/已由外部队列执行；只有 5/5 passed 才会把 `supports_real_ci_performance_validation` 改为 true。最终报告将列出 5 个 job_id、耗时、中位数/P90；未完成前该 capability 保持 false。
-- Docker 新镜像已用临时 `DOCKER_CONFIG` 构建，未修改全局配置；当前完整 image ID：`sha256:bca0bff9d784abd6532070f0f7184b7413e08fbbd5c3ce4cd256adcc35bd243f`。旧镜像未覆盖。
+- Docker 新镜像已用临时 `DOCKER_CONFIG` 构建，未修改全局配置；当前完整 image ID：`sha256:17b7a630a015b30222d3af1c57c96f01fb5e81214dc8cafe36aa4eaf9fc9a106`。旧镜像未覆盖。
 
 ## 尚未打开的能力
 
