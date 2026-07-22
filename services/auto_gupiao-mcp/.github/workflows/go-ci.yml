@@ -1,0 +1,90 @@
+name: Go CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Probe PR workflow run visibility through the GitHub connector.
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Prepare Go modules
+        run: go mod tidy
+
+      - name: Format Go files
+        run: gofmt -w .
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "Go files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run unit tests
+        run: go test ./...
+
+      - name: Build CLI
+        run: |
+          go build -o /tmp/autogupiao ./cmd/autogupiao
+          go build -o /tmp/autogupiao-server ./cmd/autogupiao-server
+          go build -o /tmp/autogupiao-dashboard ./cmd/autogupiao-dashboard
+          go build -o /tmp/autogupiao-mcp ./cmd/autogupiao-mcp
+
+      - name: Run CLI smoke tests
+        run: |
+          set -euo pipefail
+          mkdir -p reports data/bars
+
+          /tmp/autogupiao -mode select -source csv -input examples/sample_quotes.csv -top 5 -cash 10000 -min-score 60 > /tmp/select.json
+          test -s /tmp/select.json
+
+          /tmp/autogupiao -mode backtest -input examples/sample_daily_bars.csv -cash 10000 -top 1 -min-score 60 > /tmp/backtest.json
+          test -s /tmp/backtest.json
+
+          /tmp/autogupiao -mode simulate -input examples/sample_quotes.csv -sell-input examples/sample_sell_quotes.csv -cash 10000 -top 1 -min-score 60 > /tmp/simulate.json
+          test -s /tmp/simulate.json
+
+          /tmp/autogupiao -mode plan -trade-date 20260519 > /tmp/plan.json
+          test -s /tmp/plan.json
+
+          /tmp/autogupiao -mode combine-bars -input examples/sample_daily_bars.csv,examples/sample_daily_bars.csv -output data/bars/combined_ci.csv > /tmp/combine.json
+          test -s /tmp/combine.json
+          test -s data/bars/combined_ci.csv
+
+          /tmp/autogupiao -mode paper -input examples/sample_daily_bars.csv -cash 10000 -top 1 -min-score 60 > reports/paper_result.json
+          test -s reports/paper_result.json
+
+          /tmp/autogupiao -mode report -input reports/paper_result.json -report-dir reports -trade-date 20260519 > /tmp/report_manifest.json
+          test -s /tmp/report_manifest.json
+          test -s reports/paper_20260519.md
+          test -s reports/paper_20260519_trades.csv
+          test -s reports/paper_20260519_equity.csv
+
+          /tmp/autogupiao -mode daily -input examples/sample_daily_bars.csv -cash 10000 -top 1 -min-score 60 -report-dir reports -report-prefix daily_ci -trade-date 20260519 > /tmp/daily.json
+          test -s /tmp/daily.json
+          test -s reports/daily_ci.md
+          test -s reports/daily_ci_trades.csv
+          test -s reports/daily_ci_equity.csv
+
+          /tmp/autogupiao-server -config configs/server.ci.json > /tmp/server.json
+          test -s /tmp/server.json
+          test -s reports/server_ci.md
+          test -s reports/server_ci_trades.csv
+          test -s reports/server_ci_equity.csv

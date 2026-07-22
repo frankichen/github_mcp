@@ -1,0 +1,4 @@
+date,code,name,market,close,prev_close,high,low,change_pct,turnover_rate,volume_ratio,amount,market_cap,pe,pb,roe,revenue_growth,net_profit_growth,debt_asset_ratio,rsi6,ma5,ma20,ma60,five_day_pct,twenty_day_pct,limit_up,limit_down,suspended,st
+2026-05-19,600001,SampleA,SH,10.08,9.80,10.15,9.90,2.86,5.5,1.7,380000000,4950000000,18,2.25,12,8,15,40,61,9.82,9.48,8.95,6.2,10.4,false,false,false,false
+2026-05-19,000001,SampleB,SZ,22.05,22.30,22.20,21.90,-1.12,2.8,1.2,450000000,11800000000,12,1.58,10,5,6,55,55,22.05,21.30,20.75,1.8,6.8,false,false,false,false
+2026-05-19,688001,SampleC,SH,84.50,86.20,85.20,83.10,-1.97,13.5,3.8,720000000,20500000000,86,9.3,4,-2,-8,20,75,81.00,71.20,68.40,28.0,55.0,false,false,false,false

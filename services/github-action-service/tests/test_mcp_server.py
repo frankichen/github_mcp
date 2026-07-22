@@ -1,0 +1,573 @@
+import pytest
+import asyncio
+from unittest.mock import MagicMock, patch, AsyncMock
+from fastapi.testclient import TestClient
+
+import os
+os.environ["GITHUB_TOKEN"] = "test_token_value"
+os.environ["ACTION_API_KEY"] = "test_api_key_32_bytes_long"
+os.environ["ALLOWED_REPOSITORIES"] = "owner/allowed-repo"
+os.environ["ALLOW_DEFAULT_BRANCH_WRITE"] = "false"
+os.environ["MAX_FILE_CHARACTERS"] = "5000"
+os.environ["MAX_TOTAL_CHARACTERS"] = "10000"
+os.environ["MAX_FILES_PER_COMMIT"] = "5"
+os.environ["SERVICE_URL"] = "https://github.555044.xyz"
+os.environ["IDEMPOTENCY_DB_PATH"] = "/tmp/idempotency_test.db"
+
+from app.main import app
+from app.config import settings
+
+VALID_API_KEY = settings.ACTION_API_KEY.get_secret_value()
+
+
+@pytest.fixture
+def client():
+    with TestClient(app) as c:
+        yield c
+
+
+def auth_headers():
+    return {"Authorization": f"Bearer {VALID_API_KEY}"}
+
+
+class TestMCPTools:
+    @pytest.mark.asyncio
+    async def test_mcp_tools_are_registered(self):
+        from app.mcp_server import mcp
+        tools = await mcp.list_tools()
+        tool_names = [t.name for t in tools]
+        assert "get_github_file" in tool_names
+        assert "list_github_directory" in tool_names
+        assert "create_github_branch" in tool_names
+        assert "commit_github_files" in tool_names
+        assert "create_github_pull_request" in tool_names
+
+    @pytest.mark.asyncio
+    async def test_mcp_total_tool_count(self):
+        from app.mcp_server import mcp
+        tools = await mcp.list_tools()
+        tool_names = [t.name for t in tools]
+        assert len(tools) == 13
+
+    @pytest.mark.asyncio
+    async def test_get_github_file_tool(self):
+        import json
+        from app.mcp_server import get_github_file
+
+        with patch("app.mcp_server._service") as mock_service:
+            mock_service.get_file.return_value = {
+                "repository": "owner/repo",
+                "path": "test.py",
+                "ref": "main",
+                "sha": "abc123",
+                "size": 100,
+                "content": "print('hello')",
+                "start_line": 1,
+                "end_line": 1,
+                "total_lines": 1,
+                "truncated": False,
+            }
+
+            result = await get_github_file(repository="owner/repo", path="test.py", ref="main")
+
+            data = json.loads(result)
+            assert data["sha"] == "abc123"
+            assert data["content"] == "print('hello')"
+            mock_service.get_file.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_list_github_directory_tool(self):
+        import json
+        from app.mcp_server import list_github_directory
+
+        with patch("app.mcp_server._service") as mock_service:
+            mock_service.list_directory.return_value = {
+                "repository": "owner/repo",
+                "path": "src",
+                "ref": "main",
+                "items": [
+                    {"name": "file.py", "path": "src/file.py", "type": "file", "sha": "abc", "size": 42},
+                ],
+            }
+
+            result = await list_github_directory(repository="owner/repo", path="src")
+
+            data = json.loads(result)
+            assert len(data["items"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_create_github_branch_tool(self):
+        import json
+        from app.mcp_server import create_github_branch
+
+        with patch("app.mcp_server._service") as mock_service:
+            mock_service.create_branch.return_value = {
+                "success": True,
+                "repository": "owner/repo",
+                "branch": "feature-x",
+                "base_branch": "main",
+                "commit_sha": "abc123",
+            }
+
+            result = await create_github_branch(repository="owner/repo", branch="feature-x")
+
+            data = json.loads(result)
+            assert data["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_commit_github_files_tool(self):
+        import json
+        from app.mcp_server import commit_github_files
+
+        files_json = json.dumps([{"path": "test.py", "operation": "upsert", "content": "print('hello')"}])
+
+        with patch("app.mcp_server._service") as mock_service:
+            mock_service.commit_files.return_value = {
+                "success": True,
+                "repository": "owner/repo",
+                "branch": "feature-x",
+                "commit_sha": "abc123",
+                "commit_url": "https://github.com/owner/repo/commit/abc123",
+                "changed_files": [{"path": "test.py", "operation": "upsert"}],
+                "pull_request": None,
+            }
+
+            result = await commit_github_files(
+                repository="owner/repo",
+                branch="feature-x",
+                commit_message="test commit",
+                files_json=files_json,
+            )
+
+            data = json.loads(result)
+            assert data["success"] is True
+            assert data["commit_sha"] == "abc123"
+
+    @pytest.mark.asyncio
+    async def test_create_github_pull_request_tool(self):
+        import json
+        from app.mcp_server import create_github_pull_request
+
+        with patch("app.mcp_server._service") as mock_service:
+            mock_service.create_pull_request.return_value = {
+                "success": True,
+                "repository": "owner/repo",
+                "head_branch": "feature-x",
+                "base_branch": "main",
+                "pull_request": {"number": 42, "url": "https://github.com/owner/repo/pull/42"},
+            }
+
+            result = await create_github_pull_request(
+                repository="owner/repo",
+                head_branch="feature-x",
+                base_branch="main",
+                title="Test PR",
+            )
+
+            data = json.loads(result)
+            assert data["success"] is True
+            assert data["pull_request"]["number"] == 42
+
+    @pytest.mark.asyncio
+    async def test_tool_returns_error_on_exception(self):
+        import json
+        from app.mcp_server import get_github_file
+        from app.exceptions import NotFoundError
+
+        with patch("app.mcp_server._service") as mock_service:
+            mock_service.get_file.side_effect = NotFoundError("File not found")
+
+            result = await get_github_file(repository="owner/repo", path="nonexistent.py")
+
+            data = json.loads(result)
+            assert data["error"] == "NotFoundError"
+
+    @pytest.mark.asyncio
+    async def test_token_verifier_valid(self):
+        from app.mcp_server import ApiKeyVerifier
+
+        verifier = ApiKeyVerifier()
+        result = await verifier.verify_token(VALID_API_KEY)
+        assert result is not None
+        assert result.client_id == "github-action-service"
+
+    @pytest.mark.asyncio
+    async def test_token_verifier_invalid(self):
+        from app.mcp_server import ApiKeyVerifier
+
+        verifier = ApiKeyVerifier()
+        result = await verifier.verify_token("wrong-key")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_token_verifier_empty(self):
+        from app.mcp_server import ApiKeyVerifier
+
+        verifier = ApiKeyVerifier()
+        result = await verifier.verify_token("")
+        assert result is None
+
+
+class TestCITools:
+    @pytest.mark.asyncio
+    async def test_ci_tools_are_registered(self):
+        from app.mcp_server import mcp
+        tools = await mcp.list_tools()
+        tool_names = [t.name for t in tools]
+        assert "list_ci_workers" in tool_names
+        assert "list_ci_profiles" in tool_names
+        assert "list_ci_jobs" in tool_names
+        assert "start_ci_job" in tool_names
+        assert "get_ci_job" in tool_names
+        assert "get_ci_logs" in tool_names
+        assert "cancel_ci_job" in tool_names
+
+    @pytest.mark.asyncio
+    async def test_list_ci_workers_tool(self):
+        import json
+        from app.mcp_server import list_ci_workers
+
+        mock_result = {
+            "repository": "owner/repo",
+            "total_count": 2,
+            "runners": [
+                {"id": 1, "name": "runner-1", "os": "linux", "status": "online", "busy": False, "labels": ["self-hosted"]},
+                {"id": 2, "name": "runner-2", "os": "linux", "status": "offline", "busy": False, "labels": ["self-hosted"]},
+            ],
+        }
+
+        with patch("app.mcp_server._ci_service.list_ci_workers", AsyncMock(return_value=mock_result)):
+            result = await list_ci_workers(repository="owner/repo")
+            data = json.loads(result)
+            assert data["total_count"] == 2
+            assert len(data["runners"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_list_ci_profiles_tool(self):
+        import json
+        from app.mcp_server import list_ci_profiles
+
+        mock_result = {
+            "repository": "owner/repo",
+            "total_count": 1,
+            "workflows": [
+                {"id": 123, "name": "CI", "path": ".github/workflows/ci.yml", "state": "active", "url": "https://github.com/owner/repo/actions/workflows/ci.yml"},
+            ],
+        }
+
+        with patch("app.mcp_server._ci_service.list_ci_profiles", AsyncMock(return_value=mock_result)):
+            result = await list_ci_profiles(repository="owner/repo")
+            data = json.loads(result)
+            assert data["total_count"] == 1
+            assert data["workflows"][0]["name"] == "CI"
+
+    @pytest.mark.asyncio
+    async def test_list_ci_jobs_tool(self):
+        import json
+        from app.mcp_server import list_ci_jobs
+
+        mock_result = {
+            "repository": "owner/repo",
+            "total_count": 1,
+            "workflow_runs": [
+                {"id": 456, "name": "CI", "status": "completed", "conclusion": "success", "head_branch": "main", "url": "https://github.com/owner/repo/actions/runs/456"},
+            ],
+        }
+
+        with patch("app.mcp_server._ci_service.list_ci_jobs", AsyncMock(return_value=mock_result)):
+            result = await list_ci_jobs(repository="owner/repo")
+            data = json.loads(result)
+            assert data["total_count"] == 1
+            assert data["workflow_runs"][0]["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_get_ci_job_tool(self):
+        import json
+        from app.mcp_server import get_ci_job
+
+        mock_result = {
+            "repository": "owner/repo",
+            "run_id": 456,
+            "name": "CI",
+            "status": "completed",
+            "conclusion": "success",
+            "jobs": [{"id": 1, "name": "build", "status": "completed", "conclusion": "success", "steps": []}],
+        }
+
+        with patch("app.mcp_server._ci_service.get_ci_job", AsyncMock(return_value=mock_result)):
+            result = await get_ci_job(repository="owner/repo", run_id="456")
+            data = json.loads(result)
+            assert data["status"] == "completed"
+            assert len(data["jobs"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_get_ci_logs_tool(self):
+        import json
+        from app.mcp_server import get_ci_logs
+
+        mock_result = {
+            "repository": "owner/repo",
+            "run_id": "456",
+            "logs": [{"job_id": 1, "log": "Build output..."}],
+        }
+
+        with patch("app.mcp_server._ci_service.get_ci_logs", AsyncMock(return_value=mock_result)):
+            result = await get_ci_logs(repository="owner/repo", run_id="456")
+            data = json.loads(result)
+            assert data["run_id"] == "456"
+            assert len(data["logs"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_start_ci_job_tool(self):
+        import json
+        from app.mcp_server import start_ci_job
+
+        mock_result = {
+            "success": True,
+            "repository": "owner/repo",
+            "workflow_id": "123",
+            "ref": "main",
+            "message": "Workflow dispatch triggered",
+        }
+
+        with patch("app.mcp_server._ci_service.start_ci_job", AsyncMock(return_value=mock_result)):
+            result = await start_ci_job(repository="owner/repo", workflow_id="123", ref="main")
+            data = json.loads(result)
+            assert data["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_cancel_ci_job_tool(self):
+        import json
+        from app.mcp_server import cancel_ci_job
+
+        mock_result = {
+            "success": True,
+            "repository": "owner/repo",
+            "run_id": "456",
+            "message": "Workflow run 456 cancelled successfully",
+        }
+
+        with patch("app.mcp_server._ci_service.cancel_ci_job", AsyncMock(return_value=mock_result)):
+            result = await cancel_ci_job(repository="owner/repo", run_id="456")
+            data = json.loads(result)
+            assert data["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_ci_tool_error_handling(self):
+        import json
+        from app.mcp_server import list_ci_workers
+
+        with patch("app.mcp_server._ci_service.list_ci_workers", AsyncMock(side_effect=Exception("API connection failed"))):
+            result = await list_ci_workers(repository="owner/repo")
+            data = json.loads(result)
+            assert "error" in data
+            assert data["error"] == "Exception"
+            assert "API connection failed" in data["message"]
+
+
+class TestStartCiJob:
+    @pytest.mark.asyncio
+    async def test_start_ci_job_success_empty_inputs(self):
+        """Test 1: inputs_json='{}' + GitHub returns 204 → success=true"""
+        import json
+        from app.mcp_server import start_ci_job
+
+        mock_result = {
+            "success": True,
+            "repository": "owner/repo",
+            "workflow_id": "ci.yml",
+            "ref": "main",
+            "message": "Workflow dispatch triggered for workflow ci.yml on ref main",
+        }
+
+        with patch("app.mcp_server._ci_service.start_ci_job", AsyncMock(return_value=mock_result)):
+            result = await start_ci_job(repository="owner/repo", workflow_id="ci.yml", inputs_json="{}")
+            data = json.loads(result)
+            assert data["success"] is True
+            assert "error" not in data
+
+    @pytest.mark.asyncio
+    async def test_start_ci_job_success_with_inputs(self):
+        """Test 2: Valid inputs_json with inputs → success=true, and service receives inputs"""
+        import json
+        from app.mcp_server import start_ci_job
+
+        mock_result = {
+            "success": True,
+            "repository": "owner/repo",
+            "workflow_id": "ci.yml",
+            "ref": "main",
+            "message": "Workflow dispatch triggered for workflow ci.yml on ref main",
+        }
+
+        mock_fn = AsyncMock(return_value=mock_result)
+        with patch("app.mcp_server._ci_service.start_ci_job", mock_fn):
+            result = await start_ci_job(
+                repository="owner/repo",
+                workflow_id="ci.yml",
+                ref="main",
+                inputs_json='{"environment":"test"}',
+            )
+            data = json.loads(result)
+            assert data["success"] is True
+            mock_fn.assert_called_once_with(
+                repository="owner/repo",
+                workflow_id="ci.yml",
+                ref="main",
+                inputs={"environment": "test"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_start_ci_job_invalid_json(self):
+        """Test 3: inputs_json='{' → json_parse_error, no HTTP call"""
+        import json
+        from app.mcp_server import start_ci_job
+
+        mock_fn = AsyncMock()
+        with patch("app.mcp_server._ci_service.start_ci_job", mock_fn):
+            result = await start_ci_job(repository="owner/repo", workflow_id="ci.yml", inputs_json="{")
+            data = json.loads(result)
+            assert data["error"] == "json_parse_error"
+            assert "not valid JSON" in data["message"]
+            mock_fn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_ci_job_array_inputs(self):
+        """Test 4: inputs_json='[]' → validation_error, no HTTP call"""
+        import json
+        from app.mcp_server import start_ci_job
+
+        mock_fn = AsyncMock()
+        with patch("app.mcp_server._ci_service.start_ci_job", mock_fn):
+            result = await start_ci_job(repository="owner/repo", workflow_id="ci.yml", inputs_json="[]")
+            data = json.loads(result)
+            assert data["error"] == "validation_error"
+            assert "JSON object" in data["message"]
+            mock_fn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_ci_job_http_422(self):
+        """Test 5: GitHub 422 → error includes GitHub response body, not 'inputs_json is not valid'"""
+        import json
+        from app.mcp_server import start_ci_job
+
+        mock_response = MagicMock()
+        mock_response.status_code = 422
+        mock_response.text = '{"message":"Workflow does not have workflow_dispatch trigger"}'
+        import httpx
+        http_error = httpx.HTTPStatusError("422 error", request=MagicMock(), response=mock_response)
+
+        with patch("app.mcp_server._ci_service.start_ci_job", AsyncMock(side_effect=http_error)):
+            result = await start_ci_job(repository="owner/repo", workflow_id="ci.yml")
+            data = json.loads(result)
+            assert data["error"] == "http_error"
+            assert data["status_code"] == 422
+            assert "inputs_json" not in data["message"].lower()
+            assert "Workflow does not have" in data["message"]
+
+    @pytest.mark.asyncio
+    async def test_start_ci_job_http_404(self):
+        """Test 6: GitHub 404 → workflow or repo not found error"""
+        import json
+        from app.mcp_server import start_ci_job
+
+        mock_response = MagicMock()
+        mock_response.status_code = 404
+        mock_response.text = '{"message":"Not Found"}'
+        import httpx
+        http_error = httpx.HTTPStatusError("404 error", request=MagicMock(), response=mock_response)
+
+        with patch("app.mcp_server._ci_service.start_ci_job", AsyncMock(side_effect=http_error)):
+            result = await start_ci_job(repository="owner/repo", workflow_id="ci.yml")
+            data = json.loads(result)
+            assert data["error"] == "http_error"
+            assert data["status_code"] == 404
+            assert "inputs_json" not in data["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_start_ci_job_http_401(self):
+        """Test 7: GitHub 401 → auth error, not 'inputs_json is not valid'"""
+        import json
+        from app.mcp_server import start_ci_job
+
+        mock_response = MagicMock()
+        mock_response.status_code = 401
+        mock_response.text = '{"message":"Bad credentials"}'
+        import httpx
+        http_error = httpx.HTTPStatusError("401 error", request=MagicMock(), response=mock_response)
+
+        with patch("app.mcp_server._ci_service.start_ci_job", AsyncMock(side_effect=http_error)):
+            result = await start_ci_job(repository="owner/repo", workflow_id="ci.yml")
+            data = json.loads(result)
+            assert data["error"] == "http_error"
+            assert data["status_code"] == 401
+            assert "inputs_json" not in data["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_start_ci_job_timeout(self):
+        """Test 8: Network timeout → timeout error"""
+        import json
+        from app.mcp_server import start_ci_job
+        import httpx
+
+        with patch("app.mcp_server._ci_service.start_ci_job", AsyncMock(side_effect=httpx.TimeoutException("timeout"))):
+            result = await start_ci_job(repository="owner/repo", workflow_id="ci.yml")
+            data = json.loads(result)
+            assert data["error"] == "timeout"
+            assert "timed out" in data["message"]
+
+    @pytest.mark.asyncio
+    async def test_start_ci_job_generic_exception(self):
+        """Test 9: Non-HTTP exception → generic error preserved"""
+        import json
+        from app.mcp_server import start_ci_job
+
+        with patch("app.mcp_server._ci_service.start_ci_job", AsyncMock(side_effect=ValueError("bad repo"))):
+            result = await start_ci_job(repository="owner/repo", workflow_id="ci.yml")
+            data = json.loads(result)
+            assert data["error"] == "ValueError"
+            assert data["message"] == "bad repo"
+
+    @pytest.mark.asyncio
+    async def test_start_ci_job_http_403(self):
+        """Test 10: GitHub 403 → permission error, not 'inputs_json is not valid'"""
+        import json
+        from app.mcp_server import start_ci_job
+
+        mock_response = MagicMock()
+        mock_response.status_code = 403
+        mock_response.text = '{"message":"Resource not accessible by integration"}'
+        import httpx
+        http_error = httpx.HTTPStatusError("403 error", request=MagicMock(), response=mock_response)
+
+        with patch("app.mcp_server._ci_service.start_ci_job", AsyncMock(side_effect=http_error)):
+            result = await start_ci_job(repository="owner/repo", workflow_id="ci.yml")
+            data = json.loads(result)
+            assert data["error"] == "http_error"
+            assert data["status_code"] == 403
+            assert "inputs_json" not in data["message"].lower()
+
+
+class TestOAuthWellKnown:
+    def test_well_known_returns_200(self, client):
+        response = client.get("/.well-known/oauth-protected-resource")
+        assert response.status_code == 200
+
+    def test_well_known_resource_field(self, client):
+        response = client.get("/.well-known/oauth-protected-resource")
+        data = response.json()
+        assert data["resource"] == "https://github.555044.xyz"
+
+    def test_well_known_authorization_servers(self, client):
+        response = client.get("/.well-known/oauth-protected-resource")
+        data = response.json()
+        assert "https://github.555044.xyz" in data["authorization_servers"]
+
+    def test_well_known_bearer_methods(self, client):
+        response = client.get("/.well-known/oauth-protected-resource")
+        data = response.json()
+        assert "header" in data["bearer_methods_supported"]
+
+    def test_well_known_no_auth_required(self, client):
+        response = client.get("/.well-known/oauth-protected-resource")
+        assert response.status_code == 200

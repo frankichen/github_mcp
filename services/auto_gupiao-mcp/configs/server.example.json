@@ -1,0 +1,85 @@
+{
+  "data": {
+    "source": "akshare",
+    "universe": "all_a",
+    "codes": [],
+    "codes_file": "",
+    "start_date": "20250101",
+    "end_date": "",
+    "bars_file": "data/bars/batch_akshare.csv",
+    "universe_limit": 30,
+    "min_universe_price": 2,
+    "max_universe_price": 80,
+    "min_universe_amount": 100000000
+  },
+  "provider": {
+    "python_path": "python",
+    "akshare_script": "scripts/akshare_fetch.py",
+    "akshare_cache": "data/cache/akshare",
+    "akshare_lookback_days": 120,
+    "refresh_cache": false,
+    "tushare_token": ""
+  },
+  "strategy": {
+    "cash": 10000,
+    "top": 1,
+    "min_score": 90,
+    "max_position_ratio": 0.8,
+    "allow_multiple_buys": false,
+    "strategy_profile": "full",
+    "strict_entry": true,
+    "paper_sell_price": "open",
+    "min_trade_amount": 3000,
+    "min_hold_days": 3,
+    "max_hold_days": 7,
+    "stop_loss_pct": 3.5,
+    "take_profit_pct": 8.0,
+    "cooldown_days": 10,
+    "stop_loss_cooldown_days": 30,
+    "poor_performer_filter": true,
+    "repeated_stop_loss_filter": true,
+    "poor_performer_min_trades": 2,
+    "poor_performer_max_net_profit": -300,
+    "single_loss_filter": true,
+    "single_loss_max_net_profit": -300,
+    "single_loss_max_return_pct": -5,
+    "large_loss_filter": false,
+    "large_loss_max_return_pct": -6.0,
+    "large_loss_cooldown_days": 15,
+    "loss_streak_pause": false,
+    "loss_streak_threshold": 4,
+    "loss_streak_pause_days": 2
+  },
+  "report": {
+    "report_dir": "reports",
+    "report_prefix": "daily_observe",
+    "trade_date": "",
+    "public_base_url": "https://你的域名/auto_gupiao_reports",
+    "cache_bust": true,
+    "latest_file": "reports/latest.json"
+  },
+  "database": {
+    "enabled": true,
+    "path": "data/autogupiao.db"
+  },
+  "dashboard": {
+    "address": ":8080",
+    "username": "admin",
+    "password": "请在 configs/server.json 中改成强密码"
+  },
+  "runtime": {
+    "lock_file": "data/locks/daily.lock"
+  },
+  "notify": {
+    "dingtalk": {
+      "enabled": false,
+      "webhook": "请在 configs/server.json 中填写钉钉机器人地址，不要提交到 GitHub",
+      "secret": ""
+    },
+    "webhook": {
+      "enabled": false,
+      "url": "https://你的服务器/api/stock-report",
+      "secret": "请在 configs/server.json 中改成强随机密钥"
+    }
+  }
+}

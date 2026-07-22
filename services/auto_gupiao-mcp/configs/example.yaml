@@ -1,0 +1,39 @@
+capital:
+  initial_cash: 10000
+  max_position_ratio: 0.30
+data_source:
+  source: tushare
+  tushare_token_env: TUSHARE_TOKEN
+  trade_date_format: YYYYMMDD
+  snapshot_cache_path: data/cache/snapshots
+  calendar_cache_path: data/cache/calendar
+  refresh_cache: false
+  refresh_calendar: false
+  warm_calendar: true
+  calendar_exchange: SSE
+  calendar_lookback_days: 30
+  calendar_forward_days: 7
+strategy:
+  top_n: 5
+  min_score: 60
+  min_turnover_rate: 1.0
+  max_debt_asset_ratio: 75
+backtest:
+  mode: backtest
+  input: examples/sample_daily_bars.csv
+  allow_multiple_buys: false
+trading:
+  buy_after: "14:00"
+  sell_around: "10:00"
+  lot_size: 100
+cost:
+  commission_rate: 0.00025
+  min_commission: 5
+  transfer_rate: 0.00001
+  stamp_duty_rate: 0.0005
+  slippage_rate: 0.001
+risk:
+  max_daily_loss_pct: 2.0
+  max_single_loss_pct: 3.0
+  max_daily_trades: 3
+  dry_run_first: true
