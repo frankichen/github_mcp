@@ -43,11 +43,17 @@ class TestMCPTools:
         assert "create_github_pull_request" in tool_names
 
     @pytest.mark.asyncio
-    async def test_mcp_total_tool_count(self):
+    async def test_mcp_tool_set_and_key_tools(self):
         from app.mcp_server import mcp
         tools = await mcp.list_tools()
         tool_names = [t.name for t in tools]
-        assert len(tools) == 13
+        assert len(tool_names) == len(set(tool_names))
+        for name in (
+            "get_github_pull_request_merge_readiness", "merge_github_pull_request",
+            "plan_test_deployment", "start_test_deployment", "rollback_test_deployment",
+            "start_private_ci_job", "wait_test_deployment",
+        ):
+            assert name in tool_names
 
     @pytest.mark.asyncio
     async def test_get_github_file_tool(self):

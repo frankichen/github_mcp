@@ -5,10 +5,20 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      DEPLOYMENT_DB_PATH: /data/private-ci/deployments.db
+      DEPLOY_STATUS_FILE: /data/private-ci/gongshi-test-status.json
+      DEPLOY_CALLBACK_API_KEY_FILE: /run/secrets/deploy_callback_api_key
     ports:
       - "127.0.0.1:8765:8000"
+      - "100.118.124.97:8788:8000"
     volumes:
       - github_action_data:/data
+      # Mount the directory, not only the SQLite main file. SQLite WAL/SHM
+      # sidecars must be visible to both the Controller and deploy agent.
+      - /var/lib/private-ci:/data/private-ci
+      - /opt/github-action-service/secrets/github_classic_pat:/run/secrets/github_classic_pat:ro
+      - /opt/github-action-service/secrets/deploy_callback_api_key:/run/secrets/deploy_callback_api_key:ro
 
 volumes:
   github_action_data:

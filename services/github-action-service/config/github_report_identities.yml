@@ -1,0 +1,14 @@
+identities:
+  xiaowu:
+    github_logins:
+      - frankichen
+    commit_emails:
+      - xiaowu@example.com
+    commit_names:
+      - Xiao Wu
+      - frankichen
+    timezone: Asia/Shanghai
+    exclude_logins:
+      - github-actions[bot]
+      - dependabot[bot]
+      - copilot[bot]

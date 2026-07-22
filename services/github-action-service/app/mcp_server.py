@@ -13,6 +13,8 @@ from app.config import settings as app_settings
 from app.github_client import GitHubClient
 from app.services.github_service import GitHubService
 from app.services.ci_service import get_ci_service
+from app.ci_mcp import register_private_ci_mcp_tools
+from app import github_utils
 
 logger = logging.getLogger(__name__)
 
@@ -42,19 +44,36 @@ Use this MCP server to read and write code on GitHub repositories, and manage CI
 
 GitHub Tools:
 - get_github_file: Read file content from a GitHub repository
-- list_github_directory: List directory contents in a GitHub repository
-- create_github_branch: Create a new branch in a GitHub repository
-- commit_github_files: Commit one or more files to a GitHub repository
-- create_github_pull_request: Create a pull request on GitHub
+- list_github_directory: List directory contents
+- create_github_branch: Create a new branch
+- commit_github_files: Commit files to a repository
+- create_github_pull_request: Create a pull request
 
-CI Tools:
-- list_ci_workers: List CI runners/workers for a GitHub repository
-- list_ci_profiles: List CI workflow definitions
-- list_ci_jobs: List CI job runs
-- start_ci_job: Trigger a CI workflow dispatch
-- get_ci_job: Get details of a CI job run
-- get_ci_logs: Get logs from a CI job
-- cancel_ci_job: Cancel a running CI job
+GitHub Actions CI Tools:
+- list_ci_workers: List GitHub Actions self-hosted runners
+- list_ci_profiles: List GitHub Actions workflows
+- list_ci_jobs: List GitHub Actions workflow runs
+- start_ci_job: Trigger a GitHub Actions workflow_dispatch
+- get_ci_job: Get details of a GitHub Actions run
+- get_ci_logs: Get logs from a GitHub Actions run
+- cancel_ci_job: Cancel a GitHub Actions run
+
+Private CI Tools (German-controller + WSL-Podman):
+- list_private_ci_workers: List private CI workers (wsl-ci-01)
+- list_private_ci_profiles: List private CI profiles (repo-auto-check)
+- list_private_ci_jobs: List private CI jobs
+- start_private_ci_job: Start a private CI job for an exact commit SHA
+- get_private_ci_job: Get private CI job details
+- get_private_ci_logs: Get private CI job logs
+- cancel_private_ci_job: Cancel a private CI job
+
+Development History & Reports:
+- list_github_commits: Query commit history by time range
+- search_github_pull_request_history: Search PR activity
+- list_github_review_history: List code reviews
+- list_github_issue_history: List issue activity
+- get_github_development_history: Aggregated development data
+- get_github_weekly_report_data: Structured weekly report data
 """,
     token_verifier=ApiKeyVerifier(),
     auth=AuthSettings(
@@ -65,43 +84,21 @@ CI Tools:
 )
 
 
-def _log_registered_tools():
-    import asyncio
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            tools = loop.run_until_complete(mcp.list_tools())
-        else:
-            tools = asyncio.run(mcp.list_tools())
-        tool_names = [t.name for t in tools]
-        for name in tool_names:
-            logger.info("Registered tool: %s", name)
-        logger.info("Total registered tools: %d", len(tools))
-    except Exception as e:
-        logger.error("Failed to list registered tools: %s", e)
-
+# ========================================================================
+# Compatibility tools from the MyGithub09 baseline. Keep their public names stable.
+# ========================================================================
 
 @mcp.tool(
     name="get_github_file",
     description="Get file content from a GitHub repository. Returns the file content with metadata including SHA, size, and line range.",
 )
 async def get_github_file(
-    repository: str,
-    path: str,
-    ref: str = "",
-    start_line: int = 0,
-    end_line: int = 0,
+    repository: str, path: str, ref: str = "", start_line: int = 0, end_line: int = 0,
 ) -> str:
     try:
         sl = start_line if start_line > 0 else None
         el = end_line if end_line > 0 else None
-        result = _service.get_file(
-            repository=repository,
-            path=path,
-            ref=ref,
-            start_line=sl,
-            end_line=el,
-        )
+        result = _service.get_file(repository=repository, path=path, ref=ref, start_line=sl, end_line=el)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": type(e).__name__, "message": str(e)})
@@ -111,17 +108,9 @@ async def get_github_file(
     name="list_github_directory",
     description="List directory contents in a GitHub repository. Returns files and subdirectories with their metadata.",
 )
-async def list_github_directory(
-    repository: str,
-    path: str,
-    ref: str = "",
-) -> str:
+async def list_github_directory(repository: str, path: str, ref: str = "") -> str:
     try:
-        result = _service.list_directory(
-            repository=repository,
-            path=path,
-            ref=ref,
-        )
+        result = _service.list_directory(repository=repository, path=path, ref=ref)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": type(e).__name__, "message": str(e)})
@@ -131,17 +120,9 @@ async def list_github_directory(
     name="create_github_branch",
     description="Create a new branch in a GitHub repository. Fails if the branch already exists.",
 )
-async def create_github_branch(
-    repository: str,
-    branch: str,
-    base_branch: str = "main",
-) -> str:
+async def create_github_branch(repository: str, branch: str, base_branch: str = "main") -> str:
     try:
-        result = _service.create_branch(
-            repository=repository,
-            branch=branch,
-            base_branch=base_branch,
-        )
+        result = _service.create_branch(repository=repository, branch=branch, base_branch=base_branch)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": type(e).__name__, "message": str(e)})
@@ -152,10 +133,7 @@ async def create_github_branch(
     description="Diagnostic: reports metadata of a received text payload (character_count, utf8_byte_count, sha256, marker checks). Use this to verify ChatGPT is not truncating tool call arguments when committing large files.",
 )
 async def diagnose_text_payload(
-    payload: str,
-    label: str = "",
-    start_marker: str = "",
-    end_marker: str = "",
+    payload: str, label: str = "", start_marker: str = "", end_marker: str = "",
 ) -> str:
     import hashlib
     utf8_bytes = payload.encode("utf-8")
@@ -175,65 +153,32 @@ async def diagnose_text_payload(
 
 @mcp.tool(
     name="commit_github_files",
-    description="""\
-Commit one or more files to a GitHub repository. All files go into a single commit.
-
-Each file in the files array must have:
-- path: File path in the repository
-- operation: "upsert" or "delete"
-- content: Full file content (required for upsert, omitted for delete)
-- expected_sha: Optional SHA of the current file for optimistic concurrency control
-
-Optional pull_request object:
-- create: Set to true to create a PR
-- base_branch: Target branch for PR (default: main)
-- title: PR title (defaults to commit message)
-- body: PR description (optional)
-""",
+    description="""Commit one or more files to a GitHub repository. All files go into a single commit.
+Each file must have: path, operation (upsert/delete), content, optional expected_sha.
+Optional pull_request object: create, base_branch, title, body.""",
 )
 async def commit_github_files(
-    repository: str,
-    branch: str,
-    commit_message: str,
-    files_json: str,
-    base_branch: str = "main",
-    create_branch_if_missing: bool = False,
-    expected_head_sha: str = "",
-    pull_request_json: str = "{}",
+    repository: str, branch: str, commit_message: str, files_json: str,
+    base_branch: str = "main", create_branch_if_missing: bool = False,
+    expected_head_sha: str = "", pull_request_json: str = "{}",
 ) -> str:
     from app.models import CommitRequest, FileOperation, PullRequestConfig
-
     try:
-        logger.info(
-            "MCP commit_github_files: repo=%s branch=%s files_json_len=%d pr_json_len=%d",
-            repository, branch, len(files_json), len(pull_request_json),
-        )
+        logger.info("MCP commit_github_files: repo=%s branch=%s files_json_len=%d", repository, branch, len(files_json))
         files_data = json.loads(files_json)
         pr_data = json.loads(pull_request_json) if pull_request_json else {}
-
         file_ops = [FileOperation(**f) for f in files_data]
         pr_config = PullRequestConfig(**pr_data) if pr_data.get("create") else None
-
         request = CommitRequest(
-            repository=repository,
-            branch=branch,
-            base_branch=base_branch,
+            repository=repository, branch=branch, base_branch=base_branch,
             create_branch_if_missing=create_branch_if_missing,
-            commit_message=commit_message,
-            expected_head_sha=expected_head_sha if expected_head_sha else None,
-            files=file_ops,
-            pull_request=pr_config,
+            commit_message=commit_message, expected_head_sha=expected_head_sha if expected_head_sha else None,
+            files=file_ops, pull_request=pr_config,
         )
-
         result = _service.commit_files(request)
         return json.dumps(result, ensure_ascii=False)
     except json.JSONDecodeError as e:
-        return json.dumps({
-            "error": "json_parse_error",
-            "message": f"files_json is not valid JSON (pos {e.pos}: {e.msg}). Chatbot may have truncated the payload.",
-            "received_len": len(files_json),
-            "preview": files_json[:200],
-        })
+        return json.dumps({"error": "json_parse_error", "message": f"files_json is not valid JSON (pos {e.pos}: {e.msg})", "received_len": len(files_json), "preview": files_json[:200]})
     except Exception as e:
         return json.dumps({"error": type(e).__name__, "message": str(e)})
 
@@ -243,35 +188,23 @@ async def commit_github_files(
     description="Create a pull request on GitHub between two branches.",
 )
 async def create_github_pull_request(
-    repository: str,
-    head_branch: str,
-    base_branch: str = "main",
-    title: str = "",
-    body: str = "",
-    draft: bool = True,
+    repository: str, head_branch: str, base_branch: str = "main",
+    title: str = "", body: str = "", draft: bool = True,
 ) -> str:
     try:
-        result = _service.create_pull_request(
-            repository=repository,
-            head_branch=head_branch,
-            base_branch=base_branch,
-            title=title,
-            body=body,
-            draft=draft,
-        )
+        result = _service.create_pull_request(repository=repository, head_branch=head_branch, base_branch=base_branch, title=title, body=body, draft=draft)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": type(e).__name__, "message": str(e)})
 
 
 # ========================================================================
-# CI Tools
+# EXISTING GitHub Actions CI TOOLS (7) - MUST NOT BE MODIFIED
 # ========================================================================
-
 
 @mcp.tool(
     name="list_ci_workers",
-    description="List self-hosted CI runners/workers for a GitHub repository. Returns runner name, status, OS, and labels.",
+    description="List GitHub repository self-hosted Actions runners. Returns runner name, status, OS, and labels. NOT for private CI workers (use list_private_ci_workers).",
 )
 async def list_ci_workers(repository: str) -> str:
     try:
@@ -283,7 +216,7 @@ async def list_ci_workers(repository: str) -> str:
 
 @mcp.tool(
     name="list_ci_profiles",
-    description="List CI workflow definitions (profiles) for a GitHub repository. Returns workflow name, state, and URL.",
+    description="List GitHub Actions workflow definitions. Returns workflow name, state, and URL. NOT for private CI profiles (use list_private_ci_profiles).",
 )
 async def list_ci_profiles(repository: str) -> str:
     try:
@@ -295,23 +228,11 @@ async def list_ci_profiles(repository: str) -> str:
 
 @mcp.tool(
     name="list_ci_jobs",
-    description="List CI job runs for a GitHub repository. Can filter by workflow_id, branch, or status.",
+    description="List GitHub Actions workflow runs. Can filter by workflow_id, branch, or status. NOT for private CI jobs (use list_private_ci_jobs).",
 )
-async def list_ci_jobs(
-    repository: str,
-    workflow_id: str = "",
-    branch: str = "",
-    status: str = "",
-    limit: int = 20,
-) -> str:
+async def list_ci_jobs(repository: str, workflow_id: str = "", branch: str = "", status: str = "", limit: int = 20) -> str:
     try:
-        result = await _ci_service.list_ci_jobs(
-            repository=repository,
-            workflow_id=workflow_id,
-            branch=branch,
-            status=status,
-            limit=limit,
-        )
+        result = await _ci_service.list_ci_jobs(repository=repository, workflow_id=workflow_id, branch=branch, status=status, limit=limit)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": type(e).__name__, "message": str(e)})
@@ -319,43 +240,29 @@ async def list_ci_jobs(
 
 @mcp.tool(
     name="start_ci_job",
-    description="Start/trigger a CI workflow dispatch on GitHub Actions. Requires workflow_id and a ref (branch/tag). Optionally pass workflow inputs as JSON string.",
+    description="Trigger a GitHub Actions workflow_dispatch workflow. Requires workflow_id and a ref (branch/tag). NOT for private CI (use start_private_ci_job).",
 )
-async def start_ci_job(
-    repository: str,
-    workflow_id: str,
-    ref: str = "main",
-    inputs_json: str = "{}",
-) -> str:
+async def start_ci_job(repository: str, workflow_id: str, ref: str = "main", inputs_json: str = "{}") -> str:
     try:
         inputs = json.loads(inputs_json) if inputs_json else {}
     except json.JSONDecodeError as e:
         return json.dumps({"error": "json_parse_error", "message": f"inputs_json is not valid JSON: {e.msg}"})
-
     if not isinstance(inputs, dict):
         return json.dumps({"error": "validation_error", "message": "inputs_json must decode to a JSON object"})
-
     try:
-        result = await _ci_service.start_ci_job(
-            repository=repository,
-            workflow_id=workflow_id,
-            ref=ref,
-            inputs=inputs,
-        )
+        result = await _ci_service.start_ci_job(repository=repository, workflow_id=workflow_id, ref=ref, inputs=inputs)
         return json.dumps(result, ensure_ascii=False)
+    except httpx.TimeoutException as e:
+        return json.dumps({"error": "timeout", "message": f"request timed out: {e}"})
     except httpx.HTTPStatusError as e:
-        status = e.response.status_code
-        body = e.response.text[:1000]
-        return json.dumps({"error": "http_error", "status_code": status, "message": body})
-    except httpx.TimeoutException:
-        return json.dumps({"error": "timeout", "message": "GitHub API request timed out"})
+        return json.dumps({"error": "http_error", "status_code": e.response.status_code, "message": e.response.text})
     except Exception as e:
         return json.dumps({"error": type(e).__name__, "message": str(e)})
 
 
 @mcp.tool(
     name="get_ci_job",
-    description="Get details of a specific CI job/workflow run by run_id. Includes job status, conclusion, and step details.",
+    description="Get details of a GitHub Actions workflow run by run_id. NOT for private CI jobs (use get_private_ci_job).",
 )
 async def get_ci_job(repository: str, run_id: str) -> str:
     try:
@@ -367,7 +274,7 @@ async def get_ci_job(repository: str, run_id: str) -> str:
 
 @mcp.tool(
     name="get_ci_logs",
-    description="Get CI job logs for a workflow run. Specify run_id and optionally job_id to get specific job logs.",
+    description="Get GitHub Actions workflow run logs. NOT for private CI logs (use get_private_ci_logs).",
 )
 async def get_ci_logs(repository: str, run_id: str, job_id: str = "") -> str:
     try:
@@ -379,7 +286,7 @@ async def get_ci_logs(repository: str, run_id: str, job_id: str = "") -> str:
 
 @mcp.tool(
     name="cancel_ci_job",
-    description="Cancel a running CI job/workflow run by run_id.",
+    description="Cancel a GitHub Actions workflow run by run_id. NOT for private CI jobs (use cancel_private_ci_job).",
 )
 async def cancel_ci_job(repository: str, run_id: str) -> str:
     try:
@@ -387,3 +294,463 @@ async def cancel_ci_job(repository: str, run_id: str) -> str:
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": type(e).__name__, "message": str(e)})
+
+
+# ========================================================================
+# NEW GITHUB UTILITY TOOLS (12)
+# ========================================================================
+
+@mcp.tool(
+    name="get_github_repository",
+    description="Get metadata about a GitHub repository including default branch, language, stars, and merge settings.",
+)
+async def get_github_repository(repository: str) -> str:
+    try:
+        return json.dumps(github_utils.get_github_repository(repository), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(
+    name="list_github_branches",
+    description="List branches in a GitHub repository with optional protected_only filter, pagination support.",
+)
+async def list_github_branches(
+    repository: str, protected_only: bool = False, limit: int = 100, page: int = 1,
+) -> str:
+    try:
+        return json.dumps(github_utils.list_github_branches(repository, protected_only, limit, page), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(
+    name="get_github_branch",
+    description="Get details of a specific branch including commit SHA and optional comparison with base branch.",
+)
+async def get_github_branch(repository: str, branch: str, base_branch: str = "") -> str:
+    try:
+        return json.dumps(github_utils.get_github_branch(repository, branch, base_branch), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(
+    name="get_github_commit",
+    description="Get details of a specific commit by SHA including author, stats, changed files, and verification status.",
+)
+async def get_github_commit(repository: str, commit_sha: str, file_limit: int = 100) -> str:
+    try:
+        return json.dumps(github_utils.get_github_commit(repository, commit_sha, file_limit), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(
+    name="compare_github_commits",
+    description="Compare two commits, branches, or tags showing ahead/behind, changed files, and commit list.",
+)
+async def compare_github_commits(
+    repository: str, base: str, head: str, file_limit: int = 100,
+) -> str:
+    try:
+        return json.dumps(github_utils.compare_github_commits(repository, base, head, file_limit), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(
+    name="list_github_pull_requests",
+    description="List pull requests in a repository with filters for state, branch, sort order, and pagination.",
+)
+async def list_github_pull_requests(
+    repository: str, state: str = "open", head_branch: str = "", base_branch: str = "",
+    sort: str = "updated", direction: str = "desc", limit: int = 30, page: int = 1,
+) -> str:
+    try:
+        return json.dumps(github_utils.list_github_pull_requests(repository, state, head_branch, base_branch, sort, direction, limit, page), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(
+    name="get_github_pull_request",
+    description="Get detailed information about a specific pull request including mergeability, reviews, and stats.",
+)
+async def get_github_pull_request(repository: str, pull_number: int) -> str:
+    try:
+        return json.dumps(github_utils.get_github_pull_request(repository, pull_number), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(
+    name="list_github_pull_request_files",
+    description="List files changed in a pull request with optional patch content and pagination.",
+)
+async def list_github_pull_request_files(
+    repository: str, pull_number: int, limit: int = 100, page: int = 1, include_patch: bool = True,
+) -> str:
+    try:
+        return json.dumps(github_utils.list_github_pull_request_files(repository, pull_number, limit, page, include_patch), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(
+    name="update_github_pull_request",
+    description="Update a PR's title, body, state, or base branch. Supports expected_head_sha for concurrency protection. Cannot merge PRs.",
+)
+async def update_github_pull_request(
+    repository: str, pull_number: int, title: str = "", body: str = "",
+    state: str = "", base_branch: str = "", expected_head_sha: str = "",
+) -> str:
+    try:
+        kwargs = {}
+        if title: kwargs["title"] = title
+        if body: kwargs["body"] = body
+        if state: kwargs["state"] = state
+        if base_branch: kwargs["base_branch"] = base_branch
+        if expected_head_sha: kwargs["expected_head_sha"] = expected_head_sha
+        return json.dumps(github_utils.update_github_pull_request(repository, pull_number, **kwargs), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(
+    name="get_github_pull_request_checks",
+    description="Get check runs and commit statuses for the PR's current head SHA. Returns overall conclusion and per-check details.",
+)
+async def get_github_pull_request_checks(repository: str, pull_number: int) -> str:
+    try:
+        return json.dumps(github_utils.get_github_pull_request_checks(repository, pull_number), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(
+    name="list_github_pull_request_comments",
+    description="List comments on a pull request (issue comments and review comments) with pagination.",
+)
+async def list_github_pull_request_comments(
+    repository: str, pull_number: int, comment_type: str = "all", limit: int = 100, page: int = 1,
+) -> str:
+    try:
+        return json.dumps(github_utils.list_github_pull_request_comments(repository, pull_number, comment_type, limit, page), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(
+    name="create_github_pull_request_comment",
+    description="Create a comment on a pull request. Supports expected_head_sha for concurrency protection.",
+)
+async def create_github_pull_request_comment(
+    repository: str, pull_number: int, body: str, expected_head_sha: str = "",
+) -> str:
+    try:
+        return json.dumps(github_utils.create_github_pull_request_comment(repository, pull_number, body, expected_head_sha), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(name="get_github_pull_request_merge_readiness", description="Aggregate safe PR merge readiness: exact head SHA, reviews, GitHub Checks, repository merge methods, and private CI gate.")
+async def get_github_pull_request_merge_readiness(repository: str, pull_number: int, expected_head_sha: str = "", required_private_ci_job_id: str = "", expected_base_branch: str = "main") -> str:
+    try:
+        return json.dumps(github_utils.get_github_pull_request_merge_readiness(repository, pull_number, expected_head_sha, required_private_ci_job_id, expected_base_branch), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(name="get_github_pull_request_conflicts", description="Read-only PR conflict diagnosis. Never updates the branch or force-pushes.")
+async def get_github_pull_request_conflicts(repository: str, pull_number: int, expected_head_sha: str = "") -> str:
+    try:
+        return json.dumps(github_utils.get_github_pull_request_conflicts(repository, pull_number, expected_head_sha), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(name="plan_github_pull_request_merge", description="Read-only merge preflight with exact SHA, review, Checks, private CI, and merge-method gates. Never merges.")
+async def plan_github_pull_request_merge(repository: str, pull_number: int, merge_method: str = "squash", expected_head_sha: str = "", required_private_ci_job_id: str = "", expected_base_branch: str = "main") -> str:
+    try:
+        return json.dumps(github_utils.plan_github_pull_request_merge(repository, pull_number, merge_method, expected_head_sha, required_private_ci_job_id, expected_base_branch), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(name="merge_github_pull_request", description="Safely merge a PR only after readiness gates, exact SHA, passed private CI, and explicit confirm=true. Never deploys.")
+async def merge_github_pull_request(repository: str, pull_number: int, merge_method: str = "squash", expected_head_sha: str = "", required_private_ci_job_id: str = "", expected_base_branch: str = "main", commit_title: str = "", commit_message: str = "", delete_head_branch: bool = False, confirm: bool = False) -> str:
+    try:
+        if delete_head_branch:
+            return json.dumps(github_utils._error_response("HEAD_BRANCH_DELETE_REQUIRES_SEPARATE_AUTHORIZATION", "Automatic head branch deletion is disabled; use delete_github_branch separately."))
+        return json.dumps(github_utils.merge_github_pull_request(repository, pull_number, merge_method, expected_head_sha, required_private_ci_job_id, expected_base_branch, commit_title, commit_message, delete_head_branch, confirm), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(name="mark_github_pull_request_ready", description="Convert a draft PR to ready-for-review with exact head SHA protection.")
+async def mark_github_pull_request_ready(repository: str, pull_number: int, expected_head_sha: str) -> str:
+    try: return json.dumps(github_utils.mark_github_pull_request_ready(repository, pull_number, expected_head_sha), ensure_ascii=False)
+    except Exception as e: return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(name="convert_github_pull_request_to_draft", description="Convert an open PR to draft with exact head SHA protection.")
+async def convert_github_pull_request_to_draft(repository: str, pull_number: int, expected_head_sha: str) -> str:
+    try: return json.dumps(github_utils.convert_github_pull_request_to_draft(repository, pull_number, expected_head_sha), ensure_ascii=False)
+    except Exception as e: return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(name="update_github_pull_request_branch", description="Request GitHub's official update-branch operation; never force-pushes locally.")
+async def update_github_pull_request_branch(repository: str, pull_number: int, expected_head_sha: str) -> str:
+    try: return json.dumps(github_utils.update_github_pull_request_branch(repository, pull_number, expected_head_sha), ensure_ascii=False)
+    except Exception as e: return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(name="list_github_pull_request_reviews", description="List submitted PR reviews, distinct from requested reviewers.")
+async def list_github_pull_request_reviews(repository: str, pull_number: int, limit: int = 100, page: int = 1) -> str:
+    try: return json.dumps(github_utils.list_github_pull_request_reviews(repository, pull_number, limit, page), ensure_ascii=False)
+    except Exception as e: return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(name="request_github_pull_request_reviewers", description="Request user and team reviewers with exact head SHA protection.")
+async def request_github_pull_request_reviewers(repository: str, pull_number: int, reviewers_json: str = "[]", team_reviewers_json: str = "[]", expected_head_sha: str = "") -> str:
+    try: return json.dumps(github_utils.request_github_pull_request_reviewers(repository, pull_number, reviewers_json, team_reviewers_json, expected_head_sha), ensure_ascii=False)
+    except Exception as e: return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(name="remove_github_pull_request_reviewers", description="Remove requested user and team reviewers with exact head SHA protection.")
+async def remove_github_pull_request_reviewers(repository: str, pull_number: int, reviewers_json: str = "[]", team_reviewers_json: str = "[]", expected_head_sha: str = "") -> str:
+    try: return json.dumps(github_utils.remove_github_pull_request_reviewers(repository, pull_number, reviewers_json, team_reviewers_json, expected_head_sha), ensure_ascii=False)
+    except Exception as e: return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(name="delete_github_branch", description="Delete a non-default, non-protected branch only with exact SHA and confirm=true. Never follows merge automatically.")
+async def delete_github_branch(repository: str, branch: str, expected_head_sha: str, confirm: bool = False) -> str:
+    try: return json.dumps(github_utils.delete_github_branch(repository, branch, expected_head_sha, confirm), ensure_ascii=False)
+    except Exception as e: return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+def _deployment_tool_error(exc):
+    return json.dumps({"ok": False, "error": {"code": "INTERNAL_ERROR", "message": str(exc), "details": {}}}, ensure_ascii=False)
+
+
+@mcp.tool(name="plan_test_deployment", description="Plan only a fullstack frankichen/sxt gongshi-test deployment; validates exact main SHA, private CI, changed files, migrations, and infrastructure changes.")
+async def plan_test_deployment(repository: str, environment: str, commit_sha: str, private_ci_job_id: str, scope: str = "fullstack", expected_current_release_id: str = "", allow_deploy_infrastructure_changes: bool = False) -> str:
+    try:
+        from app import deployment_service
+        return json.dumps(deployment_service.plan_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes), ensure_ascii=False)
+    except Exception as e: return _deployment_tool_error(e)
+
+
+@mcp.tool(name="start_test_deployment", description="Queue a whitelist-only fullstack gongshi-test deployment after exact main SHA and passed main private CI gates. Requires confirm=true; never accepts host or shell input.")
+async def start_test_deployment(repository: str, environment: str, commit_sha: str, private_ci_job_id: str, scope: str = "fullstack", expected_current_release_id: str = "", allow_deploy_infrastructure_changes: bool = False, force_redeploy: bool = False, confirm: bool = False) -> str:
+    try:
+        from app import deployment_service
+        return json.dumps(deployment_service.start_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes, force_redeploy, confirm), ensure_ascii=False)
+    except Exception as e: return _deployment_tool_error(e)
+
+
+@mcp.tool(name="get_test_deployment", description="Get a deployment status by deployment_id; deployment_id is distinct from CI job_id and GitHub Actions run_id.")
+async def get_test_deployment(deployment_id: str) -> str:
+    try:
+        from app import deployment_service
+        return json.dumps(deployment_service.get_test_deployment(deployment_id), ensure_ascii=False)
+    except Exception as e: return _deployment_tool_error(e)
+
+
+@mcp.tool(name="get_test_deployment_logs", description="Read redacted paginated deployment logs by deployment_id.")
+async def get_test_deployment_logs(deployment_id: str, offset: int = 0, limit: int = 200) -> str:
+    try:
+        from app import deployment_service
+        return json.dumps(deployment_service.get_test_deployment_logs(deployment_id, offset, limit), ensure_ascii=False)
+    except Exception as e: return _deployment_tool_error(e)
+
+
+@mcp.tool(name="wait_test_deployment", description="Long-poll deployment metadata for up to 55 seconds without returning logs or lease tokens.")
+async def wait_test_deployment(deployment_id: str, timeout_seconds: int = 55, last_known_status: str = "", last_known_step: str = "", last_known_revision: int = 0) -> str:
+    try:
+        from app import deployment_service
+        return json.dumps(deployment_service.wait_test_deployment(deployment_id, timeout_seconds, last_known_status, last_known_step, last_known_revision), ensure_ascii=False)
+    except Exception as e: return _deployment_tool_error(e)
+
+
+@mcp.tool(name="get_test_deployment_log_tail", description="Read a redacted deployment log tail without returning lease tokens.")
+async def get_test_deployment_log_tail(deployment_id: str, lines: int = 100) -> str:
+    try:
+        from app import deployment_service
+        return json.dumps(deployment_service.get_test_deployment_log_tail(deployment_id, lines), ensure_ascii=False)
+    except Exception as e: return _deployment_tool_error(e)
+
+
+@mcp.tool(name="list_test_deployments", description="List whitelist-only gongshi-test deployments with filters and pagination.")
+async def list_test_deployments(repository: str = "", environment: str = "", commit_sha: str = "", status: str = "", limit: int = 20, offset: int = 0) -> str:
+    try:
+        from app import deployment_service
+        return json.dumps(deployment_service.list_test_deployments(repository, environment, commit_sha, status, limit, offset), ensure_ascii=False)
+    except Exception as e: return _deployment_tool_error(e)
+
+
+@mcp.tool(name="cancel_test_deployment", description="Cancel a queued deployment immediately or request safe cancellation at a worker boundary.")
+async def cancel_test_deployment(deployment_id: str) -> str:
+    try:
+        from app import deployment_service
+        return json.dumps(deployment_service.cancel_test_deployment(deployment_id), ensure_ascii=False)
+    except Exception as e: return _deployment_tool_error(e)
+
+
+@mcp.tool(name="get_test_environment_status", description="Get redacted gongshi-test environment and health summary; never returns env values or credentials.")
+async def get_test_environment_status(repository: str, environment: str) -> str:
+    try:
+        from app import deployment_service
+        return json.dumps(deployment_service.get_test_environment_status(repository, environment), ensure_ascii=False)
+    except Exception as e: return _deployment_tool_error(e)
+
+
+@mcp.tool(name="list_test_releases", description="List verified gongshi-test release summaries without reading env files.")
+async def list_test_releases(repository: str, environment: str, limit: int = 20) -> str:
+    try:
+        from app import deployment_service
+        return json.dumps(deployment_service.list_test_releases(repository, environment, limit), ensure_ascii=False)
+    except Exception as e: return _deployment_tool_error(e)
+
+
+@mcp.tool(name="rollback_test_deployment", description="Queue a whitelist-only rollback after current-release and checksum gates. Never runs goose down or deletes data/releases.")
+async def rollback_test_deployment(repository: str, environment: str, target_release_id: str, expected_current_release_id: str, confirm: bool = False) -> str:
+    try:
+        from app import deployment_service
+        return json.dumps(deployment_service.rollback_test_deployment(repository, environment, target_release_id, expected_current_release_id, confirm), ensure_ascii=False)
+    except Exception as e: return _deployment_tool_error(e)
+
+
+# ========================================================================
+# DEVELOPMENT HISTORY TOOLS (6)
+# ========================================================================
+
+@mcp.tool(
+    name="list_github_commits",
+    description="Query commit history in a repository by time range. Filters by author/identity, excludes bots and merge commits by default. Supports pagination.",
+)
+async def list_github_commits_tool(
+    repository: str, branch: str = "", author: str = "", identity: str = "",
+    since: str = "", until: str = "", path: str = "",
+    include_merge_commits: bool = False, limit: int = 100, page: int = 1,
+) -> str:
+    try:
+        return json.dumps(github_utils.list_github_commits(repository, branch, author, identity, since, until, path, include_merge_commits, limit, page), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(
+    name="search_github_pull_request_history",
+    description="Search PR history across repositories by identity, time range, and activity type (authored/updated/merged/reviewed/commented).",
+)
+async def search_github_pull_request_history_tool(
+    repositories_json: str, identity: str, activity: str = "all",
+    since: str = "", until: str = "", state: str = "all",
+    include_drafts: bool = True, limit: int = 100, offset: int = 0,
+) -> str:
+    try:
+        repos = json.loads(repositories_json) if repositories_json else []
+        return json.dumps(github_utils.search_github_pull_request_history(repos, identity, activity, since, until, state, include_drafts, limit, offset), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(
+    name="list_github_review_history",
+    description="List code reviews performed by an identity across repositories in a time range.",
+)
+async def list_github_review_history_tool(
+    repositories_json: str, identity: str, since: str = "", until: str = "",
+    states_json: str = '["APPROVED","CHANGES_REQUESTED","COMMENTED"]', limit: int = 100, offset: int = 0,
+) -> str:
+    try:
+        repos = json.loads(repositories_json) if repositories_json else []
+        states = json.loads(states_json) if states_json else None
+        return json.dumps(github_utils.list_github_review_history(repos, identity, since, until, states, limit, offset), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(
+    name="list_github_issue_history",
+    description="List issues an identity participated in across repositories. Excludes pull requests from results.",
+)
+async def list_github_issue_history_tool(
+    repositories_json: str, identity: str, activity: str = "all",
+    since: str = "", until: str = "", state: str = "all",
+    limit: int = 100, offset: int = 0,
+) -> str:
+    try:
+        repos = json.loads(repositories_json) if repositories_json else []
+        return json.dumps(github_utils.list_github_issue_history(repos, identity, activity, since, until, state, limit, offset), ensure_ascii=False)
+    except Exception as e:
+        return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
+
+
+@mcp.tool(
+    name="get_github_development_history",
+    description="Get aggregated development history (commits, PRs, reviews, issues, CI runs, open work) for an identity across repositories in a time range. Ideal for daily/weekly/monthly reports.",
+)
+async def get_github_development_history_tool(
+    identity: str, repositories_json: str = "[]", since: str = "", until: str = "",
+    include_json: str = '["commits","pull_requests","reviews","issues","github_actions","private_ci","open_work"]',
+    include_details: bool = True, max_items_per_section: int = 100,
+) -> str:
+    try:
+        repos = json.loads(repositories_json) if repositories_json else None
+        include = json.loads(include_json) if include_json else None
+        result = github_utils.get_github_development_history(identity, repos, since, until, include, include_details, max_items_per_section)
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": {"code": "INTERNAL_ERROR", "message": str(e)}}, ensure_ascii=False)
+
+
+@mcp.tool(
+    name="get_github_weekly_report_data",
+    description="Get structured data for a weekly development report. Includes completed work, work in progress, code reviews, CI quality, risks, and next-week candidates.",
+)
+async def get_github_weekly_report_data_tool(
+    identity: str, repositories_json: str = "[]", week: str = "current",
+    week_start: str = "monday", timezone: str = "Asia/Shanghai",
+    include_weekend: bool = True, include_open_work: bool = True,
+    include_ci_failures: bool = True, include_code_statistics: bool = True,
+    since: str = "", until: str = "",
+) -> str:
+    try:
+        repos = json.loads(repositories_json) if repositories_json else None
+        result = github_utils.get_github_weekly_report_data(
+            identity, repos, week, week_start, timezone,
+            include_weekend, include_open_work, include_ci_failures, include_code_statistics, since, until
+        )
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": {"code": "INTERNAL_ERROR", "message": str(e)}}, ensure_ascii=False)
+
+
+# ========================================================================
+# Register Private CI MCP Tools
+# ========================================================================
+
+register_private_ci_mcp_tools(mcp)
+
+
+# ========================================================================
+# Helper: Log registered tools on startup
+# ========================================================================
+
+def _log_registered_tools():
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            tools = loop.run_until_complete(mcp.list_tools())
+        else:
+            tools = asyncio.run(mcp.list_tools())
+        tool_names = [t.name for t in tools]
+        for name in tool_names:
+            logger.info("Registered tool: %s", name)
+        logger.info("Total registered tools: %d", len(tools))
+    except Exception as e:
+        logger.error("Failed to list registered tools: %s", e)

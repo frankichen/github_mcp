@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.openapi.utils import get_openapi
 
-from app.routers import health, github
+from app.routers import health, github, ci_worker, deployments
 from app.config import settings
 from app.exceptions import AppError
 from app.idempotency import IdempotencyMiddleware
@@ -22,6 +22,14 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(os.path.dirname(settings.IDEMPOTENCY_DB_PATH), exist_ok=True)
+    try:
+        from app.ci_database import init_db
+        from app.deployment_service import init_deployment_db
+        init_db()
+        init_deployment_db()
+    except Exception:
+        logger.exception("Controller database initialization failed")
+        raise
     mcp_task = None
     tg = None
     try:
@@ -59,6 +67,8 @@ app = FastAPI(
 
 app.include_router(health.router, tags=["Health"])
 app.include_router(github.router, tags=["GitHub"])
+app.include_router(ci_worker.router, tags=["CI Worker"])
+app.include_router(deployments.router, tags=["Deployments"])
 
 
 @app.get("/.well-known/oauth-protected-resource")

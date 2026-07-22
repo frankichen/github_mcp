@@ -31,7 +31,9 @@ find services -maxdepth 2 -type f | sort
 | 服务 | 角色 | 默认位置 |
 |---|---|---|
 | `github-action-service` | GitHub API、CI、MCP 和部署编排 | 本地或 Docker |
+| `private-ci-agent` | 私有 CI 容器执行、日志、源码镜像 | WSL/Private CI 节点 |
 | `private-deploy-agent` | 私有 CI 测试环境部署 Worker | `root@de:/opt/private-deploy-agent` |
+| `private-ci-deploy-executor` | WSL 发布 Executor、测试和 systemd 模板 | WSL/发布节点 |
 
 股票服务不在仓库中，不要重新添加。
 

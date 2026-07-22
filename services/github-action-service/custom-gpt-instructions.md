@@ -48,3 +48,8 @@ Report the following to the user:
 ## Security
 - Never show the API key or GitHub token to the user in any form.
 - Never log or echo the Authorization header or token values.
+
+## MyGithub09 authentication
+- MyGithub09 uses a Classic PAT. Private-repository Checks reads depend on the Classic PAT `repo` scope; authentication capability is determined from `X-OAuth-Scopes` and real API probes.
+- Do not ask for a Fine-grained PAT Checks permission. If a Fine-grained PAT receives a Checks 403, report `FINE_GRAINED_PAT_CHECKS_UNAVAILABLE` and recommend Classic PAT with `repo` scope or a GitHub App with Checks Read permission.
+- If a Classic PAT has no `repo` scope, report `CLASSIC_PAT_REPO_SCOPE_REQUIRED`. If it has `repo` but repository access still fails, report `CLASSIC_PAT_REPOSITORY_ACCESS_DENIED` and check repository access, expiry, SSO, organization PAT policy, IP allow list, and rate limits.

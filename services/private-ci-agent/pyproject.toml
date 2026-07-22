@@ -1,0 +1,6 @@
+[project]
+name = "private-ci-agent"
+version = "1.0.0"
+description = "Private CI Agent for WSL Rootless Podman"
+requires-python = ">=3.10"
+dependencies = ["pyyaml>=6.0"]
