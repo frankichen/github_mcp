@@ -1,0 +1,18 @@
+repositories:
+  owner/repo:
+    github: true
+    private_ci: true
+    test_deploy: true
+    self_deploy: false
+    allowed_operations: [read, chunk_read, search, create_branch, patch, range_edit, upload, create_pr, ci, ready, merge]
+  frankichen/sxt:
+    github: true
+    private_ci: true
+    test_deploy: true
+    self_deploy: false
+  frankichen/github_mcp:
+    github: true
+    private_ci: true
+    test_deploy: false
+    self_deploy: false
+    allowed_operations: [read, chunk_read, search, create_branch, patch, range_edit, upload, create_pr, ci, ready, merge]

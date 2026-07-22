@@ -43,12 +43,16 @@ python3 scripts/verify_mygithub10_live.py --simulate
 
 ## 回滚
 
-保留旧镜像和数据库，不执行 down migration：
+现网实际使用 `/opt/github-action-service/docker-compose.yml`，服务名和容器名均为 `github-action-service`，旧镜像由 Compose 保留为 `github-action-service-github-action-service`。先打印计划：
 
 ```bash
-docker stop github-action-service-mygithub10-pr4
-docker rm github-action-service-mygithub10-pr4
-docker run ... github-action-service-github-action-service
+scripts/rollback_mygithub10.sh
 ```
 
-`...` 必须由人工根据旧容器备份补全，禁止从公网 MCP 参数接收任意 host、shell、路径或服务名。若 Artifact health 失败，受控 Executor 会恢复 previous current、重启固定服务并标记 `rolled_back`。
+确认备份目录、旧镜像 ID、端口、volume、restart policy 无误后才执行：
+
+```bash
+scripts/rollback_mygithub10.sh --confirm
+```
+
+脚本会先记录旧容器/image 元数据和环境文件路径（不复制或打印环境文件内容），再执行 `docker compose up -d --no-build --force-recreate github-action-service`。它不删除数据库、旧镜像或 Release，不执行 down migration。Artifact health 失败时，受控 Executor 会恢复 previous current、重启固定服务并标记 `rolled_back`。

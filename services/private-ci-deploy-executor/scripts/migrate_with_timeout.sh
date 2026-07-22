@@ -16,10 +16,18 @@ fi
 shift
 
 event migration_waiting_database
-if command -v pg_isready >/dev/null 2>&1 && [[ -n "${DATABASE_URL:-}" ]]; then
-  if ! timeout "${STEP_TIMEOUT_SECONDS}s" pg_isready -d "$DATABASE_URL"; then event migration_timeout; exit 124; fi
+if ! command -v pg_isready >/dev/null 2>&1 || [[ -z "${DATABASE_URL:-}" ]]; then
+  if [[ "${MIGRATION_TEST_MODE:-false}" == "true" ]]; then
+    event "migration_database_check_skipped reason=MIGRATION_DATABASE_CHECK_UNAVAILABLE"
+  else
+    event "migration_failed error_code=MIGRATION_DATABASE_CHECK_UNAVAILABLE"
+    exit 78
+  fi
+elif ! timeout "${STEP_TIMEOUT_SECONDS}s" pg_isready -d "$DATABASE_URL" >/dev/null 2>&1; then
+  event migration_timeout
+  exit 124
 fi
-event migration_database_ready
+if [[ "${MIGRATION_TEST_MODE:-false}" != "true" || -n "${DATABASE_URL:-}" ]]; then event migration_database_ready; fi
 
 heartbeat() {
   while true; do

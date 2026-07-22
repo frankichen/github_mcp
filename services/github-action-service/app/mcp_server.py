@@ -29,6 +29,12 @@ _service = GitHubService(_client)
 _ci_service = get_ci_service()
 
 
+def _policy_denied(repository: str, operation: str) -> str | None:
+    from app.repository_policy import require_operation
+    denial = require_operation(repository, operation)
+    return json.dumps(denial, ensure_ascii=False) if denial else None
+
+
 class ApiKeyVerifier:
     async def verify_token(self, token: str) -> Optional[AccessToken]:
         if not token or not app_settings.ACTION_API_KEY.get_secret_value():
@@ -102,6 +108,7 @@ async def get_github_file(
     repository: str, path: str, ref: str = "", start_line: int = 0, end_line: int = 0,
 ) -> str:
     try:
+        if denied := _policy_denied(repository, "read"): return denied
         sl = start_line if start_line > 0 else None
         el = end_line if end_line > 0 else None
         result = _service.get_file(repository=repository, path=path, ref=ref, start_line=sl, end_line=el)
@@ -116,6 +123,7 @@ async def get_github_file(
 )
 async def list_github_directory(repository: str, path: str, ref: str = "") -> str:
     try:
+        if denied := _policy_denied(repository, "read"): return denied
         result = _service.list_directory(repository=repository, path=path, ref=ref)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
@@ -128,6 +136,7 @@ async def list_github_directory(repository: str, path: str, ref: str = "") -> st
 )
 async def create_github_branch(repository: str, branch: str, base_branch: str = "main") -> str:
     try:
+        if denied := _policy_denied(repository, "create_branch"): return denied
         result = _service.create_branch(repository=repository, branch=branch, base_branch=base_branch)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
@@ -170,6 +179,7 @@ async def commit_github_files(
 ) -> str:
     from app.models import CommitRequest, FileOperation, PullRequestConfig
     try:
+        if denied := _policy_denied(repository, "patch"): return denied
         logger.info("MCP commit_github_files: repo=%s branch=%s files_json_len=%d", repository, branch, len(files_json))
         files_data = json.loads(files_json)
         pr_data = json.loads(pull_request_json) if pull_request_json else {}
@@ -198,6 +208,7 @@ async def create_github_pull_request(
     title: str = "", body: str = "", draft: bool = True,
 ) -> str:
     try:
+        if denied := _policy_denied(repository, "create_pr"): return denied
         result = _service.create_pull_request(repository=repository, head_branch=head_branch, base_branch=base_branch, title=title, body=body, draft=draft)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
@@ -250,6 +261,7 @@ async def list_ci_jobs(repository: str, workflow_id: str = "", branch: str = "",
 )
 async def start_ci_job(repository: str, workflow_id: str, ref: str = "main", inputs_json: str = "{}") -> str:
     try:
+        if denied := _policy_denied(repository, "ci"): return denied
         inputs = json.loads(inputs_json) if inputs_json else {}
     except json.JSONDecodeError as e:
         return json.dumps({"error": "json_parse_error", "message": f"inputs_json is not valid JSON: {e.msg}"})
@@ -487,6 +499,7 @@ async def plan_github_pull_request_merge(repository: str, pull_number: int, merg
 @mcp.tool(name="merge_github_pull_request", description="Safely merge a PR only after readiness gates, exact SHA, passed private CI, and explicit confirm=true. Never deploys.")
 async def merge_github_pull_request(repository: str, pull_number: int, merge_method: str = "squash", expected_head_sha: str = "", required_private_ci_job_id: str = "", expected_base_branch: str = "main", commit_title: str = "", commit_message: str = "", delete_head_branch: bool = False, confirm: bool = False) -> str:
     try:
+        if denied := _policy_denied(repository, "merge"): return denied
         if delete_head_branch:
             return json.dumps(github_utils._error_response("HEAD_BRANCH_DELETE_REQUIRES_SEPARATE_AUTHORIZATION", "Automatic head branch deletion is disabled; use delete_github_branch separately."))
         return json.dumps(github_utils.merge_github_pull_request(repository, pull_number, merge_method, expected_head_sha, required_private_ci_job_id, expected_base_branch, commit_title, commit_message, delete_head_branch, confirm), ensure_ascii=False)
@@ -496,7 +509,9 @@ async def merge_github_pull_request(repository: str, pull_number: int, merge_met
 
 @mcp.tool(name="mark_github_pull_request_ready", description="Convert a draft PR to ready-for-review with exact head SHA protection.")
 async def mark_github_pull_request_ready(repository: str, pull_number: int, expected_head_sha: str) -> str:
-    try: return json.dumps(github_utils.mark_github_pull_request_ready(repository, pull_number, expected_head_sha), ensure_ascii=False)
+    try:
+        if denied := _policy_denied(repository, "ready"): return denied
+        return json.dumps(github_utils.mark_github_pull_request_ready(repository, pull_number, expected_head_sha), ensure_ascii=False)
     except Exception as e: return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
 
@@ -543,6 +558,7 @@ def _deployment_tool_error(exc):
 @mcp.tool(name="plan_test_deployment", description="Plan only a fullstack frankichen/sxt gongshi-test deployment; validates exact main SHA, private CI, changed files, migrations, and infrastructure changes.")
 async def plan_test_deployment(repository: str, environment: str, commit_sha: str, private_ci_job_id: str, scope: str = "fullstack", expected_current_release_id: str = "", allow_deploy_infrastructure_changes: bool = False, artifact_id: str = "") -> str:
     try:
+        if denied := _policy_denied(repository, "test_deploy"): return denied
         if artifact_id and os.environ.get("MYGITHUB10_ARTIFACT_DEPLOY_ENABLED", "false").lower() not in {"1", "true", "yes", "on"}: return json.dumps({"ok": False, "error_code": "FEATURE_DISABLED"})
         from app import deployment_service
         return json.dumps(deployment_service.plan_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes, artifact_id), ensure_ascii=False)
@@ -552,6 +568,7 @@ async def plan_test_deployment(repository: str, environment: str, commit_sha: st
 @mcp.tool(name="start_test_deployment", description="Queue a whitelist-only fullstack gongshi-test deployment after exact main SHA and passed main private CI gates. Requires confirm=true; never accepts host or shell input.")
 async def start_test_deployment(repository: str, environment: str, commit_sha: str, private_ci_job_id: str, scope: str = "fullstack", expected_current_release_id: str = "", allow_deploy_infrastructure_changes: bool = False, force_redeploy: bool = False, confirm: bool = False, artifact_id: str = "") -> str:
     try:
+        if denied := _policy_denied(repository, "test_deploy"): return denied
         if artifact_id and os.environ.get("MYGITHUB10_ARTIFACT_DEPLOY_ENABLED", "false").lower() not in {"1", "true", "yes", "on"}: return json.dumps({"ok": False, "error_code": "FEATURE_DISABLED"})
         from app import deployment_service
         return json.dumps(deployment_service.start_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes, force_redeploy, confirm, "mcp", artifact_id), ensure_ascii=False)
@@ -757,6 +774,7 @@ async def get_mygithub_capabilities() -> str:
 @mcp.tool(name="get_github_file_manifest", description="Return exact Git Blob metadata for a file without returning file content.")
 async def get_github_file_manifest(repository: str, path: str, ref: str = "") -> str:
     try:
+        if denied := _policy_denied(repository, "read"): return denied
         return json.dumps(mygithub10.file_manifest(_service, repository, path, ref), ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
@@ -765,6 +783,7 @@ async def get_github_file_manifest(repository: str, path: str, ref: str = "") ->
 @mcp.tool(name="read_github_file_chunk", description="Read an exact UTF-8 byte chunk with SHA and continuation metadata.")
 async def read_github_file_chunk(repository: str, path: str, ref: str = "", offset_bytes: int = 0, limit_bytes: int = mygithub10.MAX_FILE_CHUNK_BYTES, expected_blob_sha: str = "") -> str:
     try:
+        if denied := _policy_denied(repository, "chunk_read"): return denied
         return json.dumps(mygithub10.file_chunk(_service, repository, path, ref, offset_bytes, limit_bytes, expected_blob_sha), ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
@@ -773,6 +792,7 @@ async def read_github_file_chunk(repository: str, path: str, ref: str = "", offs
 @mcp.tool(name="open_github_file_resource", description="Open a file resource handle for paginated reads instead of returning a large JSON body.")
 async def open_github_file_resource(repository: str, path: str, ref: str = "") -> str:
     try:
+        if denied := _policy_denied(repository, "read"): return denied
         manifest = mygithub10.file_manifest(_service, repository, path, ref)
         token = base64.urlsafe_b64encode(json.dumps({"repository": repository, "path": path, "commit": manifest["resolved_commit_sha"]}, separators=(",", ":")).encode()).decode().rstrip("=")
         return json.dumps({"resource_uri": f"mygithub10://blob/{token}", **{key: manifest[key] for key in ("repository", "path", "resolved_commit_sha", "blob_sha", "size_bytes", "content_sha256")}}, ensure_ascii=False)
@@ -794,6 +814,7 @@ async def read_github_file_resource(resource_uri: str, offset_bytes: int = 0, li
 @mcp.tool(name="apply_github_patch", description="Apply a strict unified diff atomically with exact HEAD/blob checks and optional dry-run/idempotency.")
 async def apply_github_patch(repository: str, branch: str, expected_head_sha: str, expected_blob_shas_json: str, patch: str, commit_message: str, dry_run: bool = True, idempotency_key: str = "", create_pull_request: bool = False, pull_request_json: str = "{}") -> str:
     try:
+        if denied := _policy_denied(repository, "patch"): return denied
         return json.dumps(mygithub10.apply_patch(_service, repository, branch, expected_head_sha, expected_blob_shas_json, patch, commit_message, dry_run, idempotency_key), ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
@@ -802,6 +823,7 @@ async def apply_github_patch(repository: str, branch: str, expected_head_sha: st
 @mcp.tool(name="edit_github_file_ranges", description="Apply non-overlapping, hash-checked line range edits as one atomic commit.")
 async def edit_github_file_ranges(repository: str, branch: str, expected_head_sha: str, operations_json: str, commit_message: str, dry_run: bool = True, idempotency_key: str = "") -> str:
     try:
+        if denied := _policy_denied(repository, "range_edit"): return denied
         return json.dumps(mygithub10.edit_ranges(_service, repository, branch, expected_head_sha, operations_json, commit_message, dry_run, idempotency_key), ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
@@ -829,7 +851,9 @@ async def finalize_github_file_upload(upload_id: str, expected_size_bytes: int, 
 
 @mcp.tool(name="commit_github_uploaded_files", description="Commit one finalized upload to a branch with exact HEAD/blob checks.")
 async def commit_github_uploaded_files(repository: str, branch: str, expected_head_sha: str, path: str, expected_blob_sha: str, upload_id: str, commit_message: str, idempotency_key: str = "") -> str:
-    try: return json.dumps(mygithub10.commit_upload(_service, repository, branch, expected_head_sha, path, expected_blob_sha, upload_id, commit_message, idempotency_key), ensure_ascii=False)
+    try:
+        if denied := _policy_denied(repository, "upload"): return denied
+        return json.dumps(mygithub10.commit_upload(_service, repository, branch, expected_head_sha, path, expected_blob_sha, upload_id, commit_message, idempotency_key), ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
 
 
@@ -871,6 +895,7 @@ def _register_release_artifact(metadata: dict) -> dict:
 @mcp.tool(name="build_release_artifact", description="Build and register an artifact only from server-controlled source storage and a valid attestation; callers cannot provide hashes, paths, status or identity evidence.")
 async def build_release_artifact(repository: str, commit_sha: str, private_ci_job_id: str, source_attestation_id: str) -> str:
     try:
+        if denied := _policy_denied(repository, "test_deploy"): return denied
         from app.feature_flags import ARTIFACT_BUILD, enabled
         if not enabled(ARTIFACT_BUILD): return json.dumps({"ok": False, "error_code": "FEATURE_DISABLED"})
         if repository != "frankichen/sxt": return json.dumps({"ok": False, "error_code": "REPOSITORY_NOT_ALLOWED"})

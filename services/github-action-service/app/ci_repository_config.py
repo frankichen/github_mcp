@@ -14,6 +14,11 @@ CONFIG_PATH = os.environ.get("CI_REPOS_CONFIG_PATH", "/app/config/ci_repositorie
 
 _DEFAULT_CONFIG = {
     "repositories": {
+        "frankichen/github_mcp": {
+            "enabled": True,
+            "allowed_profiles": ["repo-auto-check"],
+            "max_timeout_seconds": 900,
+        },
         "frankichen/ai_war": {
             "enabled": True,
             "allowed_profiles": ["repo-auto-check", "python-check"],

@@ -1,4 +1,10 @@
 repositories:
+  frankichen/github_mcp:
+    enabled: true
+    allowed_profiles:
+      - repo-auto-check
+    max_timeout_seconds: 900
+
   frankichen/ai_war:
     enabled: true
     allowed_profiles:

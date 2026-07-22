@@ -161,6 +161,9 @@ This is for the private WSL CI system. NOT for GitHub Actions dispatch (use star
         base_sha: str = "",
     ) -> str:
         try:
+            from app.repository_policy import require_operation
+            if denial := require_operation(repository, "private_ci"):
+                return json.dumps(denial, ensure_ascii=False)
             if not repository or "/" not in repository:
                 return _error_response("INVALID_ARGUMENT", "repository must be in owner/repo format")
             if not SHA_RE.match(commit_sha):

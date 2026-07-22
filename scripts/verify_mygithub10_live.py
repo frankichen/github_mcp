@@ -1,53 +1,150 @@
 #!/usr/bin/env python3
-"""Read-only MyGithub10 smoke acceptance; it never deploys or restarts."""
+"""MyGithub10 read-only acceptance using the official MCP ClientSession."""
 from __future__ import annotations
-import argparse, hashlib, json, os, re, sys
+
+import argparse
+import asyncio
+import hashlib
+import json
+import os
+import re
+import sys
 from pathlib import Path
+
 import httpx
+from mcp import ClientSession
+try:
+    from mcp.client.streamable_http import streamable_http_client
+except ImportError:  # MCP >= 1.12 renamed the helper.
+    from mcp.client.streamable_http import streamablehttp_client as streamable_http_client
 
-def check(name, ok, detail=""):
+
+def report(name: str, ok: bool, detail: str = "") -> None:
     print(json.dumps({"check": name, "ok": bool(ok), "detail": detail}, ensure_ascii=False))
-    if not ok: raise RuntimeError(name)
+    if not ok:
+        raise RuntimeError(name)
 
-def simulated(manifest):
-    check("manifest_tool_count", manifest["tool_count"] == len(manifest["tools"]))
-    names = {tool["name"] for tool in manifest["tools"]}
-    check("legacy_compatibility", {"get_github_file", "commit_github_files", "get_test_deployment_logs"} <= names)
-    check("manifest_source_commit", len(manifest.get("source_commit", "")) == 40)
-    check("default_gates", True, "artifact/gofmt/performance remain disabled pending evidence")
-    check("policy", True, "github_mcp self-deploy is denied by server policy")
 
-def live(base_url, api_key, manifest):
+def load_simulation(manifest_path: Path) -> tuple[dict, dict, dict, dict, list[str]]:
+    service_root = manifest_path.parents[1] / "services" / "github-action-service"
+    sys.path.insert(0, str(service_root))
+    os.environ.setdefault("CI_DB_PATH", "/tmp/mygithub10-live-ci.db")
+    os.environ.setdefault("IDEMPOTENCY_DB_PATH", "/tmp/mygithub10-live-idem.db")
+    os.environ.setdefault("DEPLOYMENT_DB_PATH", "/tmp/mygithub10-live-deploy.db")
+    from app import mygithub10
+    from app.feature_flags import ARTIFACT_BUILD, ARTIFACT_DEPLOY, ATTESTATION_REUSE, enabled
+    from app.mcp_server import mcp
+    from app.repository_policy import get_policy
+
+    async def names():
+        return [tool.name for tool in await mcp.list_tools()]
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    capabilities = mygithub10.capabilities(manifest.get("source_commit", ""))
+    flags = {"artifact_build": enabled(ARTIFACT_BUILD), "artifact_deploy": enabled(ARTIFACT_DEPLOY), "attestation_reuse": enabled(ATTESTATION_REUSE)}
+    policy = get_policy("frankichen/github_mcp")
+    return manifest, capabilities, flags, policy, asyncio.run(names())
+
+
+def simulated(manifest_path: Path) -> None:
+    manifest, capabilities, flags, policy, names = load_simulation(manifest_path)
+    report("manifest_tool_count", manifest["tool_count"] == len(manifest["tools"]))
+    report("tool_names", names == [tool["name"] for tool in manifest["tools"]])
+    report("capabilities_build_sha", bool(re.fullmatch(r"[0-9a-f]{40}", capabilities.get("build_sha", ""))))
+    report("legacy_compatibility", {"get_github_file", "commit_github_files", "get_test_deployment_logs"} <= set(names))
+    report("github_policy", policy.get("github") is True and policy.get("private_ci") is True)
+    report("github_mcp_deploy_denied", policy.get("test_deploy") is False and policy.get("self_deploy") is False)
+    report("feature_flags_loaded", flags == {"artifact_build": False, "artifact_deploy": False, "attestation_reuse": False})
+
+
+async def live(base_url: str, api_key: str, manifest_path: Path) -> None:
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    with httpx.Client(base_url=base_url.rstrip("/"), headers=headers, timeout=30) as client:
-        response = client.get("/health")
-        check("health", response.is_success, str(response.status_code))
-        def call(request_id, name, arguments):
-            response = client.post("/mcp", json={"jsonrpc":"2.0", "id":request_id, "method":"tools/call", "params":{"name":name, "arguments":arguments}})
-            check(name + "_http", response.is_success, str(response.status_code))
-            return response.json()
-        capabilities = json.dumps(call(1, "get_mygithub_capabilities", {}), ensure_ascii=False)
-        check("capabilities_build_sha", re.search(r"\b[0-9a-f]{40}\b", capabilities) is not None)
-        policy = json.dumps(call(2, "get_repository_operation_policy", {"repository":"frankichen/github_mcp"}), ensure_ascii=False)
-        check("github_mcp_policy", "self_deploy" in policy and "test_deploy" in policy)
-        artifact = json.dumps(call(3, "build_release_artifact", {"repository":"frankichen/sxt", "commit_sha":"0"*40, "private_ci_job_id":"probe", "source_attestation_id":"probe"}), ensure_ascii=False)
-        check("artifact_default_gate", "FEATURE_DISABLED" in artifact)
-        check("manifest_nonempty", manifest["tool_count"] > 0)
+    async with httpx.AsyncClient(base_url=base_url.rstrip("/"), headers=headers, trust_env=False, timeout=45) as client:
+        health = await client.get("/health")
+        report("health", health.is_success, str(health.status_code))
+        async with streamable_http_client(base_url.rstrip("/"), http_client=client) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools = (await session.list_tools()).tools
+                names = [tool.name for tool in tools]
 
-def main():
+                async def call(name: str, arguments: dict) -> dict:
+                    result = await session.call_tool(name, arguments)
+                    return json.loads(result.content[0].text)
+
+                capabilities = await call("get_mygithub_capabilities", {})
+                report("capabilities_build_sha", bool(re.fullmatch(r"[0-9a-f]{40}", capabilities.get("build_sha", ""))))
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                report("manifest_tool_count", manifest["tool_count"] == len(names))
+                report("tool_names", set(names) == {tool["name"] for tool in manifest["tools"]})
+                report("legacy_compatibility", {"get_github_file", "commit_github_files", "get_test_deployment_logs"} <= set(names))
+                policy = await call("get_repository_operation_policy", {"repository": "frankichen/github_mcp"})
+                values = policy.get("policy", {})
+                report("github_policy", values.get("github") is True and values.get("private_ci") is True)
+                report("github_mcp_deploy_denied", values.get("test_deploy") is False and values.get("self_deploy") is False)
+                artifact = await call("build_release_artifact", {"repository": "frankichen/sxt", "commit_sha": "0" * 40, "private_ci_job_id": "probe", "source_attestation_id": "probe"})
+                report("artifact_build_disabled", artifact.get("error_code") == "FEATURE_DISABLED")
+                deploy = await call("start_test_deployment", {"repository": "frankichen/sxt", "environment": "gongshi-test", "commit_sha": "0" * 40, "private_ci_job_id": "probe", "artifact_id": "probe"})
+                report("artifact_deploy_disabled", deploy.get("error_code") == "FEATURE_DISABLED")
+
+                repository = os.environ.get("MYGITHUB10_TEST_REPOSITORY", "frankichen/sxt")
+                path = os.environ.get("MYGITHUB10_TEST_FILE_PATH", "go.sum")
+                file_manifest = await call("get_github_file_manifest", {"repository": repository, "path": path, "ref": "main"})
+                report("test_file_manifest", file_manifest.get("ok", True) and file_manifest.get("size_bytes", 0) > 0)
+                blob = file_manifest["blob_sha"]
+                offset, chunks = 0, []
+                while True:
+                    chunk = await call("read_github_file_chunk", {"repository": repository, "path": path, "ref": "main", "offset_bytes": offset, "limit_bytes": 64 * 1024, "expected_blob_sha": blob})
+                    chunks.append(chunk["content"]); offset = chunk["next_offset"]
+                    if chunk["eof"]: break
+                rebuilt = "".join(chunks).encode("utf-8")
+                report("chunk_reassembly_sha", hashlib.sha256(rebuilt).hexdigest() == file_manifest["content_sha256"])
+                report("utf8_boundary", all(part.encode("utf-8").decode("utf-8") == part for part in chunks))
+                patch = "--- a/README.md\n+++ b/README.md\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+                dry = await call("apply_github_patch", {"repository": repository, "branch": "main", "expected_head_sha": "0" * 40, "expected_blob_shas_json": "{}", "patch": patch, "commit_message": "acceptance", "dry_run": True})
+                report("patch_dry_run", dry.get("dry_run") is True or dry.get("error", {}).get("code") in {"PATCH_DOES_NOT_APPLY", "PATCH_FILE_NOT_FOUND"})
+                stale = await call("apply_github_patch", {"repository": repository, "branch": "main", "expected_head_sha": "f" * 40, "expected_blob_shas_json": "{}", "patch": patch, "commit_message": "acceptance", "dry_run": True})
+                report("stale_head_rejected", stale.get("error", {}).get("code") in {"PATCH_HEAD_CHANGED", "PATCH_DOES_NOT_APPLY", "PATCH_FILE_NOT_FOUND"})
+                range_result = await call("edit_github_file_ranges", {"repository": repository, "branch": "main", "expected_head_sha": "0" * 40, "operations_json": "[]", "commit_message": "acceptance", "dry_run": True})
+                report("range_edit_dry_run", range_result.get("dry_run") is True or "error" in range_result)
+                upload = await call("begin_github_file_upload", {})
+                report("upload_lifecycle_begin", bool(upload.get("upload_id")))
+                if upload.get("upload_id"):
+                    upload_id = upload["upload_id"]; content = "验收边界✅".encode("utf-8")
+                    appended = await call("append_github_file_upload_chunk", {"upload_id": upload_id, "offset": 0, "text": content.decode("utf-8"), "chunk_sha256": hashlib.sha256(content).hexdigest()})
+                    report("upload_lifecycle_append", appended.get("next_offset") == len(content))
+                    finalized = await call("finalize_github_file_upload", {"upload_id": upload_id, "expected_size_bytes": len(content), "expected_sha256": hashlib.sha256(content).hexdigest()})
+                    report("upload_lifecycle_finalize", finalized.get("finalized") is True)
+                    aborted = await call("abort_github_file_upload", {"upload_id": upload_id})
+                    report("upload_lifecycle_abort", aborted.get("aborted") is True)
+                job_id = os.environ.get("MYGITHUB10_TEST_JOB_ID", "")
+                logs = await call("get_private_ci_log_tail", {"job_id": job_id or "invalid", "lines": 20})
+                if job_id and logs.get("ok", True):
+                    redacted = json.dumps(logs, ensure_ascii=False)
+                    report("logs_secret_redaction", re.search(r"(?i)(token|password|secret|authorization)=([^*\s]+)", redacted) is None)
+                else:
+                    report("logs_invalid_id_safe", logs.get("error_code") in {"PRIVATE_CI_JOB_NOT_FOUND", "INVALID_ARGUMENT"} or logs.get("error", {}).get("code") in {"PRIVATE_CI_JOB_NOT_FOUND", "INVALID_ARGUMENT"})
+                attestation = await call("get_attestation", {"attestation_id": "invalid"})
+                report("attestation_invalid_id", attestation.get("ok") is False)
+                valid_attestation = os.environ.get("MYGITHUB10_TEST_ATTESTATION_ID", "")
+                if valid_attestation:
+                    valid = await call("get_attestation", {"attestation_id": valid_attestation})
+                    report("attestation_read", valid.get("ok") is True and bool(valid.get("attestation")))
+
+
+def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", default="docs/MYGITHUB10_TOOL_MANIFEST.json")
     parser.add_argument("--base-url", default=os.environ.get("CONTROLLER_URL", ""))
     parser.add_argument("--simulate", action="store_true")
-    args = parser.parse_args()
-    path = Path(args.manifest)
+    args = parser.parse_args(); path = Path(args.manifest)
     try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
-        simulated(manifest) if args.simulate or not args.base_url else live(args.base_url, os.environ.get("ACTION_API_KEY", ""), manifest)
-        print(json.dumps({"ok":True, "sha256_manifest":hashlib.sha256(path.read_bytes()).hexdigest()}))
+        if args.simulate or not args.base_url: simulated(path)
+        else: asyncio.run(live(args.base_url, os.environ.get("ACTION_API_KEY", ""), path))
+        print(json.dumps({"ok": True, "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}))
         return 0
     except (OSError, ValueError, KeyError, RuntimeError, httpx.HTTPError) as exc:
-        print(json.dumps({"ok":False, "error":type(exc).__name__ + ": " + str(exc)}, ensure_ascii=False))
-        return 1
+        print(json.dumps({"ok": False, "error": type(exc).__name__ + ": " + str(exc)}, ensure_ascii=False)); return 1
+
 
 if __name__ == "__main__": sys.exit(main())

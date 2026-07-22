@@ -26,3 +26,15 @@ def is_operation_allowed(repository: str, operation: str) -> bool:
     if operation in {"github", "private_ci", "test_deploy", "self_deploy"}:
         return bool(policy.get(operation, False))
     return operation in set(policy.get("allowed_operations") or [])
+
+
+def require_operation(repository: str, operation: str) -> dict | None:
+    """Return a stable MCP error payload when the server policy denies access."""
+    if is_operation_allowed(repository, operation):
+        return None
+    return {
+        "ok": False,
+        "error_code": "REPOSITORY_OPERATION_DENIED",
+        "repository": repository,
+        "operation": operation,
+    }
