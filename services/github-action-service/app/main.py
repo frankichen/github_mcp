@@ -25,8 +25,10 @@ async def lifespan(app: FastAPI):
     try:
         from app.ci_database import init_db
         from app.deployment_service import init_deployment_db
+        from app.attestation_registry import init_registry_db
         init_db()
         init_deployment_db()
+        init_registry_db()
     except Exception:
         logger.exception("Controller database initialization failed")
         raise

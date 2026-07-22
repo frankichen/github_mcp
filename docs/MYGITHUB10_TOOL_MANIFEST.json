@@ -1,10 +1,10 @@
 {
   "service_name": "MyGithub10",
-  "source_commit": "3aa235ea288560a8ceade982fe8921e0129be3e9",
+  "source_commit": "d7c2a37d3823fd13e443bdc196c3236f3af37cc2",
   "controller_image": "not-read-from-runtime",
   "pygithub_version": "2.5.0",
   "mcp_sdk_version": "mcp>=1.7.0 (requirements baseline)",
-  "tool_count": 73,
+  "tool_count": 83,
   "tools": [
     {
       "name": "get_github_file",
@@ -1314,6 +1314,11 @@
             "default": false,
             "title": "Allow Deploy Infrastructure Changes",
             "type": "boolean"
+          },
+          "artifact_id": {
+            "default": "",
+            "title": "Artifact Id",
+            "type": "string"
           }
         },
         "required": [
@@ -1374,6 +1379,11 @@
             "default": false,
             "title": "Confirm",
             "type": "boolean"
+          },
+          "artifact_id": {
+            "default": "",
+            "title": "Artifact Id",
+            "type": "string"
           }
         },
         "required": [
@@ -2434,6 +2444,239 @@
       }
     },
     {
+      "name": "create_attestation_for_passed_job",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Create a Tree SHA attestation from server-side CI evidence; callers may only choose job_id and bounded expiry.",
+      "input_schema": {
+        "properties": {
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "expires_in_seconds": {
+            "default": 604800,
+            "title": "Expires In Seconds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "title": "create_attestation_for_passed_jobArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_attestation",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Read a persisted Tree SHA attestation by id.",
+      "input_schema": {
+        "properties": {
+          "attestation_id": {
+            "title": "Attestation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attestation_id"
+        ],
+        "title": "get_attestationArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "validate_attestation",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Validate every identity, job, toolchain, dependency, config, expiry and revocation gate before CI reuse.",
+      "input_schema": {
+        "properties": {
+          "attestation_id": {
+            "title": "Attestation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attestation_id"
+        ],
+        "title": "validate_attestationArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "revoke_attestation",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Revoke one persisted attestation so it can never be reused.",
+      "input_schema": {
+        "properties": {
+          "attestation_id": {
+            "title": "Attestation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attestation_id"
+        ],
+        "title": "revoke_attestationArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "build_release_artifact",
+      "read_only": false,
+      "consequential": true,
+      "category": "release",
+      "description": "Build and register an artifact only from server-controlled source storage and a valid attestation; callers cannot provide hashes, paths, status or identity evidence.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "commit_sha": {
+            "title": "Commit Sha",
+            "type": "string"
+          },
+          "private_ci_job_id": {
+            "title": "Private Ci Job Id",
+            "type": "string"
+          },
+          "source_attestation_id": {
+            "title": "Source Attestation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "commit_sha",
+          "private_ci_job_id",
+          "source_attestation_id"
+        ],
+        "title": "build_release_artifactArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_release_artifact",
+      "read_only": true,
+      "consequential": false,
+      "category": "release",
+      "description": "Read one registered artifact without exposing arbitrary filesystem contents.",
+      "input_schema": {
+        "properties": {
+          "artifact_id": {
+            "title": "Artifact Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_id"
+        ],
+        "title": "get_release_artifactArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_release_artifacts",
+      "read_only": true,
+      "consequential": false,
+      "category": "release",
+      "description": "List registered artifact metadata by repository and status.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "default": "",
+            "title": "Repository",
+            "type": "string"
+          },
+          "status": {
+            "default": "",
+            "title": "Status",
+            "type": "string"
+          },
+          "limit": {
+            "default": 50,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "list_release_artifactsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "validate_release_artifact",
+      "read_only": false,
+      "consequential": true,
+      "category": "release",
+      "description": "Validate artifact readiness, expiry, provenance, exact main identity and current private CI status.",
+      "input_schema": {
+        "properties": {
+          "artifact_id": {
+            "title": "Artifact Id",
+            "type": "string"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "commit_sha": {
+            "title": "Commit Sha",
+            "type": "string"
+          },
+          "tree_sha": {
+            "title": "Tree Sha",
+            "type": "string"
+          },
+          "private_ci_job_id": {
+            "title": "Private Ci Job Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "repository",
+          "branch",
+          "commit_sha",
+          "tree_sha",
+          "private_ci_job_id"
+        ],
+        "title": "validate_release_artifactArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "revoke_release_artifact",
+      "read_only": false,
+      "consequential": true,
+      "category": "release",
+      "description": "Revoke a registered artifact; revoked artifacts cannot be deployed.",
+      "input_schema": {
+        "properties": {
+          "artifact_id": {
+            "title": "Artifact Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_id"
+        ],
+        "title": "revoke_release_artifactArguments",
+        "type": "object"
+      }
+    },
+    {
       "name": "list_private_ci_workers",
       "read_only": true,
       "consequential": false,
@@ -2659,6 +2902,31 @@
           "job_id"
         ],
         "title": "get_private_ci_logsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_private_ci_log_tail",
+      "read_only": true,
+      "consequential": false,
+      "category": "private_ci",
+      "description": "Return the redacted tail of a private CI job log without requiring the caller to page through the full log.",
+      "input_schema": {
+        "properties": {
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "lines": {
+            "default": 100,
+            "title": "Lines",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "title": "get_private_ci_log_tailArguments",
         "type": "object"
       }
     },

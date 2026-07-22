@@ -848,6 +848,38 @@ def get_log_chunks(job_id: str, offset: int = 0, limit: int = 50) -> dict:
     }
 
 
+def get_log_tail(job_id: str, lines: int = 100, max_scan_bytes: int = 4 * 1024 * 1024) -> dict:
+    """Read backwards by chunk and stop only after enough complete newlines."""
+    db = _get_db()
+    row = db.execute("SELECT status, log_total_bytes, log_truncated FROM ci_jobs WHERE job_id=?", (job_id,)).fetchone()
+    if not row:
+        return {"job_id": job_id, "status": None, "last_sequence": None, "requested_lines": lines, "returned_lines": 0, "total_bytes": 0, "bytes_scanned": 0, "first_line_partial": False, "max_bytes_reached": False, "truncated": False, "lines": []}
+    lines = min(max(int(lines), 1), 1000)
+    max_scan_bytes = min(max(int(max_scan_bytes), 1), 64 * 1024 * 1024)
+    collected, scanned, cursor, last_sequence = [], 0, None, None
+    newline_count = 0
+    while scanned < max_scan_bytes:
+        params = [job_id] if cursor is None else [job_id, cursor]
+        where = "job_id=?" if cursor is None else "job_id=? AND chunk_index<?"
+        batch = db.execute(f"SELECT chunk_index, content FROM ci_job_log_chunks WHERE {where} ORDER BY chunk_index DESC LIMIT 100", params).fetchall()
+        if not batch: break
+        if last_sequence is None: last_sequence = batch[0]["chunk_index"]
+        for item in batch:
+            content = item["content"] or ""
+            remaining = max_scan_bytes - scanned
+            if len(content.encode("utf-8")) > remaining:
+                encoded = content.encode("utf-8")[:remaining]
+                content = encoded.decode("utf-8", errors="ignore")
+            collected.append(content); scanned += len(content.encode("utf-8")); newline_count += content.count("\n")
+            cursor = item["chunk_index"]
+            if newline_count >= lines + 1 or scanned >= max_scan_bytes: break
+        if newline_count >= lines + 1 or scanned >= max_scan_bytes: break
+    content = "".join(reversed(collected)); all_lines = content.splitlines()
+    first_partial = bool(collected and cursor is not None and newline_count < lines + 1 and scanned >= max_scan_bytes)
+    tail = all_lines[-lines:]
+    return {"job_id": job_id, "status": row["status"], "last_sequence": last_sequence, "requested_lines": lines, "returned_lines": len(tail), "total_bytes": row["log_total_bytes"], "bytes_scanned": scanned, "first_line_partial": first_partial, "max_bytes_reached": scanned >= max_scan_bytes, "truncated": bool(row["log_truncated"]), "lines": tail}
+
+
 ### STEPS
 
 def add_step(job_id: str, step_name: str, status: str = "pending") -> int:

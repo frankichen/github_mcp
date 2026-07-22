@@ -19,6 +19,7 @@ from app.ci_database import (
     list_jobs as db_list_jobs,
     get_workers as db_get_workers,
     get_log_chunks,
+    get_log_tail,
     get_steps,
     wait_for_job_change,
     cancel_queued_job,
@@ -35,6 +36,11 @@ from app.ci_repository_config import (
 logger = logging.getLogger(__name__)
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_TAIL_SECRET_RE = re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+|(?:token|password|secret|api[_-]?key)\s*[:=]\s*)([^\s,;]+)")
+
+
+def _redact_log_line(line: str) -> str:
+    return _TAIL_SECRET_RE.sub(lambda match: match.group(1) + "[REDACTED]", line)
 
 
 def _error_response(code: str, message: str, retryable: bool = False, details: dict = None) -> str:
@@ -256,6 +262,27 @@ This is for the private CI system. NOT for GitHub Actions logs (use get_ci_logs 
             result["status"] = job.get("status")
             result["ok"] = True
             return json.dumps(result, ensure_ascii=False)
+        except Exception as e:
+            return _error_response("INTERNAL_ERROR", str(e))
+
+    @mcp.tool(
+        name="get_private_ci_log_tail",
+        description="Return the redacted tail of a private CI job log without requiring the caller to page through the full log.",
+    )
+    async def get_private_ci_log_tail(job_id: str, lines: int = 100) -> str:
+        try:
+            job = get_job(job_id)
+            if not job:
+                return _error_response("PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found")
+            lines = min(max(lines, 1), 1000)
+            result = get_log_tail(job_id, lines)
+            return json.dumps({
+                "ok": True, "job_id": job_id, "repository": job.get("repository"),
+                "branch": job.get("branch"), "commit_sha": job.get("commit_sha"),
+                "status": job.get("status"), "last_sequence": result.get("last_sequence"), "lines": [_redact_log_line(line) for line in result.get("lines", [])],
+                "line_count": result.get("returned_lines", 0), "total_bytes": result.get("total_bytes", 0),
+                "requested_lines": result.get("requested_lines", lines), "bytes_scanned": result.get("bytes_scanned", 0), "first_line_partial": result.get("first_line_partial", False), "max_bytes_reached": result.get("max_bytes_reached", False), "truncated": result.get("truncated", False),
+            }, ensure_ascii=False)
         except Exception as e:
             return _error_response("INTERNAL_ERROR", str(e))
 

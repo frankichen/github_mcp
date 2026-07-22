@@ -13,6 +13,7 @@ import secrets
 import fcntl
 
 from app.deployment_service import init_deployment_db, _get_deploy_db
+from app.attestation_registry import validate_artifact, get_artifact
 
 WORKSPACE = os.environ.get("DEPLOY_WORKSPACE", "/srv/private-ci/deploy-workspace/sxt")
 SCRIPT = "scripts/deploy_gongshi_test.sh"
@@ -102,6 +103,12 @@ def process_once() -> bool:
     # verified current release untouched until the complete callback proves a
     # successful symlink switch and health check.
     write_status("busy", "claimed", retained_release, retained_previous, f"claimed deployment {dep_id}")
+    if row["artifact_id"] and os.environ.get("MYGITHUB10_ARTIFACT_DEPLOY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}:
+        return _process_artifact(db, row, retained_release, retained_previous)
+    if row["artifact_id"]:
+        db.execute("UPDATE deployments SET status='failed',current_step='artifact_feature_disabled',error_code='FEATURE_DISABLED',error_message='artifact deployment is disabled',exit_code=1,finished_at=?,updated_at=? WHERE deployment_id=?", (time.time(), time.time(), dep_id)); db.commit()
+        write_status("online", "idle", retained_release, retained_previous, f"artifact deployment disabled for {dep_id}")
+        return True
     if os.environ.get("DEPLOY_EXECUTION_MODE") == "claim_only":
         prior_log = row["log_text"] or ""
         log_text = (prior_log + ("\n" if prior_log else "") + f"agent claimed deployment {dep_id}; execution delegated to WSL")[-200000:]
@@ -138,6 +145,24 @@ def process_once() -> bool:
         db.execute("UPDATE deployments SET status='failed',current_step='worker_error',exit_code=1,finished_at=?,error_code='DEPLOY_WORKER_ERROR',error_message=?,log_text=? WHERE deployment_id=?", (time.time(), type(exc).__name__, redact(str(exc)), dep_id)); db.commit()
         logger.exception("deployment worker failed: deployment_id=%s", dep_id)
         write_status("online", "idle", None, None, f"deployment {dep_id} failed")
+    return True
+
+
+def _process_artifact(db, row, retained_release, retained_previous) -> bool:
+    """Artifact mode never invokes the source checkout deployment script."""
+    artifact = get_artifact(row["artifact_id"])
+    gate = validate_artifact(row["artifact_id"], repository=row["repository"], branch="main", commit_sha=row["commit_sha"], tree_sha=artifact["tree_sha"] if artifact else "", private_ci_job_id=row["private_ci_job_id"]) if artifact else {"ok": False, "error_code": "ARTIFACT_NOT_FOUND"}
+    if not gate.get("ok"):
+        db.execute("UPDATE deployments SET status='failed',current_step='artifact_validation_failed',error_code=?,error_message=?,exit_code=1,finished_at=?,updated_at=? WHERE deployment_id=?", (gate.get("error_code"), gate.get("error_code"), time.time(), time.time(), row["deployment_id"])); db.commit()
+        write_status("online", "idle", retained_release, retained_previous, f"artifact validation failed for {row['deployment_id']}")
+        return True
+    from app.private_ci_artifact_adapter import execute_verified_artifact
+    result = execute_verified_artifact(row, artifact)
+    if result.get("ok"):
+        db.execute("UPDATE deployments SET status='passed',current_step='completed',exit_code=0,finished_at=?,updated_at=? WHERE deployment_id=?", (time.time(), time.time(), row["deployment_id"]))
+    else:
+        db.execute("UPDATE deployments SET status='failed',current_step='artifact_failed',error_code=?,error_message=?,exit_code=1,finished_at=?,updated_at=? WHERE deployment_id=?", (result.get("error_code", "ARTIFACT_DEPLOY_FAILED"), result.get("error_code", "ARTIFACT_DEPLOY_FAILED"), time.time(), time.time(), row["deployment_id"]))
+    db.commit(); write_status("online", "idle", retained_release, retained_previous, f"artifact deployment {row['deployment_id']} {result.get('ok')}")
     return True
 
 
