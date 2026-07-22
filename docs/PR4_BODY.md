@@ -19,14 +19,22 @@
 
 ## 验收证据
 
-- Controller：158 passed；Private CI Agent：34 passed；Deploy Executor：5 passed，2 skipped（依赖真实外部运行时/数据库，默认安全跳过）。
-- 容器内 Controller：157 passed；容器内 compileall、工具清单生成（84 tools）和 `verify_mygithub10_live.py --simulate`：通过。
+- Controller：本轮定向策略/资源测试通过；此前完整 Controller 测试为 123 passed，剩余失败/错误均为当前 WSL `/data` 权限、临时文件权限或默认收集脚本需要外部服务造成，未将其伪报为通过。Private CI Agent 定向测试 30 passed，1 项仅因 `/mnt/c` 不保留 0700 文件权限而受环境阻塞；Deploy Executor：5 passed，2 skipped（依赖真实外部运行时/数据库，未把 skipped 写成 passed）。
+- 容器内 Controller 定向测试：9 passed；compileall 通过，工具清单为 84 tools，镜像内 manifest JSON 校验和 `verify_mygithub10_live.py --simulate` 已通过。
 - 本地/模拟在线验收：通过 7 项核心检查；真实公网验收仍需部署后由人工执行，当前不伪造 live 结果。
 - `compileall/py_compile`、`bash -n`、`git diff --check`：通过。
 - 真实 sxt 5x：已取得五个历史 passed Job 的完整证据；由于修正脚本无法在未部署的旧 Controller 上完成 schema/stream 验证，`supports_real_ci_performance_validation` 仍保持 false。
 - 同一稳定 SHA 的五个真实历史 passed Job 证据：`6545eed41839439e`、`b45c084921534e7a`、`2332022c22624c53`、`8f35c5ee22534e38`、`600398a63b9a45b5`；五次 commit 均为 `f1a9368e649e47eeb3481474b31f8c51580fa955`，tree 均为 `8a31b7620acd8ed97e53b110f421e7328448ea01`，耗时依次为 237.715/253.651/230.566/206.051/200.119 秒，median=230.566 秒，nearest-rank P90=253.651 秒。Migration=74.834/77.793/71.156/69.364/64.552 秒；Go test=72.419/74.449/68.216/60.352/63.569 秒；Admin test=13.172/10.982/9.250/8.364/9.208 秒；Console test=146.634/158.783/148.057/114.041/101.124 秒；build=57.256/61.838/52.425/48.127/51.709 秒。镜像 digest 均为 `sha256:f92b729f5f76b045df75ee1cb324ea68658bbc82feecd286c6ce08bf339fd74d`，Go=`go1.26.0`、Node=`v22.22.1`、npm=`10.9.2`。
 - 修正后的脚本对当前仍运行 MyGithub09 的旧 Controller 在 `initialize/list_tools` 阶段遇到 stream 读取失败后立即退出；因此未把这次重新执行计入 5x capability，能力值仍保持 false。
-- Docker 新镜像已用临时 `DOCKER_CONFIG` 构建，未修改全局配置；当前完整 image ID：`sha256:17b7a630a015b30222d3af1c57c96f01fb5e81214dc8cafe36aa4eaf9fc9a106`。旧镜像未覆盖。
+- Docker 新镜像未覆盖旧镜像；当前验收镜像 ID：`sha256:0b0d7abec66057396b20ba19402fc3d97d27671f3a75e7da9cb310f7ac66ddb3`，构建 SHA 环境变量为当前分支 Head `2cb060d849b3e6d7a1a4b988e7e674f4a74933ed`。
+
+## 本轮紧急修复
+
+- CI Go 工具链现在从隔离 Podman 容器内实际执行的 `go version` 取证，并与选择版本严格比较；不一致永久 fail-closed 为 `CI_TOOLCHAIN_MISMATCH`，不再用宿主机版本冒充容器版本。
+- 已验证官方及内部 registry 的 `golang:1.26.4` 均实际运行 `go1.26.4 linux/amd64`，digest 为 `sha256:f92b729f5f76b045df75ee1cb324ea68658bbc82feecd286c6ce08bf339fd74d`；内部 HTTP registry 使用显式 `--tls-verify=false`，并刷新 tag 后再判断镜像存在。
+- `repositories_json` 历史查询、私有 CI 列表/详情、部署与 artifact 操作均先验证非空仓库并执行服务器策略；混合允许/拒绝仓库整体拒绝，避免通过空列表或 ID 绕过策略。
+- MCP resource capability 仅在配置了至少 32 字节 HMAC secret 时开启；缺失/过短 secret 保持 disabled，不记录 secret。
+- PR #614 已在 `73f007808163a6686155e4d566d3290a217366dc` 合并；本轮未重跑、未部署、未启动线上 CI。
 
 ## 尚未打开的能力
 
