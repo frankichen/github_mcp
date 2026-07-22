@@ -260,6 +260,29 @@ This is for the private CI system. NOT for GitHub Actions logs (use get_ci_logs 
             return _error_response("INTERNAL_ERROR", str(e))
 
     @mcp.tool(
+        name="get_private_ci_log_tail",
+        description="Return the redacted tail of a private CI job log without requiring the caller to page through the full log.",
+    )
+    async def get_private_ci_log_tail(job_id: str, lines: int = 100) -> str:
+        try:
+            job = get_job(job_id)
+            if not job:
+                return _error_response("PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found")
+            lines = min(max(lines, 1), 1000)
+            result = get_log_chunks(job_id, 0, 2000)
+            text = "".join(chunk.get("content", "") for chunk in result.get("chunks", []))
+            tail = "\n".join(text.splitlines()[-lines:])
+            return json.dumps({
+                "ok": True, "job_id": job_id, "repository": job.get("repository"),
+                "branch": job.get("branch"), "commit_sha": job.get("commit_sha"),
+                "status": job.get("status"), "lines": tail.splitlines(),
+                "line_count": len(tail.splitlines()), "total_bytes": result.get("total_bytes", 0),
+                "truncated": result.get("truncated", False),
+            }, ensure_ascii=False)
+        except Exception as e:
+            return _error_response("INTERNAL_ERROR", str(e))
+
+    @mcp.tool(
         name="cancel_private_ci_job",
         description="""Cancel a private CI job by job_id.
 
