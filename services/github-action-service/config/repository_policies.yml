@@ -18,6 +18,14 @@ repositories:
       - range_edit
       - upload
       - create_pr
+      - update_pr
+      - comment
+      - reviewers
+      - ci_read
       - ci
       - ready
+      - draft
+      - update_branch
       - merge
+    denied_operations:
+      - delete_branch

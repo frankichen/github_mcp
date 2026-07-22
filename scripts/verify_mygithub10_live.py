@@ -57,7 +57,12 @@ def simulated(manifest_path: Path) -> None:
     report("feature_flags_loaded", flags == {"artifact_build": False, "artifact_deploy": False, "attestation_reuse": False})
 
 
-async def live(base_url: str, api_key: str, manifest_path: Path) -> None:
+async def live(base_url: str, api_key: str, manifest_path: Path, strict: bool = False) -> None:
+    required = ("MYGITHUB10_TEST_JOB_ID", "MYGITHUB10_TEST_ATTESTATION_ID", "MYGITHUB10_TEST_LARGE_FILE_PATH")
+    if strict:
+        missing = [name for name in required if not os.environ.get(name, "").strip()]
+        if missing:
+            raise RuntimeError("strict mode requires: " + ", ".join(missing))
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     async with httpx.AsyncClient(base_url=base_url.rstrip("/"), headers=headers, trust_env=False, timeout=45) as client:
         health = await client.get("/health")
@@ -89,9 +94,17 @@ async def live(base_url: str, api_key: str, manifest_path: Path) -> None:
 
                 repository = os.environ.get("MYGITHUB10_TEST_REPOSITORY", "frankichen/sxt")
                 path = os.environ.get("MYGITHUB10_TEST_FILE_PATH", "go.sum")
+                branch = await call("get_github_branch", {"repository": repository, "branch": "main"})
+                head = branch.get("commit_sha")
+                report("real_main_head", bool(re.fullmatch(r"[0-9a-f]{40}", head or "")))
                 file_manifest = await call("get_github_file_manifest", {"repository": repository, "path": path, "ref": "main"})
                 report("test_file_manifest", file_manifest.get("ok", True) and file_manifest.get("size_bytes", 0) > 0)
                 blob = file_manifest["blob_sha"]
+                file_data = await call("get_github_file", {"repository": repository, "path": path, "ref": "main"})
+                original = file_data.get("content", "")
+                first_line = original.splitlines(keepends=True)[0] if original.splitlines(keepends=True) else "\n"
+                first_line_text = first_line.rstrip("\r\n")
+                patch = f"--- a/{path}\n+++ b/{path}\n@@ -1,1 +1,1 @@\n-{first_line_text}\n+{first_line_text}\n"
                 offset, chunks = 0, []
                 while True:
                     chunk = await call("read_github_file_chunk", {"repository": repository, "path": path, "ref": "main", "offset_bytes": offset, "limit_bytes": 64 * 1024, "expected_blob_sha": blob})
@@ -100,13 +113,15 @@ async def live(base_url: str, api_key: str, manifest_path: Path) -> None:
                 rebuilt = "".join(chunks).encode("utf-8")
                 report("chunk_reassembly_sha", hashlib.sha256(rebuilt).hexdigest() == file_manifest["content_sha256"])
                 report("utf8_boundary", all(part.encode("utf-8").decode("utf-8") == part for part in chunks))
-                patch = "--- a/README.md\n+++ b/README.md\n@@ -1,1 +1,1 @@\n-old\n+new\n"
-                dry = await call("apply_github_patch", {"repository": repository, "branch": "main", "expected_head_sha": "0" * 40, "expected_blob_shas_json": "{}", "patch": patch, "commit_message": "acceptance", "dry_run": True})
-                report("patch_dry_run", dry.get("dry_run") is True or dry.get("error", {}).get("code") in {"PATCH_DOES_NOT_APPLY", "PATCH_FILE_NOT_FOUND"})
+                dry = await call("apply_github_patch", {"repository": repository, "branch": "main", "expected_head_sha": head, "expected_blob_shas_json": json.dumps({path: blob}), "patch": patch, "commit_message": "acceptance", "dry_run": True})
+                report("patch_dry_run", dry.get("dry_run") is True and (dry.get("applied") is True or dry.get("planned") is True or bool(dry.get("changed_files"))))
                 stale = await call("apply_github_patch", {"repository": repository, "branch": "main", "expected_head_sha": "f" * 40, "expected_blob_shas_json": "{}", "patch": patch, "commit_message": "acceptance", "dry_run": True})
-                report("stale_head_rejected", stale.get("error", {}).get("code") in {"PATCH_HEAD_CHANGED", "PATCH_DOES_NOT_APPLY", "PATCH_FILE_NOT_FOUND"})
-                range_result = await call("edit_github_file_ranges", {"repository": repository, "branch": "main", "expected_head_sha": "0" * 40, "operations_json": "[]", "commit_message": "acceptance", "dry_run": True})
-                report("range_edit_dry_run", range_result.get("dry_run") is True or "error" in range_result)
+                report("stale_head_rejected", stale.get("error", {}).get("code") == "PATCH_HEAD_CHANGED")
+                range_ops = [{"path": path, "operation": "replace", "start_line": 1, "end_line": 1, "expected_old_text_sha256": hashlib.sha256(first_line.encode()).hexdigest(), "replacement": first_line}]
+                range_result = await call("edit_github_file_ranges", {"repository": repository, "branch": "main", "expected_head_sha": head, "operations_json": json.dumps(range_ops), "commit_message": "acceptance", "dry_run": True})
+                report("range_edit_dry_run", range_result.get("dry_run") is True and bool(range_result.get("changed_files")))
+                head_after = await call("get_github_branch", {"repository": repository, "branch": "main"})
+                report("dry_run_head_unchanged", head_after.get("commit_sha") == head)
                 upload = await call("begin_github_file_upload", {})
                 report("upload_lifecycle_begin", bool(upload.get("upload_id")))
                 if upload.get("upload_id"):
@@ -130,6 +145,17 @@ async def live(base_url: str, api_key: str, manifest_path: Path) -> None:
                 if valid_attestation:
                     valid = await call("get_attestation", {"attestation_id": valid_attestation})
                     report("attestation_read", valid.get("ok") is True and bool(valid.get("attestation")))
+                large_path = os.environ.get("MYGITHUB10_TEST_LARGE_FILE_PATH", "")
+                if strict:
+                    large_manifest = await call("get_github_file_manifest", {"repository": repository, "path": large_path, "ref": "main"})
+                    report("large_file_exceeds_inline", large_manifest.get("size_bytes", 0) > capabilities.get("max_inline_response_bytes", 0))
+                    large_chunks, large_offset = [], 0
+                    while True:
+                        chunk = await call("read_github_file_chunk", {"repository": repository, "path": large_path, "ref": "main", "offset_bytes": large_offset, "limit_bytes": 64 * 1024, "expected_blob_sha": large_manifest["blob_sha"]})
+                        large_chunks.append(chunk["content"]); large_offset = chunk["next_offset"]
+                        if chunk["eof"]: break
+                    report("large_file_multiple_chunks", len(large_chunks) > 1)
+                    report("large_file_sha", hashlib.sha256("".join(large_chunks).encode()).hexdigest() == large_manifest["content_sha256"])
 
 
 def main() -> int:
@@ -137,10 +163,11 @@ def main() -> int:
     parser.add_argument("--manifest", default="docs/MYGITHUB10_TOOL_MANIFEST.json")
     parser.add_argument("--base-url", default=os.environ.get("CONTROLLER_URL", ""))
     parser.add_argument("--simulate", action="store_true")
+    parser.add_argument("--strict", action="store_true")
     args = parser.parse_args(); path = Path(args.manifest)
     try:
         if args.simulate or not args.base_url: simulated(path)
-        else: asyncio.run(live(args.base_url, os.environ.get("ACTION_API_KEY", ""), path))
+        else: asyncio.run(live(args.base_url, os.environ.get("ACTION_API_KEY", ""), path, args.strict))
         print(json.dumps({"ok": True, "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}))
         return 0
     except (OSError, ValueError, KeyError, RuntimeError, httpx.HTTPError) as exc:

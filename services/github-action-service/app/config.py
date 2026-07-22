@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     MYGITHUB10_ARTIFACT_BUILD_ENABLED: bool = False
     MYGITHUB10_ARTIFACT_DEPLOY_ENABLED: bool = False
     MYGITHUB10_ATTESTATION_REUSE_ENABLED: bool = False
+    MYGITHUB10_RESOURCE_TOKEN_SECRET: SecretStr = SecretStr("")
 
     model_config = {
         "env_file": ".env",

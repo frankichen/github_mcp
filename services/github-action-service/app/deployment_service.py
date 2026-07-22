@@ -351,6 +351,13 @@ def get_test_deployment(deployment_id):
     return {"ok": True, "deployment": deployment}
 
 
+def get_deployment_repository(deployment_id: str) -> str | None:
+    """Return the server-recorded owner before any deployment-id operation."""
+    init_deployment_db()
+    row = _get_deploy_db().execute("SELECT repository FROM deployments WHERE deployment_id=?", (deployment_id,)).fetchone()
+    return row["repository"] if row else None
+
+
 def get_test_deployment_logs(deployment_id, offset=0, limit=200):
     init_deployment_db(); row = _get_deploy_db().execute("SELECT log_text FROM deployments WHERE deployment_id=?", (deployment_id,)).fetchone()
     if not row: return _error_response("DEPLOYMENT_NOT_FOUND", "deployment not found")

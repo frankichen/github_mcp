@@ -1,9 +1,13 @@
 import hmac
+import hashlib
+import time
 import json
 import logging
 import base64
 import os
 import subprocess
+import inspect
+from functools import wraps
 from pathlib import Path
 from typing import Optional
 
@@ -28,11 +32,78 @@ _client = GitHubClient()
 _service = GitHubService(_client)
 _ci_service = get_ci_service()
 
+TOOL_OPERATION_MAP = {
+    **{name: "read" for name in {
+        "get_github_file", "list_github_directory", "get_github_repository", "list_github_branches", "get_github_branch", "get_github_commit", "compare_github_commits", "list_github_pull_requests", "get_github_pull_request", "list_github_pull_request_files", "get_github_pull_request_checks", "list_github_pull_request_comments", "list_github_pull_request_reviews", "get_github_pull_request_merge_readiness", "get_github_pull_request_conflicts", "plan_github_pull_request_merge", "list_github_commits", "search_github_pull_request_history", "list_github_review_history", "list_github_issue_history", "get_github_development_history", "get_github_weekly_report_data", "get_github_file_manifest", "get_repository_operation_policy",
+    }},
+    **{name: "create_branch" for name in {"create_github_branch"}},
+    **{name: "patch" for name in {"commit_github_files", "apply_github_patch"}},
+    **{name: "range_edit" for name in {"edit_github_file_ranges"}},
+    **{name: "upload" for name in {"commit_github_uploaded_files"}},
+    **{name: "create_pr" for name in {"create_github_pull_request"}},
+    **{name: "update_pr" for name in {"update_github_pull_request"}},
+    **{name: "comment" for name in {"create_github_pull_request_comment"}},
+    **{name: "reviewers" for name in {"request_github_pull_request_reviewers", "remove_github_pull_request_reviewers"}},
+    **{name: "ready" for name in {"mark_github_pull_request_ready"}},
+    **{name: "draft" for name in {"convert_github_pull_request_to_draft"}},
+    **{name: "update_branch" for name in {"update_github_pull_request_branch"}},
+    **{name: "merge" for name in {"merge_github_pull_request"}},
+    **{name: "delete_branch" for name in {"delete_github_branch"}},
+    **{name: "ci_read" for name in {"list_ci_workers", "list_ci_profiles", "list_ci_jobs", "get_ci_job", "get_ci_logs"}},
+    **{name: "ci" for name in {"start_ci_job"}},
+    **{name: "ci_cancel" for name in {"cancel_ci_job"}},
+    **{name: "chunk_read" for name in {"read_github_file_chunk", "read_github_file_resource"}},
+    **{name: "search" for name in {"search_github_pull_request_history"}},
+    **{name: "private_ci" for name in {"list_private_ci_profiles", "list_private_ci_jobs", "start_private_ci_job"}},
+    **{name: "test_deploy" for name in {"plan_test_deployment", "start_test_deployment", "list_test_deployments", "get_test_environment_status", "list_test_releases", "rollback_test_deployment", "build_release_artifact", "get_release_artifact", "list_release_artifacts", "validate_release_artifact", "revoke_release_artifact"}},
+}
+
 
 def _policy_denied(repository: str, operation: str) -> str | None:
     from app.repository_policy import require_operation
     denial = require_operation(repository, operation)
     return json.dumps(denial, ensure_ascii=False) if denial else None
+
+
+def _resource_secret() -> bytes:
+    return app_settings.MYGITHUB10_RESOURCE_TOKEN_SECRET.get_secret_value().encode("utf-8")
+
+
+def _resource_token(payload: dict) -> str:
+    encoded = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()).decode().rstrip("=")
+    signature = hmac.new(_resource_secret(), encoded.encode(), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def _resource_error(code: str) -> str:
+    return json.dumps({"ok": False, "error": {"code": code, "message": code, "details": {}}}, ensure_ascii=False)
+
+
+def _deployment_policy_denied(deployment_id: str, operation: str) -> str | None:
+    from app import deployment_service
+    repository = deployment_service.get_deployment_repository(deployment_id)
+    if repository and (denied := _policy_denied(repository, operation)):
+        return denied
+    return None
+
+
+def _install_repository_policy_guards() -> None:
+    """Guard every registered repository-bearing tool from one server-owned map."""
+    tools = getattr(getattr(mcp, "_tool_manager", None), "_tools", {})
+    for name, operation in TOOL_OPERATION_MAP.items():
+        tool = tools.get(name)
+        if not tool or getattr(tool, "_policy_guarded", False):
+            continue
+        original = tool.fn
+        @wraps(original)
+        async def guarded(*args, __original=original, __operation=operation, **kwargs):
+            bound = inspect.signature(__original).bind_partial(*args, **kwargs)
+            repository = bound.arguments.get("repository")
+            if repository and (denied := _policy_denied(repository, __operation)):
+                return denied
+            return await __original(*args, **kwargs)
+        tool.fn = guarded
+        tool._policy_guarded = True
 
 
 class ApiKeyVerifier:
@@ -578,6 +649,7 @@ async def start_test_deployment(repository: str, environment: str, commit_sha: s
 @mcp.tool(name="get_test_deployment", description="Get a deployment status by deployment_id; deployment_id is distinct from CI job_id and GitHub Actions run_id.")
 async def get_test_deployment(deployment_id: str) -> str:
     try:
+        if denied := _deployment_policy_denied(deployment_id, "test_deploy"): return denied
         from app import deployment_service
         return json.dumps(deployment_service.get_test_deployment(deployment_id), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
@@ -586,6 +658,7 @@ async def get_test_deployment(deployment_id: str) -> str:
 @mcp.tool(name="get_test_deployment_logs", description="Read redacted paginated deployment logs by deployment_id.")
 async def get_test_deployment_logs(deployment_id: str, offset: int = 0, limit: int = 200) -> str:
     try:
+        if denied := _deployment_policy_denied(deployment_id, "test_deploy"): return denied
         from app import deployment_service
         return json.dumps(deployment_service.get_test_deployment_logs(deployment_id, offset, limit), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
@@ -594,6 +667,7 @@ async def get_test_deployment_logs(deployment_id: str, offset: int = 0, limit: i
 @mcp.tool(name="wait_test_deployment", description="Long-poll deployment metadata for up to 55 seconds without returning logs or lease tokens.")
 async def wait_test_deployment(deployment_id: str, timeout_seconds: int = 55, last_known_status: str = "", last_known_step: str = "", last_known_revision: int = 0) -> str:
     try:
+        if denied := _deployment_policy_denied(deployment_id, "test_deploy"): return denied
         from app import deployment_service
         return json.dumps(deployment_service.wait_test_deployment(deployment_id, timeout_seconds, last_known_status, last_known_step, last_known_revision), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
@@ -602,6 +676,7 @@ async def wait_test_deployment(deployment_id: str, timeout_seconds: int = 55, la
 @mcp.tool(name="get_test_deployment_log_tail", description="Read a redacted deployment log tail without returning lease tokens.")
 async def get_test_deployment_log_tail(deployment_id: str, lines: int = 100) -> str:
     try:
+        if denied := _deployment_policy_denied(deployment_id, "test_deploy"): return denied
         from app import deployment_service
         return json.dumps(deployment_service.get_test_deployment_log_tail(deployment_id, lines), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
@@ -610,6 +685,8 @@ async def get_test_deployment_log_tail(deployment_id: str, lines: int = 100) -> 
 @mcp.tool(name="list_test_deployments", description="List whitelist-only gongshi-test deployments with filters and pagination.")
 async def list_test_deployments(repository: str = "", environment: str = "", commit_sha: str = "", status: str = "", limit: int = 20, offset: int = 0) -> str:
     try:
+        if not repository: return _policy_denied("", "test_deploy") or json.dumps({"ok": False, "error_code": "INVALID_ARGUMENT"})
+        if denied := _policy_denied(repository, "test_deploy"): return denied
         from app import deployment_service
         return json.dumps(deployment_service.list_test_deployments(repository, environment, commit_sha, status, limit, offset), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
@@ -618,6 +695,7 @@ async def list_test_deployments(repository: str = "", environment: str = "", com
 @mcp.tool(name="cancel_test_deployment", description="Cancel a queued deployment immediately or request safe cancellation at a worker boundary.")
 async def cancel_test_deployment(deployment_id: str) -> str:
     try:
+        if denied := _deployment_policy_denied(deployment_id, "test_deploy"): return denied
         from app import deployment_service
         return json.dumps(deployment_service.cancel_test_deployment(deployment_id), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
@@ -642,6 +720,7 @@ async def list_test_releases(repository: str, environment: str, limit: int = 20)
 @mcp.tool(name="rollback_test_deployment", description="Queue a whitelist-only rollback after current-release and checksum gates. Never runs goose down or deletes data/releases.")
 async def rollback_test_deployment(repository: str, environment: str, target_release_id: str, expected_current_release_id: str, confirm: bool = False) -> str:
     try:
+        if denied := _policy_denied(repository, "test_deploy"): return denied
         from app import deployment_service
         return json.dumps(deployment_service.rollback_test_deployment(repository, environment, target_release_id, expected_current_release_id, confirm), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
@@ -794,7 +873,9 @@ async def open_github_file_resource(repository: str, path: str, ref: str = "") -
     try:
         if denied := _policy_denied(repository, "read"): return denied
         manifest = mygithub10.file_manifest(_service, repository, path, ref)
-        token = base64.urlsafe_b64encode(json.dumps({"repository": repository, "path": path, "commit": manifest["resolved_commit_sha"]}, separators=(",", ":")).encode()).decode().rstrip("=")
+        if not _resource_secret(): return _resource_error("RESOURCE_TOKEN_INVALID")
+        payload = {"repository": repository, "path": path, "commit": manifest["resolved_commit_sha"], "expires_at": int(time.time()) + 900}
+        token = _resource_token(payload)
         return json.dumps({"resource_uri": f"mygithub10://blob/{token}", **{key: manifest[key] for key in ("repository", "path", "resolved_commit_sha", "blob_sha", "size_bytes", "content_sha256")}}, ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
@@ -804,9 +885,18 @@ async def open_github_file_resource(repository: str, path: str, ref: str = "") -
 async def read_github_file_resource(resource_uri: str, offset_bytes: int = 0, limit_bytes: int = mygithub10.MAX_FILE_CHUNK_BYTES) -> str:
     try:
         token = resource_uri.rsplit("/", 1)[-1]
-        token += "=" * (-len(token) % 4)
-        item = json.loads(base64.urlsafe_b64decode(token).decode())
+        encoded, supplied_signature = token.rsplit(".", 1)
+        expected_signature = hmac.new(_resource_secret(), encoded.encode(), hashlib.sha256).hexdigest()
+        if not _resource_secret() or not hmac.compare_digest(supplied_signature, expected_signature): return _resource_error("RESOURCE_TOKEN_INVALID")
+        encoded += "=" * (-len(encoded) % 4)
+        item = json.loads(base64.urlsafe_b64decode(encoded).decode())
+        if int(item.get("expires_at", 0)) <= int(time.time()): return _resource_error("RESOURCE_TOKEN_EXPIRED")
+        if denied := _policy_denied(item["repository"], "chunk_read"): return denied
+        manifest = mygithub10.file_manifest(_service, item["repository"], item["path"], item["commit"])
+        if manifest.get("resolved_commit_sha") != item["commit"]: return _resource_error("RESOURCE_TOKEN_INVALID")
         return json.dumps(mygithub10.file_chunk(_service, item["repository"], item["path"], item["commit"], offset_bytes, limit_bytes), ensure_ascii=False)
+    except (ValueError, KeyError, json.JSONDecodeError, UnicodeError):
+        return _resource_error("RESOURCE_TOKEN_INVALID")
     except Exception as exc:
         return _mygithub10_error(exc)
 
@@ -866,6 +956,8 @@ async def abort_github_file_upload(upload_id: str) -> str:
 @mcp.tool(name="create_attestation_for_passed_job", description="Create a Tree SHA attestation from server-side CI evidence; callers may only choose job_id and bounded expiry.")
 async def create_attestation_for_passed_job(job_id: str, expires_in_seconds: int = 604800) -> str:
     try:
+        from app.ci_mcp import _job_policy_denial
+        if denial := _job_policy_denial(job_id): return denial
         return json.dumps({"ok": True, "attestation": attestation_registry.create_attestation_for_passed_job(job_id=job_id, expires_in_seconds=expires_in_seconds)}, ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
 
@@ -873,18 +965,23 @@ async def create_attestation_for_passed_job(job_id: str, expires_in_seconds: int
 @mcp.tool(name="get_attestation", description="Read a persisted Tree SHA attestation by id.")
 async def get_attestation(attestation_id: str) -> str:
     item = attestation_registry.get_attestation(attestation_id)
+    if item and (denied := _policy_denied(item.get("repository", ""), "private_ci")): return denied
     return json.dumps({"ok": bool(item), "attestation": item}, ensure_ascii=False)
 
 
 @mcp.tool(name="validate_attestation", description="Validate every identity, job, toolchain, dependency, config, expiry and revocation gate before CI reuse.")
 async def validate_attestation(attestation_id: str) -> str:
     try:
+        item = attestation_registry.get_attestation(attestation_id)
+        if item and (denied := _policy_denied(item.get("repository", ""), "private_ci")): return denied
         return json.dumps(attestation_registry.validate_attestation(attestation_id), ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
 
 
 @mcp.tool(name="revoke_attestation", description="Revoke one persisted attestation so it can never be reused.")
 async def revoke_attestation(attestation_id: str) -> str:
+    item = attestation_registry.get_attestation(attestation_id)
+    if item and (denied := _policy_denied(item.get("repository", ""), "private_ci")): return denied
     return json.dumps({"ok": True, "attestation": attestation_registry.revoke_attestation(attestation_id)}, ensure_ascii=False)
 
 
@@ -933,21 +1030,27 @@ async def build_release_artifact(repository: str, commit_sha: str, private_ci_jo
 @mcp.tool(name="get_release_artifact", description="Read one registered artifact without exposing arbitrary filesystem contents.")
 async def get_release_artifact(artifact_id: str) -> str:
     item = attestation_registry.get_artifact(artifact_id)
+    if item and (denied := _policy_denied(item.get("repository", ""), "test_deploy")): return denied
     return json.dumps({"ok": bool(item), "artifact": item}, ensure_ascii=False)
 
 
 @mcp.tool(name="list_release_artifacts", description="List registered artifact metadata by repository and status.")
 async def list_release_artifacts(repository: str = "", status: str = "", limit: int = 50) -> str:
+    if not repository: return _policy_denied("", "test_deploy") or json.dumps({"ok": False, "error_code": "INVALID_ARGUMENT"})
+    if denied := _policy_denied(repository, "test_deploy"): return denied
     return json.dumps({"ok": True, "artifacts": attestation_registry.list_artifacts(repository, status, limit)}, ensure_ascii=False)
 
 
 @mcp.tool(name="validate_release_artifact", description="Validate artifact readiness, expiry, provenance, exact main identity and current private CI status.")
 async def validate_release_artifact(artifact_id: str, repository: str, branch: str, commit_sha: str, tree_sha: str, private_ci_job_id: str) -> str:
+    if denied := _policy_denied(repository, "test_deploy"): return denied
     return json.dumps(attestation_registry.validate_artifact(artifact_id, repository=repository, branch=branch, commit_sha=commit_sha, tree_sha=tree_sha, private_ci_job_id=private_ci_job_id), ensure_ascii=False)
 
 
 @mcp.tool(name="revoke_release_artifact", description="Revoke a registered artifact; revoked artifacts cannot be deployed.")
 async def revoke_release_artifact(artifact_id: str) -> str:
+    item = attestation_registry.get_artifact(artifact_id)
+    if item and (denied := _policy_denied(item.get("repository", ""), "test_deploy")): return denied
     return json.dumps({"ok": True, "artifact": attestation_registry.revoke_artifact(artifact_id)}, ensure_ascii=False)
 
 
@@ -957,6 +1060,7 @@ async def get_repository_operation_policy(repository: str) -> str:
     return json.dumps({"ok": True, "repository": repository, "policy": get_policy(repository)}, ensure_ascii=False)
 
 register_private_ci_mcp_tools(mcp)
+_install_repository_policy_guards()
 
 
 # ========================================================================

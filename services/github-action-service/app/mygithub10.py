@@ -296,9 +296,12 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
 
 
 def apply_patch(client, repository: str, branch: str, expected_head_sha: str, expected_blob_shas_json: str, patch: str, commit_message: str, dry_run: bool, idempotency_key: str = "") -> dict[str, Any]:
+    repo = _repo(client, repository)
+    actual_head = repo.get_git_ref(f"heads/{branch}").object.sha if hasattr(repo, "get_git_ref") else repo.get_commit(branch).sha
+    if expected_head_sha and actual_head != expected_head_sha:
+        raise MyGithub10Error("PATCH_HEAD_CHANGED", "branch HEAD changed", {"expected": expected_head_sha, "actual": actual_head})
     parsed = _parse_patch(patch)
     expected = json.loads(expected_blob_shas_json or "{}")
-    repo = _repo(client, repository)
     changed: dict[str, bytes | None] = {}
     previews = []
     for path, operation, hunks in parsed:
@@ -328,6 +331,9 @@ def apply_patch(client, repository: str, branch: str, expected_head_sha: str, ex
 def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, operations_json: str, commit_message: str, dry_run: bool, idempotency_key: str = "") -> dict[str, Any]:
     operations = json.loads(operations_json or "[]")
     repo = _repo(client, repository)
+    actual_head = repo.get_git_ref(f"heads/{branch}").object.sha if hasattr(repo, "get_git_ref") else repo.get_commit(branch).sha
+    if expected_head_sha and actual_head != expected_head_sha:
+        raise MyGithub10Error("PATCH_HEAD_CHANGED", "branch HEAD changed", {"expected": expected_head_sha, "actual": actual_head})
     changed = {}
     expected = {}
     for path in sorted({item["path"] for item in operations}):

@@ -4,7 +4,8 @@ repositories:
     private_ci: true
     test_deploy: true
     self_deploy: false
-    allowed_operations: [read, chunk_read, search, create_branch, patch, range_edit, upload, create_pr, ci, ready, merge]
+    allowed_operations: [read, chunk_read, search, create_branch, patch, range_edit, upload, create_pr, update_pr, comment, reviewers, ci_read, ci, ci_cancel, ready, draft, update_branch, merge]
+    denied_operations: [delete_branch]
   frankichen/sxt:
     github: true
     private_ci: true
@@ -15,4 +16,5 @@ repositories:
     private_ci: true
     test_deploy: false
     self_deploy: false
-    allowed_operations: [read, chunk_read, search, create_branch, patch, range_edit, upload, create_pr, ci, ready, merge]
+    allowed_operations: [read, chunk_read, search, create_branch, patch, range_edit, upload, create_pr, update_pr, comment, reviewers, ci_read, ci, ci_cancel, ready, draft, update_branch, merge]
+    denied_operations: [delete_branch]
