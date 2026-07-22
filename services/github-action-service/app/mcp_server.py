@@ -836,10 +836,10 @@ async def abort_github_file_upload(upload_id: str) -> str:
     except Exception as exc: return _mygithub10_error(exc)
 
 
-@mcp.tool(name="create_attestation_for_passed_job", description="Persist a Tree SHA attestation only for an exact passed, non-superseded repo-auto-check job.")
-async def create_attestation_for_passed_job(repository: str, job_id: str, tested_commit_sha: str, tested_tree_sha: str, base_sha: str, profile: str, ci_image_digest: str, go_version: str, node_version: str, npm_version: str, go_sum_sha256: str, admin_lock_sha256: str, console_lock_sha256: str, test_config_sha256: str, changed_files_json: str = "[]", expires_at: float = 0) -> str:
+@mcp.tool(name="create_attestation_for_passed_job", description="Create a Tree SHA attestation from server-side CI evidence; callers may only choose job_id and bounded expiry.")
+async def create_attestation_for_passed_job(job_id: str, expires_in_seconds: int = 604800) -> str:
     try:
-        return json.dumps({"ok": True, "attestation": attestation_registry.create_attestation_for_passed_job(repository=repository, job_id=job_id, tested_commit_sha=tested_commit_sha, tested_tree_sha=tested_tree_sha, base_sha=base_sha, profile=profile, ci_image_digest=ci_image_digest, go_version=go_version, node_version=node_version, npm_version=npm_version, go_sum_sha256=go_sum_sha256, admin_lock_sha256=admin_lock_sha256, console_lock_sha256=console_lock_sha256, test_config_sha256=test_config_sha256, changed_files=json.loads(changed_files_json or "[]"), expires_at=expires_at or None)}, ensure_ascii=False)
+        return json.dumps({"ok": True, "attestation": attestation_registry.create_attestation_for_passed_job(job_id=job_id, expires_in_seconds=expires_in_seconds)}, ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
 
 
@@ -861,16 +861,34 @@ async def revoke_attestation(attestation_id: str) -> str:
     return json.dumps({"ok": True, "attestation": attestation_registry.revoke_attestation(attestation_id)}, ensure_ascii=False)
 
 
-@mcp.tool(name="register_release_artifact", description="Register a ready artifact using server-controlled storage metadata and immutable provenance.")
-async def register_release_artifact(metadata_json: str) -> str:
+def _register_release_artifact(metadata: dict) -> dict:
+    return attestation_registry.register_release_artifact(metadata)
+
+
+@mcp.tool(name="build_release_artifact", description="Build and register an artifact only from server-controlled source storage and a valid attestation; callers cannot provide hashes, paths, status or identity evidence.")
+async def build_release_artifact(repository: str, commit_sha: str, private_ci_job_id: str, source_attestation_id: str) -> str:
     try:
-        metadata = json.loads(metadata_json)
-        root = Path(os.environ.get("ARTIFACT_STORAGE_ROOT", "/var/lib/private-ci/artifacts")).resolve()
-        storage = Path(str(metadata.get("storage_path", ""))).resolve()
-        if root not in storage.parents:
-            return json.dumps({"ok": False, "error_code": "ARTIFACT_STORAGE_PATH_DENIED"})
-        metadata["storage_path"] = str(storage)
-        return json.dumps({"ok": True, "artifact": attestation_registry.register_release_artifact(metadata)}, ensure_ascii=False)
+        if repository != "frankichen/sxt": return json.dumps({"ok": False, "error_code": "REPOSITORY_NOT_ALLOWED"})
+        branch_state = github_utils.get_github_branch(repository, "main")
+        if not branch_state.get("ok") or branch_state.get("commit_sha") != commit_sha: return json.dumps({"ok": False, "error_code": "COMMIT_NOT_CURRENT_MAIN"})
+        job = attestation_registry.get_job(private_ci_job_id) if hasattr(attestation_registry, "get_job") else None
+        attestation = attestation_registry.get_attestation(source_attestation_id)
+        if not attestation or attestation["private_ci_job_id"] != private_ci_job_id or attestation["repository"] != repository or attestation["tested_commit_sha"] != commit_sha: return json.dumps({"ok": False, "error_code": "ATTESTATION_INVALID"})
+        if not job or job.get("status") != "passed" or job.get("exit_code") != 0 or job.get("branch") != "main" or job.get("superseded_by_job_id"): return json.dumps({"ok": False, "error_code": "ARTIFACT_CI_GATE_FAILED"})
+        source_root = Path(os.environ.get("ARTIFACT_SOURCE_ROOT", "")).resolve()
+        storage_root = Path(os.environ.get("ARTIFACT_STORAGE_ROOT", "/var/lib/private-ci/artifacts")).resolve()
+        if not source_root.is_dir(): return json.dumps({"ok": False, "error_code": "ARTIFACT_SOURCE_NOT_CONFIGURED"})
+        import importlib.util
+        script = Path(__file__).resolve().parents[2] / "private-ci-deploy-executor" / "scripts" / "artifact_release.py"
+        spec = importlib.util.spec_from_file_location("controlled_artifact_builder", script)
+        if not spec or not spec.loader: return json.dumps({"ok": False, "error_code": "ARTIFACT_BUILDER_NOT_CONFIGURED"})
+        builder = importlib.util.module_from_spec(spec); spec.loader.exec_module(builder)
+        artifact_id = str(__import__("uuid").uuid4()); output = storage_root / artifact_id
+        summary = job.get("summary") or {}; evidence = summary.get("evidence") or {}
+        metadata = {"repository": repository, "branch": "main", "commit_sha": commit_sha, "tree_sha": attestation["tested_tree_sha"], "private_ci_job_id": private_ci_job_id, "source_attestation_id": source_attestation_id, "profile": attestation["profile"], "ci_image_digest": attestation["ci_image_digest"], "go_version": attestation["go_version"], "node_version": attestation["node_version"], "npm_version": attestation["npm_version"]}
+        built = builder.build_release_artifact(source_root, output, metadata)
+        metadata.update({"artifact_id": artifact_id, "status": "ready", "storage_path": built["storage_path"], "archive_sha256": built["archive_sha256"], "archive_size_bytes": built["archive_size_bytes"], "manifest_sha256": built["manifest_sha256"], "checksums_sha256": built["checksums_sha256"], "migration_required": any(path.startswith("db/migrations/") for path in evidence.get("changed_files", []))})
+        return json.dumps({"ok": True, "artifact": _register_release_artifact(metadata)}, ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
 
 

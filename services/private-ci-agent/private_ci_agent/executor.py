@@ -3,7 +3,7 @@
 import logging
 import os
 import time
-import os
+import hashlib
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -59,6 +59,14 @@ class JobExecutor:
         }
         tree = subprocess.run(["git", "-C", job.source_dir, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True, timeout=20)
         metadata["git_tree_sha"] = tree.stdout.strip() if tree.returncode == 0 else None
+        metadata["evidence"] = {
+            "base_sha": job.base_sha,
+            "changed_files": list(job.changed_files),
+            "go_sum_sha256": self._hash_files(job.source_dir, ["go.sum"]),
+            "admin_lock_sha256": self._hash_files(job.source_dir, ["h5/lenshub-admin/package-lock.json", "h5/lenshub-admin/pnpm-lock.yaml"]),
+            "console_lock_sha256": self._hash_files(job.source_dir, ["h5/lenshub-console/package-lock.json", "h5/lenshub-console/pnpm-lock.yaml"]),
+            "test_config_sha256": self._hash_files(job.source_dir, [".github/workflows/ci.yml", ".github/workflows/repo-auto-check.yml", "scripts/ci.yml"]),
+        }
         go_workspace = next((item for item in plan.get("workspaces", []) if item.get("stack") == "go"), None)
         if go_workspace:
             go_commands = go_commands_for_workspace(job.source_dir, go_workspace["path"])
@@ -122,6 +130,19 @@ class JobExecutor:
             return result.stdout.strip() if result.returncode == 0 else None
         except (OSError, subprocess.TimeoutExpired):
             return None
+
+    @staticmethod
+    def _hash_files(root, names):
+        digest = hashlib.sha256(); found = False
+        for name in names:
+            path = os.path.join(root, name)
+            if not os.path.isfile(path):
+                continue
+            found = True
+            with open(path, "rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(name.encode() + b"\0" + block)
+        return digest.hexdigest() if found else ""
 
     @staticmethod
     def _performance(steps, total_start):

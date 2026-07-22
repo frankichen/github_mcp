@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 import sqlite3
+import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -76,17 +78,60 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def create_attestation_for_passed_job(*, repository: str, job_id: str, tested_commit_sha: str, tested_tree_sha: str, base_sha: str, profile: str, ci_image_digest: str, go_version: str, node_version: str, npm_version: str, go_sum_sha256: str, admin_lock_sha256: str, console_lock_sha256: str, test_config_sha256: str, changed_files: list[str], expires_at: float | None = None) -> dict:
+def _verify_archive(item: dict) -> tuple[bool, str]:
+    archive = Path(item["storage_path"]).resolve(); directory = archive.parent
+    try:
+        names = subprocess.run(["tar", "--zstd", "-tf", str(archive)], check=True, capture_output=True, text=True, timeout=60).stdout.splitlines()
+        if len(names) != len(set(names)) or any(not name or Path(name).is_absolute() or ".." in Path(name).parts for name in names):
+            return False, "ARTIFACT_UNSAFE_ARCHIVE_ENTRY"
+        with tempfile.TemporaryDirectory(prefix="artifact-verify-") as temp:
+            subprocess.run(["tar", "--zstd", "--extract", "--no-same-owner", "--no-same-permissions", "-f", str(archive), "-C", temp], check=True, timeout=60)
+            root = Path(temp)
+            if any(path.is_symlink() for path in root.rglob("*")): return False, "ARTIFACT_LINK_ENTRY"
+            manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+            provenance = json.loads((directory / "provenance.json").read_text(encoding="utf-8"))
+            listed = {item["path"]: item for item in manifest.get("files", [])}
+            if set(names) != set(listed): return False, "ARTIFACT_ARCHIVE_EXTRA_OR_MISSING_ENTRY"
+            checksums = {}
+            for line in (directory / "checksums.sha256").read_text(encoding="utf-8").splitlines():
+                if "  " not in line: return False, "ARTIFACT_CHECKSUM_FILE_INVALID"
+                digest, name = line.split("  ", 1); checksums[name] = digest
+            if set(checksums) != set(listed): return False, "ARTIFACT_CHECKSUM_EXTRA_OR_MISSING"
+            for name, expected in listed.items():
+                path = root / name
+                if not path.is_file() or path.stat().st_size != expected["size_bytes"] or _file_sha256(path) != expected["sha256"] or checksums.get(name) != expected["sha256"]:
+                    return False, "ARTIFACT_PAYLOAD_CHECKSUM_MISMATCH"
+            identity = {"repository": item["repository"], "branch": item["branch"], "commit_sha": item["commit_sha"], "tree_sha": item["tree_sha"], "private_ci_job_id": item["private_ci_job_id"], "source_attestation_id": item["source_attestation_id"], "profile": item["profile"], "ci_image_digest": item["ci_image_digest"], "go_version": item.get("go_version", ""), "node_version": item.get("node_version", ""), "npm_version": item.get("npm_version", "")}
+            if any(manifest.get(key) != value for key, value in identity.items() if key in manifest): return False, "ARTIFACT_MANIFEST_IDENTITY_MISMATCH"
+            if any(provenance.get(key) != value for key, value in identity.items() if key in provenance): return False, "ARTIFACT_PROVENANCE_IDENTITY_MISMATCH"
+            if provenance.get("toolchain", {}).get("go_version") != identity["go_version"] or provenance.get("toolchain", {}).get("node_version") != identity["node_version"] or provenance.get("toolchain", {}).get("npm_version") != identity["npm_version"]: return False, "ARTIFACT_PROVENANCE_TOOLCHAIN_MISMATCH"
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, json.JSONDecodeError):
+        return False, "ARTIFACT_ARCHIVE_INVALID"
+    return True, ""
+
+
+def create_attestation_for_passed_job(*, job_id: str, expires_in_seconds: int = 604800) -> dict:
     job = get_job(job_id)
     if not job or job.get("status") != "passed" or job.get("exit_code") != 0:
         raise ValueError(ATTESTATION_ERRORS["job"])
     if job.get("superseded_by_job_id"):
         raise ValueError(ATTESTATION_ERRORS["superseded"])
-    if job.get("repository") != repository or job.get("commit_sha") != tested_commit_sha or job.get("profile") != profile:
-        raise ValueError(ATTESTATION_ERRORS["tree"])
-    if profile != "repo-auto-check":
+    summary = job.get("summary") if isinstance(job.get("summary"), dict) else {}
+    evidence = summary.get("evidence") if isinstance(summary.get("evidence"), dict) else {}
+    repository, tested_commit_sha = job.get("repository", ""), job.get("commit_sha", "")
+    profile = job.get("profile", "")
+    tested_tree_sha = summary.get("git_tree_sha", "")
+    base_sha = evidence.get("base_sha") or job.get("base_sha", "")
+    ci_image_digest = summary.get("image_digest", "")
+    go_version, node_version, npm_version = summary.get("go_version", ""), summary.get("node_version", ""), summary.get("npm_version", "")
+    go_sum_sha256, admin_lock_sha256 = evidence.get("go_sum_sha256", ""), evidence.get("admin_lock_sha256", "")
+    console_lock_sha256, test_config_sha256 = evidence.get("console_lock_sha256", ""), evidence.get("test_config_sha256", "")
+    changed_files = evidence.get("changed_files", job.get("changed_files", []))
+    if profile != "repo-auto-check" or len(tested_commit_sha) != 40 or len(tested_tree_sha) != 40:
         raise ValueError(ATTESTATION_ERRORS["job"])
-    init_registry_db(); attestation_id = str(uuid.uuid4()); now = time.time(); expiry = expires_at or now + 7 * 86400
+    if not all((base_sha, ci_image_digest, go_version, node_version, npm_version, go_sum_sha256, admin_lock_sha256, console_lock_sha256, test_config_sha256)):
+        raise ValueError("ATTESTATION_EVIDENCE_INCOMPLETE")
+    init_registry_db(); attestation_id = str(uuid.uuid4()); now = time.time(); expiry = now + min(max(int(expires_in_seconds), 60), 30 * 86400)
     db = _db()
     db.execute("INSERT INTO ci_tree_attestations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (attestation_id, repository, tested_commit_sha, tested_tree_sha, base_sha, job_id, profile, ci_image_digest, go_version, node_version, npm_version, go_sum_sha256, admin_lock_sha256, console_lock_sha256, test_config_sha256, _sha(changed_files), "active", now, expiry, None))
     db.commit(); row = db.execute("SELECT * FROM ci_tree_attestations WHERE attestation_id=?", (attestation_id,)).fetchone(); db.close()
@@ -121,7 +166,13 @@ def revoke_attestation(attestation_id: str) -> dict:
 
 def register_release_artifact(metadata: dict) -> dict:
     init_registry_db(); artifact_id = metadata.get("artifact_id") or str(uuid.uuid4()); now = time.time(); expiry = float(metadata.get("expires_at") or now + 7 * 86400)
-    db = _db(); db.execute("INSERT OR REPLACE INTO release_artifacts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (artifact_id, metadata["repository"], metadata["branch"], metadata["commit_sha"], metadata["tree_sha"], metadata["private_ci_job_id"], metadata.get("source_attestation_id", ""), metadata["profile"], metadata["ci_image_digest"], metadata.get("status", "ready"), metadata["storage_path"], metadata["archive_sha256"], int(metadata["archive_size_bytes"]), metadata["manifest_sha256"], metadata["checksums_sha256"], int(bool(metadata.get("migration_required"))), int(bool(metadata.get("deploy_config_changed"))), now, expiry, metadata.get("error_code"), metadata.get("error_message"))); db.commit(); row = db.execute("SELECT * FROM release_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone(); db.close(); return _row(row)
+    if metadata.get("status", "ready") not in {"building", "ready", "failed"}: raise ValueError("ARTIFACT_STATUS_INVALID")
+    db = _db()
+    try:
+        db.execute("INSERT INTO release_artifacts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (artifact_id, metadata["repository"], metadata["branch"], metadata["commit_sha"], metadata["tree_sha"], metadata["private_ci_job_id"], metadata.get("source_attestation_id", ""), metadata["profile"], metadata["ci_image_digest"], metadata.get("status", "ready"), metadata["storage_path"], metadata["archive_sha256"], int(metadata["archive_size_bytes"]), metadata["manifest_sha256"], metadata["checksums_sha256"], int(bool(metadata.get("migration_required"))), int(bool(metadata.get("deploy_config_changed"))), now, expiry, metadata.get("error_code"), metadata.get("error_message")))
+    except sqlite3.IntegrityError as exc:
+        db.rollback(); db.close(); raise ValueError("ARTIFACT_ID_CONFLICT") from exc
+    db.commit(); row = db.execute("SELECT * FROM release_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone(); db.close(); return _row(row)
 
 
 def get_artifact(artifact_id: str) -> dict | None:
@@ -136,7 +187,9 @@ def validate_artifact(artifact_id: str, *, repository: str, branch: str, commit_
     item = get_artifact(artifact_id)
     if not item: return {"ok": False, "error_code": "ARTIFACT_NOT_FOUND"}
     if item["status"] in ("revoked", "expired"): return {"ok": False, "error_code": f"ARTIFACT_{item['status'].upper()}"}
-    if item["expires_at"] <= time.time(): return {"ok": False, "error_code": "ARTIFACT_EXPIRED"}
+    if item["expires_at"] <= time.time():
+        db = _db(); db.execute("UPDATE release_artifacts SET status='expired' WHERE artifact_id=? AND status='ready'", (artifact_id,)); db.commit(); db.close()
+        return {"ok": False, "error_code": "ARTIFACT_EXPIRED"}
     if item["status"] != "ready": return {"ok": False, "error_code": "ARTIFACT_NOT_READY"}
     root = Path(os.environ.get("ARTIFACT_STORAGE_ROOT", "/var/lib/private-ci/artifacts")).resolve()
     archive = Path(item["storage_path"]).resolve()
@@ -145,6 +198,8 @@ def validate_artifact(artifact_id: str, *, repository: str, branch: str, commit_
     metadata_dir = archive.parent
     if not all((metadata_dir / name).is_file() for name in ("manifest.json", "checksums.sha256", "provenance.json")): return {"ok": False, "error_code": "ARTIFACT_METADATA_MISSING"}
     if _file_sha256(metadata_dir / "manifest.json") != item["manifest_sha256"] or _file_sha256(metadata_dir / "checksums.sha256") != item["checksums_sha256"]: return {"ok": False, "error_code": "ARTIFACT_METADATA_CHECKSUM_MISMATCH"}
+    valid_archive, archive_error = _verify_archive(item)
+    if not valid_archive: return {"ok": False, "error_code": archive_error}
     job = get_job(private_ci_job_id)
     if not job or job.get("status") != "passed" or job.get("exit_code") != 0: return {"ok": False, "error_code": "ARTIFACT_CI_NOT_PASSED"}
     if job.get("superseded_by_job_id"): return {"ok": False, "error_code": "ARTIFACT_CI_SUPERSEDED"}

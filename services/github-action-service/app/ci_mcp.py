@@ -281,7 +281,7 @@ This is for the private CI system. NOT for GitHub Actions logs (use get_ci_logs 
                 "branch": job.get("branch"), "commit_sha": job.get("commit_sha"),
                 "status": job.get("status"), "last_sequence": result.get("last_sequence"), "lines": [_redact_log_line(line) for line in result.get("lines", [])],
                 "line_count": result.get("returned_lines", 0), "total_bytes": result.get("total_bytes", 0),
-                "requested_lines": result.get("requested_lines", lines), "truncated": result.get("truncated", False),
+                "requested_lines": result.get("requested_lines", lines), "bytes_scanned": result.get("bytes_scanned", 0), "first_line_partial": result.get("first_line_partial", False), "max_bytes_reached": result.get("max_bytes_reached", False), "truncated": result.get("truncated", False),
             }, ensure_ascii=False)
         except Exception as e:
             return _error_response("INTERNAL_ERROR", str(e))

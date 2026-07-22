@@ -70,9 +70,9 @@ def build_release_artifact(root: str | Path, output_dir: str | Path, metadata: d
             relative = source.relative_to(root); target = payload / relative; target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(source.read_bytes())
         manifest = build_manifest(payload, metadata["repository"], metadata["commit_sha"], metadata["tree_sha"], staging / "manifest.json")
-        manifest.update({k: metadata[k] for k in ("private_ci_job_id", "profile", "ci_image_digest", "go_version", "node_version", "npm_version") if k in metadata})
+        manifest.update({k: metadata[k] for k in ("branch", "private_ci_job_id", "source_attestation_id", "profile", "ci_image_digest", "go_version", "node_version", "npm_version") if k in metadata})
         (staging / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-        provenance = {"artifact_format": 1, "repository": metadata["repository"], "commit_sha": metadata["commit_sha"], "tree_sha": metadata["tree_sha"], "private_ci_job_id": metadata["private_ci_job_id"], "profile": metadata["profile"], "ci_image_digest": metadata["ci_image_digest"], "toolchain": {k: metadata.get(k, "") for k in ("go_version", "node_version", "npm_version")}}
+        provenance = {"artifact_format": 1, "repository": metadata["repository"], "branch": metadata.get("branch", "main"), "commit_sha": metadata["commit_sha"], "tree_sha": metadata["tree_sha"], "private_ci_job_id": metadata["private_ci_job_id"], "source_attestation_id": metadata.get("source_attestation_id", ""), "profile": metadata["profile"], "ci_image_digest": metadata["ci_image_digest"], "toolchain": {k: metadata.get(k, "") for k in ("go_version", "node_version", "npm_version")}}
         (staging / "provenance.json").write_text(json.dumps(provenance, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         archive = staging / "release.tar.zst"; create_tar_zst(payload, archive)
         result = {"manifest": manifest, "provenance": provenance, "archive_sha256": _sha256(archive), "archive_size_bytes": archive.stat().st_size}
@@ -88,18 +88,18 @@ def verify_release_artifact(artifact_dir: str | Path) -> dict:
     manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
     checksums = (directory / "checksums.sha256").read_text(encoding="utf-8").splitlines()
     expected = {line.split("  ", 1)[1]: line.split("  ", 1)[0] for line in checksums if "  " in line}
-    listing = subprocess.run(["tar", "--zstd", "-tvf", str(archive)], check=True, capture_output=True, text=True).stdout.splitlines()
+    listing = subprocess.run(["tar", "--zstd", "-tf", str(archive)], check=True, capture_output=True, text=True).stdout.splitlines()
     names = set()
     for line in listing:
         if not line: continue
-        if line[0] in "lhd" and line[0] in "lh": raise ValueError("ARTIFACT_UNSAFE_ARCHIVE_ENTRY")
-        name = line.rsplit(" ", 1)[-1]
+        name = line
         if not _safe_member(name): raise ValueError("ARTIFACT_UNSAFE_ARCHIVE_ENTRY")
         names.add(name)
     listed = {item["path"] for item in manifest.get("files", [])}
     if names != listed: raise ValueError("ARTIFACT_ARCHIVE_EXTRA_OR_MISSING_ENTRY")
     with tempfile.TemporaryDirectory(prefix="verify-") as tmp:
         subprocess.run(["tar", "--zstd", "--extract", "--no-same-owner", "--no-same-permissions", "-f", str(archive), "-C", tmp], check=True)
+        if any(path.is_symlink() for path in Path(tmp).rglob("*")): raise ValueError("ARTIFACT_UNSAFE_ARCHIVE_ENTRY")
         verify_manifest(tmp, manifest)
         if any(expected.get(item["path"]) != item["sha256"] for item in manifest.get("files", [])): raise ValueError("ARTIFACT_CHECKSUM_FILE_MISMATCH")
     return {"ok": True, "archive_sha256": _sha256(archive), "files": len(manifest.get("files", []))}

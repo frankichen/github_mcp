@@ -1,6 +1,6 @@
 {
   "service_name": "MyGithub10",
-  "source_commit": "25f786c5f7fe375b87387c3c341e14a90728304c",
+  "source_commit": "3318d5075786bd47c49dc3a5cc78e127473eb885",
   "controller_image": "not-read-from-runtime",
   "pygithub_version": "2.5.0",
   "mcp_sdk_version": "mcp>=1.7.0 (requirements baseline)",
@@ -2448,91 +2448,21 @@
       "read_only": false,
       "consequential": true,
       "category": "github",
-      "description": "Persist a Tree SHA attestation only for an exact passed, non-superseded repo-auto-check job.",
+      "description": "Create a Tree SHA attestation from server-side CI evidence; callers may only choose job_id and bounded expiry.",
       "input_schema": {
         "properties": {
-          "repository": {
-            "title": "Repository",
-            "type": "string"
-          },
           "job_id": {
             "title": "Job Id",
             "type": "string"
           },
-          "tested_commit_sha": {
-            "title": "Tested Commit Sha",
-            "type": "string"
-          },
-          "tested_tree_sha": {
-            "title": "Tested Tree Sha",
-            "type": "string"
-          },
-          "base_sha": {
-            "title": "Base Sha",
-            "type": "string"
-          },
-          "profile": {
-            "title": "Profile",
-            "type": "string"
-          },
-          "ci_image_digest": {
-            "title": "Ci Image Digest",
-            "type": "string"
-          },
-          "go_version": {
-            "title": "Go Version",
-            "type": "string"
-          },
-          "node_version": {
-            "title": "Node Version",
-            "type": "string"
-          },
-          "npm_version": {
-            "title": "Npm Version",
-            "type": "string"
-          },
-          "go_sum_sha256": {
-            "title": "Go Sum Sha256",
-            "type": "string"
-          },
-          "admin_lock_sha256": {
-            "title": "Admin Lock Sha256",
-            "type": "string"
-          },
-          "console_lock_sha256": {
-            "title": "Console Lock Sha256",
-            "type": "string"
-          },
-          "test_config_sha256": {
-            "title": "Test Config Sha256",
-            "type": "string"
-          },
-          "changed_files_json": {
-            "default": "[]",
-            "title": "Changed Files Json",
-            "type": "string"
-          },
-          "expires_at": {
-            "default": 0,
-            "title": "Expires At",
-            "type": "number"
+          "expires_in_seconds": {
+            "default": 604800,
+            "title": "Expires In Seconds",
+            "type": "integer"
           }
         },
         "required": [
-          "repository",
-          "job_id",
-          "tested_commit_sha",
-          "tested_tree_sha",
-          "base_sha",
-          "profile",
-          "ci_image_digest",
-          "go_version",
-          "node_version",
-          "npm_version",
-          "go_sum_sha256",
-          "admin_lock_sha256",
-          "console_lock_sha256",
-          "test_config_sha256"
+          "job_id"
         ],
         "title": "create_attestation_for_passed_jobArguments",
         "type": "object"
@@ -2669,22 +2599,37 @@
       }
     },
     {
-      "name": "register_release_artifact",
+      "name": "build_release_artifact",
       "read_only": false,
       "consequential": true,
       "category": "release",
-      "description": "Register a ready artifact using server-controlled storage metadata and immutable provenance.",
+      "description": "Build and register an artifact only from server-controlled source storage and a valid attestation; callers cannot provide hashes, paths, status or identity evidence.",
       "input_schema": {
         "properties": {
-          "metadata_json": {
-            "title": "Metadata Json",
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "commit_sha": {
+            "title": "Commit Sha",
+            "type": "string"
+          },
+          "private_ci_job_id": {
+            "title": "Private Ci Job Id",
+            "type": "string"
+          },
+          "source_attestation_id": {
+            "title": "Source Attestation Id",
             "type": "string"
           }
         },
         "required": [
-          "metadata_json"
+          "repository",
+          "commit_sha",
+          "private_ci_job_id",
+          "source_attestation_id"
         ],
-        "title": "register_release_artifactArguments",
+        "title": "build_release_artifactArguments",
         "type": "object"
       }
     },
