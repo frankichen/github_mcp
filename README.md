@@ -1,43 +1,42 @@
-# MCP 服务集合
+# MCP 与 CI 部署服务
 
-这是个人 MCP 服务代码仓库，当前包含两个可以独立部署的服务：
+本仓库包含两个端：
 
-- `services/github-action-service`：Python 服务，提供 GitHub 文件、分支、提交、Pull Request 和 CI 工作流管理能力。
-- `services/auto_gupiao-mcp`：Go 服务，提供 A 股观察盘报告和运行记录的只读 MCP 查询能力。
+- `services/github-action-service`：本地或 CI 环境使用的 GitHub/MCP 控制端，负责 GitHub API、CI 查询、提交和部署意图编排。
+- `services/private-deploy-agent`：服务器 `root@de` 上运行的私有部署 Worker，负责领取部署队列、记录状态，并按受控策略执行测试环境部署。
 
-仓库只保存源代码、示例配置、测试和部署说明。真实 Token、API Key、Webhook、数据库、行情缓存、报告和编译产物不会提交到仓库。
+股票选股和股票 MCP 服务已经从仓库移除。
 
-## 安全声明
-
-所有服务都应启用鉴权，并通过环境变量或外部 Secret 管理敏感信息。不要把 `.env`、生产配置、私钥、数据库文件或真实行情报告提交到 Git。
-
-如果某个 Token 曾经出现在日志、备份或聊天记录中，应立即在对应平台撤销并重新生成。
-
-## 仓库结构
+## 两端关系
 
 ```text
-.
-├── README.md
-├── SECURITY.md
-├── docs/
-└── services/
-    ├── github-action-service/
-    └── auto_gupiao-mcp/
+AI / MCP 客户端
+        │
+        ▼
+github-action-service
+  GitHub API / CI / 部署编排
+        │ 受控部署队列
+        ▼
+private-deploy-agent（服务器端）
+  claim_only 或受控执行
+        │
+        ▼
+测试环境 / 发布工作区
 ```
+
+本仓库不包含生产环境 Secret、`.env`、数据库、私有 SSH 密钥、Xray 配置和运行数据。部署时必须从 Secret 管理系统或服务器受限环境文件注入。
+
+## 快速入口
+
+- AI 重新部署：[`docs/AI重新部署指南.md`](docs/AI重新部署指南.md)
+- 迁移与部署说明：[`docs/迁移与部署说明.md`](docs/迁移与部署说明.md)
+- 安全说明：[`SECURITY.md`](SECURITY.md)
+- GitHub/MCP 服务：[`services/github-action-service`](services/github-action-service)
+- 私有部署 Worker：[`services/private-deploy-agent`](services/private-deploy-agent)
 
 ## GitHub Action Service
 
-该服务基于 FastAPI 和 MCP Python SDK，主要能力包括：
-
-- 读取 GitHub 文件内容和目录列表；
-- 创建分支；
-- 以单次提交方式新增、修改或删除多个文件；
-- 创建 Pull Request；
-- 查询 CI Worker、CI Profile、Job 和日志；
-- 触发或取消 CI 工作流；
-- 对大文本提交参数做长度、哈希和边界标记诊断。
-
-### 本地运行
+Python 服务提供 GitHub 文件、目录、分支、提交、Pull Request、CI Worker、CI Job、日志和工作流操作能力。默认应只监听 `127.0.0.1`，通过 HTTPS 反向代理或安全隧道提供 MCP 访问。
 
 ```bash
 cd services/github-action-service
@@ -45,25 +44,10 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-```
-
-编辑 `.env`：
-
-```dotenv
-GITHUB_TOKEN=替换为细粒度 GitHub Token
-ACTION_API_KEY=替换为随机生成的服务访问密钥
-GITHUB_API_URL=https://api.github.com
-ALLOWED_REPOSITORIES=owner/repo-a,owner/repo-b
-ALLOW_DEFAULT_BRANCH_WRITE=false
-```
-
-启动：
-
-```bash
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Docker 运行：
+Docker：
 
 ```bash
 cd services/github-action-service
@@ -71,95 +55,20 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Compose 默认只把宿主机 `127.0.0.1:8765` 映射到容器的 8000 端口。生产环境不要直接绑定公网地址。
+必须配置 `GITHUB_TOKEN`、`ACTION_API_KEY`，并按最小权限设置 `ALLOWED_REPOSITORIES` 和 `ALLOW_DEFAULT_BRANCH_WRITE`。
 
-### 权限建议
+## Private Deploy Agent
 
-GitHub Token 应使用细粒度 Token，并只授予确实需要的仓库和权限。只读使用时不要授予写入权限；需要提交或创建 PR 时，再逐项授予 Contents、Pull requests 和 Actions 的最小权限。
+该服务从 `root@de` 的 `/opt/private-deploy-agent/app` 提取了非敏感源码。服务器当前 systemd 服务名为 `private-deploy-agent.service`，实际环境文件在服务器的 `/etc/private-ci/deploy-worker.env`，不会提交到 Git。
 
-## auto_gupiao-mcp
+Worker 支持 `claim_only` 模式：只领取部署任务并把执行交给受控的 WSL 流程；生产部署时必须明确审核执行模式、工作区、目标环境和回滚策略。
 
-该 Go 服务提供只读 MCP HTTP 服务，用于查询观察盘结果：
+详细部署步骤、变量表、systemd 模板、健康检查和故障处理请阅读 [AI 重新部署指南](docs/AI重新部署指南.md)。
 
-- `get_latest_report`：读取最新报告；
-- `list_recent_runs`：查询最近运行记录；
-- `get_run_detail`：读取指定运行详情；
-- `get_run_note`：读取人工备注。
+## 安全底线
 
-只读 MCP 不触发日报、不重新拉取行情、不发送钉钉消息、不修改 SQLite、不连接券商，也不执行真实交易。
-
-### 构建和测试
-
-```bash
-cd services/auto_gupiao-mcp
-go test ./...
-go build -o ./bin/autogupiao-mcp ./cmd/autogupiao-mcp
-```
-
-### 启动
-
-```bash
-cd services/auto_gupiao-mcp
-export AUTO_GUPIAO_MCP_TOKEN='请替换为强随机密钥'
-./bin/autogupiao-mcp \
-  -config configs/server.example.json \
-  -addr 127.0.0.1:8090
-```
-
-生产配置应复制示例配置后在本机保存为 `configs/server.json`；该文件已被 `.gitignore` 排除。数据库、报告和行情缓存也应放在仓库之外。
-
-### HTTP/MCP 入口
-
-健康检查：
-
-```bash
-curl http://127.0.0.1:8090/healthz
-```
-
-工具列表：
-
-```bash
-curl -s http://127.0.0.1:8090/mcp \
-  -H 'Authorization: Bearer 请替换为强随机密钥' \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-```
-
-SSE 入口：
-
-```bash
-curl -N http://127.0.0.1:8090/sse \
-  -H 'Authorization: Bearer 请替换为强随机密钥'
-```
-
-完整的协议、反向代理和 systemd 说明见 `services/auto_gupiao-mcp/docs/只读MCP接入说明.md`。
-
-## 部署原则
-
-1. 复制示例配置，在服务器上填写 Secret；
-2. MCP 服务默认监听 `127.0.0.1`；
-3. 对外提供服务时使用 HTTPS、反向代理和访问控制；
-4. 数据库、报告、行情缓存和日志放在仓库之外；
-5. 发布前执行测试和 Secret 扫描；
-6. 升级前备份数据库和服务配置。
-
-## 测试清单
-
-Python 服务：
-
-```bash
-cd services/github-action-service
-pip install -r requirements-dev.txt
-pytest
-```
-
-Go 服务：
-
-```bash
-cd services/auto_gupiao-mcp
-go test ./...
-```
-
-## 免责声明
-
-`auto_gupiao-mcp` 仅用于策略研究、工程开发、观察盘和模拟验证，不构成投资建议，也不承诺收益。任何真实交易接入都需要单独的权限、风控和人工复核流程。
+- 不提交 `.env`、Token、API Key、密码、Webhook Secret、SSH 私钥或 TLS 私钥；
+- 不把任意 SSH、Shell、主机或脚本路径暴露为 MCP 参数；
+- 默认禁止直接写默认分支；
+- 部署前执行计划检查、变更范围检查和人工确认；
+- 任何 Token 一旦出现在日志、备份或聊天记录中，立即撤销并轮换。

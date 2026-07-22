@@ -1,0 +1,159 @@
+name: lenshub-test
+
+x-app-env: &app-env
+  env_file:
+    - path: ${LENSHUB_ENV_FILE:-/home/dly/env/lenshub.env}
+      required: false
+
+x-app-service: &app-service
+  image: ${LENSHUB_RUNTIME_IMAGE:-lenshub-test-runtime:${LENSHUB_IMAGE_TAG:-latest}}
+  <<: *app-env
+  restart: unless-stopped
+  working_dir: /opt/lenshub
+  volumes:
+    - type: bind
+      source: ${LENSHUB_RELEASE_DIR:-/home/dly/releases/current}
+      target: /opt/lenshub
+      read_only: true
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+  networks:
+    - lenshub
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-lenshub}
+      POSTGRES_USER: ${POSTGRES_USER:-lenshub}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      - type: bind
+        source: ${LENSHUB_DATA_DIR:-/home/dly/data}/postgres
+        target: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - lenshub
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - type: bind
+        source: ${LENSHUB_DATA_DIR:-/home/dly/data}/redis
+        target: /data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - lenshub
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-lenshub}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-}
+    volumes:
+      - type: bind
+        source: ${LENSHUB_DATA_DIR:-/home/dly/data}/rabbitmq
+        target: /var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - lenshub
+
+  api:
+    <<: *app-service
+    command: ["/opt/lenshub/bin/lenshub-api"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/public/v1/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  worker:
+    <<: *app-service
+    command: ["/opt/lenshub/bin/lenshub-worker"]
+
+  scheduler:
+    <<: *app-service
+    command: ["/opt/lenshub/bin/lenshub-scheduler"]
+
+  migrate:
+    image: ${LENSHUB_RUNTIME_IMAGE:-lenshub-test-runtime:${LENSHUB_IMAGE_TAG:-latest}}
+    <<: *app-env
+    working_dir: /opt/lenshub
+    volumes:
+      - type: bind
+        source: ${LENSHUB_RELEASE_DIR:-/home/dly/releases/current}
+        target: /opt/lenshub
+        read_only: true
+    profiles: ["ops"]
+    command: ["sh", "-lc", "/opt/lenshub/bin/goose -dir /opt/lenshub/db/migrations postgres \"$${DATABASE_URL}\" up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - lenshub
+
+  admin-bootstrap:
+    image: ${LENSHUB_RUNTIME_IMAGE:-lenshub-test-runtime:${LENSHUB_IMAGE_TAG:-latest}}
+    working_dir: /opt/lenshub
+    volumes:
+      - type: bind
+        source: ${LENSHUB_RELEASE_DIR:-/home/dly/releases/current}
+        target: /opt/lenshub
+        read_only: true
+    env_file:
+      - path: ${LENSHUB_ENV_FILE:-/home/dly/env/lenshub.env}
+        required: false
+      - path: ${LENSHUB_ADMIN_BOOTSTRAP_ENV_FILE:-/home/dly/env/admin-bootstrap.env}
+        required: false
+    profiles: ["ops"]
+    command: ["/opt/lenshub/bin/lenshub-admin-bootstrap"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - lenshub
+
+  web:
+    image: ${LENSHUB_WEB_IMAGE:-lenshub-test-web:${LENSHUB_IMAGE_TAG:-latest}}
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: ${LENSHUB_RELEASE_DIR:-/home/dly/releases/current}/frontend/html
+        target: /usr/share/nginx/html
+        read_only: true
+      - type: bind
+        source: ${LENSHUB_RELEASE_DIR:-/home/dly/releases/current}/deploy/nginx/lenshub-test.conf
+        target: /etc/nginx/conf.d/default.conf
+        read_only: true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/nginx-health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks:
+      - lenshub
+
+networks:
+  lenshub:
+    driver: bridge
