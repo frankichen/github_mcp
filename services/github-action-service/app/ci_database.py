@@ -848,6 +848,19 @@ def get_log_chunks(job_id: str, offset: int = 0, limit: int = 50) -> dict:
     }
 
 
+def get_log_tail(job_id: str, lines: int = 100) -> dict:
+    """Read from the end of the log sequence; never scans a fixed first-page limit."""
+    db = _get_db()
+    row = db.execute("SELECT status, log_total_bytes, log_truncated FROM ci_jobs WHERE job_id=?", (job_id,)).fetchone()
+    if not row:
+        return {"job_id": job_id, "status": None, "last_sequence": None, "total_bytes": 0, "requested_lines": lines, "returned_lines": 0, "truncated": False, "lines": []}
+    lines = min(max(int(lines), 1), 1000)
+    chunks = db.execute("SELECT chunk_index, offset_from, offset_to, content FROM ci_job_log_chunks WHERE job_id=? ORDER BY chunk_index DESC LIMIT ?", (job_id, max(lines, 1) * 4)).fetchall()
+    content = "".join((item["content"] or "") for item in reversed(chunks))
+    tail = content.splitlines()[-lines:]
+    return {"job_id": job_id, "status": row["status"], "last_sequence": chunks[0]["chunk_index"] if chunks else None, "total_bytes": row["log_total_bytes"], "requested_lines": lines, "returned_lines": len(tail), "truncated": bool(row["log_truncated"]), "lines": tail}
+
+
 ### STEPS
 
 def add_step(job_id: str, step_name: str, status: str = "pending") -> int:

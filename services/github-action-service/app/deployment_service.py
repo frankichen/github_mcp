@@ -61,6 +61,7 @@ def init_deployment_db():
       frontend_included INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL,
       started_at REAL, finished_at REAL, updated_at REAL, log_revision INTEGER NOT NULL DEFAULT 0,
       current_release_path TEXT, current_git_sha TEXT, lease_token TEXT,
+      artifact_id TEXT,
       performance_json TEXT NOT NULL DEFAULT '{}',
       log_text TEXT NOT NULL DEFAULT ''
     );
@@ -75,6 +76,7 @@ def init_deployment_db():
         "current_git_sha": "TEXT",
         "lease_token": "TEXT",
         "performance_json": "TEXT NOT NULL DEFAULT '{}'",
+        "artifact_id": "TEXT",
     }
     for name, definition in additions.items():
         if name not in columns:
@@ -271,7 +273,7 @@ def _ci_gate(job_id, commit_sha):
     return None, job
 
 
-def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope=SCOPE, expected_current_release_id="", allow_deploy_infrastructure_changes=False):
+def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope=SCOPE, expected_current_release_id="", allow_deploy_infrastructure_changes=False, artifact_id=""):
     reason = _validate_common(repository, environment, scope, commit_sha)
     if reason: return {"ok": True, "ready": False, "reasons": [reason]}
     reasons = []
@@ -282,6 +284,13 @@ def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id,
     if commit_sha != main_sha: reasons.append("COMMIT_NOT_CURRENT_MAIN")
     ci_reason, ci_job = _ci_gate(private_ci_job_id, commit_sha)
     if ci_reason: reasons.append(ci_reason)
+    artifact = None
+    if artifact_id:
+        from app.attestation_registry import validate_artifact
+        artifact_result = validate_artifact(artifact_id, repository=repository, branch="main", commit_sha=commit_sha, tree_sha="", private_ci_job_id=private_ci_job_id)
+        artifact = artifact_result.get("artifact") if artifact_result.get("ok") else None
+        if not artifact_result.get("ok"):
+            reasons.append(artifact_result.get("error_code", "ARTIFACT_INVALID"))
     infra_changed = any(path == "scripts/deploy_gongshi_test.sh" or path == "scripts/sync_test_env.sh" or path.startswith("deploy/") for path in files)
     if infra_changed and not allow_deploy_infrastructure_changes: reasons.append("DEPLOY_INFRASTRUCTURE_CHANGE_REQUIRES_EXPLICIT_ALLOW")
     migrations_changed = any(path.startswith("db/migrations/") for path in files)
@@ -295,6 +304,7 @@ def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id,
             "current_release_path": (current_release or {}).get("current_release_path"),
             "target_release_id": f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{commit_sha[:12]}",
             "changed_files": files, "migrations_changed": migrations_changed, "deploy_infrastructure_changed": infra_changed,
+            "artifact_id": artifact_id or None, "artifact": artifact,
             "backend_components": ["lenshub-api", "lenshub-worker", "lenshub-scheduler", "lenshub-admin-bootstrap", "goose"],
             "frontend_components": ["admin", "newadmin", "root", "app", "h5", "tester", "docs", "openapi"],
             "restart_services": ["api", "worker", "scheduler", "web"],
@@ -302,9 +312,9 @@ def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id,
             "rollback_plan": "flock 后恢复 previous current；不执行 goose down，不删除 release", "expected_current_release_id": expected_current_release_id}
 
 
-def start_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope=SCOPE, expected_current_release_id="", allow_deploy_infrastructure_changes=False, force_redeploy=False, confirm=False, requested_by="mcp"):
+def start_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope=SCOPE, expected_current_release_id="", allow_deploy_infrastructure_changes=False, force_redeploy=False, confirm=False, requested_by="mcp", artifact_id=""):
     if not confirm: return _error_response("CONFIRM_REQUIRED", "confirm must be true")
-    plan = plan_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes)
+    plan = plan_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes, artifact_id)
     if not plan.get("ready"): return {**plan, "error": {"code": plan.get("reasons", ["NOT_READY"])[0]}}
     init_deployment_db(); db = _get_deploy_db()
     with _lock:
@@ -314,7 +324,7 @@ def start_test_deployment(repository, environment, commit_sha, private_ci_job_id
             return _error_response("ALREADY_DEPLOYED", "same SHA already passed")
         deployment_id = "dep_" + uuid.uuid4().hex
         now = _now()
-        db.execute("INSERT INTO deployments(deployment_id,repository,environment,commit_sha,private_ci_job_id,requested_scope,current_release_before,target_release,status,created_at,updated_at,requested_by,frontend_included) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)", (deployment_id, repository, environment, commit_sha, private_ci_job_id, scope, plan.get("current_release_id"), plan["target_release_id"], "queued", now, now, requested_by))
+        db.execute("INSERT INTO deployments(deployment_id,repository,environment,commit_sha,private_ci_job_id,requested_scope,current_release_before,target_release,status,created_at,updated_at,requested_by,frontend_included,artifact_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,?)", (deployment_id, repository, environment, commit_sha, private_ci_job_id, scope, plan.get("current_release_id"), plan["target_release_id"], "queued", now, now, requested_by, artifact_id or None))
         db.commit()
     return {"ok": True, "deployment_id": deployment_id, "status": "queued", "target_release_id": plan["target_release_id"], "message": "queued for private-deploy-agent"}
 

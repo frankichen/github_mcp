@@ -19,6 +19,7 @@ from app.ci_database import (
     list_jobs as db_list_jobs,
     get_workers as db_get_workers,
     get_log_chunks,
+    get_log_tail,
     get_steps,
     wait_for_job_change,
     cancel_queued_job,
@@ -35,6 +36,11 @@ from app.ci_repository_config import (
 logger = logging.getLogger(__name__)
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_TAIL_SECRET_RE = re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+|(?:token|password|secret|api[_-]?key)\s*[:=]\s*)([^\s,;]+)")
+
+
+def _redact_log_line(line: str) -> str:
+    return _TAIL_SECRET_RE.sub(lambda match: match.group(1) + "[REDACTED]", line)
 
 
 def _error_response(code: str, message: str, retryable: bool = False, details: dict = None) -> str:
@@ -269,15 +275,13 @@ This is for the private CI system. NOT for GitHub Actions logs (use get_ci_logs 
             if not job:
                 return _error_response("PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found")
             lines = min(max(lines, 1), 1000)
-            result = get_log_chunks(job_id, 0, 2000)
-            text = "".join(chunk.get("content", "") for chunk in result.get("chunks", []))
-            tail = "\n".join(text.splitlines()[-lines:])
+            result = get_log_tail(job_id, lines)
             return json.dumps({
                 "ok": True, "job_id": job_id, "repository": job.get("repository"),
                 "branch": job.get("branch"), "commit_sha": job.get("commit_sha"),
-                "status": job.get("status"), "lines": tail.splitlines(),
-                "line_count": len(tail.splitlines()), "total_bytes": result.get("total_bytes", 0),
-                "truncated": result.get("truncated", False),
+                "status": job.get("status"), "last_sequence": result.get("last_sequence"), "lines": [_redact_log_line(line) for line in result.get("lines", [])],
+                "line_count": result.get("returned_lines", 0), "total_bytes": result.get("total_bytes", 0),
+                "requested_lines": result.get("requested_lines", lines), "truncated": result.get("truncated", False),
             }, ensure_ascii=False)
         except Exception as e:
             return _error_response("INTERNAL_ERROR", str(e))

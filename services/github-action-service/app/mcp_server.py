@@ -3,6 +3,7 @@ import json
 import logging
 import base64
 import os
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -18,6 +19,7 @@ from app.services.ci_service import get_ci_service
 from app.ci_mcp import register_private_ci_mcp_tools
 from app import github_utils
 from app import mygithub10
+from app import attestation_registry
 
 logger = logging.getLogger(__name__)
 
@@ -538,18 +540,18 @@ def _deployment_tool_error(exc):
 
 
 @mcp.tool(name="plan_test_deployment", description="Plan only a fullstack frankichen/sxt gongshi-test deployment; validates exact main SHA, private CI, changed files, migrations, and infrastructure changes.")
-async def plan_test_deployment(repository: str, environment: str, commit_sha: str, private_ci_job_id: str, scope: str = "fullstack", expected_current_release_id: str = "", allow_deploy_infrastructure_changes: bool = False) -> str:
+async def plan_test_deployment(repository: str, environment: str, commit_sha: str, private_ci_job_id: str, scope: str = "fullstack", expected_current_release_id: str = "", allow_deploy_infrastructure_changes: bool = False, artifact_id: str = "") -> str:
     try:
         from app import deployment_service
-        return json.dumps(deployment_service.plan_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes), ensure_ascii=False)
+        return json.dumps(deployment_service.plan_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes, artifact_id), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
 
 
 @mcp.tool(name="start_test_deployment", description="Queue a whitelist-only fullstack gongshi-test deployment after exact main SHA and passed main private CI gates. Requires confirm=true; never accepts host or shell input.")
-async def start_test_deployment(repository: str, environment: str, commit_sha: str, private_ci_job_id: str, scope: str = "fullstack", expected_current_release_id: str = "", allow_deploy_infrastructure_changes: bool = False, force_redeploy: bool = False, confirm: bool = False) -> str:
+async def start_test_deployment(repository: str, environment: str, commit_sha: str, private_ci_job_id: str, scope: str = "fullstack", expected_current_release_id: str = "", allow_deploy_infrastructure_changes: bool = False, force_redeploy: bool = False, confirm: bool = False, artifact_id: str = "") -> str:
     try:
         from app import deployment_service
-        return json.dumps(deployment_service.start_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes, force_redeploy, confirm), ensure_ascii=False)
+        return json.dumps(deployment_service.start_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes, force_redeploy, confirm, "mcp", artifact_id), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
 
 
@@ -832,6 +834,65 @@ async def commit_github_uploaded_files(repository: str, branch: str, expected_he
 async def abort_github_file_upload(upload_id: str) -> str:
     try: return json.dumps(mygithub10.abort_upload(upload_id), ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
+
+
+@mcp.tool(name="create_attestation_for_passed_job", description="Persist a Tree SHA attestation only for an exact passed, non-superseded repo-auto-check job.")
+async def create_attestation_for_passed_job(repository: str, job_id: str, tested_commit_sha: str, tested_tree_sha: str, base_sha: str, profile: str, ci_image_digest: str, go_version: str, node_version: str, npm_version: str, go_sum_sha256: str, admin_lock_sha256: str, console_lock_sha256: str, test_config_sha256: str, changed_files_json: str = "[]", expires_at: float = 0) -> str:
+    try:
+        return json.dumps({"ok": True, "attestation": attestation_registry.create_attestation_for_passed_job(repository=repository, job_id=job_id, tested_commit_sha=tested_commit_sha, tested_tree_sha=tested_tree_sha, base_sha=base_sha, profile=profile, ci_image_digest=ci_image_digest, go_version=go_version, node_version=node_version, npm_version=npm_version, go_sum_sha256=go_sum_sha256, admin_lock_sha256=admin_lock_sha256, console_lock_sha256=console_lock_sha256, test_config_sha256=test_config_sha256, changed_files=json.loads(changed_files_json or "[]"), expires_at=expires_at or None)}, ensure_ascii=False)
+    except Exception as exc: return _mygithub10_error(exc)
+
+
+@mcp.tool(name="get_attestation", description="Read a persisted Tree SHA attestation by id.")
+async def get_attestation(attestation_id: str) -> str:
+    item = attestation_registry.get_attestation(attestation_id)
+    return json.dumps({"ok": bool(item), "attestation": item}, ensure_ascii=False)
+
+
+@mcp.tool(name="validate_attestation", description="Validate every identity, job, toolchain, dependency, config, expiry and revocation gate before CI reuse.")
+async def validate_attestation(attestation_id: str, repository: str, tested_commit_sha: str, tested_tree_sha: str, base_sha: str, profile: str, ci_image_digest: str, go_version: str, node_version: str, npm_version: str, go_sum_sha256: str, admin_lock_sha256: str, console_lock_sha256: str, test_config_sha256: str, changed_files_json: str = "[]") -> str:
+    try:
+        return json.dumps(attestation_registry.validate_attestation(attestation_id, repository=repository, tested_commit_sha=tested_commit_sha, tested_tree_sha=tested_tree_sha, base_sha=base_sha, profile=profile, ci_image_digest=ci_image_digest, go_version=go_version, node_version=node_version, npm_version=npm_version, go_sum_sha256=go_sum_sha256, admin_lock_sha256=admin_lock_sha256, console_lock_sha256=console_lock_sha256, test_config_sha256=test_config_sha256, changed_files=json.loads(changed_files_json or "[]")), ensure_ascii=False)
+    except Exception as exc: return _mygithub10_error(exc)
+
+
+@mcp.tool(name="revoke_attestation", description="Revoke one persisted attestation so it can never be reused.")
+async def revoke_attestation(attestation_id: str) -> str:
+    return json.dumps({"ok": True, "attestation": attestation_registry.revoke_attestation(attestation_id)}, ensure_ascii=False)
+
+
+@mcp.tool(name="register_release_artifact", description="Register a ready artifact using server-controlled storage metadata and immutable provenance.")
+async def register_release_artifact(metadata_json: str) -> str:
+    try:
+        metadata = json.loads(metadata_json)
+        root = Path(os.environ.get("ARTIFACT_STORAGE_ROOT", "/var/lib/private-ci/artifacts")).resolve()
+        storage = Path(str(metadata.get("storage_path", ""))).resolve()
+        if root not in storage.parents:
+            return json.dumps({"ok": False, "error_code": "ARTIFACT_STORAGE_PATH_DENIED"})
+        metadata["storage_path"] = str(storage)
+        return json.dumps({"ok": True, "artifact": attestation_registry.register_release_artifact(metadata)}, ensure_ascii=False)
+    except Exception as exc: return _mygithub10_error(exc)
+
+
+@mcp.tool(name="get_release_artifact", description="Read one registered artifact without exposing arbitrary filesystem contents.")
+async def get_release_artifact(artifact_id: str) -> str:
+    item = attestation_registry.get_artifact(artifact_id)
+    return json.dumps({"ok": bool(item), "artifact": item}, ensure_ascii=False)
+
+
+@mcp.tool(name="list_release_artifacts", description="List registered artifact metadata by repository and status.")
+async def list_release_artifacts(repository: str = "", status: str = "", limit: int = 50) -> str:
+    return json.dumps({"ok": True, "artifacts": attestation_registry.list_artifacts(repository, status, limit)}, ensure_ascii=False)
+
+
+@mcp.tool(name="validate_release_artifact", description="Validate artifact readiness, expiry, provenance, exact main identity and current private CI status.")
+async def validate_release_artifact(artifact_id: str, repository: str, branch: str, commit_sha: str, tree_sha: str, private_ci_job_id: str) -> str:
+    return json.dumps(attestation_registry.validate_artifact(artifact_id, repository=repository, branch=branch, commit_sha=commit_sha, tree_sha=tree_sha, private_ci_job_id=private_ci_job_id), ensure_ascii=False)
+
+
+@mcp.tool(name="revoke_release_artifact", description="Revoke a registered artifact; revoked artifacts cannot be deployed.")
+async def revoke_release_artifact(artifact_id: str) -> str:
+    return json.dumps({"ok": True, "artifact": attestation_registry.revoke_artifact(artifact_id)}, ensure_ascii=False)
 
 register_private_ci_mcp_tools(mcp)
 
