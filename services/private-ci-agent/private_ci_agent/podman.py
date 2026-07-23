@@ -64,6 +64,7 @@ class PodmanRunner:
 
         # Map caches to container paths
         cache_mounts = []
+        project_root = os.path.abspath(os.path.join(source_dir, os.pardir, os.pardir))
         go_cache = None
         for cache_name, cache_path in cache_dirs.items():
             if cache_name == "go":
@@ -89,6 +90,7 @@ class PodmanRunner:
             "--tmpfs=/run:rw,noexec,nosuid,size=64m",
             "--tmpfs=/data:rw,noexec,nosuid,size=64m",
             "-v", f"{source_dir}:/workspace:Z",
+            "-v", f"{project_root}:/repo:ro",
             "--workdir", "/workspace",
             "--network=none",
         ] + cache_mounts + [
@@ -160,6 +162,7 @@ class PodmanRunner:
         container_name = self._container_name(job_id, source_dir)
 
         cache_mounts = []
+        project_root = os.path.abspath(os.path.join(source_dir, os.pardir, os.pardir))
         go_cache = None
         for cache_name, cache_path in cache_dirs.items():
             if cache_name == "go":
@@ -188,6 +191,7 @@ class PodmanRunner:
             "--tmpfs=/run:rw,noexec,nosuid,size=64m",
             "--tmpfs=/data:rw,noexec,nosuid,size=64m",
             "-v", f"{source_dir}:/workspace:Z",
+            "-v", f"{project_root}:/repo:ro",
             "--workdir", "/workspace",
         ] + net_arg + cache_mounts + [
             "--entrypoint", "/bin/sh",
@@ -198,6 +202,16 @@ class PodmanRunner:
         safe_env = {k: v for k, v in os.environ.items()
                     if k in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"} and v}
         safe_env.update(self._go_cache_env(go_cache))
+        safe_env.update({
+            "ACTION_API_KEY": "test_api_key_32_bytes_long",
+            "GITHUB_TOKEN": "test_token_value",
+            "ALLOWED_REPOSITORIES": "owner/allowed-repo",
+            "ALLOW_DEFAULT_BRANCH_WRITE": "false",
+            "MAX_FILE_CHARACTERS": "5000",
+            "MAX_TOTAL_CHARACTERS": "10000",
+            "MAX_FILES_PER_COMMIT": "5",
+            "REPOSITORY_POLICY_FILE": "/workspace/tests/repository_policies_test.yml",
+        })
         if env:
             allowed = {"DATABASE_URL", "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "RABBITMQ_URL"}
             safe_env.update({k: v for k, v in env.items() if k in allowed})
