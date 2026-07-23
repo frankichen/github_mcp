@@ -3,6 +3,10 @@ profiles:
     description: "Scan controlled Manifest workspaces and orchestrate approved checks"
     execution_mode: sequential
 
+  repo-fast-check:
+    description: "Run the same complete repository checks with bounded safe parallelism"
+    execution_mode: sequential
+
   go-check:
     description: "Go version-aware format, vet, test, build"
     language: go

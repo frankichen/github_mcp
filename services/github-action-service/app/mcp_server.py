@@ -37,7 +37,7 @@ TOOL_OPERATION_MAP = {
         "get_github_file", "list_github_directory", "get_github_repository", "list_github_branches", "get_github_branch", "get_github_commit", "compare_github_commits", "list_github_pull_requests", "get_github_pull_request", "list_github_pull_request_files", "get_github_pull_request_checks", "list_github_pull_request_comments", "list_github_pull_request_reviews", "get_github_pull_request_merge_readiness", "get_github_pull_request_conflicts", "plan_github_pull_request_merge", "list_github_commits", "search_github_pull_request_history", "list_github_review_history", "list_github_issue_history", "get_github_development_history", "get_github_weekly_report_data", "get_github_file_manifest", "get_repository_operation_policy",
     }},
     **{name: "create_branch" for name in {"create_github_branch"}},
-    **{name: "patch" for name in {"commit_github_files", "apply_github_patch"}},
+    **{name: "patch" for name in {"commit_github_files", "apply_github_patch", "replace_text_in_github_file", "copy_or_move_github_file"}},
     **{name: "range_edit" for name in {"edit_github_file_ranges"}},
     **{name: "upload" for name in {"commit_github_uploaded_files"}},
     **{name: "create_pr" for name in {"create_github_pull_request"}},
@@ -936,6 +936,30 @@ async def edit_github_file_ranges(repository: str, branch: str, expected_head_sh
         return json.dumps(mygithub10.edit_ranges(_service, repository, branch, expected_head_sha, operations_json, commit_message, dry_run, idempotency_key), ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
+
+
+@mcp.tool(name="replace_text_in_github_file", description="Replace exact UTF-8 text with exact HEAD/blob protection and optional dry-run/idempotency.")
+async def replace_text_in_github_file(repository: str, branch: str, expected_head_sha: str, path: str, expected_blob_sha: str, old_text: str, new_text: str, replace_all: bool = False, expected_occurrences: int = 1, commit_message: str = "replace text", dry_run: bool = True, idempotency_key: str = "") -> str:
+    try:
+        if denied := _policy_denied(repository, "patch"): return denied
+        return json.dumps(mygithub10.replace_text(_service, repository, branch, expected_head_sha, path, expected_blob_sha, old_text, new_text, replace_all, expected_occurrences, commit_message, dry_run, idempotency_key), ensure_ascii=False)
+    except Exception as exc: return _mygithub10_error(exc)
+
+
+@mcp.tool(name="copy_or_move_github_file", description="Copy or move a Git blob server-side without downloading and re-uploading file contents.")
+async def copy_or_move_github_file(repository: str, branch: str, expected_head_sha: str, source_path: str, destination_path: str, expected_source_blob_sha: str, operation: str = "copy", overwrite: bool = False, expected_destination_blob_sha: str = "", commit_message: str = "copy or move file", dry_run: bool = True, idempotency_key: str = "") -> str:
+    try:
+        if denied := _policy_denied(repository, "patch"): return denied
+        return json.dumps(mygithub10.copy_or_move(_service, repository, branch, expected_head_sha, source_path, destination_path, expected_source_blob_sha, operation, overwrite, expected_destination_blob_sha, commit_message, dry_run, idempotency_key), ensure_ascii=False)
+    except Exception as exc: return _mygithub10_error(exc)
+
+
+@mcp.tool(name="autofix_gofmt_for_pr", description="Run controlled gofmt on tracked Go files changed by an open non-main PR, with exact PR HEAD protection.")
+async def autofix_gofmt_for_pr(repository: str, pull_number: int, expected_head_sha: str, commit_message: str = "自动修复：执行 gofmt 格式化", dry_run: bool = True, idempotency_key: str = "") -> str:
+    try:
+        if denied := _policy_denied(repository, "patch"): return denied
+        return json.dumps(mygithub10.autofix_gofmt_for_pr(_service, repository, pull_number, expected_head_sha, commit_message, dry_run, idempotency_key), ensure_ascii=False)
+    except Exception as exc: return _mygithub10_error(exc)
 
 
 @mcp.tool(name="begin_github_file_upload", description="Begin a bounded, permission-0600 chunked file upload.")

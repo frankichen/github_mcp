@@ -1,4 +1,11 @@
 repositories:
+  frankichen/github_mcp:
+    enabled: true
+    auto_detect: true
+    allowed_profiles:
+      - repo-auto-check
+    max_timeout_seconds: 900
+
   frankichen/ai_war:
     enabled: true
     auto_detect: true
@@ -12,6 +19,7 @@ repositories:
     auto_detect: true
     allowed_profiles:
       - repo-auto-check
+      - repo-fast-check
       - go-check
       - node-check
     max_timeout_seconds: 900

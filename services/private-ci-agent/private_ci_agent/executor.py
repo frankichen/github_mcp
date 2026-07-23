@@ -43,7 +43,7 @@ class JobExecutor:
         self.client.update_job_status(job_id, "preparing")
 
         repo_config = get_repository_overrides(job.repository, job.profile)
-        if job.profile == "repo-auto-check":
+        if job.profile in {"repo-auto-check", "repo-fast-check"}:
             plan = self._auto_plan(job.source_dir, repo_config)
         else:
             plan = self._explicit_plan(job.profile, job.source_dir)
