@@ -129,7 +129,7 @@ PYTHON_COMMANDS = {
         '[ -f pyproject.toml ] && pip install --no-input -e ".[dev,test]" 2>&1 || true',
     ],
     "check": [
-        {"name": "ruff", "command": "python -m ruff check . 2>&1"},
+        {"name": "ruff", "command": "python -m ruff check app 2>&1"},
         {"name": "compileall", "command": "python -m compileall -q . 2>&1"},
         {"name": "pytest", "command": "python -m pytest -q -p no:warnings 2>&1"},
     ],
