@@ -367,7 +367,7 @@ def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, op
         lines = text.splitlines(keepends=True)
         items = [item for item in operations if item["path"] == path]
         positions = []
-        eol = "\r\n" if "\r\n" in data else "\n"
+        eol = "\r\n" if "\r\n" in text else "\n"
         for order, item in enumerate(items):
             operation = item.get("operation")
             if operation not in {"replace", "delete", "insert_before", "insert_after"}:
