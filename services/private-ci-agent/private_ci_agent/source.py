@@ -89,6 +89,7 @@ def prepare_source_from_mirror(repository: str, commit_sha: str, dest_dir: str, 
             if os.path.exists(dest_dir):
                 shutil.rmtree(dest_dir)
             os.makedirs(os.path.dirname(dest_dir), mode=0o700, exist_ok=True)
+            subprocess.run(["git", "-C", mirror, "worktree", "prune"], capture_output=True, text=True, timeout=20)
             checked = subprocess.run(["git", "-C", mirror, "worktree", "add", "--detach", dest_dir, commit_sha], capture_output=True, text=True, timeout=120)
             if checked.returncode:
                 return {"ok": False, "error_code": "SOURCE_WORKTREE_CREATE_FAILED", "message": checked.stderr[-500:]}
