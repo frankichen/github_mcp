@@ -5,6 +5,7 @@ import os
 import time
 import hashlib
 import subprocess
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from private_ci_agent.models import Job
@@ -42,7 +43,7 @@ class JobExecutor:
         self.client.update_job_status(job_id, "preparing")
 
         repo_config = get_repository_overrides(job.repository, job.profile)
-        if job.profile == "repo-auto-check":
+        if job.profile in {"repo-auto-check", "repo-fast-check"}:
             plan = self._auto_plan(job.source_dir, repo_config)
         else:
             plan = self._explicit_plan(job.profile, job.source_dir)
@@ -52,9 +53,11 @@ class JobExecutor:
             "selected_profiles": plan.get("selected_profiles", []),
             "workspaces": self._public_workspaces(plan.get("workspaces", [])),
             "source_mirror_hit": bool(self.config.get("source_mirror_enabled")),
-            "go_version": self._command_version("go", "version"),
-            "node_version": self._command_version("node", "--version"),
-            "npm_version": self._command_version("npm", "--version"),
+            # Versions must come from the isolated Podman runtime, never from
+            # the host running the agent.
+            "go_version": None,
+            "node_version": None,
+            "npm_version": None,
             "cpu_count": os.cpu_count(),
         }
         tree = subprocess.run(["git", "-C", job.source_dir, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True, timeout=20)
@@ -75,7 +78,6 @@ class JobExecutor:
                 metadata["selected_go_version"] = go_commands["selected_go_version"]
                 metadata["source_image"] = go_commands["source_image"]
                 metadata["selected_image"] = go_commands["selected_image"]
-                metadata["image_digest"] = self.podman.image_digest(go_commands["selected_image"])
         self.log_manager.upload(job_id, f"detected_stacks={metadata['detected_stacks']}\n")
         self.log_manager.upload(job_id, f"selected_profiles={metadata['selected_profiles']}\n")
         self.log_manager.upload(job_id, f"workspaces={metadata['workspaces']}\n")
@@ -103,6 +105,11 @@ class JobExecutor:
                     results.append(future.result())
                 for result in results:
                     all_steps.extend(result["steps"])
+                    metadata["go_version"] = metadata["go_version"] or result.get("go_version")
+                    metadata["node_version"] = metadata["node_version"] or result.get("node_version")
+                    metadata["npm_version"] = metadata["npm_version"] or result.get("npm_version")
+                    if result.get("image_digest"):
+                        metadata["image_digest"] = result["image_digest"]
                     if not result["passed"]:
                         all_passed = False
                         final_exit_code = final_exit_code or result["exit_code"]
@@ -119,17 +126,20 @@ class JobExecutor:
             "performance": self._performance(all_steps, total_start),
             "log_truncated": self.log_manager.is_truncated(job_id),
         }
+        infrastructure_error = next(
+            (step for step in all_steps if step.get("error_code") == "CI_TOOLCHAIN_MISMATCH"),
+            None,
+        )
         self.log_manager.flush(job_id)
-        self.client.finish_job(job_id, final_exit_code, summary["status"], summary=summary)
+        self.client.finish_job(
+            job_id,
+            final_exit_code,
+            summary["status"],
+            summary=summary,
+            error_code="CI_TOOLCHAIN_MISMATCH" if infrastructure_error else None,
+            error_message=infrastructure_error.get("message") if infrastructure_error else None,
+        )
         return summary
-
-    @staticmethod
-    def _command_version(command, argument):
-        try:
-            result = subprocess.run([command, argument], capture_output=True, text=True, timeout=10)
-            return result.stdout.strip() if result.returncode == 0 else None
-        except (OSError, subprocess.TimeoutExpired):
-            return None
 
     @staticmethod
     def _hash_files(root, names):
@@ -229,6 +239,9 @@ class JobExecutor:
                 "exit_code": 2,
                 "steps": [{"step_name": label, "status": "configuration_error", "exit_code": 2, "message": message}],
             }
+        # Capture the immutable digest only after image_available() has
+        # refreshed the tag and before the first container is started.
+        image_digest = getattr(self.podman, "image_digest", lambda _image: None)(image) if workspace["stack"] == "go" else None
         if workspace["stack"] == "go":
             # Go 缓存必须和源码目录分离，并按 job 隔离，避免第三方模块进入 gofmt 的源码扫描范围。
             cache_root = os.path.join(job.workspace or os.path.dirname(job.source_dir), "go-cache")
@@ -238,6 +251,7 @@ class JobExecutor:
         else:
             caches = {name: CACHE_MAP[name] for name in commands.get("cache_dirs", {}) if name in CACHE_MAP}
         steps = []
+        runtime_versions = {}
         service_env = None
         if workspace["stack"] == "go":
             self.log_manager.upload(job.job_id, "[services:prepare] Starting isolated PostgreSQL/Redis/RabbitMQ\n")
@@ -246,7 +260,7 @@ class JobExecutor:
                 self.log_manager.upload(job.job_id, f"[services:ready] {service_env.public_summary()}\n")
             except ServiceSetupError as exc:
                 self.log_manager.upload(job.job_id, f"[services:failed] {exc.code}\n")
-                return {"passed": False, "exit_code": 1, "steps": [{"step_name": "services:prepare", "status": "failed", "exit_code": 1, "error_code": exc.code}]}
+                return {"passed": False, "exit_code": 1, "steps": [{"step_name": "services:prepare", "status": "failed", "exit_code": 1, "error_code": exc.code}], "image_digest": image_digest}
         passed = True
         exit_code = 0
 
@@ -256,6 +270,17 @@ class JobExecutor:
             command = setup.get("command") if isinstance(setup, dict) else setup
             step = self._run_setup(job, label, image, source_dir, caches, name, command, service_env)
             steps.append(step)
+            if workspace["stack"] == "go" and name == "version":
+                actual = (step.get("runtime_version") or "").strip()
+                expected = commands.get("selected_go_version", "")
+                match = re.search(r"\bgo(1\.\d+(?:\.\d+)?)\b", actual)
+                actual_version = match.group(1) if match else ""
+                runtime_versions["go_version"] = actual
+                if step["exit_code"] != 0 or not actual_version or actual_version != expected:
+                    message = f"requested Go {expected}, isolated runtime reported {actual or 'unavailable'}"
+                    self.log_manager.upload(job.job_id, f"CI_TOOLCHAIN_MISMATCH: {message}\n")
+                    step.update({"status": "infrastructure_error", "error_code": "CI_TOOLCHAIN_MISMATCH", "message": message})
+                    return {"passed": False, "exit_code": 2, "steps": steps, "image_digest": image_digest, **runtime_versions}
             if step["exit_code"] != 0:
                 setup_failed = True
                 passed = False
@@ -287,7 +312,7 @@ class JobExecutor:
                 passed = False
                 exit_code = exit_code or step["exit_code"]
 
-        return {"passed": passed, "exit_code": exit_code, "steps": steps}
+        return {"passed": passed, "exit_code": exit_code, "steps": steps, "image_digest": image_digest, **runtime_versions}
 
     def _run_setup(self, job, label, image, source_dir, caches, step_name, command, service_env=None):
         name = f"{label}:{step_name}"
@@ -298,7 +323,10 @@ class JobExecutor:
         self._upload_output(job.job_id, result)
         status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else "failed")
         self.log_manager.upload(job.job_id, f"[{name}] {status.upper()} (exit={result['exit_code']})\n")
-        return {"step_name": name, "command": command, "status": status, "exit_code": result["exit_code"], "duration_seconds": time.time() - start}
+        step = {"step_name": name, "command": command, "status": status, "exit_code": result["exit_code"], "duration_seconds": time.time() - start}
+        if name.endswith(":version"):
+            step["runtime_version"] = result.get("stdout", "").strip()
+        return step
 
     def _run_check(self, job, label, image, source_dir, caches, name, command, service_env=None):
         step_name = f"{label}:{name}"

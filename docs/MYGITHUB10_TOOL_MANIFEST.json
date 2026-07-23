@@ -1,10 +1,12 @@
 {
   "service_name": "MyGithub10",
-  "source_commit": "d7c2a37d3823fd13e443bdc196c3236f3af37cc2",
+  "source_tree_sha": "4ae98bd51f308b7467e7f9f5f464d7590d7b0b7f",
+  "generated_from_commit": "HEAD",
+  "generated_at": "2026-07-23T03:39:03.879601Z",
   "controller_image": "not-read-from-runtime",
   "pygithub_version": "2.5.0",
   "mcp_sdk_version": "mcp>=1.7.0 (requirements baseline)",
-  "tool_count": 83,
+  "tool_count": 87,
   "tools": [
     {
       "name": "get_github_file",
@@ -2282,6 +2284,201 @@
       }
     },
     {
+      "name": "replace_text_in_github_file",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Replace exact UTF-8 text with exact HEAD/blob protection and optional dry-run/idempotency.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "expected_blob_sha": {
+            "title": "Expected Blob Sha",
+            "type": "string"
+          },
+          "old_text": {
+            "title": "Old Text",
+            "type": "string"
+          },
+          "new_text": {
+            "title": "New Text",
+            "type": "string"
+          },
+          "replace_all": {
+            "default": false,
+            "title": "Replace All",
+            "type": "boolean"
+          },
+          "expected_occurrences": {
+            "default": 1,
+            "title": "Expected Occurrences",
+            "type": "integer"
+          },
+          "commit_message": {
+            "default": "replace text",
+            "title": "Commit Message",
+            "type": "string"
+          },
+          "dry_run": {
+            "default": true,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "idempotency_key": {
+            "default": "",
+            "title": "Idempotency Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "branch",
+          "expected_head_sha",
+          "path",
+          "expected_blob_sha",
+          "old_text",
+          "new_text"
+        ],
+        "title": "replace_text_in_github_fileArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "copy_or_move_github_file",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Copy or move a Git blob server-side without downloading and re-uploading file contents.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "source_path": {
+            "title": "Source Path",
+            "type": "string"
+          },
+          "destination_path": {
+            "title": "Destination Path",
+            "type": "string"
+          },
+          "expected_source_blob_sha": {
+            "title": "Expected Source Blob Sha",
+            "type": "string"
+          },
+          "operation": {
+            "default": "copy",
+            "title": "Operation",
+            "type": "string"
+          },
+          "overwrite": {
+            "default": false,
+            "title": "Overwrite",
+            "type": "boolean"
+          },
+          "expected_destination_blob_sha": {
+            "default": "",
+            "title": "Expected Destination Blob Sha",
+            "type": "string"
+          },
+          "commit_message": {
+            "default": "copy or move file",
+            "title": "Commit Message",
+            "type": "string"
+          },
+          "dry_run": {
+            "default": true,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "idempotency_key": {
+            "default": "",
+            "title": "Idempotency Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "branch",
+          "expected_head_sha",
+          "source_path",
+          "destination_path",
+          "expected_source_blob_sha"
+        ],
+        "title": "copy_or_move_github_fileArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "autofix_gofmt_for_pr",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Run controlled gofmt on tracked Go files changed by an open non-main PR, with exact PR HEAD protection.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "expected_head_sha": {
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "commit_message": {
+            "default": "自动修复：执行 gofmt 格式化",
+            "title": "Commit Message",
+            "type": "string"
+          },
+          "dry_run": {
+            "default": true,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "idempotency_key": {
+            "default": "",
+            "title": "Idempotency Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number",
+          "expected_head_sha"
+        ],
+        "title": "autofix_gofmt_for_prArguments",
+        "type": "object"
+      }
+    },
+    {
       "name": "begin_github_file_upload",
       "read_only": false,
       "consequential": true,
@@ -2673,6 +2870,26 @@
           "artifact_id"
         ],
         "title": "revoke_release_artifactArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_repository_operation_policy",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Read the server-owned allowlist for a repository; it cannot be widened by MCP parameters.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "get_repository_operation_policyArguments",
         "type": "object"
       }
     },

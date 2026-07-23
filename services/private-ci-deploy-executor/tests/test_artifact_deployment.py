@@ -12,6 +12,6 @@ def test_artifact_deploy_rolls_back_on_health_failure(tmp_path, monkeypatch):
     current = tmp_path / "current"; current.symlink_to(previous)
     monkeypatch.setattr("scripts.artifact_deployment.verify_release_artifact", lambda _: {"archive_sha256": "a" * 64})
     monkeypatch.setattr("scripts.artifact_deployment.subprocess.run", lambda *args, **kwargs: None)
-    result = deploy_artifact(artifact, tmp_path / "incoming", current, healthcheck=lambda: False)
+    result = deploy_artifact(artifact, tmp_path / "incoming", current, healthcheck=lambda _: False)
     assert result["ok"] is False
     assert current.resolve() == previous

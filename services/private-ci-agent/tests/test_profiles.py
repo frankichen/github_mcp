@@ -1,4 +1,7 @@
 import json
+from pathlib import Path
+
+import yaml
 
 import pytest
 
@@ -14,6 +17,12 @@ from private_ci_agent.profiles import (
 
 def write_json(path, value):
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def test_registered_profiles_match_worker_declaration():
+    profiles = yaml.safe_load((Path(__file__).parents[1] / "deploy" / "profiles.yml").read_text())['profiles']
+    from private_ci_agent.config import DEFAULT_CONFIG
+    assert set(DEFAULT_CONFIG["supported_profiles"]) == set(profiles)
 
 
 def node_package(path, scripts=None, deps=None):

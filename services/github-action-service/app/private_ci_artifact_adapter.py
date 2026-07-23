@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
+import importlib
 
 
 def execute_verified_artifact(row, artifact: dict) -> dict:
-    from importlib.util import module_from_spec, spec_from_file_location
-    script = Path(__file__).resolve().parents[2] / "private-ci-deploy-executor" / "scripts" / "artifact_deployment.py"
-    spec = spec_from_file_location("private_artifact_deployment", script)
-    if not spec or not spec.loader: return {"ok": False, "error_code": "ARTIFACT_EXECUTOR_NOT_CONFIGURED"}
-    module = module_from_spec(spec); spec.loader.exec_module(module)
-    incoming = Path(os.environ.get("DEPLOY_ARTIFACT_INCOMING_ROOT", "/srv/private-ci/deploy-incoming")) / row["deployment_id"]
-    current = Path(os.environ.get("DEPLOY_CURRENT_LINK", "/srv/private-ci/current"))
-    def unavailable():
-        return False
-    return module.deploy_artifact(artifact["storage_dir"], incoming, current, migration_required=artifact["migration_required"], migration_runner=unavailable, healthcheck=unavailable, restart_services=unavailable)
+    """Submit to the isolated executor; never execute deployment commands here."""
+    module_name = os.environ.get("ARTIFACT_EXECUTOR_TRANSPORT", "").strip()
+    if not module_name:
+        return {"ok": False, "error_code": "ARTIFACT_EXECUTOR_NOT_CONFIGURED"}
+    try:
+        transport = importlib.import_module(module_name)
+        submit = getattr(transport, "submit_artifact_deployment")
+    except (ImportError, AttributeError):
+        return {"ok": False, "error_code": "ARTIFACT_EXECUTOR_NOT_CONFIGURED"}
+    return submit({
+        "deployment_id": row["deployment_id"],
+        "artifact_id": artifact["artifact_id"],
+        "expected_current_release_id": row.get("current_release_before") if hasattr(row, "get") else row["current_release_before"],
+    })

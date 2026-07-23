@@ -55,6 +55,17 @@ def _error_response(code: str, message: str, retryable: bool = False, details: d
     }, ensure_ascii=False)
 
 
+def _job_policy_denial(job_id: str) -> str | None:
+    """Resolve ownership before allowing any job-id based operation."""
+    job = get_job(job_id)
+    if not job:
+        return _error_response("PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found")
+    from app.repository_policy import require_operation
+    if denial := require_operation(job.get("repository", ""), "private_ci"):
+        return json.dumps(denial, ensure_ascii=False)
+    return None
+
+
 def register_private_ci_mcp_tools(mcp: FastMCP):
     """Register private CI MCP tools on the FastMCP server."""
 
@@ -89,6 +100,11 @@ This is for the private CI system. NOT for GitHub Actions workflows (use list_ci
     )
     async def list_private_ci_profiles(repository: str = "") -> str:
         try:
+            from app.repository_policy import require_operation
+            if not repository:
+                return _error_response("INVALID_ARGUMENT", "repository is required")
+            if denial := require_operation(repository, "private_ci"):
+                return json.dumps(denial, ensure_ascii=False)
             profiles = get_allowed_profiles(repository or None)
             result = {
                 "ok": True,
@@ -116,6 +132,11 @@ This is for the private CI system. NOT for GitHub Actions runs (use list_ci_jobs
         offset: int = 0,
     ) -> str:
         try:
+            from app.repository_policy import require_operation
+            if not repository:
+                return _error_response("INVALID_ARGUMENT", "repository is required")
+            if denial := require_operation(repository, "private_ci"):
+                return json.dumps(denial, ensure_ascii=False)
             jobs = db_list_jobs(
                 repository=repository if repository else None,
                 branch=branch if branch else None,
@@ -161,6 +182,9 @@ This is for the private WSL CI system. NOT for GitHub Actions dispatch (use star
         base_sha: str = "",
     ) -> str:
         try:
+            from app.repository_policy import require_operation
+            if denial := require_operation(repository, "private_ci"):
+                return json.dumps(denial, ensure_ascii=False)
             if not repository or "/" not in repository:
                 return _error_response("INVALID_ARGUMENT", "repository must be in owner/repo format")
             if not SHA_RE.match(commit_sha):
@@ -207,6 +231,7 @@ This is for the private CI system. NOT for GitHub Actions runs (use get_ci_job f
     )
     async def get_private_ci_job(job_id: str) -> str:
         try:
+            if denial := _job_policy_denial(job_id): return denial
             job = get_job(job_id)
             if not job:
                 return _error_response("PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found")
@@ -232,6 +257,7 @@ This is for the private CI system. NOT for GitHub Actions runs (use get_ci_job f
         last_known_step: str = "", last_known_revision: int = 0,
     ) -> str:
         try:
+            if denial := _job_policy_denial(job_id): return denial
             result = await asyncio.to_thread(
                 wait_for_job_change, job_id, timeout_seconds, last_known_status,
                 last_known_step, last_known_revision,
@@ -252,6 +278,7 @@ This is for the private CI system. NOT for GitHub Actions logs (use get_ci_logs 
         job_id: str, offset: int = 0, limit: int = 200,
     ) -> str:
         try:
+            if denial := _job_policy_denial(job_id): return denial
             job = get_job(job_id)
             if not job:
                 return _error_response("PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found")
@@ -271,6 +298,7 @@ This is for the private CI system. NOT for GitHub Actions logs (use get_ci_logs 
     )
     async def get_private_ci_log_tail(job_id: str, lines: int = 100) -> str:
         try:
+            if denial := _job_policy_denial(job_id): return denial
             job = get_job(job_id)
             if not job:
                 return _error_response("PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found")
@@ -298,6 +326,7 @@ This is for the private CI system. NOT for GitHub Actions (use cancel_ci_job for
     )
     async def cancel_private_ci_job(job_id: str) -> str:
         try:
+            if denial := _job_policy_denial(job_id): return denial
             job = get_job(job_id)
             if not job:
                 return _error_response("PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found")

@@ -8,7 +8,10 @@ from app.mcp_server import mcp
 
 @pytest.mark.asyncio
 async def test_checked_in_manifest_matches_registered_tools():
-    manifest_path = Path(__file__).parents[3] / "docs" / "MYGITHUB10_TOOL_MANIFEST.json"
+    candidates = [parent / "docs" / "MYGITHUB10_TOOL_MANIFEST.json" for parent in Path(__file__).parents]
+    fallback = [Path("/app/docs/MYGITHUB10_TOOL_MANIFEST.json"), Path("/repo/docs/MYGITHUB10_TOOL_MANIFEST.json"), Path("/docs/MYGITHUB10_TOOL_MANIFEST.json")]
+    manifest_path = next((path for path in [*candidates, *fallback] if path.is_file()), None)
+    assert manifest_path is not None, "checked-in tool manifest is required"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     actual = await mcp.list_tools()
     actual_names = [tool.name for tool in actual]

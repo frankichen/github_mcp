@@ -142,6 +142,7 @@ PROFILE_COMMANDS = {
     "python-check": PYTHON_COMMANDS,
     "node-check": None,
     "repo-auto-check": None,
+    "repo-fast-check": None,
 }
 
 
@@ -326,7 +327,7 @@ def get_commands_for_profile(profile: str, source_dir: str = "") -> dict:
     if profile not in PROFILE_COMMANDS:
         logger.error("Unknown profile: %s", profile)
         return None
-    if profile == "repo-auto-check":
+    if profile in {"repo-auto-check", "repo-fast-check"}:
         detected = discover_workspaces(source_dir)
         if not detected["workspaces"]:
             return {"error": "unsupported", "message": "No supported project Manifest detected", **detected}

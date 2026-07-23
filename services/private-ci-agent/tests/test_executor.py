@@ -22,10 +22,14 @@ class FakeClient:
 
 
 class FakePodman:
-    def __init__(self, failing_command=None):
+    def __init__(self, failing_command=None, go_version="go1.26.4"):
         self.failing_command = failing_command
+        self.go_version = go_version
         self.commands = []
         self.caches = []
+
+    def image_digest(self, _image):
+        return "sha256:runtime-image-b"
 
     def image_available(self, _image):
         return True
@@ -34,7 +38,8 @@ class FakePodman:
         self.caches.append(_caches)
         self.commands.append((command, network))
         exit_code = 1 if self.failing_command and self.failing_command in command else 0
-        return {"exit_code": exit_code, "stdout": "", "stderr": "", "timed_out": False}
+        stdout = f"go version {self.go_version} linux/amd64\n" if command == "go version" and exit_code == 0 else ""
+        return {"exit_code": exit_code, "stdout": stdout, "stderr": "", "timed_out": False}
 
 
 def make_executor(podman):
@@ -86,6 +91,24 @@ def test_go_build_failure_fails_workspace(tmp_path):
 
     assert result["passed"] is False
     assert any(step["step_name"].endswith(":gobuild") and step["status"] == "failed" for step in result["steps"])
+
+
+def test_go_runtime_version_mismatch_fails_closed(tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    podman = FakePodman(go_version="go1.26.0")
+    result = make_executor(podman)._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
+
+    assert result["passed"] is False
+    assert result["exit_code"] == 2
+    assert any(step.get("error_code") == "CI_TOOLCHAIN_MISMATCH" for step in result["steps"])
+    assert not any("go test" in command or "go build" in command for command, _ in podman.commands)
+
+
+def test_summary_uses_digest_after_refreshed_image(tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    result = make_executor(FakePodman())._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
+
+    assert result["image_digest"] == "sha256:runtime-image-b"
 
 
 def test_go_cache_is_job_scoped_and_outside_source(tmp_path):

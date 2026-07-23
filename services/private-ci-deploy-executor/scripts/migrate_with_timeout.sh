@@ -7,19 +7,31 @@ TOTAL_TIMEOUT_SECONDS="${MIGRATION_TOTAL_TIMEOUT_SECONDS:-600}"
 STEP_TIMEOUT_SECONDS="${MIGRATION_STEP_TIMEOUT_SECONDS:-120}"
 HEARTBEAT_SECONDS="${MIGRATION_HEARTBEAT_SECONDS:-10}"
 
+event() { echo "$1 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2; }
+
 if [[ "${1:-}" != "--" || "$#" -lt 2 ]]; then
   echo "usage: $0 -- migration-command [args...]" >&2
   exit 64
 fi
 shift
 
-if command -v pg_isready >/dev/null 2>&1 && [[ -n "${DATABASE_URL:-}" ]]; then
-  timeout "${STEP_TIMEOUT_SECONDS}s" pg_isready -d "$DATABASE_URL"
+event migration_waiting_database
+if ! command -v pg_isready >/dev/null 2>&1 || [[ -z "${DATABASE_URL:-}" ]]; then
+  if [[ "${MIGRATION_TEST_MODE:-false}" == "true" ]]; then
+    event "migration_database_check_skipped reason=MIGRATION_DATABASE_CHECK_UNAVAILABLE"
+  else
+    event "migration_failed error_code=MIGRATION_DATABASE_CHECK_UNAVAILABLE"
+    exit 78
+  fi
+elif ! timeout "${STEP_TIMEOUT_SECONDS}s" pg_isready -d "$DATABASE_URL" >/dev/null 2>&1; then
+  event migration_timeout
+  exit 124
 fi
+if [[ "${MIGRATION_TEST_MODE:-false}" != "true" || -n "${DATABASE_URL:-}" ]]; then event migration_database_ready; fi
 
 heartbeat() {
   while true; do
-    echo "migration-heartbeat ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) command=${1}" >&2
+    event migration_heartbeat
     sleep "$HEARTBEAT_SECONDS"
   done
 }
@@ -28,4 +40,11 @@ heartbeat "$1" &
 HEARTBEAT_PID=$!
 trap 'kill "$HEARTBEAT_PID" 2>/dev/null || true' EXIT
 
-timeout --foreground "${TOTAL_TIMEOUT_SECONDS}s" "$@"
+event migration_started
+if timeout --foreground "${TOTAL_TIMEOUT_SECONDS}s" "$@"; then
+  event migration_completed
+else
+  code=$?
+  if [[ "$code" == 124 ]]; then event migration_timeout; else event migration_failed; fi
+  exit "$code"
+fi

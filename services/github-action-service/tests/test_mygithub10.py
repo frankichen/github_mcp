@@ -82,6 +82,93 @@ def test_strict_patch_dry_run_and_range_dry_run():
     assert range_result["dry_run"] is True
 
 
+def test_patch_dry_run_rejects_wrong_expected_blob_sha():
+    service = FakeService(FakeRepo(b"one\ntwo\n"))
+    patch = "--- a/file.txt\n+++ b/file.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n"
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        mygithub10.apply_patch(service, "owner/repo", "main", "head-1", json.dumps({"file.txt": "wrong-blob"}), patch, "change", True)
+    assert exc.value.code == "PATCH_FILE_CHANGED"
+
+
+def test_strict_patch_uses_hunk_line_numbers_and_supports_multiple_hunks():
+    service = FakeService(FakeRepo(b"a\nb\nc\nd\ne\n"))
+    patch = """--- a/file.txt
++++ b/file.txt
+@@ -2,1 +2,1 @@
+-b
++B
+@@ -5,1 +5,1 @@
+-e
++E
+"""
+    result = mygithub10.apply_patch(service, "owner/repo", "main", "head-1", "{}", patch, "change", True)
+    assert result["dry_run"] is True
+    parsed = mygithub10._parse_patch(patch)
+    assert len(parsed[0][2]) == 2
+    assert mygithub10._apply_file_patch(b"a\nb\nc\nd\ne\n", parsed[0][2]) == b"a\nB\nc\nd\nE\n"
+
+
+def test_strict_patch_rejects_wrong_hunk_location_and_counts():
+    with pytest.raises(mygithub10.MyGithub10Error) as location:
+        mygithub10._apply_file_patch(b"a\nb\n", [{"old_start": 1, "old_count": 1, "new_start": 1, "new_count": 1, "entries": [{"prefix": "-", "text": "b\n", "old_no_newline": "0", "new_no_newline": "0"}, {"prefix": "+", "text": "B\n", "old_no_newline": "0", "new_no_newline": "0"}]}])
+    assert location.value.code == "PATCH_DOES_NOT_APPLY"
+    with pytest.raises(mygithub10.MyGithub10Error) as count:
+        mygithub10._parse_patch("--- a/f\n+++ b/f\n@@ -1,2 +1,1 @@\n-a\n+b\n")
+    assert count.value.code == "PATCH_HUNK_COUNT_MISMATCH"
+
+
+def test_range_insert_before_does_not_replace_anchor():
+    service = FakeService(FakeRepo(b"one\ntwo\n"))
+    ops = [{"path": "file.txt", "operation": "insert_before", "start_line": 2, "end_line": 2, "replacement": "inserted\n", "expected_anchor_sha256": hashlib.sha256(b"two\n").hexdigest()}]
+    result = mygithub10.edit_ranges(service, "owner/repo", "main", "head-1", json.dumps(ops), "change", True)
+    assert result["dry_run"] is True
+
+
+def test_replace_text_exact_matching():
+    service = FakeService(FakeRepo(b"one\ntwo\none\n"))
+    result = mygithub10.replace_text(service, "owner/repo", "main", "head-1", "file.txt", "blob-1", "two", "TWO", False, 1, "change", True)
+    assert result["occurrence_count"] == 1
+    with pytest.raises(mygithub10.MyGithub10Error) as ambiguous:
+        mygithub10.replace_text(service, "owner/repo", "main", "head-1", "file.txt", "blob-1", "one", "ONE", False, 1, "change", True)
+    assert ambiguous.value.code == "REPLACE_TEXT_AMBIGUOUS"
+
+
+def test_patch_commit_uses_pygithub_git_commit_tree(monkeypatch):
+    class Ref:
+        object = SimpleNamespace(sha="head-1")
+
+        def edit(self, sha, force):
+            assert sha == "commit-1"
+            assert force is False
+
+    class Repo(FakeRepo):
+        def get_git_ref(self, name):
+            assert name == "heads/main"
+            return Ref()
+
+        def get_git_commit(self, sha):
+            return SimpleNamespace(tree=SimpleNamespace(sha="tree-1"))
+
+    class Client(FakeRaw):
+        def create_blob(self, repository, content):
+            return SimpleNamespace(sha="blob-2")
+
+        def create_git_tree(self, repository, elements, base_tree):
+            assert base_tree == "tree-1"
+            return SimpleNamespace(sha="tree-2")
+
+        def create_commit(self, repository, message, tree_sha, parents):
+            assert tree_sha == "tree-2"
+            assert parents == ["head-1"]
+            return SimpleNamespace(sha="commit-1")
+
+    repo = Repo(b"one\ntwo\n")
+    service = SimpleNamespace(client=Client(repo), _check_repository_allowed=lambda _: None, _check_default_branch_write=lambda *_: None)
+    monkeypatch.setattr(mygithub10, "_repo", lambda *_: repo)
+    result = mygithub10._commit_files(service, "owner/repo", "main", "head-1", {"file.txt": b"updated\n"}, {}, "change")
+    assert result["commit_sha"] == "commit-1"
+
+
 def test_invalid_utf8_boundary_is_rejected():
     service = FakeService(FakeRepo("😀".encode()))
     with pytest.raises(mygithub10.MyGithub10Error) as exc:
