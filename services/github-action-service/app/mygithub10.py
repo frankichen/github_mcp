@@ -285,7 +285,7 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
         else:
             blob = service.client.create_blob(repository, content.decode("utf-8"))
             elements.append({"path": path, "mode": "100644", "type": "blob", "sha": blob.sha})
-    base_tree = repo.get_git_commit(actual_head).commit.tree.sha
+    base_tree = repo.get_git_commit(actual_head).tree.sha
     tree = service.client.create_git_tree(repository, elements, base_tree)
     commit = service.client.create_commit(repository, message, tree.sha, [actual_head])
     try:

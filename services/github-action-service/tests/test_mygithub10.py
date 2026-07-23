@@ -90,6 +90,42 @@ def test_patch_dry_run_rejects_wrong_expected_blob_sha():
     assert exc.value.code == "PATCH_FILE_CHANGED"
 
 
+def test_patch_commit_uses_pygithub_git_commit_tree(monkeypatch):
+    class Ref:
+        object = SimpleNamespace(sha="head-1")
+
+        def edit(self, sha, force):
+            assert sha == "commit-1"
+            assert force is False
+
+    class Repo(FakeRepo):
+        def get_git_ref(self, name):
+            assert name == "heads/main"
+            return Ref()
+
+        def get_git_commit(self, sha):
+            return SimpleNamespace(tree=SimpleNamespace(sha="tree-1"))
+
+    class Client(FakeRaw):
+        def create_blob(self, repository, content):
+            return SimpleNamespace(sha="blob-2")
+
+        def create_git_tree(self, repository, elements, base_tree):
+            assert base_tree == "tree-1"
+            return SimpleNamespace(sha="tree-2")
+
+        def create_commit(self, repository, message, tree_sha, parents):
+            assert tree_sha == "tree-2"
+            assert parents == ["head-1"]
+            return SimpleNamespace(sha="commit-1")
+
+    repo = Repo(b"one\ntwo\n")
+    service = SimpleNamespace(client=Client(repo), _check_repository_allowed=lambda _: None, _check_default_branch_write=lambda *_: None)
+    monkeypatch.setattr(mygithub10, "_repo", lambda *_: repo)
+    result = mygithub10._commit_files(service, "owner/repo", "main", "head-1", {"file.txt": b"updated\n"}, {}, "change")
+    assert result["commit_sha"] == "commit-1"
+
+
 def test_invalid_utf8_boundary_is_rejected():
     service = FakeService(FakeRepo("😀".encode()))
     with pytest.raises(mygithub10.MyGithub10Error) as exc:
