@@ -31,10 +31,10 @@ def main() -> int:
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     names = [tool.name for tool in asyncio.run(mcp.list_tools())]
     capabilities = mygithub10.capabilities(os.environ.get("MYGITHUB10_BUILD_SHA", ""))
-    assert manifest["tool_count"] == 84 == len(names)
+    assert manifest["tool_count"] == 87 == len(names)
     assert names == [tool["name"] for tool in manifest["tools"]]
     assert re.fullmatch(r"[0-9a-f]{40}", capabilities.get("build_sha", ""))
-    assert {"get_github_file", "commit_github_files", "get_test_deployment_logs"} <= set(names)
+    assert {"get_github_file", "commit_github_files", "get_test_deployment_logs", "replace_text_in_github_file", "copy_or_move_github_file", "autofix_gofmt_for_pr"} <= set(names)
     policy = get_policy("frankichen/github_mcp")
     assert policy.get("github") is True and policy.get("private_ci") is True
     assert policy.get("test_deploy") is False and policy.get("self_deploy") is False
