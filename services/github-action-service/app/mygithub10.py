@@ -283,11 +283,11 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
         if content is None:
             elements.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
         else:
-            blob = service.create_blob(repository, content.decode("utf-8"))
+            blob = service.client.create_blob(repository, content.decode("utf-8"))
             elements.append({"path": path, "mode": "100644", "type": "blob", "sha": blob.sha})
     base_tree = repo.get_git_commit(actual_head).commit.tree.sha
-    tree = service.create_git_tree(repository, elements, base_tree)
-    commit = service.create_commit(repository, message, tree.sha, [actual_head])
+    tree = service.client.create_git_tree(repository, elements, base_tree)
+    commit = service.client.create_commit(repository, message, tree.sha, [actual_head])
     try:
         ref.edit(sha=commit.sha, force=False)
     except Exception as exc:
