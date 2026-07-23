@@ -1,8 +1,8 @@
 {
   "service_name": "MyGithub10",
-  "source_tree_sha": "3f2a82511066b393d9dea271dc790e050e6e55c2",
-  "generated_from_commit": "b1fc76422b878725c53ff5f9f432e1e46d16c44e",
-  "generated_at": "2026-07-23T02:11:11.591828Z",
+  "source_tree_sha": "f259ab0178821dac1d2c9b956f01d9a992784da8",
+  "generated_from_commit": "c94a0c380ec062add95c94cac35c716513890825",
+  "generated_at": "2026-07-23T02:18:51.913656Z",
   "controller_image": "not-read-from-runtime",
   "pygithub_version": "2.5.0",
   "mcp_sdk_version": "mcp>=1.7.0 (requirements baseline)",
