@@ -8,5 +8,12 @@ def test_source_mirror_rejects_unapproved_repository(tmp_path):
     assert result["error_code"] == "SOURCE_REPOSITORY_NOT_ALLOWED"
 
 
-def test_source_mirror_constants_are_authoritative():
-    assert source.AUTHORITATIVE_REPOSITORY_URL == "https://github.com/frankichen/sxt.git"
+def test_source_mirror_url_is_derived_from_enabled_allowlist(tmp_path, monkeypatch):
+    config = tmp_path / "repositories.yml"
+    config.write_text(
+        "repositories:\n  frankichen/github_mcp:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(source, "REPOSITORY_CONFIG_PATH", str(config))
+    assert source._authoritative_repository_url("frankichen/github_mcp") == "https://github.com/frankichen/github_mcp.git"
+    assert source._authoritative_repository_url("evil/repo") is None
