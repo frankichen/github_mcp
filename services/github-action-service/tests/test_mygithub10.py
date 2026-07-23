@@ -82,6 +82,14 @@ def test_strict_patch_dry_run_and_range_dry_run():
     assert range_result["dry_run"] is True
 
 
+def test_patch_dry_run_rejects_wrong_expected_blob_sha():
+    service = FakeService(FakeRepo(b"one\ntwo\n"))
+    patch = "--- a/file.txt\n+++ b/file.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n"
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        mygithub10.apply_patch(service, "owner/repo", "main", "head-1", json.dumps({"file.txt": "wrong-blob"}), patch, "change", True)
+    assert exc.value.code == "PATCH_FILE_CHANGED"
+
+
 def test_invalid_utf8_boundary_is_rejected():
     service = FakeService(FakeRepo("😀".encode()))
     with pytest.raises(mygithub10.MyGithub10Error) as exc:

@@ -309,6 +309,9 @@ def apply_patch(client, repository: str, branch: str, expected_head_sha: str, ex
         old_sha = None
         if operation != "add":
             old, old_sha, _ = _read_blob(repo, path, branch)
+        expected_sha = expected.get(path, "")
+        if expected_sha and expected_sha != (old_sha or ""):
+            raise MyGithub10Error("PATCH_FILE_CHANGED", f"file blob changed: {path}", {"expected": expected_sha, "actual": old_sha})
         new = None if operation == "delete" else _apply_file_patch(old, [hunks])
         changed[path] = new
         previews.append({"path": path, "operation": operation, "old_blob_sha": old_sha, "new_content_sha256": _sha256(new or b""), "added_lines": 0, "deleted_lines": 0})
