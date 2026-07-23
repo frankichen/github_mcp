@@ -87,6 +87,7 @@ class PodmanRunner:
             "--read-only",
             "--tmpfs=/tmp:rw,noexec,nosuid,size=256m",
             "--tmpfs=/run:rw,noexec,nosuid,size=64m",
+            "--tmpfs=/data:rw,noexec,nosuid,size=64m",
             "-v", f"{source_dir}:/workspace:Z",
             "--workdir", "/workspace",
             "--network=none",
@@ -185,6 +186,7 @@ class PodmanRunner:
             "--read-only",
             "--tmpfs=/tmp:rw,noexec,nosuid,size=256m",
             "--tmpfs=/run:rw,noexec,nosuid,size=64m",
+            "--tmpfs=/data:rw,noexec,nosuid,size=64m",
             "-v", f"{source_dir}:/workspace:Z",
             "--workdir", "/workspace",
         ] + net_arg + cache_mounts + [

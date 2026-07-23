@@ -31,7 +31,7 @@ def _notify_job_change(job_id: str) -> None:
 def _get_db():
     import sqlite3
     if not hasattr(_local, "db") or _local.db is None:
-        db = sqlite3.connect(DB_PATH, timeout=15)
+        db = sqlite3.connect(os.environ.get("CI_DB_PATH", DB_PATH), timeout=15)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA busy_timeout=15000")

@@ -21,6 +21,7 @@ COPY app/ ./app/
 COPY tests/ ./tests/
 COPY config/ ./config/
 COPY scripts/ ./scripts/
+COPY docs/ ./docs/
 RUN mkdir -p /app/docs \
     && python -c 'import asyncio,json; from pathlib import Path; from app.mcp_server import mcp; tools=asyncio.run(mcp.list_tools()); items=[]; [items.append({"name": t.name, "read_only": t.name.startswith(("get_","list_","compare_","search_","diagnose_","plan_")) and not t.name.startswith(("create_","update_","delete_","merge_","mark_","convert_","start_","cancel_","rollback_")), "consequential": not (t.name.startswith(("get_","list_","compare_","search_","diagnose_","plan_")) and not t.name.startswith(("create_","update_","delete_","merge_","mark_","convert_","start_","cancel_","rollback_"))), "category": "github", "description": t.description or "", "input_schema": t.inputSchema}) for t in tools]; Path("/app/docs/MYGITHUB10_TOOL_MANIFEST.json").write_text(json.dumps({"service_name":"MyGithub10","source_tree_sha":"unknown","generated_from_commit":"unknown","generated_at":"unknown","controller_image":"not-read-from-runtime","pygithub_version":"2.5.0","mcp_sdk_version":"mcp>=1.7.0 (requirements baseline)","tool_count":len(items),"tools":items},ensure_ascii=False,indent=2)+chr(10),encoding="utf-8")'
 
