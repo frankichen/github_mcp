@@ -40,6 +40,7 @@ GO_COMMANDS = {
         {"name": "migrate", "command": "make migrate-up 2>&1"},
     ],
     "check": [
+        {"name": "ai-integrity", "command": "make ai-integrity-check 2>&1"},
         {"name": "gofmt", "command": 'UNFORMATTED=$(gofmt -l . 2>&1); if [ -n "$UNFORMATTED" ]; then echo "UNFORMATTED FILES:"; echo "$UNFORMATTED"; exit 1; fi; echo "All Go files properly formatted"'},
         {"name": "govet", "command": "go vet ./... 2>&1"},
         {"name": "gotest", "command": "go test -p 6 -count=1 ./... 2>&1"},
@@ -47,6 +48,15 @@ GO_COMMANDS = {
     ],
     "image": "docker.io/library/golang:1.26.4",
     "cache_dirs": {"go": "/ci-cache"},
+}
+
+FAST_CHECK_COMMANDS = {
+    "setup": [],
+    "check": [
+        {"name": "ai-integrity", "command": "make ai-integrity-check 2>&1"},
+    ],
+    "image": "docker.io/library/golang:1.26.4",
+    "cache_dirs": {},
 }
 
 APPROVED_GO_IMAGE_PREFIXES = (
@@ -142,6 +152,7 @@ PROFILE_COMMANDS = {
     "python-check": PYTHON_COMMANDS,
     "node-check": None,
     "repo-auto-check": None,
+    "repo-fast-check": FAST_CHECK_COMMANDS,
 }
 
 
