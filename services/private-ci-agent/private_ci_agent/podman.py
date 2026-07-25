@@ -243,16 +243,6 @@ class PodmanRunner:
                 "PIP_CACHE_DIR": "/ci-cache/pip",
                 "PIP_DISABLE_PIP_VERSION_CHECK": "1",
             })
-        safe_env.update({
-            "ACTION_API_KEY": "test_api_key_32_bytes_long",
-            "GITHUB_TOKEN": "test_token_value",
-            "ALLOWED_REPOSITORIES": "owner/allowed-repo",
-            "ALLOW_DEFAULT_BRANCH_WRITE": "false",
-            "MAX_FILE_CHARACTERS": "5000",
-            "MAX_TOTAL_CHARACTERS": "10000",
-            "MAX_FILES_PER_COMMIT": "5",
-            "REPOSITORY_POLICY_FILE": "/workspace/tests/repository_policies_test.yml",
-        })
         if env:
             allowed = {"DATABASE_URL", "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "RABBITMQ_URL"}
             safe_env.update({key: value for key, value in env.items() if key in allowed})
