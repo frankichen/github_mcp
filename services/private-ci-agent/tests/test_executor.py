@@ -195,7 +195,7 @@ def test_gofmt_autofix_failure_still_fails_workspace(tmp_path):
     assert result["passed"] is False
     gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
     assert gofmt_step["status"] in ("failed", "timed_out")
-    assert gofmt_step.get("autofix") is None
+    assert gofmt_step["autofix"]["reason"] == "repository_not_allowed"
 
 
 def test_setup_failure_blocks_gofmt_autofix(tmp_path):
