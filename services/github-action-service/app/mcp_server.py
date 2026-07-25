@@ -925,6 +925,54 @@ async def validate_release_artifact(artifact_id: str, repository: str, branch: s
 async def revoke_release_artifact(artifact_id: str) -> str:
     return json.dumps({"ok": True, "artifact": attestation_registry.revoke_artifact(artifact_id)}, ensure_ascii=False)
 
+
+@mcp.tool(name="get_repository_operation_policy", description="Return the operation policy for a repository: what MyGithub10 operations are allowed (GitHub read/write, private CI, test deploy, self deploy).")
+async def get_repository_operation_policy(repository: str) -> str:
+    """Return allowed operations for a repository based on CI and deploy config."""
+    from app.ci_repository_config import is_repository_allowed, get_allowed_profiles
+
+    github_allowed = False
+    private_ci_allowed = False
+    test_deploy_allowed = False
+    self_deploy_allowed = False
+
+    # GitHub operations: repository must be in allowed list (or wildcard)
+    allowed_repos_env = os.environ.get("ALLOWED_REPOSITORIES", "*").strip()
+    if allowed_repos_env == "*":
+        github_allowed = True
+    else:
+        allowed = {r.strip() for r in allowed_repos_env.split(",") if r.strip()}
+        github_allowed = repository in allowed
+
+    # Private CI: repository must be explicitly configured with at least one profile
+    if is_repository_allowed(repository):
+        profiles = get_allowed_profiles(repository)
+        private_ci_allowed = len(profiles) > 0
+
+    # Deployment policy: derived from environment or config
+    deploy_repos = os.environ.get("DEPLOY_ALLOWED_REPOSITORIES", "").strip()
+    if deploy_repos == "*":
+        test_deploy_allowed = True
+    elif deploy_repos:
+        test_deploy_allowed = repository in {r.strip() for r in deploy_repos.split(",") if r.strip()}
+    self_deploy_env = os.environ.get("SELF_DEPLOY_REPOSITORIES", "").strip()
+    if self_deploy_env == "*":
+        self_deploy_allowed = True
+    elif self_deploy_env:
+        self_deploy_allowed = repository in {r.strip() for r in self_deploy_env.split(",") if r.strip()}
+
+    return json.dumps({
+        "ok": True,
+        "repository": repository,
+        "policy": {
+            "github": github_allowed,
+            "private_ci": private_ci_allowed,
+            "test_deploy": test_deploy_allowed,
+            "self_deploy": self_deploy_allowed,
+        },
+    }, ensure_ascii=False)
+
+
 register_private_ci_mcp_tools(mcp)
 
 
