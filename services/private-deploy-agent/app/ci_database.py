@@ -390,7 +390,7 @@ def _job_row_to_dict(row, db) -> dict:
             summary = json.loads(row["summary_json"])
         except Exception:
             pass
-    return {
+    result = {
         "job_id": row["job_id"],
         "repository": row["repository"],
         "branch": row["branch"],
