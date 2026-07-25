@@ -4,3 +4,11 @@ version = "1.0.0"
 description = "Private CI Agent for WSL Rootless Podman"
 requires-python = ">=3.10"
 dependencies = ["pyyaml>=6.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["private_ci_agent*"]
+exclude = ["deploy*", "tests*"]
