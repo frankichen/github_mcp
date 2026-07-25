@@ -1,0 +1,168 @@
+#!/bin/bash
+set +e
+
+CONF_DIR="/etc/private-ci"
+WORKER_ENV="${CONF_DIR}/worker.env"
+SUBUID_FILE="/etc/subuid"
+SUBGID_FILE="/etc/subgid"
+PODMAN_BIN="/usr/bin/podman"
+NEWUIDMAP="/usr/bin/newuidmap"
+NEWGIDMAP="/usr/bin/newgidmap"
+WORKSPACE_ROOT="/srv/private-ci/workspaces"
+CACHE_ROOT="/srv/private-ci/cache"
+LOG_ROOT="/srv/private-ci/logs"
+RUN_DIR="/srv/private-ci/run"
+
+CIWORKER_UID=1500
+CIWORKER_GID=1500
+XDG_RUNTIME_DIR="/run/user/${CIWORKER_UID}"
+
+CURRENT_UID=$(id -u)
+CURRENT_USER=$(id -un)
+
+CRITICAL_FAILURES=0
+WARNINGS=0
+
+log_pass()  { echo "[PASS] $*"; }
+log_warn()  { echo "[WARN] $*"; WARNINGS=$((WARNINGS + 1)); }
+log_fail()  { echo "[FAIL] $*"; CRITICAL_FAILURES=$((CRITICAL_FAILURES + 1)); }
+
+sanitize_output() {
+    sed -E 's/(token[=: ][^ ]+)/token=***/gi; s/(Bearer )[^ ]+/\1***/gi; s/(CI_WORKER_TOKEN=)[^ ]+/\1***/gi'
+}
+
+podman_run_as_ciworker() {
+    if [ "${CURRENT_UID}" = "${CIWORKER_UID}" ]; then
+        "${PODMAN_BIN}" "$@"
+    else
+        runuser -u ciworker -g ciworker -- /bin/bash -c 'cd /tmp; exec /usr/bin/podman "$@"' -- "$@"
+    fi
+}
+
+run_preflight() {
+    echo "=== Private CI Pre-flight Check at $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+    echo "=== Running as: uid=${CURRENT_UID} user=${CURRENT_USER} ==="
+
+    if id ciworker &>/dev/null; then
+        log_pass "ciworker user exists"
+    else
+        log_fail "ciworker user does not exist"
+    fi
+
+    local actual_uid actual_gid
+    actual_uid=$(id -u ciworker 2>/dev/null || echo 0)
+    actual_gid=$(id -g ciworker 2>/dev/null || echo 0)
+    [ "${actual_uid}" = "${CIWORKER_UID}" ] && log_pass "ciworker UID=${CIWORKER_UID} unchanged" || log_fail "ciworker UID changed: expected ${CIWORKER_UID}, got ${actual_uid}"
+    [ "${actual_gid}" = "${CIWORKER_GID}" ] && log_pass "ciworker GID=${CIWORKER_GID} unchanged" || log_fail "ciworker GID changed: expected ${CIWORKER_GID}, got ${actual_gid}"
+
+    grep -q "^ciworker:" "${SUBUID_FILE}" 2>/dev/null && log_pass "/etc/subuid has ciworker mapping" || log_fail "/etc/subuid missing ciworker mapping"
+    grep -q "^ciworker:" "${SUBGID_FILE}" 2>/dev/null && log_pass "/etc/subgid has ciworker mapping" || log_fail "/etc/subgid missing ciworker mapping"
+
+    if [ -x "${NEWUIDMAP}" ]; then
+        local perms
+        perms=$(stat -c '%A' "${NEWUIDMAP}" 2>/dev/null || echo "???")
+        [ "${perms:3:1}" = "s" ] && log_pass "newuidmap present and setuid (${perms})" || log_fail "newuidmap missing setuid bit (${perms})"
+    else
+        log_fail "newuidmap not found"
+    fi
+
+    if [ -x "${NEWGIDMAP}" ]; then
+        local perms
+        perms=$(stat -c '%A' "${NEWGIDMAP}" 2>/dev/null || echo "???")
+        [ "${perms:3:1}" = "s" ] && log_pass "newgidmap present and setuid (${perms})" || log_fail "newgidmap missing setuid bit (${perms})"
+    else
+        log_fail "newgidmap not found"
+    fi
+
+    local max_ns
+    max_ns=$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo 0)
+    [ "${max_ns}" -gt 0 ] && log_pass "user.max_user_namespaces=${max_ns}" || log_fail "user.max_user_namespaces=${max_ns} (must be > 0)"
+
+    if [ -d "${XDG_RUNTIME_DIR}" ]; then
+        local xdg_owner
+        xdg_owner=$(stat -c '%u' "${XDG_RUNTIME_DIR}" 2>/dev/null || echo 0)
+        [ "${xdg_owner}" = "${CIWORKER_UID}" ] && log_pass "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR} owned by ciworker" || { log_warn "XDG_RUNTIME_DIR owner mismatch, fixing..."; mkdir -p "${XDG_RUNTIME_DIR}" 2>/dev/null; chown "${CIWORKER_UID}:${CIWORKER_GID}" "${XDG_RUNTIME_DIR}" 2>/dev/null; chmod 700 "${XDG_RUNTIME_DIR}" 2>/dev/null; log_pass "XDG_RUNTIME_DIR fixed"; }
+    else
+        log_warn "XDG_RUNTIME_DIR missing, creating..."; mkdir -p "${XDG_RUNTIME_DIR}" 2>/dev/null; chown "${CIWORKER_UID}:${CIWORKER_GID}" "${XDG_RUNTIME_DIR}" 2>/dev/null; chmod 700 "${XDG_RUNTIME_DIR}" 2>/dev/null; log_pass "XDG_RUNTIME_DIR created"
+    fi
+
+    local pm_storage
+    if podman_run_as_ciworker info --format json >/dev/null 2>&1; then
+        pm_storage=$(podman_run_as_ciworker info --format json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['store']['graphRoot'])" 2>/dev/null || echo "")
+    else
+        pm_storage=""
+    fi
+    [ -n "${pm_storage}" ] && log_pass "Podman storage: ${pm_storage}" || log_warn "Could not query Podman storage path"
+
+    # Pre-cleanup: kill stale catatonit and reset runtime before namespace test
+    pkill -9 -u ${CIWORKER_UID} catatonit 2>/dev/null || true
+    sleep 0.5
+    rm -rf "${XDG_RUNTIME_DIR}/containers" "${XDG_RUNTIME_DIR}/libpod" 2>/dev/null || true
+    mkdir -p "${XDG_RUNTIME_DIR}/containers" "${XDG_RUNTIME_DIR}/libpod" 2>/dev/null || true
+    chown ${CIWORKER_UID}:${CIWORKER_GID} "${XDG_RUNTIME_DIR}/containers" "${XDG_RUNTIME_DIR}/libpod" 2>/dev/null || true
+    podman_run_as_ciworker system migrate >/dev/null 2>&1 || true
+    echo "[PREFLIGHT] Pre-cleaned podman runtime before unshare check"
+    if podman_run_as_ciworker unshare true 2>/dev/null; then
+        log_pass "podman unshare successful"
+    else
+        # A WSL restart can leave a stale rootless pause namespace behind.
+        # Migrate only when there is no running container; never reset/prune.
+        local running_containers
+        running_containers=$(podman_run_as_ciworker ps --format '{{.ID}}' 2>/dev/null | sed '/^[[:space:]]*$/d' | wc -l)
+        if [ "${running_containers}" -eq 0 ]; then
+            log_warn "podman unshare failed; no running containers, attempting safe system migrate"
+            if podman_run_as_ciworker system migrate >/dev/null 2>&1 && podman_run_as_ciworker unshare true 2>/dev/null; then
+                log_pass "podman system migrate restored rootless namespace"
+            else
+                log_warn "podman unshare failed after safe system migrate (non-critical)"
+            fi
+        else
+            log_warn "podman unshare failed while ${running_containers} container(s) are running (non-critical)"
+        fi
+    fi
+
+    if timeout 5 bash -c "echo >/dev/tcp/100.118.124.97/8788" 2>/dev/null; then
+        log_pass "Controller 100.118.124.97:8788 reachable"
+    else
+        log_warn "Controller 100.118.124.97:8788 not reachable"
+    fi
+
+    local proxy_host proxy_port=10808
+    proxy_host=$(ip route show default 2>/dev/null | awk '{print $3}' | head -1)
+    proxy_host="${proxy_host:-127.0.0.1}"
+    [ -f /srv/private-ci/run/proxy.runtime.conf ] && { local ph; ph=$(grep '^PROXY_HOST=' /srv/private-ci/run/proxy.runtime.conf 2>/dev/null | tail -1); [ -n "${ph}" ] && proxy_host="${ph#PROXY_HOST=}"; }
+    timeout 2 bash -c "echo >/dev/tcp/${proxy_host}/${proxy_port}" 2>/dev/null && log_pass "Proxy ${proxy_host}:${proxy_port} reachable" || log_warn "Proxy ${proxy_host}:${proxy_port} not reachable (non-critical)"
+
+    local no_proxy_val
+    no_proxy_val=$(grep '^NO_PROXY=' /etc/private-ci/proxy.conf 2>/dev/null | cut -d= -f2- || echo "")
+    echo "${no_proxy_val}" | grep -q "100.118.124.97" && log_pass "NO_PROXY includes Controller IP" || log_warn "NO_PROXY may not include Controller IP"
+
+    local agent_count
+    agent_count=$(pgrep -cf "private_ci_agent.main" 2>/dev/null || true)
+    agent_count=${agent_count:-0}
+    [ "${agent_count}" -le 1 ] && log_pass "Agent instance count: ${agent_count}" || log_warn "Multiple agent instances: ${agent_count}"
+
+    for d in "${WORKSPACE_ROOT}" "${CACHE_ROOT}" "${LOG_ROOT}" "${RUN_DIR}"; do
+        if [ -d "${d}" ]; then
+            local dir_owner
+            dir_owner=$(stat -c '%u' "${d}" 2>/dev/null || echo 0)
+            [ "${dir_owner}" = "${CIWORKER_UID}" ] && log_pass "Dir ${d} owned by ciworker" || { log_warn "Dir ${d} owned by ${dir_owner}, fixing..."; chown "${CIWORKER_UID}:${CIWORKER_GID}" "${d}" 2>/dev/null || true; }
+        else
+            log_warn "Dir ${d} missing, creating..."; mkdir -p "${d}" 2>/dev/null; chown "${CIWORKER_UID}:${CIWORKER_GID}" "${d}" 2>/dev/null || true
+        fi
+    done
+
+    if [ -f "${WORKER_ENV}" ]; then
+        grep -q "^CI_WORKER_TOKEN=" "${WORKER_ENV}" 2>/dev/null && log_pass "Worker config present (token=***)" || log_fail "Worker config missing CI_WORKER_TOKEN"
+    else
+        log_fail "Worker config ${WORKER_ENV} missing"
+    fi
+
+    echo "=== Pre-flight complete: ${CRITICAL_FAILURES} critical, ${WARNINGS} warnings ==="
+
+    [ "${CRITICAL_FAILURES}" -gt 0 ] && return 1
+    return 0
+}
+
+run_preflight 2>&1 | sanitize_output
+exit "${PIPESTATUS[0]}"
