@@ -257,7 +257,8 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
     service = client
     service._check_repository_allowed(repository)
     service._check_default_branch_write(repository, branch)
-    repo = _repo(service.client, repository) if hasattr(service, "client") else _repo(service, repository)
+    gh = service.client if hasattr(service, "client") else service
+    repo = _repo(gh, repository)
     ref = repo.get_git_ref(f"heads/{branch}")
     actual_head = ref.object.sha
     if expected_head_sha and actual_head != expected_head_sha:
@@ -278,11 +279,11 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
         if content is None:
             elements.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
         else:
-            blob = service.create_blob(repository, content.decode("utf-8"))
+            blob = gh.create_blob(repository, content.decode("utf-8"))
             elements.append({"path": path, "mode": "100644", "type": "blob", "sha": blob.sha})
     base_tree = repo.get_git_commit(actual_head).commit.tree.sha
-    tree = service.create_git_tree(repository, elements, base_tree)
-    commit = service.create_commit(repository, message, tree.sha, [actual_head])
+    tree = gh.create_git_tree(repository, elements, base_tree)
+    commit = gh.create_commit(repository, message, tree.sha, [actual_head])
     try:
         ref.edit(sha=commit.sha, force=False)
     except Exception as exc:
@@ -365,13 +366,17 @@ def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, op
         raise
 
 
-def capabilities(build_sha: str = "unknown") -> dict[str, Any]:
+def capabilities(build_sha: str = "unknown", version: str = "10.0.1") -> dict[str, Any]:
     if not re.fullmatch(r"[0-9a-f]{40}", build_sha or ""):
         try:
-            build_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[3], text=True, stderr=subprocess.DEVNULL).strip()
+            repo_root = Path(__file__).resolve().parents[3]
+        except IndexError:
+            repo_root = Path(__file__).resolve().parent
+        try:
+            build_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True, stderr=subprocess.DEVNULL).strip()
         except (OSError, subprocess.CalledProcessError):
             build_sha = "unknown"
-    return {"name": "MyGithub10", "version": "10.0.0", "build_sha": build_sha, "source_repository": "frankichen/github_mcp", "max_inline_response_bytes": MAX_INLINE_RESPONSE_BYTES, "max_file_chunk_bytes": MAX_FILE_CHUNK_BYTES, "max_patch_bytes": MAX_PATCH_BYTES, "max_upload_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES, "supports_file_manifest": True, "supports_byte_chunks": True, "supports_mcp_resources": True, "supports_incremental_patch": True, "supports_range_edit": True, "supports_chunked_upload": True, "supports_dry_run": True, "supports_expected_head_sha": True, "supports_expected_blob_sha": True, "supports_idempotency_key": True, "supports_operation_audit": True, "supports_tree_attestation": True, "supports_artifact_deployment": False, "supports_gofmt_autofix": True, "supports_real_ci_performance_validation": False, "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}]}
+    return {"name": "MyGithub10", "version": version, "build_sha": build_sha, "source_repository": "frankichen/github_mcp", "max_inline_response_bytes": MAX_INLINE_RESPONSE_BYTES, "max_file_chunk_bytes": MAX_FILE_CHUNK_BYTES, "max_patch_bytes": MAX_PATCH_BYTES, "max_upload_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES, "supports_file_manifest": True, "supports_byte_chunks": True, "supports_mcp_resources": True, "supports_incremental_patch": True, "supports_range_edit": True, "supports_chunked_upload": True, "supports_dry_run": True, "supports_expected_head_sha": True, "supports_expected_blob_sha": True, "supports_idempotency_key": True, "supports_operation_audit": True, "supports_tree_attestation": True, "supports_artifact_deployment": False, "supports_gofmt_autofix": True, "supports_real_ci_performance_validation": False, "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}]}
 
 
 _UPLOAD_ROOT = Path(os.environ.get("MYGITHUB10_UPLOAD_DIR", tempfile.gettempdir())) / "mygithub10-uploads"
