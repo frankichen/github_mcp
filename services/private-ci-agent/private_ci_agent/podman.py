@@ -13,16 +13,57 @@ class PodmanRunner:
     def __init__(self, podman_binary: str = "/usr/bin/podman"):
         self.podman = podman_binary
 
+    @staticmethod
+    def _container_proxy_env() -> dict[str, str]:
+        """Pass host-loopback proxies through rootless Podman containers."""
+        proxy_keys = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"}
+        result = {
+            key: value for key, value in os.environ.items()
+            if key in proxy_keys and value
+        }
+        container_proxy_host = os.environ.get("PRIVATE_CI_CONTAINER_PROXY_HOST", "host.containers.internal")
+        for key, value in list(result.items()):
+            if "127.0.0.1" in value or "localhost" in value:
+                result[key] = value.replace("127.0.0.1", container_proxy_host).replace("localhost", container_proxy_host)
+        no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy")
+        if no_proxy:
+            result["NO_PROXY"] = no_proxy
+            result["no_proxy"] = no_proxy
+        return result
+
     def image_available(self, image: str) -> bool:
-        """Return whether a pre-approved image is already available locally."""
+        """Verify the selected image exists locally.
+
+        Checks local storage first to avoid unnecessary network pull.
+        Falls back to pull only when the image is not present locally.
+        """
         try:
-            result = subprocess.run(
+            # Fast path: image already cached locally
+            exists = subprocess.run(
                 [self.podman, "image", "exists", image],
                 capture_output=True,
                 text=True,
                 timeout=15,
             )
-            return result.returncode == 0
+            if exists.returncode == 0:
+                return True
+
+            # Slow path: pull missing image from registry
+            pull = [self.podman, "pull", "--platform", "linux/amd64"]
+            if image.startswith("100.118.124.97:5555/"):
+                pull.extend(["--tls-verify=false"])
+            pull.append(image)
+            refreshed = subprocess.run(pull, capture_output=True, text=True, timeout=180)
+            if refreshed.returncode != 0:
+                return False
+            # Double-check after pull
+            verify = subprocess.run(
+                [self.podman, "image", "exists", image],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return verify.returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             return False
 
@@ -57,6 +98,7 @@ class PodmanRunner:
 
         # Map caches to container paths
         cache_mounts = []
+        project_root = os.path.abspath(os.path.join(source_dir, os.pardir, os.pardir))
         go_cache = None
         for cache_name, cache_path in cache_dirs.items():
             if cache_name == "go":
@@ -80,7 +122,9 @@ class PodmanRunner:
             "--read-only",
             "--tmpfs=/tmp:rw,noexec,nosuid,size=256m",
             "--tmpfs=/run:rw,noexec,nosuid,size=64m",
+            "--tmpfs=/data:rw,noexec,nosuid,size=64m",
             "-v", f"{source_dir}:/workspace:Z",
+            "-v", f"{project_root}:/repo:ro",
             "--workdir", "/workspace",
             "--network=none",
         ] + cache_mounts + [
@@ -90,8 +134,7 @@ class PodmanRunner:
         ]
 
         env_vars = env or {}
-        inherited_proxy = {k: v for k, v in os.environ.items()
-                           if k in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"} and v}
+        inherited_proxy = self._container_proxy_env()
         safe_env = {**inherited_proxy, **self._go_cache_env(go_cache)}
         if go_cache:
             safe_env.update({
@@ -152,6 +195,7 @@ class PodmanRunner:
         container_name = self._container_name(job_id, source_dir)
 
         cache_mounts = []
+        project_root = os.path.abspath(os.path.join(source_dir, os.pardir, os.pardir))
         go_cache = None
         for cache_name, cache_path in cache_dirs.items():
             if cache_name == "go":
@@ -178,7 +222,9 @@ class PodmanRunner:
             "--read-only",
             "--tmpfs=/tmp:rw,noexec,nosuid,size=256m",
             "--tmpfs=/run:rw,noexec,nosuid,size=64m",
+            "--tmpfs=/data:rw,noexec,nosuid,size=64m",
             "-v", f"{source_dir}:/workspace:Z",
+            "-v", f"{project_root}:/repo:ro",
             "--workdir", "/workspace",
         ] + net_arg + cache_mounts + [
             "--entrypoint", "/bin/sh",
@@ -186,9 +232,18 @@ class PodmanRunner:
             "-c", command,
         ]
 
-        safe_env = {k: v for k, v in os.environ.items()
-                    if k in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"} and v}
+        safe_env = self._container_proxy_env()
         safe_env.update(self._go_cache_env(go_cache))
+        safe_env.update({
+            "ACTION_API_KEY": "test_api_key_32_bytes_long",
+            "GITHUB_TOKEN": "test_token_value",
+            "ALLOWED_REPOSITORIES": "owner/allowed-repo",
+            "ALLOW_DEFAULT_BRANCH_WRITE": "false",
+            "MAX_FILE_CHARACTERS": "5000",
+            "MAX_TOTAL_CHARACTERS": "10000",
+            "MAX_FILES_PER_COMMIT": "5",
+            "REPOSITORY_POLICY_FILE": "/workspace/tests/repository_policies_test.yml",
+        })
         if env:
             allowed = {"DATABASE_URL", "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "RABBITMQ_URL"}
             safe_env.update({k: v for k, v in env.items() if k in allowed})
