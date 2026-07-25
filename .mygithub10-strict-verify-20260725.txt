@@ -1,2 +1,2 @@
-strict-write-v1
+strict-write-v2
 cleanup-required
