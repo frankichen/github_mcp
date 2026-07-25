@@ -119,3 +119,75 @@ def test_job_cleanup_removes_go_cache_with_workspace(tmp_path):
     manager.cleanup("job-123")
 
     assert not (tmp_path / "workspaces" / "job-123").exists()
+
+
+class OnceFailingPodman(FakePodman):
+    """Fail only the first command matching a pattern; all subsequent calls pass."""
+
+    def __init__(self, failing_command: str):
+        super().__init__(None)
+        self._failing = failing_command
+        self._already_failed = False
+
+    def run_command(self, _image, _job_id, _source_dir, _caches, command, _timeout, network=False, **_kwargs):
+        self.caches.append(_caches)
+        self.commands.append((command, network))
+        exit_code = 0
+        if self._failing and self._failing in command and not self._already_failed:
+            self._already_failed = True
+            exit_code = 1
+        return {"exit_code": exit_code, "stdout": "", "stderr": "", "timed_out": False}
+
+
+class AlwaysFailPodman(FakePodman):
+    """Fail every command matching a pattern."""
+
+    def __init__(self, failing_command: str):
+        super().__init__(None)
+        self._failing = failing_command
+
+    def run_command(self, _image, _job_id, _source_dir, _caches, command, _timeout, network=False, **_kwargs):
+        self.caches.append(_caches)
+        self.commands.append((command, network))
+        exit_code = 1 if self._failing and self._failing in command else 0
+        return {"exit_code": exit_code, "stdout": "", "stderr": "", "timed_out": False}
+
+
+def test_gofmt_autofix_success_makes_workspace_pass(tmp_path):
+    """gofmt check fails → autofix formats + verifies → workspace passes, step=autofixed."""
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    podman = OnceFailingPodman("gofmt -l")
+    result = make_executor(podman)._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
+
+    assert result["passed"] is True
+    gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
+    assert gofmt_step["status"] == "autofixed"
+    assert gofmt_step.get("autofix", {}).get("formatted") is True
+    # Verify gofmt -w was called in container
+    assert any("gofmt -w" in cmd for cmd, _ in podman.commands)
+
+
+def test_gofmt_autofix_failure_still_fails_workspace(tmp_path):
+    """gofmt check fails → autofix also fails (gofmt -w errors) → workspace still fails."""
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    podman = AlwaysFailPodman("gofmt -l")
+    result = make_executor(podman)._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
+
+    assert result["passed"] is False
+    gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
+    assert gofmt_step["status"] in ("failed", "timed_out")
+    assert gofmt_step.get("autofix") is None
+
+
+def test_setup_failure_blocks_gofmt_autofix(tmp_path):
+    """setup failure → gofmt still runs but autofix is skipped (not setup_failed guard)."""
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    # "go mod download" in the setup step fails → setup_failed = True
+    podman = FakePodman("go mod download")
+    result = make_executor(podman)._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
+
+    assert result["passed"] is False
+    gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
+    # gofmt should still have run (not blocked) but autofix skipped due to setup_failed
+    assert gofmt_step["status"] == "failed"
+    assert gofmt_step.get("autofix") is None

@@ -284,6 +284,14 @@ class JobExecutor:
             step = self._run_check(job, label, image, source_dir, caches, check["name"], check["command"], service_env)
             steps.append(step)
             if step["exit_code"] != 0:
+                # gofmt auto-fix: format + commit + push, then treat as non-failure
+                if check["name"] == "gofmt" and not setup_failed:
+                    autofix = self._gofmt_autofix(job, label, image, source_dir, caches, step, service_env)
+                    if autofix and autofix.get("formatted"):
+                        step["status"] = "autofixed"
+                        step["autofix"] = autofix
+                        self.log_manager.upload(job.job_id, f"[{step['step_name']}] AUTOFIXED: {autofix.get('message', '')}\n")
+                        continue
                 passed = False
                 exit_code = exit_code or step["exit_code"]
 
@@ -314,7 +322,7 @@ class JobExecutor:
         self.log_manager.upload(job.job_id, f"[{step_name}] {status.upper()} (exit={result['exit_code']}, {duration:.1f}s)\n")
         if step_id:
             self.client.finish_step(job.job_id, step_id, status, result["exit_code"], self.log_manager.get_total(job.job_id))
-        return {"step_name": step_name, "command": command, "status": status, "exit_code": result["exit_code"], "duration_seconds": duration}
+        return {"step_name": step_name, "command": command, "status": status, "exit_code": result["exit_code"], "duration_seconds": duration, "step_id": step_id}
 
     @staticmethod
     def _service_env(service_env):
@@ -331,3 +339,120 @@ class JobExecutor:
             self.log_manager.upload(job_id, output)
             if not output.endswith("\n"):
                 self.log_manager.upload(job_id, "\n")
+
+    def _gofmt_autofix(self, job, label, image, source_dir, caches, step, service_env):
+        """Run gofmt -w inside container, verify, then git push on host.
+
+        Returns dict with keys: formatted (bool), pushed (bool), message (str).
+        """
+        step_name = f"{label}:gofmt-autofix"
+        self.log_manager.upload(job.job_id, f"[{step_name}] Running gofmt -w ...\n")
+
+        # 1. Format in container (source_dir is bind-mounted rw)
+        fix_cmd = 'gofmt -w . 2>&1 && echo "GOFMT_AUTOFIX_DONE"'
+        fix_result = self.podman.run_command(image, job.job_id, source_dir, caches, fix_cmd, 120,
+                                             network=False, env=self._service_env(service_env))
+        if fix_result["exit_code"] != 0:
+            self.log_manager.upload(job.job_id,
+                                    f"[{step_name}] FAILED: gofmt -w returned {fix_result['exit_code']}\n")
+            return {"formatted": False, "pushed": False,
+                    "message": f"gofmt -w failed (exit {fix_result['exit_code']})"}
+
+        # 2. Verify no remaining unformatted files
+        verify_cmd = ('UNFORMATTED=$(gofmt -l . 2>&1); '
+                      'if [ -n "$UNFORMATTED" ]; then echo "UNFORMATTED FILES:"; echo "$UNFORMATTED"; exit 1; fi; '
+                      'echo "All Go files properly formatted"')
+        verify_result = self.podman.run_command(image, job.job_id, source_dir, caches, verify_cmd, 60,
+                                                network=False, env=self._service_env(service_env))
+        if verify_result["exit_code"] != 0:
+            self.log_manager.upload(job.job_id,
+                                    f"[{step_name}] VERIFY_FAILED: fmt still needed after gofmt -w\n")
+            return {"formatted": False, "pushed": False,
+                    "message": "verification failed after gofmt -w"}
+
+        # 3. Git add + commit + push on host
+        pushed = self._git_push_autofix(job, source_dir)
+        message = "gofmt auto-fixed and pushed" if pushed else "gofmt auto-fixed (push skipped)"
+
+        if step.get("step_id"):
+            self.client.finish_step(job.job_id, step["step_id"], "autofixed", 0,
+                                    self.log_manager.get_total(job.job_id))
+
+        return {"formatted": True, "pushed": pushed, "message": message}
+
+    def _git_push_autofix(self, job, source_dir):
+        """Commit gofmt changes to local git and push to origin. Returns True on success."""
+        git_dir = os.path.join(source_dir, ".git")
+        if not os.path.isdir(git_dir) and not os.path.isfile(git_dir):
+            self.log_manager.upload(job.job_id, "[gofmt-autofix] No .git directory — skipping push\n")
+            return False
+
+        try:
+            status = subprocess.run(
+                ["git", "-C", source_dir, "status", "--porcelain", "--", "*.go"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if not status.stdout.strip():
+                self.log_manager.upload(job.job_id, "[gofmt-autofix] No Go file changes to commit\n")
+                return False
+
+            add = subprocess.run(
+                ["git", "-C", source_dir, "add", "--", "*.go"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if add.returncode != 0:
+                self.log_manager.upload(job.job_id, "[gofmt-autofix] git add failed\n")
+                return False
+
+            commit = subprocess.run(
+                ["git", "-C", source_dir, "commit", "-m", "gofmt auto-fix"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if commit.returncode != 0:
+                # "nothing to commit" is also a non-zero exit in some git versions
+                if "nothing to commit" in (commit.stdout + commit.stderr).lower():
+                    return True
+                self.log_manager.upload(job.job_id, f"[gofmt-autofix] git commit failed: {commit.stderr[-200:]}\n")
+                return False
+            self.log_manager.upload(job.job_id, f"[gofmt-autofix] Committed: {commit.stdout.strip()}\n")
+
+            push_branch = job.branch
+
+            # Inject token for HTTPS push when CI_GITHUB_TOKEN is set
+            token = os.environ.get("CI_GITHUB_TOKEN")
+            origin_restore = None
+            if token:
+                origin_url = subprocess.run(
+                    ["git", "-C", source_dir, "remote", "get-url", "origin"],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout.strip()
+                if origin_url.startswith("https://"):
+                    origin_restore = origin_url
+                    auth_url = origin_url.replace("https://", f"https://x-access-token:{token}@")
+                    subprocess.run(
+                        ["git", "-C", source_dir, "remote", "set-url", "origin", auth_url],
+                        capture_output=True, text=True, timeout=10,
+                    )
+
+            push = subprocess.run(
+                ["git", "-C", source_dir, "push", "origin", f"HEAD:{push_branch}"],
+                capture_output=True, text=True, timeout=120,
+            )
+
+            # Restore original URL
+            if origin_restore and token:
+                subprocess.run(
+                    ["git", "-C", source_dir, "remote", "set-url", "origin", origin_restore],
+                    capture_output=True, text=True, timeout=10,
+                )
+
+            if push.returncode != 0:
+                self.log_manager.upload(job.job_id,
+                                        f"[gofmt-autofix] git push failed: {push.stderr[-200:]}\n")
+                return False
+
+            self.log_manager.upload(job.job_id, f"[gofmt-autofix] Pushed to origin/{push_branch}\n")
+            return True
+        except Exception as exc:
+            self.log_manager.upload(job.job_id, f"[gofmt-autofix] Exception: {exc}\n")
+            return False
