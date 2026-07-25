@@ -752,8 +752,8 @@ def _mygithub10_error(exc: Exception) -> str:
 @mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithub10 capability and compatibility contract.")
 async def get_mygithub_capabilities() -> str:
     return json.dumps(mygithub10.capabilities(
-        os.environ.get("MYGITHUB10_BUILD_SHA", "unknown"),
-        os.environ.get("MYGITHUB10_VERSION", "10.0.1"),
+        os.environ.get("MYGITHUB10_BUILD_SHA") or "unknown",
+        os.environ.get("MYGITHUB10_VERSION") or "10.0.1",
     ), ensure_ascii=False)
 
 
