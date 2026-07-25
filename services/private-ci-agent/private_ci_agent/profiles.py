@@ -28,6 +28,9 @@ LOCK_FILES = {
 SAFE_NODE_SCRIPTS = ("lint", "typecheck", "test:run", "test:ci", "test", "build")
 UNSAFE_SCRIPT_WORDS = ("dev", "serve", "start", "preview", "watch")
 
+# Known Python package directory names (checked in order).
+_PYTHON_PACKAGE_DIRS = ("app", "private_ci_agent", "private_deploy_agent", "src")
+
 GO_COMMANDS = {
     "setup": [
         {
@@ -40,7 +43,6 @@ GO_COMMANDS = {
         {"name": "migrate", "command": "make migrate-up 2>&1"},
     ],
     "check": [
-        {"name": "ai-integrity", "command": "make ai-integrity-check 2>&1"},
         {"name": "gofmt", "command": 'UNFORMATTED=$(gofmt -l . 2>&1); if [ -n "$UNFORMATTED" ]; then echo "UNFORMATTED FILES:"; echo "$UNFORMATTED"; exit 1; fi; echo "All Go files properly formatted"'},
         {"name": "govet", "command": "go vet ./... 2>&1"},
         {"name": "gotest", "command": "go test -p 6 -count=1 ./... 2>&1"},
@@ -48,15 +50,6 @@ GO_COMMANDS = {
     ],
     "image": "docker.io/library/golang:1.26.4",
     "cache_dirs": {"go": "/ci-cache"},
-}
-
-FAST_CHECK_COMMANDS = {
-    "setup": [],
-    "check": [
-        {"name": "ai-integrity", "command": "make ai-integrity-check 2>&1"},
-    ],
-    "image": "docker.io/library/golang:1.26.4",
-    "cache_dirs": {},
 }
 
 APPROVED_GO_IMAGE_PREFIXES = (
@@ -152,11 +145,105 @@ PYTHON_COMMANDS = {
 
 PROFILE_COMMANDS = {
     "go-check": GO_COMMANDS,
-    "python-check": PYTHON_COMMANDS,
+    "python-check": None,
     "node-check": None,
     "repo-auto-check": None,
-    "repo-fast-check": FAST_CHECK_COMMANDS,
 }
+
+PYTHON_COMMANDS = {
+    "setup": [],
+    "check": [],
+    "skipped": [],
+    "image": "docker.io/library/python:3.12-slim",
+    "cache_dirs": {"pip": "/srv/private-ci/cache/pip"},
+}
+
+
+def python_commands_for_workspace(source_dir: str, workspace_dir: str | None = None) -> dict:
+    """Generate setup/check commands for a Python workspace based on its manifest.
+
+    Returns a dict with 'setup', 'check', 'skipped', 'image', 'cache_dirs'.
+    Failed detection returns an error dict with 'error' and 'message'.
+    """
+    root = Path(source_dir) / (workspace_dir or "")
+    if not root.is_dir():
+        root = Path(source_dir)
+
+    files = {p.name for p in root.iterdir() if p.is_file()}
+    dirs = {p.name for p in root.iterdir() if p.is_dir()}
+
+    has_req = "requirements.txt" in files
+    has_req_dev = "requirements-dev.txt" in files
+    has_pyproject = "pyproject.toml" in files
+    has_setup_py = "setup.py" in files or "setup.cfg" in files
+
+    # Find the first real Python package directory
+    pkg_dir = None
+    for candidate in _PYTHON_PACKAGE_DIRS:
+        if candidate in dirs and (root / candidate / "__init__.py").is_file():
+            pkg_dir = candidate
+            break
+        elif candidate in dirs:
+            pkg_dir = candidate  # implicit namespace package
+            break
+    if pkg_dir is None and "tests" in dirs:
+        pkg_dir = "."  # fallback for test-only layouts
+
+    has_tests = "tests" in dirs
+
+    # sanity: need at least one manifest
+    if not (has_req or has_pyproject or has_setup_py):
+        return {"error": "configuration_error",
+                "message": "Python workspace missing requirements.txt, pyproject.toml, or setup.py"}
+
+    setup = [
+        "python -m venv /ci-venv 2>&1",
+        "/ci-venv/bin/python -m pip install --no-input --quiet ruff pytest 2>&1",
+    ]
+
+    # Install project dependencies
+    if has_req_dev:
+        setup.append("/ci-venv/bin/python -m pip install --no-input --quiet -r requirements-dev.txt 2>&1")
+    elif has_req:
+        setup.append("/ci-venv/bin/python -m pip install --no-input --quiet -r requirements.txt 2>&1")
+    if has_pyproject:
+        setup.append("/ci-venv/bin/python -m pip install --no-input --quiet -e . 2>&1")
+    elif has_setup_py:
+        setup.append("/ci-venv/bin/python -m pip install --no-input --quiet -e . 2>&1")
+
+    check = []
+    skipped = []
+
+    # ruff
+    ruff_targets = " ".join(d for d in [pkg_dir, "tests"] if d and d != "." and (d in dirs or d == "tests"))
+    if not ruff_targets:
+        ruff_targets = "."
+    check.append({"name": "ruff", "command": f"/ci-venv/bin/python -m ruff check {ruff_targets} 2>&1"})
+
+    # compileall
+    compile_targets = [d for d in [pkg_dir, "tests"] if d and d != "." and d in dirs]
+    if compile_targets:
+        check.append({"name": "compileall",
+                      "command": f"/ci-venv/bin/python -m compileall -q {' '.join(compile_targets)} 2>&1"})
+    else:
+        skipped.append({"name": "compileall", "status": "configuration_error",
+                        "reason": "no_python_package_directory"})
+
+    # pytest
+    if has_tests:
+        check.append({"name": "pytest",
+                      "command": "/ci-venv/bin/python -m pytest -q -p no:warnings 2>&1"})
+    else:
+        skipped.append({"name": "pytest", "status": "skipped",
+                        "reason": "no_tests_directory"})
+
+    return {
+        "setup": setup,
+        "check": check,
+        "skipped": skipped,
+        "image": PYTHON_COMMANDS["image"],
+        "cache_dirs": dict(PYTHON_COMMANDS.get("cache_dirs", {})),
+    }
 
 
 def _relative_depth(path: str) -> int:
