@@ -1,6 +1,7 @@
 """执行受控 Profile 的多工作区 CI 任务。"""
 
 import logging
+import json
 import os
 import time
 import hashlib
@@ -9,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from private_ci_agent.models import Job
 from private_ci_agent.profiles import (
+    FAST_CHECK_COMMANDS,
     GO_COMMANDS,
     PYTHON_COMMANDS,
     discover_workspaces,
@@ -42,6 +44,18 @@ class JobExecutor:
         self.client.update_job_status(job_id, "preparing")
 
         repo_config = get_repository_overrides(job.repository, job.profile)
+
+        # Fast path: repo-fast-check runs make ai-integrity-check in Podman
+        if job.profile == "repo-fast-check":
+            self.log_manager.upload(job_id, "[fast-check] entering repo-fast-check Podman path\n")
+            summary = self._execute_fast_check(job)
+            self.log_manager.flush(job_id)
+            self.client.finish_job(job_id, summary["exit_code"], summary["status"],
+                                   summary=summary,
+                                   error_code=summary.get("error_code"),
+                                   error_message=summary.get("error_message"))
+            return summary
+
         if job.profile == "repo-auto-check":
             plan = self._auto_plan(job.source_dir, repo_config)
         else:
@@ -254,7 +268,8 @@ class JobExecutor:
         for setup in commands.get("setup", []):
             name = setup.get("name", "setup") if isinstance(setup, dict) else "setup"
             command = setup.get("command") if isinstance(setup, dict) else setup
-            step = self._run_setup(job, label, image, source_dir, caches, name, command, service_env)
+            step = self._run_setup(job, label, image, source_dir, caches, name, command, service_env,
+                                   pass_proxy=(workspace["stack"] == "python"))
             steps.append(step)
             if step["exit_code"] != 0:
                 setup_failed = True
@@ -281,7 +296,17 @@ class JobExecutor:
                 steps.append(step)
                 self.log_manager.upload(job.job_id, f"[{step['step_name']}] BLOCKED_BY_SETUP\n")
                 continue
-            step = self._run_check(job, label, image, source_dir, caches, check["name"], check["command"], service_env)
+            extra_env = None
+            if check["name"] == "ai-integrity":
+                extra_env = {
+                    "AI_INTEGRITY_BASE_SHA": job.base_sha,
+                    "AI_INTEGRITY_REPORT": "/tmp/ai-integrity-report.json",
+                }
+                # Only pass changed_files if list is NOT truncated; otherwise
+                # the project script uses git diff base...HEAD.
+                if job.changed_files and not getattr(job, 'changed_files_truncated', False):
+                    extra_env["AI_INTEGRITY_CHANGED_FILES"] = "\n".join(job.changed_files)
+            step = self._run_check(job, label, image, source_dir, caches, check["name"], check["command"], service_env, extra_env=extra_env)
             steps.append(step)
             if step["exit_code"] != 0:
                 # gofmt auto-fix: format + commit + push, then treat as non-failure
@@ -297,25 +322,30 @@ class JobExecutor:
 
         return {"passed": passed, "exit_code": exit_code, "steps": steps}
 
-    def _run_setup(self, job, label, image, source_dir, caches, step_name, command, service_env=None):
+    def _run_setup(self, job, label, image, source_dir, caches, step_name, command, service_env=None, pass_proxy=False):
         name = f"{label}:{step_name}"
         self.log_manager.upload(job.job_id, f"[{name}] Starting: {command}\n")
         start = time.time()
         result = self.podman.run_command(image, job.job_id, source_dir, caches, command, 300, network=True,
-                                         env=self._service_env(service_env), network_name=service_env.network if service_env else None)
+                                         env=self._service_env(service_env), network_name=service_env.network if service_env else None,
+                                         pass_proxy=pass_proxy)
         self._upload_output(job.job_id, result)
         status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else "failed")
         self.log_manager.upload(job.job_id, f"[{name}] {status.upper()} (exit={result['exit_code']})\n")
         return {"step_name": name, "command": command, "status": status, "exit_code": result["exit_code"], "duration_seconds": time.time() - start}
 
-    def _run_check(self, job, label, image, source_dir, caches, name, command, service_env=None):
+    def _run_check(self, job, label, image, source_dir, caches, name, command, service_env=None, extra_env=None, pass_proxy=False):
         step_name = f"{label}:{name}"
         self.log_manager.upload(job.job_id, f"[{step_name}] Starting: {command}\n")
         step_id = self.client.start_step(job.job_id, step_name)
         start = time.time()
+        env = self._service_env(service_env) or {}
+        if extra_env:
+            env.update(extra_env)
         result = self.podman.run_command(image, job.job_id, source_dir, caches, command, job.timeout_seconds,
-                                         network=True if service_env else False, env=self._service_env(service_env),
-                                         network_name=service_env.network if service_env else None)
+                                         network=True if service_env else False, env=env if env else None,
+                                         network_name=service_env.network if service_env else None,
+                                         pass_proxy=pass_proxy)
         self._upload_output(job.job_id, result)
         status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else "failed")
         duration = time.time() - start
@@ -456,3 +486,157 @@ class JobExecutor:
         except Exception as exc:
             self.log_manager.upload(job.job_id, f"[gofmt-autofix] Exception: {exc}\n")
             return False
+
+    # ---- repo-fast-check ----
+
+    # Stable error codes for fast-check failures.
+    FAST_CHECK_ERROR_CODES = {
+        "missing_make": "FAST_CHECK_MAKE_MISSING",
+        "missing_python3": "FAST_CHECK_PYTHON_MISSING",
+        "entrypoint_missing": "FAST_CHECK_ENTRYPOINT_MISSING",
+        "sha_not_found": "FAST_CHECK_SHA_NOT_FOUND",
+        "timeout": "FAST_CHECK_TIMEOUT",
+        "integrity_failed": "FAST_CHECK_INTEGRITY_FAILED",
+    }
+
+    def _execute_fast_check(self, job: Job) -> dict:
+        """Execute repo-fast-check in Podman container.
+
+        Runs make ai-integrity-check inside container with network=none,
+        using the fast-check image.  Artifacts are written to a mounted
+        directory that survives container --rm.
+        """
+        job_id = job.job_id
+        source_dir = job.source_dir
+        start = time.time()
+
+        self.client.update_job_status(job_id, "running")
+        image = FAST_CHECK_COMMANDS.get("image", "docker.io/library/golang:1.26.4")
+        if not self.podman.image_available(image, allow_pull=False):
+            self.log_manager.upload(job_id, f"[repo-fast-check] IMAGE_UNAVAILABLE: {image}\n")
+            return {
+                "status": "failed", "exit_code": 2,
+                "error_code": "FAST_CHECK_IMAGE_UNAVAILABLE",
+                "error_message": f"Image {image} not prewarmed",
+                "steps": [], "log_truncated": self.log_manager.is_truncated(job_id),
+            }
+
+        # Artifact directory (survives container --rm)
+        artifacts_dir = os.path.join(job.workspace or os.path.dirname(source_dir), "artifacts")
+        os.makedirs(artifacts_dir, exist_ok=True)
+        report_path = "/ci-artifacts/ai-integrity-report.json"
+
+        # Build ai-integrity env: prefer base SHA for Git diff, fall back to
+        # newline-separated changed files only when list is NOT truncated.
+        ai_env = {"AI_INTEGRITY_BASE_SHA": job.base_sha,
+                  "AI_INTEGRITY_REPORT": report_path}
+        if job.changed_files and not getattr(job, 'changed_files_truncated', False):
+            ai_env["AI_INTEGRITY_CHANGED_FILES"] = "\n".join(job.changed_files)
+
+        image_digest = self.podman.image_digest(image)
+
+        # ---- Execute in Podman ----
+        step_name = "repo-fast-check:ai-integrity"
+        self.log_manager.upload(job_id, f"[{step_name}] Starting in Podman: make ai-integrity-check\n")
+        step_id = self.client.start_step(job_id, step_name)
+        step_start = time.time()
+        step_exit_code = -1
+        step_status = "internal_error"
+
+        try:
+            result = self.podman.run_command(
+                image, job_id, source_dir, {"go": None},  # no go cache for fast-check
+                "make ai-integrity-check 2>&1",
+                timeout_seconds=60,
+                env=ai_env,
+                network=False,  # fast-check: network=none
+                extra_mounts=[f"{artifacts_dir}:/ci-artifacts:Z"],
+                pass_proxy=False,
+            )
+            step_exit_code = result["exit_code"]
+            timed_out = result.get("timed_out", False)
+
+            output = result.get("stdout", "")
+            if result.get("stderr"):
+                output += "\n" + result["stderr"]
+            if output:
+                self.log_manager.upload(job_id, output)
+                if not output.endswith("\n"):
+                    self.log_manager.upload(job_id, "\n")
+
+            if timed_out:
+                step_status = "timed_out"
+                step_exit_code = -1
+                self.log_manager.upload(job_id, f"[{step_name}] TIMED_OUT\n")
+            elif step_exit_code == 0:
+                step_status = "passed"
+            else:
+                step_status = "failed"
+        except Exception as exc:
+            step_status = "internal_error"
+            step_exit_code = -1
+            self.log_manager.upload(job_id, f"[{step_name}] EXCEPTION: {type(exc).__name__}\n")
+        finally:
+            step_duration = time.time() - step_start
+            self.log_manager.upload(job_id,
+                                    f"[{step_name}] {step_status.upper()} (exit={step_exit_code}, {step_duration:.1f}s)\n")
+            if step_id:
+                self.client.finish_step(job_id, step_id, step_status, step_exit_code,
+                                        self.log_manager.get_total(job_id))
+
+        steps = [{
+            "step_name": step_name,
+            "command": f"make -C /workspace ai-integrity-check",
+            "status": step_status,
+            "exit_code": step_exit_code,
+            "duration_seconds": round(step_duration, 3),
+        }]
+
+        error_code = None
+        if step_status == "timed_out":
+            error_code = self.FAST_CHECK_ERROR_CODES["timeout"]
+        elif step_status == "failed":
+            error_code = self.FAST_CHECK_ERROR_CODES["integrity_failed"]
+        elif step_status == "internal_error":
+            error_code = "FAST_CHECK_INTERNAL_ERROR"
+
+        # Collect JSON report from artifacts dir
+        report_available = False
+        host_report = os.path.join(artifacts_dir, "ai-integrity-report.json")
+        if os.path.isfile(host_report):
+            try:
+                with open(host_report, "r", encoding="utf-8") as fh:
+                    report_data = json.load(fh)
+                report_available = True
+                steps.append({
+                    "step_name": "repo-fast-check:report",
+                    "status": "collected", "exit_code": None,
+                    "report_summary": {
+                        k: report_data.get(k) for k in ("status", "errors", "warnings", "details")
+                        if k in report_data
+                    } if isinstance(report_data, dict) else {},
+                })
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        total = time.time() - start
+        summary = {
+            "status": "passed" if step_exit_code == 0 else "failed",
+            "exit_code": step_exit_code,
+            "profile": "repo-fast-check",
+            "base_sha": job.base_sha,
+            "commit_sha": job.commit_sha,
+            "image": image,
+            "image_digest": image_digest,
+            "source_mirror_hit": bool(self.config.get("source_mirror_enabled")),
+            "resource_policy": self.podman.resource_summary(),
+            "ai_integrity_seconds": round(step_duration, 3),
+            "total_duration_seconds": round(total, 3),
+            "steps": steps,
+            "log_truncated": self.log_manager.is_truncated(job_id),
+        }
+        if report_available:
+            summary["report_available"] = True
+        if error_code:
+            summary["error_code"] = error_code
+        return summary

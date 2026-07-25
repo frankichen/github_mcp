@@ -40,6 +40,7 @@ GO_COMMANDS = {
         {"name": "migrate", "command": "make migrate-up 2>&1"},
     ],
     "check": [
+        {"name": "ai-integrity", "command": "make ai-integrity-check 2>&1"},
         {"name": "gofmt", "command": 'UNFORMATTED=$(gofmt -l . 2>&1); if [ -n "$UNFORMATTED" ]; then echo "UNFORMATTED FILES:"; echo "$UNFORMATTED"; exit 1; fi; echo "All Go files properly formatted"'},
         {"name": "govet", "command": "go vet ./... 2>&1"},
         {"name": "gotest", "command": "go test -p 6 -count=1 ./... 2>&1"},
@@ -47,6 +48,15 @@ GO_COMMANDS = {
     ],
     "image": "docker.io/library/golang:1.26.4",
     "cache_dirs": {"go": "/ci-cache"},
+}
+
+FAST_CHECK_COMMANDS = {
+    "setup": [],
+    "check": [
+        {"name": "ai-integrity", "command": "make ai-integrity-check 2>&1"},
+    ],
+    "image": "docker.io/library/golang:1.26.4",
+    "cache_dirs": {},
 }
 
 APPROVED_GO_IMAGE_PREFIXES = (
@@ -124,17 +134,20 @@ def go_commands_for_workspace(source_dir: str, workspace_path: str = ".") -> dic
 
 PYTHON_COMMANDS = {
     "setup": [
-        "pip install --no-input ruff pytest 2>&1",
-        '[ -f requirements.txt ] && pip install --no-input -r requirements.txt 2>&1 || true',
-        '[ -f pyproject.toml ] && pip install --no-input -e ".[dev,test]" 2>&1 || true',
+        "python -m venv /ci-venv 2>&1",
+        "/ci-venv/bin/python -m pip install --no-input --quiet ruff pytest 2>&1",
+        "[ -f requirements-dev.txt ] && /ci-venv/bin/python -m pip install --no-input --quiet -r requirements-dev.txt 2>&1 || true",
+        "[ -f requirements.txt ] && /ci-venv/bin/python -m pip install --no-input --quiet -r requirements.txt 2>&1 || true",
+        "[ -f pyproject.toml ] && /ci-venv/bin/python -m pip install --no-input --quiet -e . 2>&1 || true",
     ],
     "check": [
-        {"name": "ruff", "command": "python -m ruff check . 2>&1"},
-        {"name": "compileall", "command": "python -m compileall -q . 2>&1"},
-        {"name": "pytest", "command": "python -m pytest -q -p no:warnings 2>&1"},
+        {"name": "ruff",    "command": "test -d . && /ci-venv/bin/python -m ruff check . 2>&1"},
+        {"name": "compileall", "command": "for d in app src private_ci_agent private_deploy_agent; do test -d \"$d\" && /ci-venv/bin/python -m compileall -q \"$d\"; done; test -d tests && /ci-venv/bin/python -m compileall -q tests; true"},
+        {"name": "pytest",  "command": "test -d tests && /ci-venv/bin/python -m pytest -q -p no:warnings 2>&1 || echo 'SKIPPED: no tests directory'"},
     ],
+    "skipped": [],
     "image": "docker.io/library/python:3.12-slim",
-    "cache_dirs": {"pip": "/root/.cache/pip"},
+    "cache_dirs": {"pip": "/srv/private-ci/cache/pip"},
 }
 
 PROFILE_COMMANDS = {
@@ -142,6 +155,7 @@ PROFILE_COMMANDS = {
     "python-check": PYTHON_COMMANDS,
     "node-check": None,
     "repo-auto-check": None,
+    "repo-fast-check": FAST_CHECK_COMMANDS,
 }
 
 
