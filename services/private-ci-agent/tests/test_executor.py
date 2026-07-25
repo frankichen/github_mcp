@@ -149,16 +149,42 @@ class AlwaysFailPodman(FakePodman):
         return {"exit_code": exit_code, "stdout": "", "stderr": "", "timed_out": False}
 
 
-def test_gofmt_autofix_success_makes_workspace_pass(tmp_path):
+def test_gofmt_autofix_without_verified_push_keeps_workspace_failed(tmp_path):
     (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
     podman = OnceFailingPodman("gofmt -l")
-    result = make_executor(podman)._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
+    executor = make_executor(podman)
+    executor._gofmt_autofix = lambda *_args, **_kwargs: {
+        "formatted": True,
+        "pushed": False,
+        "verified": False,
+        "reason": "git_commit_failed",
+    }
+
+    result = executor._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
+
+    assert result["passed"] is False
+    gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
+    assert gofmt_step["status"] == "failed"
+    assert gofmt_step["autofix"]["reason"] == "git_commit_failed"
+
+
+def test_gofmt_autofix_verified_push_makes_workspace_pass(tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    podman = OnceFailingPodman("gofmt -l")
+    executor = make_executor(podman)
+    executor._gofmt_autofix = lambda *_args, **_kwargs: {
+        "formatted": True,
+        "committed": True,
+        "pushed": True,
+        "verified": True,
+        "reason": "ok",
+    }
+
+    result = executor._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
 
     assert result["passed"] is True
     gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
     assert gofmt_step["status"] == "autofixed"
-    assert gofmt_step.get("autofix", {}).get("formatted") is True
-    assert any("gofmt -w" in cmd for cmd, _ in podman.commands)
 
 
 def test_gofmt_autofix_failure_still_fails_workspace(tmp_path):
