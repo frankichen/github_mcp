@@ -16,6 +16,7 @@ from private_ci_agent.profiles import (
     get_commands_for_profile,
     get_repository_overrides,
     node_commands_for_workspace,
+    python_commands_for_workspace,
 )
 from private_ci_agent.podman import PodmanRunner
 from private_ci_agent.logs import LogManager
@@ -209,7 +210,7 @@ class JobExecutor:
         if stack == "go":
             return go_commands_for_workspace(source_dir)
         if stack == "python":
-            return PYTHON_COMMANDS
+            return python_commands_for_workspace(source_dir)
         return {"error": "unsupported", "message": f"Unsupported stack: {stack}"}
 
     def _execute_workspace(self, job: Job, workspace: dict) -> dict:
@@ -235,6 +236,16 @@ class JobExecutor:
             os.makedirs(cache_root, mode=0o700, exist_ok=True)
             os.chmod(cache_root, 0o700)
             caches = {"go": cache_root}
+        elif workspace["stack"] == "python":
+            # Python venv must persist across container steps.
+            cache_root = os.path.join(job.workspace or os.path.dirname(job.source_dir), "python-venv")
+            os.makedirs(cache_root, mode=0o700, exist_ok=True)
+            os.chmod(cache_root, 0o700)
+            caches = {"python_venv": cache_root}
+            # Also include pip cache if configured
+            for cache_name in commands.get("cache_dirs", {}):
+                if cache_name == "pip" and cache_name in CACHE_MAP:
+                    caches[cache_name] = CACHE_MAP[cache_name]
         else:
             caches = {name: CACHE_MAP[name] for name in commands.get("cache_dirs", {}) if name in CACHE_MAP}
         steps = []
@@ -254,7 +265,8 @@ class JobExecutor:
         for setup in commands.get("setup", []):
             name = setup.get("name", "setup") if isinstance(setup, dict) else "setup"
             command = setup.get("command") if isinstance(setup, dict) else setup
-            step = self._run_setup(job, label, image, source_dir, caches, name, command, service_env)
+            step = self._run_setup(job, label, image, source_dir, caches, name, command, service_env,
+                                   pass_proxy=(workspace["stack"] == "python"))
             steps.append(step)
             if step["exit_code"] != 0:
                 setup_failed = True
@@ -281,6 +293,17 @@ class JobExecutor:
                 steps.append(step)
                 self.log_manager.upload(job.job_id, f"[{step['step_name']}] BLOCKED_BY_SETUP\n")
                 continue
+            if setup_failed and workspace["stack"] == "python":
+                step = {
+                    "step_name": f"{label}:{check['name']}",
+                    "command": check["command"],
+                    "status": "blocked_by_setup",
+                    "exit_code": None,
+                    "duration_seconds": 0,
+                }
+                steps.append(step)
+                self.log_manager.upload(job.job_id, f"[{step['step_name']}] BLOCKED_BY_SETUP\n")
+                continue
             step = self._run_check(job, label, image, source_dir, caches, check["name"], check["command"], service_env)
             steps.append(step)
             if step["exit_code"] != 0:
@@ -297,25 +320,30 @@ class JobExecutor:
 
         return {"passed": passed, "exit_code": exit_code, "steps": steps}
 
-    def _run_setup(self, job, label, image, source_dir, caches, step_name, command, service_env=None):
+    def _run_setup(self, job, label, image, source_dir, caches, step_name, command, service_env=None, pass_proxy=False):
         name = f"{label}:{step_name}"
         self.log_manager.upload(job.job_id, f"[{name}] Starting: {command}\n")
         start = time.time()
         result = self.podman.run_command(image, job.job_id, source_dir, caches, command, 300, network=True,
-                                         env=self._service_env(service_env), network_name=service_env.network if service_env else None)
+                                         env=self._service_env(service_env), network_name=service_env.network if service_env else None,
+                                         pass_proxy=pass_proxy)
         self._upload_output(job.job_id, result)
         status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else "failed")
         self.log_manager.upload(job.job_id, f"[{name}] {status.upper()} (exit={result['exit_code']})\n")
         return {"step_name": name, "command": command, "status": status, "exit_code": result["exit_code"], "duration_seconds": time.time() - start}
 
-    def _run_check(self, job, label, image, source_dir, caches, name, command, service_env=None):
+    def _run_check(self, job, label, image, source_dir, caches, name, command, service_env=None, extra_env=None, pass_proxy=False):
         step_name = f"{label}:{name}"
         self.log_manager.upload(job.job_id, f"[{step_name}] Starting: {command}\n")
         step_id = self.client.start_step(job.job_id, step_name)
         start = time.time()
+        env = self._service_env(service_env) or {}
+        if extra_env:
+            env.update(extra_env)
         result = self.podman.run_command(image, job.job_id, source_dir, caches, command, job.timeout_seconds,
-                                         network=True if service_env else False, env=self._service_env(service_env),
-                                         network_name=service_env.network if service_env else None)
+                                         network=True if service_env else False, env=env if env else None,
+                                         network_name=service_env.network if service_env else None,
+                                         pass_proxy=pass_proxy)
         self._upload_output(job.job_id, result)
         status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else "failed")
         duration = time.time() - start
@@ -456,3 +484,4 @@ class JobExecutor:
         except Exception as exc:
             self.log_manager.upload(job.job_id, f"[gofmt-autofix] Exception: {exc}\n")
             return False
+

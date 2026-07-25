@@ -1,10 +1,9 @@
 """Rootless Podman container management."""
 
+import hashlib
 import logging
 import os
 import subprocess
-import hashlib
-import time
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +31,8 @@ class PodmanRunner:
         return result
 
     def image_available(self, image: str) -> bool:
-        """Verify the selected image exists locally.
-
-        Checks local storage first to avoid unnecessary network pull.
-        Falls back to pull only when the image is not present locally.
-        """
+        """Verify the selected image exists locally, pulling only when missing."""
         try:
-            # Fast path: image already cached locally
             exists = subprocess.run(
                 [self.podman, "image", "exists", image],
                 capture_output=True,
@@ -48,7 +42,6 @@ class PodmanRunner:
             if exists.returncode == 0:
                 return True
 
-            # Slow path: pull missing image from registry
             pull = [self.podman, "pull", "--platform", "linux/amd64"]
             if image.startswith("100.118.124.97:5555/"):
                 pull.extend(["--tls-verify=false"])
@@ -56,7 +49,6 @@ class PodmanRunner:
             refreshed = subprocess.run(pull, capture_output=True, text=True, timeout=180)
             if refreshed.returncode != 0:
                 return False
-            # Double-check after pull
             verify = subprocess.run(
                 [self.podman, "image", "exists", image],
                 capture_output=True,
@@ -83,6 +75,25 @@ class PodmanRunner:
         except (OSError, subprocess.TimeoutExpired):
             return None
 
+    @staticmethod
+    def _cache_mounts(cache_dirs: dict) -> tuple[list[str], str | None]:
+        mounts: list[str] = []
+        go_cache = None
+        for cache_name, cache_path in cache_dirs.items():
+            if cache_name == "go":
+                go_cache = os.path.realpath(cache_path)
+                if os.path.exists(go_cache):
+                    mounts.extend(["--mount", f"type=bind,src={go_cache},dst=/ci-cache,rw"])
+            elif cache_name == "python_venv":
+                if os.path.exists(cache_path):
+                    mounts.extend(["-v", f"{cache_path}:/ci-venv:Z"])
+            elif cache_name == "pip":
+                if os.path.exists(cache_path):
+                    mounts.extend(["-v", f"{cache_path}:/ci-cache/pip:Z"])
+            elif os.path.exists(cache_path):
+                mounts.extend(["-v", f"{cache_path}:{cache_path}:Z"])
+        return mounts, go_cache
+
     def run(
         self,
         image: str,
@@ -95,18 +106,8 @@ class PodmanRunner:
     ) -> dict:
         """Run commands in an isolated rootless Podman container."""
         container_name = self._container_name(job_id, source_dir)
-
-        # Map caches to container paths
-        cache_mounts = []
+        cache_mounts, go_cache = self._cache_mounts(cache_dirs)
         project_root = os.path.abspath(os.path.join(source_dir, os.pardir, os.pardir))
-        go_cache = None
-        for cache_name, cache_path in cache_dirs.items():
-            if cache_name == "go":
-                go_cache = os.path.realpath(cache_path)
-                if os.path.exists(go_cache):
-                    cache_mounts.extend(["--mount", f"type=bind,src={go_cache},dst=/ci-cache,rw"])
-            elif os.path.exists(cache_path):
-                cache_mounts.extend(["-v", f"{cache_path}:{cache_path}:Z"])
 
         cmd = [
             self.podman, "run",
@@ -136,6 +137,11 @@ class PodmanRunner:
         env_vars = env or {}
         inherited_proxy = self._container_proxy_env()
         safe_env = {**inherited_proxy, **self._go_cache_env(go_cache)}
+        if "pip" in cache_dirs:
+            safe_env.update({
+                "PIP_CACHE_DIR": "/ci-cache/pip",
+                "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+            })
         if go_cache:
             safe_env.update({
                 key: value for key, value in env_vars.items()
@@ -148,8 +154,8 @@ class PodmanRunner:
                                for f in ["TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH"])}
 
         env_args = []
-        for k, v in safe_env.items():
-            env_args.extend(["--env", f"{k}={v}"])
+        for key, value in safe_env.items():
+            env_args.extend(["--env", f"{key}={value}"])
         cmd[cmd.index("--entrypoint"):cmd.index("--entrypoint")] = env_args
 
         logger.info("Running podman container: %s image=%s", container_name, image)
@@ -160,9 +166,8 @@ class PodmanRunner:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=timeout_seconds + 60,  # Extra padding
+                timeout=timeout_seconds + 60,
             )
-
             return {
                 "exit_code": process.returncode,
                 "stdout": process.stdout,
@@ -178,36 +183,35 @@ class PodmanRunner:
                 "stderr": "TIMEOUT: Job exceeded maximum execution time",
                 "timed_out": True,
             }
-        except Exception as e:
-            logger.error("Container execution failed: %s", e)
+        except Exception as exc:
+            logger.error("Container execution failed: %s", exc)
             return {
                 "exit_code": -1,
                 "stdout": "",
-                "stderr": f"ERROR: {str(e)}",
+                "stderr": f"ERROR: {str(exc)}",
                 "timed_out": False,
             }
 
-    def run_command(self, image: str, job_id: str, source_dir: str,
-                    cache_dirs: dict, command: str, timeout_seconds: int,
-                    env: dict = None, network: bool = False,
-                    network_name: str | None = None) -> dict:
-        """Run a single command in a container. Supports optional network."""
+    def run_command(
+        self,
+        image: str,
+        job_id: str,
+        source_dir: str,
+        cache_dirs: dict,
+        command: str,
+        timeout_seconds: int,
+        env: dict = None,
+        network: bool = False,
+        network_name: str | None = None,
+        pass_proxy: bool = False,
+    ) -> dict:
+        """Run one command with explicit network and proxy boundaries."""
         container_name = self._container_name(job_id, source_dir)
-
-        cache_mounts = []
+        cache_mounts, go_cache = self._cache_mounts(cache_dirs)
         project_root = os.path.abspath(os.path.join(source_dir, os.pardir, os.pardir))
-        go_cache = None
-        for cache_name, cache_path in cache_dirs.items():
-            if cache_name == "go":
-                go_cache = os.path.realpath(cache_path)
-                if os.path.exists(go_cache):
-                    cache_mounts.extend(["--mount", f"type=bind,src={go_cache},dst=/ci-cache,rw"])
-            elif os.path.exists(cache_path):
-                cache_mounts.extend(["-v", f"{cache_path}:{cache_path}:Z"])
-
         net_arg = ["--pod", network_name] if network_name else ([] if network else ["--network=none"])
-
         userns_arg = [] if network_name else ["--userns=keep-id"]
+
         cmd = [
             self.podman, "run",
             "--rm",
@@ -232,28 +236,26 @@ class PodmanRunner:
             "-c", command,
         ]
 
-        safe_env = self._container_proxy_env()
+        safe_env = self._container_proxy_env() if (pass_proxy or network) else {}
         safe_env.update(self._go_cache_env(go_cache))
-        safe_env.update({
-            "ACTION_API_KEY": "test_api_key_32_bytes_long",
-            "GITHUB_TOKEN": "test_token_value",
-            "ALLOWED_REPOSITORIES": "owner/allowed-repo",
-            "ALLOW_DEFAULT_BRANCH_WRITE": "false",
-            "MAX_FILE_CHARACTERS": "5000",
-            "MAX_TOTAL_CHARACTERS": "10000",
-            "MAX_FILES_PER_COMMIT": "5",
-            "REPOSITORY_POLICY_FILE": "/workspace/tests/repository_policies_test.yml",
-        })
+        if "pip" in cache_dirs:
+            safe_env.update({
+                "PIP_CACHE_DIR": "/ci-cache/pip",
+                "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+            })
         if env:
             allowed = {"DATABASE_URL", "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "RABBITMQ_URL"}
-            safe_env.update({k: v for k, v in env.items() if k in allowed})
+            safe_env.update({key: value for key, value in env.items() if key in allowed})
         if network_name:
             existing = safe_env.get("NO_PROXY", "")
-            safe_env["NO_PROXY"] = ",".join(dict.fromkeys([item for item in existing.split(",") + ["postgres", "redis", "rabbitmq"] if item]))
+            safe_env["NO_PROXY"] = ",".join(dict.fromkeys(
+                [item for item in existing.split(",") + ["postgres", "redis", "rabbitmq"] if item]
+            ))
             safe_env["no_proxy"] = safe_env["NO_PROXY"]
+
         env_args = []
-        for k, v in safe_env.items():
-            env_args.extend(["--env", f"{k}={v}"])
+        for key, value in safe_env.items():
+            env_args.extend(["--env", f"{key}={value}"])
         cmd[cmd.index("--entrypoint"):cmd.index("--entrypoint")] = env_args
 
         try:
@@ -277,11 +279,11 @@ class PodmanRunner:
                 "stderr": "TIMEOUT",
                 "timed_out": True,
             }
-        except Exception as e:
+        except Exception as exc:
             return {
                 "exit_code": -1,
                 "stdout": "",
-                "stderr": f"ERROR: {str(e)}",
+                "stderr": f"ERROR: {str(exc)}",
                 "timed_out": False,
             }
 
@@ -332,12 +334,12 @@ class PodmanRunner:
                 capture_output=True, text=True, timeout=10,
             )
             for name in result.stdout.strip().split("\n"):
-                if name.startswith("ci-") and not any(name.startswith(f"ci-{p[:12]}") for p in job_id_prefixes):
+                if name.startswith("ci-") and not any(name.startswith(f"ci-{prefix[:12]}") for prefix in job_id_prefixes):
                     logger.info("Removing stale container: %s", name)
                     try:
                         subprocess.run([self.podman, "rm", "-f", name],
                                        capture_output=True, timeout=10)
                     except Exception:
                         pass
-        except Exception as e:
-            logger.warning("Cleanup stale containers failed: %s", e)
+        except Exception as exc:
+            logger.warning("Cleanup stale containers failed: %s", exc)
