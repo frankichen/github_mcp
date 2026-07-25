@@ -257,7 +257,8 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
     service = client
     service._check_repository_allowed(repository)
     service._check_default_branch_write(repository, branch)
-    repo = _repo(service.client, repository) if hasattr(service, "client") else _repo(service, repository)
+    gh = service.client if hasattr(service, "client") else service
+    repo = _repo(gh, repository)
     ref = repo.get_git_ref(f"heads/{branch}")
     actual_head = ref.object.sha
     if expected_head_sha and actual_head != expected_head_sha:
@@ -278,11 +279,11 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
         if content is None:
             elements.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
         else:
-            blob = service.create_blob(repository, content.decode("utf-8"))
+            blob = gh.create_blob(repository, content.decode("utf-8"))
             elements.append({"path": path, "mode": "100644", "type": "blob", "sha": blob.sha})
     base_tree = repo.get_git_commit(actual_head).commit.tree.sha
-    tree = service.create_git_tree(repository, elements, base_tree)
-    commit = service.create_commit(repository, message, tree.sha, [actual_head])
+    tree = gh.create_git_tree(repository, elements, base_tree)
+    commit = gh.create_commit(repository, message, tree.sha, [actual_head])
     try:
         ref.edit(sha=commit.sha, force=False)
     except Exception as exc:
