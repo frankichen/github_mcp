@@ -1,17 +1,146 @@
-"""Rootless Podman container management."""
+"""Rootless Podman container management.
+
+Provides config-driven resource limits, proxy-aware image prewarming,
+and persistent image reuse with --pull=never.
+"""
 
 import logging
 import os
+import re
 import subprocess
 import hashlib
 import time
 
 logger = logging.getLogger(__name__)
 
+# Patterns to redact from log output: proxy credentials, tokens, etc.
+_PROXY_REDACT_RE = re.compile(
+    r"(https?://)[^@:]*:[^@]*@|"
+    r"(token|password|secret|api[_-]?key|authorization)\s*[:=]\s*\S+|"
+    r"(Proxy-Authorization|Authorization)\s*:\s*\S+",
+    re.IGNORECASE,
+)
+
+DEFAULT_RESOURCE_POLICY = {
+    "mode": "dedicated_worker",
+    "reserve_cpus": 1,
+    "reserve_memory_mb": 2048,
+    "pids_limit": 2048,
+    "max_parallel_workspaces": 3,
+}
+
 
 class PodmanRunner:
-    def __init__(self, podman_binary: str = "/usr/bin/podman"):
+    def __init__(self, podman_binary: str = "/usr/bin/podman",
+                 resource_policy: dict | None = None,
+                 prewarm_images: list[str] | None = None):
         self.podman = podman_binary
+        self.resource_policy = resource_policy or dict(DEFAULT_RESOURCE_POLICY)
+        self.prewarm_images = prewarm_images or []
+        self._image_digest_cache: dict[str, str] = {}
+
+    # ---- Resource limit construction ----
+
+    def _build_resource_args(self, overrides: dict | None = None) -> list[str]:
+        """Build Podman resource args from config-driven policy.
+
+        dedicated_worker mode: omit CPU/memory caps; rely on systemd cgroup.
+        shared_worker mode: apply explicit limits from policy or overrides.
+        Values of 0 or None are omitted.
+        """
+        policy = dict(self.resource_policy)
+        if overrides:
+            policy.update(overrides)
+
+        args = []
+        mode = policy.get("mode", "dedicated_worker")
+
+        if mode == "shared_worker":
+            for key, flag in [("cpus", "--cpus"), ("memory", "--memory"),
+                              ("memory_swap", "--memory-swap")]:
+                val = policy.get(key)
+                if val and str(val) != "0":
+                    args.extend([flag, str(val)])
+        # dedicated_worker: no CPU/memory caps — systemd slice controls total
+
+        pids = policy.get("pids_limit", 2048)
+        if pids:
+            args.extend(["--pids-limit", str(pids)])
+
+        return args
+
+    def resource_summary(self) -> dict:
+        """Public-safe summary of the active resource policy."""
+        p = dict(self.resource_policy)
+        return {
+            "mode": p.get("mode", "dedicated_worker"),
+            "pids_limit": p.get("pids_limit"),
+            "reserve_cpus": p.get("reserve_cpus") if p.get("mode") == "dedicated_worker" else None,
+            "reserve_memory_mb": p.get("reserve_memory_mb") if p.get("mode") == "dedicated_worker" else None,
+        }
+
+    # ---- Image prewarming ----
+
+    def prewarm(self) -> dict[str, str | None]:
+        """Ensure prewarm images exist locally. Records digests.
+
+        Uses proxy env vars for pull when image is missing.
+        Does NOT delete existing images.
+        """
+        digests: dict[str, str | None] = {}
+        for image in self.prewarm_images:
+            try:
+                exists = subprocess.run(
+                    [self.podman, "image", "exists", image],
+                    capture_output=True, text=True, timeout=15,
+                )
+                if exists.returncode == 0:
+                    digest = self.image_digest(image)
+                    digests[image] = digest
+                    logger.info("Prewarm cache hit: %s digest=%s", image, digest)
+                    continue
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+            # Pull with proxy
+            logger.info("Prewarm pull: %s", image)
+            try:
+                pull_env = self._sanitized_proxy_env()
+                pull = subprocess.run(
+                    [self.podman, "pull", "--platform", "linux/amd64", image],
+                    capture_output=True, text=True, timeout=300,
+                    env={**os.environ, **pull_env},
+                )
+                if pull.returncode == 0:
+                    digest = self.image_digest(image)
+                    digests[image] = digest
+                    self._image_digest_cache[image] = digest or ""
+                    logger.info("Prewarm pulled: %s digest=%s", image, digest)
+                else:
+                    digests[image] = None
+                    logger.warning("Prewarm pull failed for %s: %s", image, _PROXY_REDACT_RE.sub("***", pull.stderr[-200:]))
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                digests[image] = None
+                logger.warning("Prewarm pull error for %s: %s", image, exc)
+        return digests
+
+    # ---- Proxy helpers ----
+
+    @staticmethod
+    def _sanitized_proxy_env() -> dict[str, str]:
+        """Return proxy env vars for host-level operations (pull, fetch).
+
+        Includes HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY and lowercase
+        variants.  Credentials are NOT stripped here — callers must redact
+        before logging.
+        """
+        result = {}
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                    "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+            val = os.environ.get(key)
+            if val:
+                result[key] = val
+        return result
 
     @staticmethod
     def _container_proxy_env() -> dict[str, str]:
@@ -31,39 +160,48 @@ class PodmanRunner:
             result["no_proxy"] = no_proxy
         return result
 
-    def image_available(self, image: str) -> bool:
+    def image_available(self, image: str, allow_pull: bool = False) -> bool:
         """Verify the selected image exists locally.
 
-        Checks local storage first to avoid unnecessary network pull.
-        Falls back to pull only when the image is not present locally.
+        When allow_pull=False (default for job execution): checks local
+        storage only — images must be prewarmed.
+        When allow_pull=True: pulls missing images via proxy.
         """
         try:
-            # Fast path: image already cached locally
             exists = subprocess.run(
                 [self.podman, "image", "exists", image],
-                capture_output=True,
-                text=True,
-                timeout=15,
+                capture_output=True, text=True, timeout=15,
             )
             if exists.returncode == 0:
                 return True
+        except (OSError, subprocess.TimeoutExpired):
+            if not allow_pull:
+                return False
 
-            # Slow path: pull missing image from registry
+        if not allow_pull:
+            return False
+
+        # Slow path: pull missing image from registry via proxy
+        try:
+            pull_env = self._sanitized_proxy_env()
             pull = [self.podman, "pull", "--platform", "linux/amd64"]
             if image.startswith("100.118.124.97:5555/"):
                 pull.extend(["--tls-verify=false"])
             pull.append(image)
-            refreshed = subprocess.run(pull, capture_output=True, text=True, timeout=180)
+            refreshed = subprocess.run(pull, capture_output=True, text=True, timeout=180,
+                                       env={**os.environ, **pull_env})
             if refreshed.returncode != 0:
                 return False
-            # Double-check after pull
             verify = subprocess.run(
                 [self.podman, "image", "exists", image],
-                capture_output=True,
-                text=True,
-                timeout=15,
+                capture_output=True, text=True, timeout=15,
             )
-            return verify.returncode == 0
+            if verify.returncode == 0:
+                digest = self.image_digest(image)
+                if digest:
+                    self._image_digest_cache[image] = digest
+                return True
+            return False
         except (OSError, subprocess.TimeoutExpired):
             return False
 
@@ -190,8 +328,17 @@ class PodmanRunner:
     def run_command(self, image: str, job_id: str, source_dir: str,
                     cache_dirs: dict, command: str, timeout_seconds: int,
                     env: dict = None, network: bool = False,
-                    network_name: str | None = None) -> dict:
-        """Run a single command in a container. Supports optional network."""
+                    network_name: str | None = None,
+                    extra_mounts: list[str] | None = None,
+                    resource_limits: dict | None = None,
+                    pass_proxy: bool = False) -> dict:
+        """Run a single command in a container with config-driven resource limits.
+
+        Args:
+            extra_mounts: additional `-v src:dst` mount pairs.
+            resource_limits: overrides for resource_policy (cpus, memory, etc.).
+            pass_proxy: if True, pass proxy env to container (for dep download).
+        """
         container_name = self._container_name(job_id, source_dir)
 
         cache_mounts = []
@@ -205,62 +352,57 @@ class PodmanRunner:
             elif os.path.exists(cache_path):
                 cache_mounts.extend(["-v", f"{cache_path}:{cache_path}:Z"])
 
-        net_arg = ["--pod", network_name] if network_name else ([] if network else ["--network=none"])
+        # Extra mounts (e.g. artifacts dir)
+        extra = extra_mounts or []
+
+        net_arg = (["--pod", network_name] if network_name
+                   else ([] if network else ["--network=none"]))
 
         userns_arg = [] if network_name else ["--userns=keep-id"]
+        resource_args = self._build_resource_args(resource_limits)
+
         cmd = [
             self.podman, "run",
             "--rm",
+            "--pull=never",
             "--name", container_name,
         ] + userns_arg + [
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
-            "--pids-limit=256",
-            "--memory=2g",
-            "--memory-swap=3g",
-            "--cpus=2",
             "--read-only",
             "--tmpfs=/tmp:rw,noexec,nosuid,size=256m",
             "--tmpfs=/run:rw,noexec,nosuid,size=64m",
-            "--tmpfs=/data:rw,noexec,nosuid,size=64m",
             "-v", f"{source_dir}:/workspace:Z",
             "-v", f"{project_root}:/repo:ro",
             "--workdir", "/workspace",
-        ] + net_arg + cache_mounts + [
+        ] + net_arg + resource_args + cache_mounts + extra + [
             "--entrypoint", "/bin/sh",
             image,
             "-c", command,
         ]
 
-        safe_env = self._container_proxy_env()
+        safe_env = {}
+        if pass_proxy:
+            safe_env.update(self._container_proxy_env())
         safe_env.update(self._go_cache_env(go_cache))
-        safe_env.update({
-            "ACTION_API_KEY": "test_api_key_32_bytes_long",
-            "GITHUB_TOKEN": "test_token_value",
-            "ALLOWED_REPOSITORIES": "owner/allowed-repo",
-            "ALLOW_DEFAULT_BRANCH_WRITE": "false",
-            "MAX_FILE_CHARACTERS": "5000",
-            "MAX_TOTAL_CHARACTERS": "10000",
-            "MAX_FILES_PER_COMMIT": "5",
-            "REPOSITORY_POLICY_FILE": "/workspace/tests/repository_policies_test.yml",
-        })
         if env:
-            allowed = {"DATABASE_URL", "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "RABBITMQ_URL"}
+            allowed = {"DATABASE_URL", "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "RABBITMQ_URL",
+                       "AI_INTEGRITY_BASE_SHA", "AI_INTEGRITY_REPORT", "AI_INTEGRITY_CHANGED_FILES"}
             safe_env.update({k: v for k, v in env.items() if k in allowed})
         if network_name:
             existing = safe_env.get("NO_PROXY", "")
-            safe_env["NO_PROXY"] = ",".join(dict.fromkeys([item for item in existing.split(",") + ["postgres", "redis", "rabbitmq"] if item]))
+            safe_env["NO_PROXY"] = ",".join(dict.fromkeys(
+                [item for item in existing.split(",") + ["postgres", "redis", "rabbitmq"] if item]))
             safe_env["no_proxy"] = safe_env["NO_PROXY"]
         env_args = []
         for k, v in safe_env.items():
             env_args.extend(["--env", f"{k}={v}"])
-        cmd[cmd.index("--entrypoint"):cmd.index("--entrypoint")] = env_args
+        if env_args:
+            cmd[cmd.index("--entrypoint"):cmd.index("--entrypoint")] = env_args
 
         try:
             process = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
+                cmd, capture_output=True, text=True,
                 timeout=timeout_seconds + 60,
             )
             return {
@@ -271,19 +413,9 @@ class PodmanRunner:
             }
         except subprocess.TimeoutExpired:
             self._kill_container(container_name)
-            return {
-                "exit_code": -1,
-                "stdout": "",
-                "stderr": "TIMEOUT",
-                "timed_out": True,
-            }
+            return {"exit_code": -1, "stdout": "", "stderr": "TIMEOUT", "timed_out": True}
         except Exception as e:
-            return {
-                "exit_code": -1,
-                "stdout": "",
-                "stderr": f"ERROR: {str(e)}",
-                "timed_out": False,
-            }
+            return {"exit_code": -1, "stdout": "", "stderr": f"ERROR: {type(e).__name__}", "timed_out": False}
 
     @staticmethod
     def _container_name(job_id: str, source_dir: str = "") -> str:
