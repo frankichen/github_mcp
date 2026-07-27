@@ -1,6 +1,8 @@
 func baseP2PSyncInput() {
     LocalP2P: LocalP2PInfo{
         P2PID: "x",
+        Provider: "demo",
+        ProviderConfigVersion: 7,
     },
     FirmwareVersion: "1.0.0",
 }
