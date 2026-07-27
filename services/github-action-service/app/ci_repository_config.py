@@ -24,6 +24,17 @@ _DEFAULT_CONFIG = {
             "allowed_profiles": ["repo-auto-check", "repo-fast-check", "python-check"],
             "max_timeout_seconds": 900,
         },
+        "frankichen/auto_gupiao": {
+            "enabled": True,
+            "private_ci": True,
+            "auto_detect": True,
+            "allowed_profiles": ["repo-auto-check"],
+            "max_timeout_seconds": 900,
+            "merge_policy": {
+                "private_ci_authoritative": True,
+                "required_private_ci_profile": "repo-auto-check",
+            },
+        },
     }
 }
 

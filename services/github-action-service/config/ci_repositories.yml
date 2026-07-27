@@ -37,13 +37,14 @@ repositories:
 
   frankichen/auto_gupiao:
     enabled: true
-    private_ci: false
+    private_ci: true
     auto_detect: true
-    allowed_profiles: []
+    allowed_profiles:
+      - repo-auto-check
     max_timeout_seconds: 900
     merge_policy:
-      private_ci_authoritative: false
-      required_private_ci_profile: ""
+      private_ci_authoritative: true
+      required_private_ci_profile: repo-auto-check
       github_checks_mode: required_only
       allow_non_required_check_failures: true
       allow_quota_or_infrastructure_failures: true
