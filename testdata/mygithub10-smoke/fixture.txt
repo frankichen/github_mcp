@@ -12,15 +12,17 @@ DeviceActivationRequest:
   properties:
     provider_types:
       type: array
+    provider_region_id:
+      type: string
 DeviceActivationResponse:
   type: object
 
-alpha=1
+alpha=updated
 beta=2
 gamma=3
 
 unicode=中文🙂
 tail=preserve
 
-section_b=before
+section_b=after
 section_b_tail=keep
