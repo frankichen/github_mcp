@@ -517,7 +517,7 @@ def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, op
         raise
 
 
-def capabilities(build_sha: str = "unknown", version: str = "10.0.2") -> dict[str, Any]:
+def capabilities(build_sha: str = "unknown", version: str = "10.0.3") -> dict[str, Any]:
     build_sha_source = "environment" if re.fullmatch(r"[0-9a-f]{40}", build_sha or "") else "vcs_fallback"
     if not re.fullmatch(r"[0-9a-f]{40}", build_sha or ""):
         try:

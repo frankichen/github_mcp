@@ -757,7 +757,7 @@ def _mygithub10_error(exc: Exception) -> str:
 async def get_mygithub_capabilities() -> str:
     return json.dumps(mygithub10.capabilities(
         os.environ.get("MYGITHUB10_BUILD_SHA") or "unknown",
-        os.environ.get("MYGITHUB10_VERSION") or "10.0.2",
+        os.environ.get("MYGITHUB10_VERSION") or "10.0.3",
     ), ensure_ascii=False)
 
 
