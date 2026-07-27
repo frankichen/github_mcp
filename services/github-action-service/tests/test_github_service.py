@@ -339,6 +339,12 @@ class TestMultiFileCommit:
             mock_ref = MagicMock()
             mock_repo.get_git_ref.return_value = mock_ref
 
+            readback_a = MagicMock(sha="blob1_sha", decoded_content=b"content a")
+            readback_b = MagicMock(sha="blob2_sha", decoded_content=b"content b")
+            mock_repo.get_contents.side_effect = [
+                MagicMock(sha="old_a"), MagicMock(sha="old_b"), readback_a, readback_b,
+            ]
+
             mock_gh.get_repo.return_value = mock_repo
 
             response = client.post(
