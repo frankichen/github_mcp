@@ -28,13 +28,16 @@ ALLOWED_PRIORITIES = {"normal": 50, "high": 40}
 
 
 def effective_priority(branch: str, profile: str, requested: int) -> int:
-    """Lower numbers are leased first; preserve main/PR/fast ordering."""
+    """Higher numbers are leased first.
+
+    Order: repo-fast-check (150) > main repo-auto-check (130) > PR repo-auto-check (100).
+    """
+    if profile == "repo-fast-check":
+        return 150
     if profile == "repo-auto-check" and branch == "main":
         return 130
     if profile == "repo-auto-check":
         return 100
-    if profile == "repo-fast-check":
-        return 60
     return requested
 
 

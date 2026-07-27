@@ -105,6 +105,26 @@ def test_private_ci_exact_sha_profile_and_superseded(monkeypatch):
     assert result["ready"] is True
 
 
+def test_private_ci_disabled_skips_gate_for_readiness_and_merge(monkeypatch):
+    head = "a" * 40
+    base = {"ok": True, "state": "open", "merged": False, "draft": False, "base_branch": "main", "base_sha": "b" * 40,
+            "head_branch": "feature", "head_sha": head, "mergeable": True, "mergeable_state": "clean",
+            "review_decision": "APPROVED", "reviews": [], "requested_reviewers": [], "requested_teams": []}
+    monkeypatch.setattr(github_utils, "get_github_pull_request", lambda *args: base)
+    monkeypatch.setattr(github_utils, "_private_ci_policy", lambda *_: (True, False))
+    monkeypatch.setattr(github_utils, "_get_gh", lambda: SimpleNamespace(get_repo=lambda *_: SimpleNamespace(allow_squash_merge=True)))
+    monkeypatch.setattr(github_utils, "_review_policy", lambda *args: {"required_approvals": 0, "current_approvals": 0, "source": "none", "changes_requested": False})
+    monkeypatch.setattr(github_utils, "get_github_pull_request_checks", lambda *args: {"ok": True, "checks": [], "statuses": [], "overall_conclusion": "neutral", "required_check_sources": {"errors": []}})
+    monkeypatch.setattr(github_utils, "get_github_repository", lambda *args: {"allow_squash_merge": True})
+
+    readiness = github_utils.get_github_pull_request_merge_readiness("frankichen/auto_gupiao", 32, head)
+    assert "PRIVATE_CI_REQUIRED" not in readiness["blocking"]
+    assert readiness["private_ci_required"] is False
+
+    merge = github_utils.merge_github_pull_request("frankichen/auto_gupiao", 32, "squash", head, confirm=True)
+    assert merge["error"]["code"] != "PRIVATE_CI_REQUIRED"
+
+
 def test_infrastructure_signals_are_classified_without_project_failure():
     assert github_utils._is_actions_infrastructure_failure({"status": "completed", "conclusion": "failure", "runner_id": 0})
     assert github_utils._is_actions_infrastructure_failure({"status": "completed", "conclusion": "failure", "logs_http_status": 404})

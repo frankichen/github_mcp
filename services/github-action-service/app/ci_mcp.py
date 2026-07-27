@@ -29,6 +29,7 @@ from app.ci_models import ALLOWED_PRIORITIES, effective_priority, make_idempoten
 from app.ci_repository_config import (
     is_repository_allowed,
     is_profile_allowed,
+    is_private_ci_enabled,
     get_max_timeout,
     get_allowed_profiles,
 )
@@ -167,6 +168,8 @@ This is for the private WSL CI system. NOT for GitHub Actions dispatch (use star
                 return _error_response("INVALID_ARGUMENT", "commit_sha must be exactly 40 hex characters")
             if not is_repository_allowed(repository):
                 return _error_response("REPOSITORY_NOT_ALLOWED", f"Repository '{repository}' is not in the CI allowed list")
+            if not is_private_ci_enabled(repository):
+                return _error_response("REPOSITORY_OPERATION_DENIED", f"Private CI is disabled for '{repository}'")
             if not is_profile_allowed(repository, profile):
                 return _error_response("PRIVATE_CI_PROFILE_NOT_ALLOWED", f"Profile '{profile}' not allowed for '{repository}'")
             if priority not in ALLOWED_PRIORITIES:

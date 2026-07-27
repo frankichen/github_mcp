@@ -11,6 +11,10 @@ EnvironmentFile=/etc/private-ci/deploy-worker.env
 Environment=DEPLOY_STATUS_FILE=/var/lib/private-ci/gongshi-test-status.json
 Environment=ENVIRONMENT_URL=http://gongshi-test
 Environment=DEPLOY_EXECUTION_MODE=claim_only
+# auto_gupiao uses the same worker with its own fixed contract/workspace.
+# Set this to the clean exact-main checkout maintained by the controlled WSL executor.
+Environment=AUTO_GUPIAO_DEPLOY_WORKSPACE=/srv/private-ci/deploy-workspace/auto_gupiao
+Environment=AUTO_GUPIAO_DEPLOY_STATUS_FILE=/var/lib/private-ci/auto-gupiao-status.json
 ExecStart=/opt/private-deploy-agent/venv/bin/python -m app.deploy_worker
 Restart=always
 RestartSec=5

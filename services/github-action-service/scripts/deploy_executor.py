@@ -31,6 +31,25 @@ EXPECTED_ENVIRONMENT = "gongshi-test"
 TIMEOUT_SECONDS = int(os.environ.get("DEPLOY_TIMEOUT_SECONDS", "3600"))
 SECRET_RE = re.compile(r"(?i)(token|authorization|password|secret|database_url|cookie|private_key)=\S+")
 
+CONTRACTS = {
+    "frankichen/sxt": {
+        "environment": "gongshi-test",
+        "workspace": WORKSPACE,
+        "mirror": DEPLOY_MIRROR,
+        "repository_url": AUTHORITATIVE_REPOSITORY_URL,
+        "script": "scripts/deploy_gongshi_test.sh",
+        "frontend": True,
+    },
+    "frankichen/auto_gupiao": {
+        "environment": "auto-gupiao-test",
+        "workspace": os.environ.get("AUTO_GUPIAO_DEPLOY_WORKSPACE", "/home/xiaowu/work/auto_gupiao"),
+        "mirror": os.environ.get("AUTO_GUPIAO_DEPLOY_MIRROR", os.path.join(DEPLOY_CACHE, "frankichen-auto_gupiao.git")),
+        "repository_url": os.environ.get("AUTO_GUPIAO_REPOSITORY_URL", "https://github.com/frankichen/auto_gupiao.git"),
+        "script": "scripts/deploy_auto_gupiao.sh",
+        "frontend": False,
+    },
+}
+
 
 class DeploymentSourceError(RuntimeError):
     def __init__(self, code: str, message: str):
@@ -48,30 +67,35 @@ def _git(*args: str, cwd: str | None = None) -> str:
 
 def prepare_workspace(row: dict) -> tuple[str, list[str]]:
     """Refresh the authoritative mirror and create a disposable exact-SHA checkout."""
+    contract = CONTRACTS.get(row.get("repository"))
+    if not contract:
+        raise DeploymentSourceError("REPOSITORY_NOT_ALLOWED", "no deployment contract")
     expected = row["commit_sha"]
-    if not os.path.isdir(DEPLOY_MIRROR):
+    mirror = contract["mirror"]
+    if not os.path.isdir(mirror):
         raise DeploymentSourceError("DEPLOY_SOURCE_FETCH_FAILED", "authoritative deploy mirror is missing")
-    remote = _git("remote", "get-url", "origin", cwd=DEPLOY_MIRROR)
-    if remote != AUTHORITATIVE_REPOSITORY_URL:
+    remote = _git("remote", "get-url", "origin", cwd=mirror)
+    if remote != contract["repository_url"]:
         raise DeploymentSourceError("DEPLOY_SOURCE_FETCH_FAILED", "deploy mirror origin is not authoritative")
     try:
-        _git("remote", "update", "--prune", cwd=DEPLOY_MIRROR)
+        _git("remote", "update", "--prune", cwd=mirror)
     except DeploymentSourceError as exc:
         raise DeploymentSourceError("DEPLOY_SOURCE_FETCH_FAILED", str(exc)) from exc
-    mirror_sha = _git("rev-parse", "refs/heads/main", cwd=DEPLOY_MIRROR)
+    mirror_sha = _git("rev-parse", "refs/heads/main", cwd=mirror)
     if mirror_sha != expected:
         raise DeploymentSourceError("DEPLOY_MAIN_SHA_MISMATCH", f"mirror main={mirror_sha} expected={expected}")
     try:
-        _git("cat-file", "-e", f"{expected}^{{commit}}", cwd=DEPLOY_MIRROR)
+        _git("cat-file", "-e", f"{expected}^{{commit}}", cwd=mirror)
     except DeploymentSourceError as exc:
         raise DeploymentSourceError("DEPLOY_COMMIT_NOT_FOUND", f"commit {expected} is not in authoritative mirror") from exc
-    workspace = os.path.join(DEPLOY_WORKSPACES, row["deployment_id"])
+    workspaces = DEPLOY_WORKSPACES if row["repository"] == EXPECTED_REPOSITORY else os.path.join(DEPLOY_WORKSPACES, row["repository"].replace("/", "-"))
+    workspace = os.path.join(workspaces, row["deployment_id"])
     if os.path.exists(workspace):
         raise DeploymentSourceError("DEPLOY_WORKSPACE_EXISTS", "deployment workspace already exists")
-    os.makedirs(DEPLOY_WORKSPACES, exist_ok=True)
+    os.makedirs(workspaces, exist_ok=True)
     try:
-        _git("clone", "--no-local", "--branch", "main", DEPLOY_MIRROR, workspace)
-        _git("remote", "set-url", "origin", AUTHORITATIVE_REPOSITORY_URL, cwd=workspace)
+        _git("clone", "--no-local", "--branch", "main", mirror, workspace)
+        _git("remote", "set-url", "origin", contract["repository_url"], cwd=workspace)
         _git("fetch", "--no-tags", "origin", "main", cwd=workspace)
     except DeploymentSourceError:
         raise
@@ -84,7 +108,7 @@ def prepare_workspace(row: dict) -> tuple[str, list[str]]:
     if branch != "main" or head_sha != expected or dirty:
         raise DeploymentSourceError("DEPLOY_MAIN_SHA_MISMATCH", "isolated checkout is not exact clean main")
     return workspace, [
-        f"authoritative_origin={AUTHORITATIVE_REPOSITORY_URL}",
+        f"authoritative_origin={contract['repository_url']}",
         f"mirror_main_sha={mirror_sha}",
         f"origin_main_sha={origin_sha}",
         f"checked_out_head={head_sha}",
@@ -137,7 +161,8 @@ def _step(line: str) -> str:
 
 def execute(row: dict) -> None:
     deployment_id = row["deployment_id"]
-    if row.get("repository") != EXPECTED_REPOSITORY or row.get("environment") != EXPECTED_ENVIRONMENT:
+    contract = CONTRACTS.get(row.get("repository"))
+    if not contract or row.get("environment") != contract["environment"]:
         return
     _callback(f"/internal/deployments/{deployment_id}/progress", {"current_step": "preparing_workspace", "status": "running", "message": "WSL workspace preparation started"})
     output = []
@@ -148,15 +173,18 @@ def execute(row: dict) -> None:
         for line in source_lines:
             output.append(line)
             _callback(f"/internal/deployments/{deployment_id}/progress", {"current_step": "validating_main", "status": "running", "message": line})
-        script = os.path.join(workspace, "scripts", "deploy_gongshi_test.sh")
+        script = os.path.join(workspace, contract["script"])
         if not os.path.isfile(script):
             raise DeploymentSourceError("DEPLOY_COMMIT_NOT_FOUND", "deployment script is missing from exact checkout")
         deploy_env = {**os.environ, "DEPLOYMENT_ID": deployment_id}
         # The release script's integration tests share the WSL PostgreSQL
         # fixture. Serialize Go packages to avoid cross-package fixture races.
         deploy_env["GOFLAGS"] = (deploy_env.get("GOFLAGS", "") + " -p=1").strip()
+        args = ["bash", script, "--yes", "--expected-sha", row["commit_sha"]]
+        if contract["frontend"]:
+            args.insert(3, "--with-frontend")
         process = subprocess.Popen(
-            ["bash", script, "--yes", "--with-frontend", "--expected-sha", row["commit_sha"]],
+            args,
             cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             env=deploy_env,
         )
@@ -192,11 +220,11 @@ def execute(row: dict) -> None:
             return
         proof = {
             "release_id": release_id,
-            "repository": EXPECTED_REPOSITORY,
-            "environment": EXPECTED_ENVIRONMENT,
+            "repository": row["repository"],
+            "environment": contract["environment"],
             "git_sha": row["commit_sha"],
             "current_release_path": release_path,
-            "frontend_included": True,
+            "frontend_included": contract["frontend"],
             "manifest_verified": True,
             "checksum_verified": True,
             "health_verified": True,

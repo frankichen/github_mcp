@@ -21,7 +21,7 @@ _DEFAULT_CONFIG = {
         },
         "frankichen/sxt": {
             "enabled": True,
-            "allowed_profiles": ["repo-auto-check", "python-check"],
+            "allowed_profiles": ["repo-auto-check", "repo-fast-check", "python-check"],
             "max_timeout_seconds": 900,
         },
     }
@@ -98,3 +98,23 @@ def get_allowed_profiles(repository: Optional[str] = None) -> list[str]:
         for p in repo_cfg.get("allowed_profiles", []):
             profiles.add(p)
     return sorted(profiles)
+
+
+def get_repository_config(repository: str) -> dict:
+    """Return the configured repository entry without exposing secrets."""
+    config = _load_config()
+    return dict(config.get("repositories", {}).get(repository, {}) or {})
+
+
+def is_private_ci_enabled(repository: str) -> bool:
+    """Return whether private CI is an enabled policy gate for a repository."""
+    entry = get_repository_config(repository)
+    if "private_ci" in entry:
+        return entry.get("private_ci") is True
+    return bool(entry.get("enabled", False) and entry.get("allowed_profiles"))
+
+
+def get_deployment_config(repository: str) -> dict:
+    """Return the fixed, repository-scoped deployment contract."""
+    entry = get_repository_config(repository)
+    return dict(entry.get("deployment") or {})

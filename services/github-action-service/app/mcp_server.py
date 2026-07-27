@@ -541,7 +541,7 @@ def _deployment_tool_error(exc):
 
 
 @mcp.tool(name="plan_test_deployment", description="Plan only a fullstack frankichen/sxt gongshi-test deployment; validates exact main SHA, private CI, changed files, migrations, and infrastructure changes.")
-async def plan_test_deployment(repository: str, environment: str, commit_sha: str, private_ci_job_id: str, scope: str = "fullstack", expected_current_release_id: str = "", allow_deploy_infrastructure_changes: bool = False, artifact_id: str = "") -> str:
+async def plan_test_deployment(repository: str, environment: str, commit_sha: str, private_ci_job_id: str = "", scope: str = "fullstack", expected_current_release_id: str = "", allow_deploy_infrastructure_changes: bool = False, artifact_id: str = "") -> str:
     try:
         if artifact_id and os.environ.get("MYGITHUB10_ARTIFACT_DEPLOY_ENABLED", "false").lower() not in {"1", "true", "yes", "on"}: return json.dumps({"ok": False, "error_code": "FEATURE_DISABLED"})
         from app import deployment_service
@@ -550,7 +550,7 @@ async def plan_test_deployment(repository: str, environment: str, commit_sha: st
 
 
 @mcp.tool(name="start_test_deployment", description="Queue a whitelist-only fullstack gongshi-test deployment after exact main SHA and passed main private CI gates. Requires confirm=true; never accepts host or shell input.")
-async def start_test_deployment(repository: str, environment: str, commit_sha: str, private_ci_job_id: str, scope: str = "fullstack", expected_current_release_id: str = "", allow_deploy_infrastructure_changes: bool = False, force_redeploy: bool = False, confirm: bool = False, artifact_id: str = "") -> str:
+async def start_test_deployment(repository: str, environment: str, commit_sha: str, private_ci_job_id: str = "", scope: str = "fullstack", expected_current_release_id: str = "", allow_deploy_infrastructure_changes: bool = False, force_redeploy: bool = False, confirm: bool = False, artifact_id: str = "") -> str:
     try:
         if artifact_id and os.environ.get("MYGITHUB10_ARTIFACT_DEPLOY_ENABLED", "false").lower() not in {"1", "true", "yes", "on"}: return json.dumps({"ok": False, "error_code": "FEATURE_DISABLED"})
         from app import deployment_service
@@ -752,8 +752,8 @@ def _mygithub10_error(exc: Exception) -> str:
 @mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithub10 capability and compatibility contract.")
 async def get_mygithub_capabilities() -> str:
     return json.dumps(mygithub10.capabilities(
-        os.environ.get("MYGITHUB10_BUILD_SHA", "unknown"),
-        os.environ.get("MYGITHUB10_VERSION", "10.0.1"),
+        os.environ.get("MYGITHUB10_BUILD_SHA") or "unknown",
+        os.environ.get("MYGITHUB10_VERSION") or "10.0.1",
     ), ensure_ascii=False)
 
 
@@ -932,7 +932,7 @@ async def revoke_release_artifact(artifact_id: str) -> str:
 @mcp.tool(name="get_repository_operation_policy", description="Return the operation policy for a repository: what MyGithub10 operations are allowed (GitHub read/write, private CI, test deploy, self deploy).")
 async def get_repository_operation_policy(repository: str) -> str:
     """Return allowed operations for a repository based on authoritative policy sources."""
-    from app.ci_repository_config import is_repository_allowed, get_allowed_profiles
+    from app.ci_repository_config import is_private_ci_enabled
     from app.deployment_service import REPOSITORY as DEPLOY_REPOSITORY
 
     github_allowed = False
@@ -949,9 +949,7 @@ async def get_repository_operation_policy(repository: str) -> str:
         github_allowed = repository in allowed
 
     # Private CI: same policy as start_private_ci_job
-    if is_repository_allowed(repository):
-        profiles = get_allowed_profiles(repository)
-        private_ci_allowed = len(profiles) > 0
+    private_ci_allowed = is_private_ci_enabled(repository)
 
     # Test deploy: same policy as plan_test_deployment / start_test_deployment
     # (hardcoded single repository constant in deployment_service.py)
