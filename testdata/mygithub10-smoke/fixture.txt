@@ -1,0 +1,24 @@
+func baseP2PSyncInput() {
+    LocalP2P: LocalP2PInfo{
+        P2PID: "x",
+    },
+    FirmwareVersion: "1.0.0",
+}
+
+DeviceActivationRequest:
+  type: object
+  properties:
+    provider_types:
+      type: array
+DeviceActivationResponse:
+  type: object
+
+alpha=1
+beta=2
+gamma=3
+
+unicode=中文🙂
+tail=preserve
+
+section_b=before
+section_b_tail=keep
