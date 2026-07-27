@@ -22,7 +22,7 @@ beta=2
 gamma=3
 
 unicode=中文🙂
-tail=preserve
+tail=changed
 
 section_b=after
 section_b_tail=keep
