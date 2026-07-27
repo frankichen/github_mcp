@@ -16,6 +16,7 @@ from pathlib import Path
 
 from app.ci_database import get_job
 from app.github_utils import SHA_RE, _get_gh, _error_response
+from app.ci_repository_config import get_deployment_config, is_private_ci_enabled
 
 REPOSITORY = "frankichen/sxt"
 ENVIRONMENT = "gongshi-test"
@@ -25,6 +26,19 @@ STATUSES = ("queued", "claimed", "running", "preparing", "validating_main", "tes
 INFRA_FILES = ("scripts/deploy_gongshi_test.sh", "deploy/", "scripts/sync_test_env.sh")
 _lock = threading.Lock()
 _local = threading.local()
+
+
+def _deployment_spec(repository: str) -> dict:
+    configured = get_deployment_config(repository)
+    if not configured.get("enabled") and repository != REPOSITORY:
+        return {}
+    return {
+        "environment": configured.get("environment", ENVIRONMENT),
+        "scope": configured.get("scope", SCOPE),
+        "private_ci": configured.get("private_ci", is_private_ci_enabled(repository)) is True,
+        "profile": configured.get("profile", PROFILE),
+        "script": configured.get("script", "scripts/deploy_gongshi_test.sh"),
+    }
 
 
 def _get_deploy_db():
@@ -110,9 +124,10 @@ def _row(row):
 
 
 def _validate_common(repository, environment, scope, commit_sha):
-    if repository != REPOSITORY: return "REPOSITORY_NOT_ALLOWED"
-    if environment != ENVIRONMENT: return "ENVIRONMENT_NOT_ALLOWED"
-    if scope != SCOPE: return "SCOPE_NOT_ALLOWED"
+    spec = _deployment_spec(repository)
+    if not spec: return "REPOSITORY_NOT_ALLOWED"
+    if environment != spec["environment"]: return "ENVIRONMENT_NOT_ALLOWED"
+    if scope != spec["scope"]: return "SCOPE_NOT_ALLOWED"
     if not SHA_RE.fullmatch(commit_sha): return "INVALID_COMMIT_SHA"
     return None
 
@@ -253,21 +268,24 @@ def _persist_release_snapshot(release: dict) -> None:
         handle.write("\n")
 
 
-def _repo_state(commit_sha):
+def _repo_state(repository, commit_sha):
     gh = _get_gh()
-    repo = gh.get_repo(REPOSITORY)
+    repo = gh.get_repo(repository)
     main_sha = repo.get_branch("main").commit.sha
     files = [f.filename for f in repo.get_commit(commit_sha).files]
     return main_sha, files
 
 
-def _ci_gate(job_id, commit_sha):
+def _ci_gate(repository, job_id, commit_sha):
+    spec = _deployment_spec(repository)
+    if not spec.get("private_ci"):
+        return None, {"required": False, "status": "not_required"}
     job = get_job(job_id)
     if not job: return "PRIVATE_CI_JOB_NOT_FOUND", None
-    if job.get("repository") != REPOSITORY: return "PRIVATE_CI_REPOSITORY_MISMATCH", job
+    if job.get("repository") != repository: return "PRIVATE_CI_REPOSITORY_MISMATCH", job
     if job.get("branch") != "main": return "PRIVATE_CI_BRANCH_MISMATCH", job
     if job.get("commit_sha") != commit_sha: return "PRIVATE_CI_SHA_MISMATCH", job
-    if job.get("profile") != PROFILE: return "PRIVATE_CI_PROFILE_MISMATCH", job
+    if job.get("profile") != spec.get("profile", PROFILE): return "PRIVATE_CI_PROFILE_MISMATCH", job
     if job.get("status") != "passed" or job.get("exit_code") != 0: return "PRIVATE_CI_NOT_PASSED", job
     if job.get("superseded_by_job_id"): return "PRIVATE_CI_SUPERSEDED", job
     return None, job
@@ -279,11 +297,11 @@ def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id,
     if reason: return {"ok": True, "ready": False, "reasons": [reason]}
     reasons = []
     try:
-        main_sha, files = _repo_state(commit_sha)
+        main_sha, files = _repo_state(repository, commit_sha)
     except Exception as exc:
         return {"ok": True, "ready": False, "reasons": ["GITHUB_STATE_UNAVAILABLE"], "message": str(exc)}
     if commit_sha != main_sha: reasons.append("COMMIT_NOT_CURRENT_MAIN")
-    ci_reason, ci_job = _ci_gate(private_ci_job_id, commit_sha)
+    ci_reason, ci_job = _ci_gate(repository, private_ci_job_id, commit_sha)
     if ci_reason: reasons.append(ci_reason)
     artifact = None
     if artifact_id:
@@ -292,7 +310,8 @@ def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id,
         artifact = artifact_result.get("artifact") if artifact_result.get("ok") else None
         if not artifact_result.get("ok"):
             reasons.append(artifact_result.get("error_code", "ARTIFACT_INVALID"))
-    infra_changed = any(path == "scripts/deploy_gongshi_test.sh" or path == "scripts/sync_test_env.sh" or path.startswith("deploy/") for path in files)
+    spec = _deployment_spec(repository)
+    infra_changed = any(path == spec.get("script") or path == "scripts/deploy_gongshi_test.sh" or path == "scripts/sync_test_env.sh" or path.startswith("deploy/") for path in files)
     if infra_changed and not allow_deploy_infrastructure_changes: reasons.append("DEPLOY_INFRASTRUCTURE_CHANGE_REQUIRES_EXPLICIT_ALLOW")
     migrations_changed = any(path.startswith("db/migrations/") for path in files)
     snapshot = _status_snapshot() or {}
@@ -306,10 +325,10 @@ def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id,
             "target_release_id": f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{commit_sha[:12]}",
             "changed_files": files, "migrations_changed": migrations_changed, "deploy_infrastructure_changed": infra_changed,
             "artifact_id": artifact_id or None, "artifact": artifact,
-            "backend_components": ["lenshub-api", "lenshub-worker", "lenshub-scheduler", "lenshub-admin-bootstrap", "goose"],
-            "frontend_components": ["admin", "newadmin", "root", "app", "h5", "tester", "docs", "openapi"],
-            "restart_services": ["api", "worker", "scheduler", "web"],
-            "health_endpoints": ["/public/v1/health", "/nginx-health", "/", "/app/", "/h5/", "/admin/", "/newadmin/", "/tester/", "/docs/"],
+            "backend_components": [] if repository == "frankichen/auto_gupiao" else ["lenshub-api", "lenshub-worker", "lenshub-scheduler", "lenshub-admin-bootstrap", "goose"],
+            "frontend_components": [] if repository == "frankichen/auto_gupiao" else ["admin", "newadmin", "root", "app", "h5", "tester", "docs", "openapi"],
+            "restart_services": ["auto-gupiao"] if repository == "frankichen/auto_gupiao" else ["api", "worker", "scheduler", "web"],
+            "health_endpoints": ["/"] if repository == "frankichen/auto_gupiao" else ["/public/v1/health", "/nginx-health", "/", "/app/", "/h5/", "/admin/", "/newadmin/", "/tester/", "/docs/"],
             "rollback_plan": "flock 后恢复 previous current；不执行 goose down，不删除 release", "expected_current_release_id": expected_current_release_id}
 
 
@@ -318,6 +337,8 @@ def start_test_deployment(repository, environment, commit_sha, private_ci_job_id
     if not confirm: return _error_response("CONFIRM_REQUIRED", "confirm must be true")
     plan = plan_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes, artifact_id)
     if not plan.get("ready"): return {**plan, "error": {"code": plan.get("reasons", ["NOT_READY"])[0]}}
+    if not private_ci_job_id and not _deployment_spec(repository).get("private_ci"):
+        private_ci_job_id = "not_required"
     init_deployment_db(); db = _get_deploy_db()
     with _lock:
         active = db.execute("SELECT deployment_id FROM deployments WHERE environment=? AND status IN ('queued','preparing','building','uploading','migrating','switching','verifying','cancel_requested')", (environment,)).fetchone()
@@ -438,8 +459,12 @@ def cancel_test_deployment(deployment_id):
     db.commit(); return get_test_deployment(deployment_id)
 
 
-def _status_snapshot():
-    path = os.environ.get("DEPLOY_STATUS_FILE", "/data/gongshi-test-status.json")
+def _status_snapshot(repository=""):
+    spec = _deployment_spec(repository) if repository else {}
+    status_env = get_deployment_config(repository).get("status_file_env") if repository else ""
+    path = os.environ.get(status_env, "") if status_env else ""
+    if not path:
+        path = os.environ.get("DEPLOY_STATUS_FILE", "/data/gongshi-test-status.json")
     try:
         with open(path, encoding="utf-8") as handle:
             value = json.load(handle)
@@ -498,7 +523,7 @@ def get_test_environment_status(repository, environment):
     if reason == "INVALID_COMMIT_SHA": reason = None
     if repository != REPOSITORY: return _error_response("REPOSITORY_NOT_ALLOWED", "repository is not allowed")
     if environment != ENVIRONMENT: return _error_response("ENVIRONMENT_NOT_ALLOWED", "environment is not allowed")
-    snapshot = _status_snapshot() or {}
+    snapshot = _status_snapshot(repository) or {}
     current, releases = _release_snapshot(snapshot)
     status = dict(snapshot)
     status.update({
@@ -515,7 +540,7 @@ def get_test_environment_status(repository, environment):
 def list_test_releases(repository, environment, limit=20):
     if repository != REPOSITORY: return _error_response("REPOSITORY_NOT_ALLOWED", "repository is not allowed")
     if environment != ENVIRONMENT: return _error_response("ENVIRONMENT_NOT_ALLOWED", "environment is not allowed")
-    snapshot = _status_snapshot() or {}
+    snapshot = _status_snapshot(repository) or {}
     _, releases = _release_snapshot(snapshot)
     return {"ok": True, "items": releases[:min(max(limit, 1), 100)]}
 
@@ -524,7 +549,7 @@ def rollback_test_deployment(repository, environment, target_release_id, expecte
     if not confirm: return _error_response("CONFIRM_REQUIRED", "confirm must be true")
     if repository != REPOSITORY: return _error_response("REPOSITORY_NOT_ALLOWED", "repository is not allowed")
     if environment != ENVIRONMENT: return _error_response("ENVIRONMENT_NOT_ALLOWED", "environment is not allowed")
-    snapshot = _status_snapshot() or {}
+    snapshot = _status_snapshot(repository) or {}
     current = snapshot.get("current_release_id")
     if not current: return _error_response("ENVIRONMENT_STATUS_UNAVAILABLE", "deploy worker status is unavailable")
     if current != expected_current_release_id: return _error_response("CURRENT_RELEASE_CHANGED", "current release changed", details={"current_release_id": current})

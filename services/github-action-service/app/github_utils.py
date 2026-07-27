@@ -593,6 +593,20 @@ def _private_ci_job(job_id: str) -> Optional[dict]:
         return None
 
 
+def _private_ci_policy(repository: str) -> tuple[bool, bool]:
+    """Return (available, required) from the repository operation policy."""
+    try:
+        from app.ci_repository_config import is_private_ci_enabled
+        return True, is_private_ci_enabled(repository)
+    except Exception:
+        return False, False
+
+
+def _is_private_ci_required(repository: str) -> bool:
+    """Compatibility helper exposing only the required flag."""
+    return _private_ci_policy(repository)[1]
+
+
 def _review_policy(repo, base_branch: str) -> dict:
     """Read protection policy without changing it; unavailable is explicit."""
     result = {"required_approvals": 0, "current_approvals": 0,
@@ -625,7 +639,7 @@ def _review_policy(repo, base_branch: str) -> dict:
 
 def _repository_merge_policy(repository: str) -> dict:
     """Load only the explicitly configured MyGithub09 merge policy."""
-    path = os.environ.get("CI_REPOSITORIES_PATH", "/app/config/ci_repositories.yml")
+    path = os.environ.get("CI_REPOS_CONFIG_PATH") or os.environ.get("CI_REPOSITORIES_PATH", "/app/config/ci_repositories.yml")
     if not os.path.exists(path):
         path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "ci_repositories.yml")
     try:
@@ -801,8 +815,11 @@ def _readiness(repository: str, pull_number: int, expected_head_sha: str = "",
                 warnings.append(classification)
         warnings.extend(checks.get("required_check_sources", {}).get("errors", []))
 
+    policy_available, private_ci_required = _private_ci_policy(repository)
+    if not policy_available:
+        reasons.append("REPOSITORY_POLICY_UNAVAILABLE")
     private_ci = None
-    if required_private_ci_job_id:
+    if private_ci_required and required_private_ci_job_id:
         private_ci = _private_ci_job(required_private_ci_job_id)
         if not private_ci:
             reasons.append("PRIVATE_CI_JOB_NOT_FOUND")
@@ -816,7 +833,7 @@ def _readiness(repository: str, pull_number: int, expected_head_sha: str = "",
             if private_ci.get("status") != "passed" or private_ci.get("exit_code") != 0: reasons.append("PRIVATE_CI_NOT_PASSED")
             if private_ci.get("superseded_by_job_id"): reasons.append("PRIVATE_CI_SUPERSEDED")
             private_ci["valid"] = not any(reason.startswith("PRIVATE_CI_") for reason in reasons)
-    else:
+    elif private_ci_required:
         reasons.append("PRIVATE_CI_REQUIRED")
 
     repo_meta = get_github_repository(repository)
@@ -838,7 +855,8 @@ def _readiness(repository: str, pull_number: int, expected_head_sha: str = "",
         "review_decision": pr_result["review_decision"], "review_policy": review_policy,
         "requested_reviewers": pr_result["requested_reviewers"], "change_requests": [r for r in pr_result["reviews"] if r["state"] == "CHANGES_REQUESTED"],
         "github_checks": {"overall": checks.get("overall_conclusion") if checks.get("ok") else "unavailable", "checks": checks.get("checks", []) if checks.get("ok") else []},
-        "private_ci": private_ci, "allowed_merge_methods": allowed,
+        "private_ci": private_ci, "private_ci_required": private_ci_required,
+        "allowed_merge_methods": allowed,
     }
 
 
@@ -1010,7 +1028,11 @@ def merge_github_pull_request(repository: str, pull_number: int, merge_method: s
         return _readiness(repository, pull_number, expected_head_sha, required_private_ci_job_id, expected_base_branch)
     if not confirm: return _error_response("CONFIRM_REQUIRED", "confirm must be true")
     if not SHA_RE.fullmatch(expected_head_sha): return _error_response("EXPECTED_HEAD_SHA_REQUIRED", "expected_head_sha must be a full 40-character SHA")
-    if not required_private_ci_job_id: return _error_response("PRIVATE_CI_REQUIRED", "required_private_ci_job_id is required")
+    policy_available, private_ci_required = _private_ci_policy(repository)
+    if not policy_available:
+        return _error_response("REPOSITORY_POLICY_UNAVAILABLE", "repository operation policy could not be read")
+    if private_ci_required and not required_private_ci_job_id:
+        return _error_response("PRIVATE_CI_REQUIRED", "required_private_ci_job_id is required")
     if merge_method not in ("merge", "squash", "rebase"): return _error_response("INVALID_MERGE_METHOD", "merge_method must be merge, squash, or rebase")
     readiness = _readiness(repository, pull_number, expected_head_sha, required_private_ci_job_id, expected_base_branch)
     if not readiness.get("ready"):

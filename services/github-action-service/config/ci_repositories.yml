@@ -34,3 +34,25 @@ repositories:
           - build
         optional_scripts:
           - lint
+
+  frankichen/auto_gupiao:
+    enabled: true
+    private_ci: false
+    auto_detect: true
+    allowed_profiles: []
+    max_timeout_seconds: 900
+    merge_policy:
+      private_ci_authoritative: false
+      required_private_ci_profile: ""
+      github_checks_mode: required_only
+      allow_non_required_check_failures: true
+      allow_quota_or_infrastructure_failures: true
+      required_workflows: []
+    deployment:
+      enabled: true
+      environment: auto-gupiao-test
+      scope: reports
+      private_ci: false
+      script: scripts/deploy_auto_gupiao.sh
+      workspace_env: AUTO_GUPIAO_DEPLOY_WORKSPACE
+      status_file_env: AUTO_GUPIAO_DEPLOY_STATUS_FILE

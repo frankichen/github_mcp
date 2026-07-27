@@ -14,11 +14,46 @@ import fcntl
 
 from app.deployment_service import init_deployment_db, _get_deploy_db
 
+CONTRACTS = {
+    "frankichen/sxt": {
+        "workspace": "DEPLOY_WORKSPACE",
+        "workspace_default": "/srv/private-ci/deploy-workspace/sxt",
+        "script": "scripts/deploy_gongshi_test.sh",
+        "environment": "gongshi-test",
+        "scope": "fullstack",
+        "status_file": "DEPLOY_STATUS_FILE",
+        "status_default": "/var/lib/private-ci/gongshi-test-status.json",
+    },
+    "frankichen/auto_gupiao": {
+        "workspace": "AUTO_GUPIAO_DEPLOY_WORKSPACE",
+        "workspace_default": "/srv/private-ci/deploy-workspace/auto_gupiao",
+        "script": "scripts/deploy_auto_gupiao.sh",
+        "environment": "auto-gupiao-test",
+        "scope": "reports",
+        "status_file": "AUTO_GUPIAO_DEPLOY_STATUS_FILE",
+        "status_default": "/var/lib/private-ci/auto-gupiao-status.json",
+    },
+}
+
+
+def _contract(repository):
+    return CONTRACTS.get(repository)
+
+
+def _workspace(contract):
+    return os.environ.get(contract["workspace"], contract["workspace_default"])
+
+
+def _status_path(contract):
+    return os.environ.get(contract["status_file"], contract["status_default"])
+
+
 WORKSPACE = os.environ.get("DEPLOY_WORKSPACE", "/srv/private-ci/deploy-workspace/sxt")
 SCRIPT = "scripts/deploy_gongshi_test.sh"
 SECRET_RE = re.compile(r"(?i)(token|authorization|password|secret|database_url|cookie|private_key)=\S+")
 STATUS_PATH = os.environ.get("DEPLOY_STATUS_FILE", "/var/lib/private-ci/gongshi-test-status.json")
 logger = logging.getLogger("private-deploy-agent")
+_status_repository = "frankichen/sxt"
 
 
 def redact(value: str) -> str:
@@ -26,9 +61,11 @@ def redact(value: str) -> str:
 
 
 def write_status(agent_status: str, current_step: str = "idle", current_release_id=None, previous_release_id=None, message=None):
+    contract = _contract(_status_repository) or CONTRACTS["frankichen/sxt"]
+    status_path = _status_path(contract)
     prior = {}
     try:
-        with open(STATUS_PATH, encoding="utf-8") as handle:
+        with open(status_path, encoding="utf-8") as handle:
             prior = json.load(handle)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
@@ -38,7 +75,7 @@ def write_status(agent_status: str, current_step: str = "idle", current_release_
     if previous_release_id is None:
         previous_release_id = prior.get("previous_release_id")
     payload = {
-        "environment": "gongshi-test",
+        "environment": contract.get("environment", "gongshi-test"),
         "environment_url": os.environ.get("ENVIRONMENT_URL", "http://gongshi-test"),
         "agent_status": agent_status,
         "current_step": current_step,
@@ -52,9 +89,9 @@ def write_status(agent_status: str, current_step: str = "idle", current_release_
                 "services_healthy", "releases"):
         if key in prior:
             payload[key] = prior[key]
-    directory = os.path.dirname(STATUS_PATH)
+    directory = os.path.dirname(status_path)
     os.makedirs(directory, exist_ok=True)
-    with open(STATUS_PATH, "a+", encoding="utf-8") as handle:
+    with open(status_path, "a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         handle.seek(0)
         handle.truncate()
@@ -66,17 +103,20 @@ def write_status(agent_status: str, current_step: str = "idle", current_release_
 
 
 def process_once() -> bool:
+    global _status_repository
     init_deployment_db(); db = _get_deploy_db()
     rows = db.execute(
         "SELECT deployment_id FROM deployments "
-        "WHERE status='queued' AND repository=? AND environment=? AND requested_scope=? "
+        "WHERE status='queued' AND repository IN (?, ?) "
         "ORDER BY created_at LIMIT 20",
-        ("frankichen/sxt", "gongshi-test", "fullstack"),
+        ("frankichen/sxt", "frankichen/auto_gupiao"),
     ).fetchall()
+    if rows:
+        _status_repository = rows[0]["repository"]
     logger.info("polling queue: http_status=local_sqlite rows=%d", len(rows))
     retained_release = retained_previous = None
     try:
-        with open(STATUS_PATH, encoding="utf-8") as handle:
+        with open(_status_path(_contract(_status_repository) or CONTRACTS["frankichen/sxt"]), encoding="utf-8") as handle:
             prior_status = json.load(handle)
         retained_release = prior_status.get("current_release_id")
         retained_previous = prior_status.get("previous_release_id")
@@ -113,13 +153,21 @@ def process_once() -> bool:
         logger.info("claim-only mode: deployment_id=%s delegated to WSL", dep_id)
         write_status("online", "polling", retained_release, retained_previous, f"deployment {dep_id} delegated to WSL")
         return True
-    argv = ["bash", os.path.join(WORKSPACE, SCRIPT), "--yes", "--with-frontend", "--expected-sha", row["commit_sha"]]
+    contract = _contract(row["repository"])
+    if not contract:
+        db.execute("UPDATE deployments SET status='failed',current_step='unsupported_repository',error_code='REPOSITORY_NOT_ALLOWED',error_message='no deployment contract',exit_code=1,finished_at=?,updated_at=? WHERE deployment_id=?", (time.time(), time.time(), dep_id)); db.commit()
+        return True
+    workspace = _workspace(contract)
+    script = os.path.join(workspace, contract["script"])
+    argv = ["bash", script, "--yes", "--expected-sha", row["commit_sha"]]
+    if row["repository"] == "frankichen/sxt":
+        argv.insert(3, "--with-frontend")
     try:
         deploy_env = os.environ.copy()
         date_shim_dir = deploy_env.get("DEPLOY_DATE_SHIM_DIR")
         if date_shim_dir:
             deploy_env["PATH"] = f"{date_shim_dir}:{deploy_env.get('PATH', '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin')}"
-        proc = subprocess.Popen(argv, cwd=WORKSPACE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=deploy_env)
+        proc = subprocess.Popen(argv, cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=deploy_env)
         output = []
         for line in proc.stdout:
             safe_line = redact(line)
