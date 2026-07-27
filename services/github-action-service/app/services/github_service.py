@@ -1,5 +1,6 @@
 import re
 import logging
+import hashlib
 from typing import Optional
 from github.GithubException import GithubException, UnknownObjectException
 
@@ -191,11 +192,13 @@ class GitHubService:
                 raise HeadShaConflictError(expected=request.expected_head_sha, actual=parent_sha)
 
         tree_elements = []
+        old_shas = {}
 
         for f in request.files:
+            old_shas[f.path] = self.client.get_file_sha(repository, f.path, branch)
             if f.operation == "delete":
                 if f.expected_sha:
-                    actual_sha = self.client.get_file_sha(repository, f.path, branch)
+                    actual_sha = old_shas[f.path]
                     if actual_sha is None:
                         raise NotFoundError(f"File '{f.path}' not found for deletion")
                     if actual_sha != f.expected_sha:
@@ -208,7 +211,7 @@ class GitHubService:
                 })
             else:
                 if f.expected_sha:
-                    actual_sha = self.client.get_file_sha(repository, f.path, branch)
+                    actual_sha = old_shas[f.path]
                     if actual_sha is not None and actual_sha != f.expected_sha:
                         raise ShaConflictError(path=f.path, expected=f.expected_sha, actual=actual_sha)
                 blob = self.client.create_blob(repository, f.content)
@@ -234,6 +237,18 @@ class GitHubService:
         ref_name = f"refs/heads/{branch}"
         self.client.update_ref(repository, ref_name, commit.sha, force=False)
 
+        verified_files = []
+        for f in request.files:
+            if f.operation == "delete":
+                if self.client.get_file_sha(repository, f.path, commit.sha) is not None:
+                    raise ValidationError(f"Write verification failed: deleted file '{f.path}' is still present")
+                verified_files.append({"path": f.path, "operation": "delete", "old_blob_sha": old_shas[f.path], "new_blob_sha": None, "content_sha256": None, "size_bytes": 0})
+                continue
+            actual_content, actual_sha, actual_size = self.client.get_file(repository, f.path, commit.sha)
+            if actual_content is None or actual_content.encode("utf-8") != f.content.encode("utf-8"):
+                raise ValidationError(f"Write verification failed: read-back bytes differ for '{f.path}'")
+            verified_files.append({"path": f.path, "operation": "modify" if old_shas[f.path] else "add", "old_blob_sha": old_shas[f.path], "new_blob_sha": actual_sha, "content_sha256": hashlib.sha256(f.content.encode("utf-8")).hexdigest(), "size_bytes": actual_size})
+
         commit_url = f"https://github.com/{repository}/commit/{commit.sha}"
 
         changed_files = [
@@ -247,7 +262,11 @@ class GitHubService:
             "branch": branch,
             "commit_sha": commit.sha,
             "commit_url": commit_url,
-            "changed_files": changed_files,
+            "changed_files": verified_files,
+            "old_head_sha": parent_sha,
+            "new_head_sha": commit.sha,
+            "tree_sha": tree.sha,
+            "operation_count": len(request.files),
             "pull_request": None,
         }
 

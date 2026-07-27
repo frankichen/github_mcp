@@ -186,6 +186,10 @@ async def commit_github_files(
     except json.JSONDecodeError as e:
         return json.dumps({"error": "json_parse_error", "message": f"files_json is not valid JSON (pos {e.pos}: {e.msg})", "received_len": len(files_json), "preview": files_json[:200]})
     except Exception as e:
+        if hasattr(e, "error") and getattr(e, "error", "") == "head_sha_conflict":
+            details = dict(getattr(e, "details", None) or {})
+            details.update({"repository": repository, "branch": branch, "phase": "before_write", "error_code": "HEAD_CHANGED"})
+            return json.dumps({"ok": False, "error": {"code": "HEAD_CHANGED", "message": getattr(e, "message", "Branch HEAD has changed") or "Branch HEAD has changed", "details": details}}, ensure_ascii=False)
         return json.dumps({"error": type(e).__name__, "message": str(e)})
 
 
@@ -753,7 +757,7 @@ def _mygithub10_error(exc: Exception) -> str:
 async def get_mygithub_capabilities() -> str:
     return json.dumps(mygithub10.capabilities(
         os.environ.get("MYGITHUB10_BUILD_SHA") or "unknown",
-        os.environ.get("MYGITHUB10_VERSION") or "10.0.1",
+        os.environ.get("MYGITHUB10_VERSION") or "10.0.2",
     ), ensure_ascii=False)
 
 
@@ -802,7 +806,7 @@ async def apply_github_patch(repository: str, branch: str, expected_head_sha: st
         return _mygithub10_error(exc)
 
 
-@mcp.tool(name="edit_github_file_ranges", description="Apply non-overlapping, hash-checked line range edits as one atomic commit.")
+@mcp.tool(name="edit_github_file_ranges", description="Apply non-overlapping, hash-checked line range edits as one atomic commit. start_line and end_line are 1-based inclusive; dry-run and commit use the same computed UTF-8 bytes, and the commit is read back and verified.")
 async def edit_github_file_ranges(repository: str, branch: str, expected_head_sha: str, operations_json: str, commit_message: str, dry_run: bool = True, idempotency_key: str = "") -> str:
     try:
         return json.dumps(mygithub10.edit_ranges(_service, repository, branch, expected_head_sha, operations_json, commit_message, dry_run, idempotency_key), ensure_ascii=False)

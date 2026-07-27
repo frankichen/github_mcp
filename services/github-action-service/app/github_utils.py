@@ -290,8 +290,10 @@ def get_github_branch(repository: str, branch: str, base_branch: str = "") -> di
         repo = gh.get_repo(repository)
         try:
             b = repo.get_branch(branch)
-        except GithubException:
-            return {"ok": False, "error": {"code": "BRANCH_NOT_FOUND", "message": f"Branch '{branch}' not found", "retryable": False}}
+        except GithubException as exc:
+            if exc.status == 404:
+                return {"ok": False, "error": {"code": "BRANCH_NOT_FOUND", "message": f"Branch '{branch}' not found", "retryable": False}}
+            return {"ok": False, "error": {"code": "GITHUB_API_FAILED", "message": "GitHub failed while reading the branch", "retryable": True, "details": {"status": exc.status}}}
 
         result = {
             "ok": True,
@@ -310,10 +312,13 @@ def get_github_branch(repository: str, branch: str, base_branch: str = "") -> di
                 result["base_branch"] = base_branch
                 result["ahead_by"] = comparison.ahead_by
                 result["behind_by"] = comparison.behind_by
-            except GithubException:
-                result["base_branch"] = base_branch
-                result["ahead_by"] = None
-                result["behind_by"] = None
+            except GithubException as exc:
+                if exc.status == 404:
+                    result["base_branch"] = base_branch
+                    result["ahead_by"] = None
+                    result["behind_by"] = None
+                else:
+                    return {"ok": False, "error": {"code": "GITHUB_API_FAILED", "message": "GitHub failed while comparing branches", "retryable": True, "details": {"status": exc.status}}}
 
         return result
     except GithubException as e:

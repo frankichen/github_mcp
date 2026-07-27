@@ -14,14 +14,14 @@ async def main() -> int:
     root = Path(__file__).parents[1]
     os.environ.setdefault("GITHUB_TOKEN", "test_token_value")
     os.environ.setdefault("ACTION_API_KEY", "test_action_key")
-    os.environ.setdefault("IDEMPOTENCY_DB_PATH", "/tmp/mygithub09-idempotency.db")
-    os.environ.setdefault("DEPLOYMENT_DB_PATH", "/tmp/mygithub09-deployment.db")
-    os.environ.setdefault("CI_DB_PATH", "/tmp/mygithub09-ci.db")
+    os.environ.setdefault("IDEMPOTENCY_DB_PATH", "/tmp/mygithub10-idempotency.db")
+    os.environ.setdefault("DEPLOYMENT_DB_PATH", "/tmp/mygithub10-deployment.db")
+    os.environ.setdefault("CI_DB_PATH", "/tmp/mygithub10-ci.db")
     sys.path.insert(0, str(root / "services/github-action-service"))
     from app.mcp_server import mcp  # noqa: PLC0415
 
     actual = await mcp.list_tools()
-    manifest = json.loads((root / "docs/MYGITHUB09_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
+    manifest = json.loads((root / "docs/MYGITHUB10_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     actual_names = [tool.name for tool in actual]
     manifest_names = [tool["name"] for tool in manifest["tools"]]
     if len(actual_names) != len(set(actual_names)):

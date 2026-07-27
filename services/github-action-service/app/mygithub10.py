@@ -18,6 +18,8 @@ import tempfile
 import subprocess
 import time
 import uuid
+import logging
+import fcntl
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,7 @@ MAX_UPLOAD_CHUNK_BYTES = 131072
 MAX_UPLOAD_BYTES = 1048576
 UPLOAD_TTL_SECONDS = 3600
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+logger = logging.getLogger(__name__)
 
 
 class MyGithub10Error(Exception):
@@ -60,7 +63,8 @@ def _safe_path(path: str) -> str:
 def _db() -> sqlite3.Connection:
     path = settings.IDEMPOTENCY_DB_PATH
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(path, timeout=15)
+    db = sqlite3.connect(path, timeout=15, isolation_level="IMMEDIATE")
+    db.execute("PRAGMA busy_timeout=15000")
     db.execute(
         """CREATE TABLE IF NOT EXISTS mygithub10_operations (
             operation_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
@@ -91,11 +95,15 @@ def _idempotent_start(tool_name: str, key: str, request: dict[str, Any]) -> tupl
             return "replay", old["result_commit_sha"]
         raise MyGithub10Error(old["error_code"] or "IDEMPOTENCY_FAILED", "previous operation failed")
     operation_id = str(uuid.uuid4())
-    db.execute(
-        "INSERT INTO mygithub10_operations(operation_id,idempotency_key,request_sha256,tool_name,repository,branch,expected_head_sha,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-        (operation_id, key, request_hash, tool_name, request.get("repository", ""), request.get("branch", ""), request.get("expected_head_sha", ""), "running", time.time()),
-    )
-    db.commit()
+    try:
+        db.execute(
+            "INSERT INTO mygithub10_operations(operation_id,idempotency_key,request_sha256,tool_name,repository,branch,expected_head_sha,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (operation_id, key, request_hash, tool_name, request.get("repository", ""), request.get("branch", ""), request.get("expected_head_sha", ""), "running", time.time()),
+        )
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        raise MyGithub10Error("IDEMPOTENCY_IN_PROGRESS", "operation with this key is already running")
     return operation_id, None
 
 
@@ -117,7 +125,10 @@ def _resolve_commit(repo, ref: str):
         commit = repo.get_commit(ref or repo.default_branch)
         return commit.sha, commit
     except Exception as exc:
-        raise MyGithub10Error("FILE_NOT_FOUND", "ref could not be resolved") from exc
+        status = getattr(exc, "status", None)
+        if status == 404:
+            raise MyGithub10Error("REF_NOT_FOUND", f"ref could not be resolved: {ref or repo.default_branch}", {"ref": ref or repo.default_branch, "retryable": False}) from exc
+        raise MyGithub10Error("GITHUB_READ_FAILED", "GitHub failed while resolving ref", {"ref": ref or repo.default_branch, "retryable": True}) from exc
 
 
 def _read_blob(repo, path: str, ref: str) -> tuple[bytes, str, str]:
@@ -134,7 +145,10 @@ def _read_blob(repo, path: str, ref: str) -> tuple[bytes, str, str]:
     except MyGithub10Error:
         raise
     except Exception as exc:
-        raise MyGithub10Error("FILE_NOT_FOUND", f"file not found: {path}") from exc
+        status = getattr(exc, "status", None)
+        if status == 404:
+            raise MyGithub10Error("FILE_NOT_FOUND", f"file not found: {path}", {"path": path, "ref": ref, "retryable": False}) from exc
+        raise MyGithub10Error("GITHUB_READ_FAILED", f"GitHub failed while reading {path}", {"path": path, "ref": ref, "retryable": True}) from exc
 
 
 def _text(data: bytes) -> str:
@@ -189,11 +203,11 @@ def file_chunk(client, repository: str, path: str, ref: str, offset_bytes: int =
     }
 
 
-def _parse_patch(patch: str) -> list[tuple[str, str, bytes | None]]:
+def _parse_patch(patch: str) -> list[tuple[str, str, list[tuple[int, int, list[str], list[str]]]]]:
     if not patch or len(patch.encode()) > MAX_PATCH_BYTES:
         raise MyGithub10Error("PATCH_INVALID_FORMAT", "patch is empty or exceeds the patch limit")
     lines = patch.splitlines(keepends=True)
-    result: list[tuple[str, str, bytes | None]] = []
+    result: list[tuple[str, str, list[tuple[int, int, list[str], list[str]]]]] = []
     index = 0
     while index < len(lines):
         if not lines[index].startswith("--- "):
@@ -211,43 +225,61 @@ def _parse_patch(patch: str) -> list[tuple[str, str, bytes | None]]:
         if old_path != "/dev/null" and new_path != "/dev/null" and old_path != new_path:
             raise MyGithub10Error("PATCH_RENAME_UNSUPPORTED", "rename patches are not supported")
         index += 2
-        old_lines: list[str] = []
-        new_lines: list[str] = []
+        hunks: list[tuple[int, int, list[str], list[str]]] = []
         while index < len(lines) and lines[index].startswith("@@ "):
             match = _HUNK_RE.match(lines[index])
             if not match:
                 raise MyGithub10Error("PATCH_INVALID_FORMAT", "invalid unified diff hunk")
+            old_start = int(match.group(1))
+            new_start = int(match.group(3))
+            old_lines: list[str] = []
+            new_lines: list[str] = []
+            last_side = ""
             index += 1
             while index < len(lines) and not lines[index].startswith(("--- ", "@@ ")):
                 line = lines[index]
                 if line.startswith("\\ No newline at end of file"):
+                    if last_side == "old" and old_lines:
+                        old_lines[-1] = old_lines[-1].removesuffix("\n").removesuffix("\r")
+                    elif last_side == "new" and new_lines:
+                        new_lines[-1] = new_lines[-1].removesuffix("\n").removesuffix("\r")
+                    elif last_side == "both":
+                        if old_lines:
+                            old_lines[-1] = old_lines[-1].removesuffix("\n").removesuffix("\r")
+                        if new_lines:
+                            new_lines[-1] = new_lines[-1].removesuffix("\n").removesuffix("\r")
                     index += 1
                     continue
                 if not line or line[0] not in " +-":
                     raise MyGithub10Error("PATCH_INVALID_FORMAT", "invalid unified diff line")
                 if line[0] in " -": old_lines.append(line[1:])
                 if line[0] in " +": new_lines.append(line[1:])
+                last_side = "old" if line[0] == "-" else ("new" if line[0] == "+" else "both")
                 index += 1
-        result.append((path, operation, ("".join(old_lines), "".join(new_lines))))
+            old_count = int(match.group(2) or "1")
+            new_count = int(match.group(4) or "1")
+            if len(old_lines) != old_count or len(new_lines) != new_count:
+                raise MyGithub10Error("PATCH_INVALID_FORMAT", f"hunk at old line {old_start} has invalid line counts")
+            hunks.append((old_start, new_start, old_lines, new_lines))
+        if not hunks:
+            raise MyGithub10Error("PATCH_INVALID_FORMAT", f"file patch for {path} has no hunks")
+        result.append((path, operation, hunks))
     if not result:
         raise MyGithub10Error("PATCH_EMPTY", "no file patch found")
     return result
 
 
-def _apply_file_patch(old: bytes, hunks: list[tuple[str, str]]) -> bytes:
+def _apply_file_patch(old: bytes, hunks: list[tuple[int, int, list[str], list[str]]]) -> bytes:
     source = _text(old).splitlines(keepends=True) if old else []
     cursor = 0
     output: list[str] = []
-    for old_text, new_text in hunks:
-        expected = old_text.splitlines(keepends=True)
-        try:
-            position = next(i for i in range(cursor, len(source) - len(expected) + 1) if source[i:i + len(expected)] == expected)
-        except StopIteration as exc:
-            raise MyGithub10Error("PATCH_DOES_NOT_APPLY", "patch context does not match exactly") from exc
-        if position != cursor:
-            raise MyGithub10Error("PATCH_DOES_NOT_APPLY", "fuzzy patch application is disabled")
+    for old_start, _, expected, replacement in hunks:
+        position = old_start - 1
+        if position < cursor or source[position:position + len(expected)] != expected:
+            context = "".join(expected[:3])[:240]
+            raise MyGithub10Error("PATCH_DOES_NOT_APPLY", f"hunk at old line {old_start} does not match exactly", {"old_line": old_start, "context": context})
         output.extend(source[cursor:position])
-        output.extend(new_text.splitlines(keepends=True))
+        output.extend(replacement)
         cursor = position + len(expected)
     output.extend(source[cursor:])
     return "".join(output).encode("utf-8")
@@ -262,9 +294,10 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
     ref = repo.get_git_ref(f"heads/{branch}")
     actual_head = ref.object.sha
     if expected_head_sha and actual_head != expected_head_sha:
-        raise MyGithub10Error("PATCH_HEAD_CHANGED", "branch HEAD changed", {"expected": expected_head_sha, "actual": actual_head})
+        raise MyGithub10Error("PATCH_HEAD_CHANGED", f"branch HEAD changed before write for {repository}:{branch}", {"expected": expected_head_sha, "actual": actual_head, "repository": repository, "branch": branch, "phase": "before_write", "error_code": "HEAD_CHANGED"})
     elements = []
     old_shas = {}
+    new_shas = {}
     for path, content in changed.items():
         _safe_path(path)
         try:
@@ -275,26 +308,66 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
         old_shas[path] = old_sha
         expected = expected_blob_shas.get(path, "")
         if expected and expected != (old_sha or ""):
-            raise MyGithub10Error("PATCH_FILE_CHANGED", f"file blob changed: {path}", {"expected": expected, "actual": old_sha})
+            raise MyGithub10Error("BLOB_CHANGED", f"file blob changed before write: {path}", {"expected": expected, "actual": old_sha, "repository": repository, "branch": branch, "path": path})
         if content is None:
             elements.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
         else:
             blob = gh.create_blob(repository, content.decode("utf-8"))
+            new_shas[path] = blob.sha
             elements.append({"path": path, "mode": "100644", "type": "blob", "sha": blob.sha})
-    base_tree = repo.get_git_commit(actual_head).commit.tree.sha
+    git_commit = repo.get_git_commit(actual_head)
+    base_tree = getattr(getattr(git_commit, "tree", None), "sha", None) or git_commit.commit.tree.sha
     tree = gh.create_git_tree(repository, elements, base_tree)
     commit = gh.create_commit(repository, message, tree.sha, [actual_head])
     try:
         ref.edit(sha=commit.sha, force=False)
     except Exception as exc:
-        raise MyGithub10Error("PATCH_HEAD_CHANGED", "branch changed while committing") from exc
-    return {"commit_sha": commit.sha, "tree_sha": tree.sha, "branch": branch, "repository": repository, "changed_files": [{"path": path, "operation": "delete" if content is None else ("modify" if old_shas[path] else "add")} for path, content in changed.items()]}
+        latest = None
+        try:
+            latest = repo.get_git_ref(f"heads/{branch}").object.sha
+        except Exception:
+            pass
+        raise MyGithub10Error("PATCH_HEAD_CHANGED", f"branch HEAD changed while updating {repository}:{branch}", {"expected": actual_head, "actual": latest, "repository": repository, "branch": branch, "phase": "ref_update", "error_code": "HEAD_CHANGED"}) from exc
+    file_results = []
+    for path, content in changed.items():
+        if content is None:
+            try:
+                remaining = repo.get_contents(path, ref=commit.sha)
+            except Exception as exc:
+                if getattr(exc, "status", None) != 404:
+                    raise MyGithub10Error("WRITE_VERIFY_FAILED", f"could not verify deletion of {path}", {"repository": repository, "branch": branch, "commit_sha": commit.sha, "path": path}) from exc
+                remaining = None
+            if remaining is not None:
+                raise MyGithub10Error("WRITE_VERIFY_FAILED", f"deleted file still exists after commit: {path}", {"repository": repository, "branch": branch, "commit_sha": commit.sha, "path": path})
+            file_results.append({"path": path, "operation": "delete", "old_blob_sha": old_shas[path], "new_blob_sha": None, "content_sha256": None, "size_bytes": 0})
+            continue
+        try:
+            entry = repo.get_contents(path, ref=commit.sha)
+            actual_blob = None if isinstance(entry, list) else entry.sha
+            blob = repo.get_git_blob(actual_blob) if actual_blob else None
+            actual_bytes = base64.b64decode(blob.content or "") if blob and getattr(blob, "encoding", "base64") == "base64" else (blob.content.encode("utf-8") if blob else b"")
+        except Exception as exc:
+            raise MyGithub10Error("WRITE_VERIFY_FAILED", f"could not read back {path} after commit", {"repository": repository, "branch": branch, "commit_sha": commit.sha, "path": path}) from exc
+        expected_content_sha = _sha256(content)
+        if actual_blob != new_shas[path] or actual_bytes != content:
+            raise MyGithub10Error("WRITE_VERIFY_FAILED", f"read-back bytes differ for {path}", {"repository": repository, "branch": branch, "commit_sha": commit.sha, "path": path, "expected_content_sha256": expected_content_sha, "actual_content_sha256": _sha256(actual_bytes), "expected_blob_sha": new_shas[path], "actual_blob_sha": actual_blob})
+        file_results.append({"path": path, "operation": "modify" if old_shas[path] else "add", "old_blob_sha": old_shas[path], "new_blob_sha": actual_blob, "content_sha256": expected_content_sha, "size_bytes": len(content)})
+    logger.info("mygithub10 write repository=%s branch=%s expected_head_sha=%s actual_head_sha=%s old_head_sha=%s new_head_sha=%s files=%s", repository, branch, expected_head_sha, actual_head, actual_head, commit.sha, [item["path"] for item in file_results])
+    return {"commit_sha": commit.sha, "new_head_sha": commit.sha, "old_head_sha": actual_head, "tree_sha": tree.sha, "branch": branch, "repository": repository, "changed_files": file_results}
 
 
 def apply_patch(client, repository: str, branch: str, expected_head_sha: str, expected_blob_shas_json: str, patch: str, commit_message: str, dry_run: bool, idempotency_key: str = "") -> dict[str, Any]:
     parsed = _parse_patch(patch)
-    expected = json.loads(expected_blob_shas_json or "{}")
+    try:
+        expected = json.loads(expected_blob_shas_json or "{}")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "expected_blob_shas_json must be valid JSON") from exc
+    if not isinstance(expected, dict):
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "expected_blob_shas_json must be an object")
     repo = _repo(client, repository)
+    actual_head, _ = _resolve_commit(repo, branch)
+    if expected_head_sha and actual_head != expected_head_sha:
+        raise MyGithub10Error("PATCH_HEAD_CHANGED", f"branch HEAD changed before patch for {repository}:{branch}", {"expected": expected_head_sha, "actual": actual_head, "repository": repository, "branch": branch, "phase": "before_write", "error_code": "HEAD_CHANGED"})
     changed: dict[str, bytes | None] = {}
     previews = []
     for path, operation, hunks in parsed:
@@ -302,14 +375,16 @@ def apply_patch(client, repository: str, branch: str, expected_head_sha: str, ex
         old_sha = None
         if operation != "add":
             old, old_sha, _ = _read_blob(repo, path, branch)
-        new = None if operation == "delete" else _apply_file_patch(old, [hunks])
+            if expected.get(path) and expected[path] != old_sha:
+                raise MyGithub10Error("BLOB_CHANGED", f"file blob changed before patch: {path}", {"expected": expected[path], "actual": old_sha, "repository": repository, "branch": branch, "path": path})
+        new = None if operation == "delete" else _apply_file_patch(old, hunks)
         changed[path] = new
         previews.append({"path": path, "operation": operation, "old_blob_sha": old_sha, "new_content_sha256": _sha256(new or b""), "added_lines": 0, "deleted_lines": 0})
-    fingerprint = _sha256(_json({"repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "patch": patch}).encode())
+    fingerprint = _sha256(_json({"repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "patch": patch, "commit_message": commit_message}).encode())
     result = {"ok": True, "dry_run": dry_run, "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "changed_files": previews, "diff_preview": patch[:MAX_INLINE_RESPONSE_BYTES], "diff_truncated": len(patch.encode()) > MAX_INLINE_RESPONSE_BYTES, "operation_fingerprint": fingerprint}
     if dry_run:
         return result
-    operation_id, replay = _idempotent_start("apply_github_patch", idempotency_key, {"repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "patch_sha256": _sha256(patch.encode())})
+    operation_id, replay = _idempotent_start("apply_github_patch", idempotency_key, {"tool_name": "apply_github_patch", "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "expected_blob_shas": expected, "patch_sha256": _sha256(patch.encode()), "commit_message": commit_message})
     if replay:
         return {**result, "replayed_commit_sha": replay}
     try:
@@ -322,40 +397,70 @@ def apply_patch(client, repository: str, branch: str, expected_head_sha: str, ex
 
 
 def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, operations_json: str, commit_message: str, dry_run: bool, idempotency_key: str = "") -> dict[str, Any]:
-    operations = json.loads(operations_json or "[]")
+    try:
+        operations = json.loads(operations_json or "[]")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "operations_json must be valid JSON") from exc
+    if not isinstance(operations, list) or not operations:
+        raise MyGithub10Error("PATCH_EMPTY", "at least one range edit operation is required")
+    if len(operations) > 1000:
+        raise MyGithub10Error("PATCH_SCOPE_EXCEEDED", "too many range edit operations")
     repo = _repo(client, repository)
+    actual_head, _ = _resolve_commit(repo, branch)
+    if expected_head_sha and actual_head != expected_head_sha:
+        raise MyGithub10Error("PATCH_HEAD_CHANGED", f"branch HEAD changed before range edit for {repository}:{branch}", {"expected": expected_head_sha, "actual": actual_head, "repository": repository, "branch": branch, "phase": "before_write", "error_code": "HEAD_CHANGED"})
     changed = {}
     expected = {}
+    if any(not isinstance(item, dict) or not isinstance(item.get("path"), str) for item in operations):
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "every operation must contain a path")
     for path in sorted({item["path"] for item in operations}):
-        data, blob_sha, _ = _read_blob(repo, path, branch)
+        data, blob_sha, _ = _read_blob(repo, path, actual_head)
         text = _text(data)
         lines = text.splitlines(keepends=True)
         items = [item for item in operations if item["path"] == path]
         positions = []
-        for item in items:
-            start, end = int(item["start_line"]), int(item.get("end_line", item["start_line"]))
-            if start < 1 or end < start or end > len(lines) + 1:
-                raise MyGithub10Error("PATCH_SCOPE_EXCEEDED", "line range is outside the file")
+        for order, item in enumerate(items):
+            if not isinstance(item, dict) or item.get("operation") not in {"replace", "delete", "insert_before", "insert_after"}:
+                raise MyGithub10Error("PATCH_INVALID_FORMAT", f"operation {order} is invalid")
+            try:
+                start = int(item["start_line"])
+                end = int(item.get("end_line", item["start_line"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MyGithub10Error("PATCH_INVALID_FORMAT", f"operation {order} line numbers must be integers") from exc
+            if item["operation"] in {"replace", "delete"} and (start < 1 or end < start or end > len(lines)):
+                raise MyGithub10Error("PATCH_SCOPE_EXCEEDED", f"operation {order} range {start}-{end} is outside the file")
+            if item["operation"] == "insert_before" and (start < 1 or end != start or start > len(lines) + 1):
+                raise MyGithub10Error("PATCH_SCOPE_EXCEEDED", f"operation {order} insert_before anchor is outside the file")
+            if item["operation"] == "insert_after" and (start < 1 or end < start or end > len(lines)):
+                raise MyGithub10Error("PATCH_SCOPE_EXCEEDED", f"operation {order} insert_after range is outside the file")
             if item["operation"] in ("replace", "delete"):
+                if not re.fullmatch(r"[0-9a-f]{64}", item.get("expected_old_text_sha256", "")):
+                    raise MyGithub10Error("PATCH_INVALID_FORMAT", f"operation {order} requires a lowercase SHA256 old-text hash")
                 old_text = "".join(lines[start - 1:end])
                 if _sha256(old_text.encode()) != item.get("expected_old_text_sha256", ""):
-                    raise MyGithub10Error("PATCH_FILE_CHANGED", "old range text hash does not match")
-            positions.append((start, end, item))
-        ordered = sorted(positions, key=lambda item: (item[0], item[1]))
-        if any(previous[1] > current[0] for previous, current in zip(ordered, ordered[1:])):
-            raise MyGithub10Error("PATCH_SCOPE_EXCEEDED", "overlapping ranges are not allowed")
-        for start, end, item in sorted(positions, key=lambda item: (item[0], item[1]), reverse=True):
+                    raise MyGithub10Error("PATCH_FILE_CHANGED", f"old range text hash does not match for {path}:{start}-{end}", {"path": path, "start_line": start, "end_line": end})
+            if item["operation"] == "insert_before": splice = (start - 1, start - 1)
+            elif item["operation"] == "insert_after": splice = (end, end)
+            else: splice = (start - 1, end)
+            positions.append((splice[0], splice[1], item))
+        ordered = sorted(positions, key=lambda value: (value[0], value[1], value[2].get("order", 0)))
+        for previous, current in zip(ordered, ordered[1:]):
+            ps, pe, _ = previous
+            cs, ce, _ = current
+            previous_empty = ps == pe
+            current_empty = cs == ce
+            conflict = (previous_empty and current_empty and ps == cs) or (previous_empty and cs < ps < ce) or (current_empty and ps < cs < pe) or (not previous_empty and not current_empty and cs < pe)
+            if conflict:
+                raise MyGithub10Error("PATCH_SCOPE_EXCEEDED", f"overlapping or ambiguous ranges in {path}")
+        for splice_start, splice_end, item in sorted(positions, key=lambda value: (value[0], value[1]), reverse=True):
             replacement = item.get("replacement", "")
-            if item["operation"] == "insert_before": index = start - 1
-            elif item["operation"] == "insert_after": index = end
-            else: index = start - 1; end = end
             if item["operation"] == "delete": replacement = ""
-            lines[index:end] = [replacement] if replacement else []
+            lines[splice_start:splice_end] = [replacement] if replacement else []
         changed[path] = "".join(lines).encode()
         expected[path] = blob_sha
-    result = {"ok": True, "dry_run": dry_run, "changed_files": [{"path": p, "operation": "modify"} for p in changed], "new_content_sha256": {p: _sha256(v) for p, v in changed.items()}}
+    result = {"ok": True, "dry_run": dry_run, "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "resolved_head_sha": actual_head, "changed_files": [{"path": p, "operation": "modify", "old_blob_sha": expected[p]} for p in changed], "new_content_sha256": {p: _sha256(v) for p, v in changed.items()}, "operation_count": len(operations)}
     if dry_run: return result
-    operation_id, replay = _idempotent_start("edit_github_file_ranges", idempotency_key, {"repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "operations_sha256": _sha256(operations_json.encode())})
+    operation_id, replay = _idempotent_start("edit_github_file_ranges", idempotency_key, {"tool_name": "edit_github_file_ranges", "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "operations_sha256": _sha256(operations_json.encode()), "commit_message": commit_message})
     if replay: return {**result, "replayed_commit_sha": replay}
     try:
         result.update(_commit_files(client, repository, branch, expected_head_sha, changed, expected, commit_message))
@@ -366,7 +471,7 @@ def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, op
         raise
 
 
-def capabilities(build_sha: str = "unknown", version: str = "10.0.1") -> dict[str, Any]:
+def capabilities(build_sha: str = "unknown", version: str = "10.0.2") -> dict[str, Any]:
     if not re.fullmatch(r"[0-9a-f]{40}", build_sha or ""):
         try:
             repo_root = Path(__file__).resolve().parents[3]
@@ -376,7 +481,7 @@ def capabilities(build_sha: str = "unknown", version: str = "10.0.1") -> dict[st
             build_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True, stderr=subprocess.DEVNULL).strip()
         except (OSError, subprocess.CalledProcessError):
             build_sha = "unknown"
-    return {"name": "MyGithub10", "version": version, "build_sha": build_sha, "source_repository": "frankichen/github_mcp", "max_inline_response_bytes": MAX_INLINE_RESPONSE_BYTES, "max_file_chunk_bytes": MAX_FILE_CHUNK_BYTES, "max_patch_bytes": MAX_PATCH_BYTES, "max_upload_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES, "supports_file_manifest": True, "supports_byte_chunks": True, "supports_mcp_resources": True, "supports_incremental_patch": True, "supports_range_edit": True, "supports_chunked_upload": True, "supports_dry_run": True, "supports_expected_head_sha": True, "supports_expected_blob_sha": True, "supports_idempotency_key": True, "supports_operation_audit": True, "supports_tree_attestation": True, "supports_artifact_deployment": False, "supports_gofmt_autofix": True, "supports_real_ci_performance_validation": False, "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}]}
+    return {"name": "MyGithub10", "version": version, "build_sha": build_sha, "source_repository": "frankichen/github_mcp", "max_inline_response_bytes": MAX_INLINE_RESPONSE_BYTES, "max_file_chunk_bytes": MAX_FILE_CHUNK_BYTES, "max_patch_bytes": MAX_PATCH_BYTES, "max_upload_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES, "supports_file_manifest": True, "supports_byte_chunks": True, "supports_mcp_resources": True, "supports_incremental_patch": True, "supports_range_edit": True, "range_edit_semantics": {"start_line": "1-based inclusive", "end_line": "1-based inclusive", "encoding": "UTF-8 text lines; original LF/CRLF and final-newline state are preserved"}, "supports_chunked_upload": True, "supports_dry_run": True, "supports_expected_head_sha": True, "supports_expected_blob_sha": True, "supports_idempotency_key": True, "supports_operation_audit": True, "supports_tree_attestation": True, "supports_artifact_deployment": False, "supports_gofmt_autofix": True, "supports_real_ci_performance_validation": False, "recommended_large_file_workflow": ["get_github_file_manifest", "read_github_file_chunk", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "commit_github_uploaded_files"], "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT"], "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}]}
 
 
 _UPLOAD_ROOT = Path(os.environ.get("MYGITHUB10_UPLOAD_DIR", tempfile.gettempdir())) / "mygithub10-uploads"
@@ -386,6 +491,14 @@ def _upload_paths(upload_id: str) -> tuple[Path, Path]:
     if not re.fullmatch(r"[0-9a-f-]{36}", upload_id):
         raise MyGithub10Error("PATCH_UNSAFE_PATH", "invalid upload id")
     return _UPLOAD_ROOT / f"{upload_id}.bin", _UPLOAD_ROOT / f"{upload_id}.json"
+
+
+def _upload_lock(upload_id: str):
+    _upload_paths(upload_id)
+    _UPLOAD_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handle = (_UPLOAD_ROOT / f"{upload_id}.lock").open("a+")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    return handle
 
 
 def begin_upload() -> dict[str, Any]:
@@ -415,28 +528,44 @@ def append_upload(upload_id: str, offset: int, content: bytes, chunk_sha256: str
         raise MyGithub10Error("UPLOAD_CHUNK_LIMIT_EXCEEDED", "upload chunk exceeds limit")
     if _sha256(content) != chunk_sha256:
         raise MyGithub10Error("UPLOAD_CHUNK_SHA_MISMATCH", "chunk SHA256 mismatch")
-    data_path, meta_path, meta = _load_upload(upload_id)
-    if offset != meta["size"]:
-        raise MyGithub10Error("UPLOAD_OFFSET_MISMATCH", "upload offset is not contiguous")
-    if meta["size"] + len(content) > MAX_UPLOAD_BYTES:
-        raise MyGithub10Error("UPLOAD_SIZE_EXCEEDED", "upload exceeds configured size limit")
-    with data_path.open("ab") as handle:
-        handle.write(content)
-    meta["size"] += len(content)
-    meta_path.write_text(_json(meta), encoding="utf-8")
+    lock = _upload_lock(upload_id)
+    try:
+        data_path, meta_path, meta = _load_upload(upload_id)
+        if offset != meta["size"]:
+            raise MyGithub10Error("UPLOAD_OFFSET_MISMATCH", "upload offset is not contiguous")
+        if meta["size"] + len(content) > MAX_UPLOAD_BYTES:
+            raise MyGithub10Error("UPLOAD_SIZE_EXCEEDED", "upload exceeds configured size limit")
+        with data_path.open("ab") as handle:
+            handle.write(content)
+        meta["size"] += len(content)
+        temporary_meta = meta_path.with_suffix(".json.tmp")
+        temporary_meta.write_text(_json(meta), encoding="utf-8")
+        os.chmod(temporary_meta, 0o600)
+        os.replace(temporary_meta, meta_path)
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
     return {"upload_id": upload_id, "offset": offset, "next_offset": meta["size"], "chunk_sha256": chunk_sha256}
 
 
 def finalize_upload(upload_id: str, expected_size_bytes: int, expected_sha256: str) -> dict[str, Any]:
-    data_path, meta_path, meta = _load_upload(upload_id)
-    data = data_path.read_bytes()
-    if len(data) != expected_size_bytes:
-        raise MyGithub10Error("UPLOAD_SIZE_MISMATCH", "final upload size differs from expected")
-    actual = _sha256(data)
-    if actual != expected_sha256:
-        raise MyGithub10Error("UPLOAD_SHA_MISMATCH", "final upload SHA256 differs from expected")
-    meta.update({"size": len(data), "sha256": actual, "finalized": True})
-    meta_path.write_text(_json(meta), encoding="utf-8")
+    lock = _upload_lock(upload_id)
+    try:
+        data_path, meta_path, meta = _load_upload(upload_id)
+        data = data_path.read_bytes()
+        if len(data) != expected_size_bytes:
+            raise MyGithub10Error("UPLOAD_SIZE_MISMATCH", "final upload size differs from expected")
+        actual = _sha256(data)
+        if actual != expected_sha256:
+            raise MyGithub10Error("UPLOAD_SHA_MISMATCH", "final upload SHA256 differs from expected")
+        meta.update({"size": len(data), "sha256": actual, "finalized": True})
+        temporary_meta = meta_path.with_suffix(".json.tmp")
+        temporary_meta.write_text(_json(meta), encoding="utf-8")
+        os.chmod(temporary_meta, 0o600)
+        os.replace(temporary_meta, meta_path)
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
     return {"upload_id": upload_id, "size_bytes": len(data), "sha256": actual, "finalized": True}
 
 

@@ -43,6 +43,8 @@ private-deploy-agent（服务器端）
 
 ## GitHub Action Service
 
+MyGithub10 当前修复版本为 `10.0.2`。文件写入使用非强制 CAS、expected HEAD/blob 校验和写后 blob/content SHA 回读证明；大于 64 KiB 的文件应使用 manifest、chunk read/upload 和 finalize/commit 流程，不应退化为普通全文提交。
+
 Python 服务提供 GitHub 文件、目录、分支、提交、Pull Request、CI Worker、CI Job、日志和工作流操作能力。默认应只监听 `127.0.0.1`，通过 HTTPS 反向代理或安全隧道提供 MCP 访问。
 
 ```bash

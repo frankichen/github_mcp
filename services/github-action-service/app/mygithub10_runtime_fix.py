@@ -24,64 +24,10 @@ def _base():
 def _commit_files(client, repository: str, branch: str, expected_head_sha: str,
                   changed: dict[str, bytes | None], expected_blob_shas: dict[str, str],
                   message: str) -> dict[str, Any]:
-    base = _base()
-    service = client
-    service._check_repository_allowed(repository)
-    service._check_default_branch_write(repository, branch)
-    gh = service.client if hasattr(service, "client") else service
-    repo = base._repo(gh, repository)
-    ref = repo.get_git_ref(f"heads/{branch}")
-    actual_head = ref.object.sha
-    if expected_head_sha and actual_head != expected_head_sha:
-        raise base.MyGithub10Error(
-            "PATCH_HEAD_CHANGED", "branch HEAD changed",
-            {"expected": expected_head_sha, "actual": actual_head},
-        )
-
-    elements = []
-    old_shas: dict[str, str | None] = {}
-    for path, content in changed.items():
-        base._safe_path(path)
-        try:
-            entry = repo.get_contents(path, ref=actual_head)
-            old_sha = None if isinstance(entry, list) else entry.sha
-        except Exception:
-            old_sha = None
-        old_shas[path] = old_sha
-        expected = expected_blob_shas.get(path, "")
-        if expected and expected != (old_sha or ""):
-            raise base.MyGithub10Error(
-                "PATCH_FILE_CHANGED", f"file blob changed: {path}",
-                {"expected": expected, "actual": old_sha},
-            )
-        if content is None:
-            elements.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
-        else:
-            blob = gh.create_blob(repository, content.decode("utf-8"))
-            elements.append({"path": path, "mode": "100644", "type": "blob", "sha": blob.sha})
-
-    # PyGithub's GitCommit exposes ``tree`` directly.  The old implementation
-    # incorrectly used ``.commit.tree`` and crashed before creating a tree.
-    base_tree = repo.get_git_commit(actual_head).tree.sha
-    tree = gh.create_git_tree(repository, elements, base_tree)
-    commit = gh.create_commit(repository, message, tree.sha, [actual_head])
-    try:
-        ref.edit(sha=commit.sha, force=False)
-    except Exception as exc:
-        raise base.MyGithub10Error("PATCH_HEAD_CHANGED", "branch changed while committing") from exc
-    return {
-        "commit_sha": commit.sha,
-        "tree_sha": tree.sha,
-        "branch": branch,
-        "repository": repository,
-        "changed_files": [
-            {
-                "path": path,
-                "operation": "delete" if content is None else ("modify" if old_shas[path] else "add"),
-            }
-            for path, content in changed.items()
-        ],
-    }
+    return _ORIGINAL_COMMIT_FILES(
+        client, repository, branch, expected_head_sha, changed,
+        expected_blob_shas, message,
+    )
 
 
 def _load_operations(operations_json: str) -> list[dict[str, Any]]:
@@ -183,87 +129,15 @@ def _ensure_non_overlapping(splices: list[tuple[int, int, int, dict[str, Any]]])
 def edit_ranges(client, repository: str, branch: str, expected_head_sha: str,
                 operations_json: str, commit_message: str, dry_run: bool,
                 idempotency_key: str = "") -> dict[str, Any]:
-    base = _base()
-    operations = _load_operations(operations_json)
-    repo = base._repo(client, repository)
-    actual_head, _ = base._resolve_commit(repo, branch)
-    if expected_head_sha and actual_head != expected_head_sha:
-        raise base.MyGithub10Error(
-            "PATCH_HEAD_CHANGED", "branch HEAD changed",
-            {"expected": expected_head_sha, "actual": actual_head},
-        )
-
-    changed: dict[str, bytes] = {}
-    expected: dict[str, str] = {}
-    for path in sorted({item["path"] for item in operations}):
-        data, blob_sha, _ = base._read_blob(repo, path, actual_head)
-        lines = base._text(data).splitlines(keepends=True)
-        splices: list[tuple[int, int, int, dict[str, Any]]] = []
-        for item in (value for value in operations if value["path"] == path):
-            splice_start, splice_end = _splice(item, len(lines))
-            if item["operation"] in {"replace", "delete"}:
-                old_text = "".join(lines[item["start_line"] - 1:item["end_line"]])
-                if base._sha256(old_text.encode("utf-8")) != item["expected_old_text_sha256"]:
-                    raise base.MyGithub10Error("PATCH_FILE_CHANGED", "old range text hash does not match")
-            splices.append((splice_start, splice_end, item["order"], item))
-        _ensure_non_overlapping(splices)
-        for splice_start, splice_end, _, item in sorted(
-            splices, key=lambda value: (value[0], value[1], value[2]), reverse=True
-        ):
-            replacement = "" if item["operation"] == "delete" else item["replacement"]
-            lines[splice_start:splice_end] = [replacement] if replacement else []
-        changed[path] = "".join(lines).encode("utf-8")
-        expected[path] = blob_sha
-
-    result = {
-        "ok": True,
-        "dry_run": dry_run,
-        "repository": repository,
-        "branch": branch,
-        "expected_head_sha": expected_head_sha,
-        "resolved_head_sha": actual_head,
-        "changed_files": [
-            {"path": path, "operation": "modify", "old_blob_sha": expected[path]}
-            for path in changed
-        ],
-        "new_content_sha256": {path: base._sha256(value) for path, value in changed.items()},
-        "operation_count": len(operations),
-    }
-    if dry_run:
-        return result
-
-    operation_id, replay = base._idempotent_start(
-        "edit_github_file_ranges", idempotency_key,
-        {
-            "repository": repository,
-            "branch": branch,
-            "expected_head_sha": expected_head_sha,
-            "operations_sha256": base._sha256(operations_json.encode()),
-        },
+    return _ORIGINAL_EDIT_RANGES(
+        client, repository, branch, expected_head_sha, operations_json,
+        commit_message, dry_run, idempotency_key,
     )
-    if replay:
-        return {**result, "replayed_commit_sha": replay}
-    try:
-        result.update(_commit_files(
-            client, repository, branch, expected_head_sha, changed, expected, commit_message
-        ))
-        base._idempotent_finish(operation_id, "succeeded", result["commit_sha"])
-        return result
-    except base.MyGithub10Error as exc:
-        base._idempotent_finish(operation_id, "failed", error_code=exc.code)
-        raise
 
 
 def apply_patch(client, repository: str, branch: str, expected_head_sha: str,
                 expected_blob_shas_json: str, patch: str, commit_message: str,
                 dry_run: bool, idempotency_key: str = "") -> dict[str, Any]:
-    base = _base()
-    actual_head, _ = base._resolve_commit(base._repo(client, repository), branch)
-    if expected_head_sha and actual_head != expected_head_sha:
-        raise base.MyGithub10Error(
-            "PATCH_HEAD_CHANGED", "branch HEAD changed",
-            {"expected": expected_head_sha, "actual": actual_head},
-        )
     return _ORIGINAL_APPLY_PATCH(
         client, repository, branch, expected_head_sha, expected_blob_shas_json,
         patch, commit_message, dry_run, idempotency_key,
@@ -271,14 +145,18 @@ def apply_patch(client, repository: str, branch: str, expected_head_sha: str,
 
 
 _ORIGINAL_APPLY_PATCH = None
+_ORIGINAL_COMMIT_FILES = None
+_ORIGINAL_EDIT_RANGES = None
 
 
 def install(module) -> None:
-    global _BASE, _ORIGINAL_APPLY_PATCH
+    global _BASE, _ORIGINAL_APPLY_PATCH, _ORIGINAL_COMMIT_FILES, _ORIGINAL_EDIT_RANGES
     if getattr(module, "_runtime_strict_write_fix_installed", False):
         return
     _BASE = module
     _ORIGINAL_APPLY_PATCH = module.apply_patch
+    _ORIGINAL_COMMIT_FILES = module._commit_files
+    _ORIGINAL_EDIT_RANGES = module.edit_ranges
     module._commit_files = _commit_files
     module.edit_ranges = edit_ranges
     module.apply_patch = apply_patch

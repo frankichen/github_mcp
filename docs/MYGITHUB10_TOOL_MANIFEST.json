@@ -1,10 +1,10 @@
 {
   "service_name": "MyGithub10",
-  "source_commit": "d7c2a37d3823fd13e443bdc196c3236f3af37cc2",
+  "source_commit": "8843fc10dc61e01d915d7cd7668319a621709d32",
   "controller_image": "not-read-from-runtime",
   "pygithub_version": "2.5.0",
   "mcp_sdk_version": "mcp>=1.7.0 (requirements baseline)",
-  "tool_count": 83,
+  "tool_count": 84,
   "tools": [
     {
       "name": "get_github_file",
@@ -1297,6 +1297,7 @@
             "type": "string"
           },
           "private_ci_job_id": {
+            "default": "",
             "title": "Private Ci Job Id",
             "type": "string"
           },
@@ -1324,8 +1325,7 @@
         "required": [
           "repository",
           "environment",
-          "commit_sha",
-          "private_ci_job_id"
+          "commit_sha"
         ],
         "title": "plan_test_deploymentArguments",
         "type": "object"
@@ -1352,6 +1352,7 @@
             "type": "string"
           },
           "private_ci_job_id": {
+            "default": "",
             "title": "Private Ci Job Id",
             "type": "string"
           },
@@ -1389,8 +1390,7 @@
         "required": [
           "repository",
           "environment",
-          "commit_sha",
-          "private_ci_job_id"
+          "commit_sha"
         ],
         "title": "start_test_deploymentArguments",
         "type": "object"
@@ -2236,7 +2236,7 @@
       "read_only": false,
       "consequential": true,
       "category": "github",
-      "description": "Apply non-overlapping, hash-checked line range edits as one atomic commit.",
+      "description": "Apply non-overlapping, hash-checked line range edits as one atomic commit. start_line and end_line are 1-based inclusive; dry-run and commit use the same computed UTF-8 bytes, and the commit is read back and verified.",
       "input_schema": {
         "properties": {
           "repository": {
@@ -2673,6 +2673,26 @@
           "artifact_id"
         ],
         "title": "revoke_release_artifactArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_repository_operation_policy",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Return the operation policy for a repository: what MyGithub10 operations are allowed (GitHub read/write, private CI, test deploy, self deploy).",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "get_repository_operation_policyArguments",
         "type": "object"
       }
     },

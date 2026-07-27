@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the MyGithub09 tool manifest from the running MCP registration."""
+"""Generate the MyGithub10 tool manifest from the running MCP registration."""
 
 from __future__ import annotations
 
@@ -32,12 +32,12 @@ def git_value(path: Path, *args: str) -> str:
         return "unknown"
 
 
-async def build_manifest(source: Path, source_commit: str | None = None, service_name: str = "MyGithub09") -> dict:
+async def build_manifest(source: Path, source_commit: str | None = None, service_name: str = "MyGithub10") -> dict:
     os.environ.setdefault("GITHUB_TOKEN", "test_token_value")
     os.environ.setdefault("ACTION_API_KEY", "test_action_key")
-    os.environ.setdefault("IDEMPOTENCY_DB_PATH", "/tmp/mygithub09-idempotency.db")
-    os.environ.setdefault("DEPLOYMENT_DB_PATH", "/tmp/mygithub09-deployment.db")
-    os.environ.setdefault("CI_DB_PATH", "/tmp/mygithub09-ci.db")
+    os.environ.setdefault("IDEMPOTENCY_DB_PATH", "/tmp/mygithub10-idempotency.db")
+    os.environ.setdefault("DEPLOYMENT_DB_PATH", "/tmp/mygithub10-deployment.db")
+    os.environ.setdefault("CI_DB_PATH", "/tmp/mygithub10-ci.db")
     import sys
 
     sys.path.insert(0, str(source))

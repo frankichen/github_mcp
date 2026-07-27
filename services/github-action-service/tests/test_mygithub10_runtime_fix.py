@@ -25,15 +25,19 @@ class FakeRepo:
         self.head_sha = head_sha
         self.default_branch = "main"
         self.ref = FakeRef(head_sha)
+        self.written_content = None
 
     def get_commit(self, _ref):
         return SimpleNamespace(sha=self.head_sha)
 
     def get_contents(self, _path, ref=None):
+        if ref == "new-commit" and self.written_content is not None:
+            return SimpleNamespace(sha="new-blob", size=len(self.written_content))
         return SimpleNamespace(sha=self.blob_sha, size=len(self.data))
 
     def get_git_blob(self, _sha):
-        return SimpleNamespace(encoding="base64", content=base64.b64encode(self.data).decode())
+        data = self.written_content if self.written_content is not None else self.data
+        return SimpleNamespace(encoding="base64", content=base64.b64encode(data).decode())
 
     def get_git_ref(self, _ref):
         return self.ref
@@ -53,6 +57,7 @@ class FakeGitHubClient:
 
     def create_blob(self, _repository, content):
         self.created_blobs.append(content)
+        self.repo.written_content = content.encode()
         return SimpleNamespace(sha="new-blob")
 
     def create_git_tree(self, _repository, elements, base_tree_sha=""):
@@ -152,7 +157,10 @@ def test_dry_run_rejects_stale_head_before_calculating_changes():
             json.dumps(_replace_line_two()), "stale", True,
         )
     assert exc.value.code == "PATCH_HEAD_CHANGED"
-    assert exc.value.details == {"expected": "stale-head", "actual": "actual-head"}
+    assert exc.value.details["expected"] == "stale-head"
+    assert exc.value.details["actual"] == "actual-head"
+    assert exc.value.details["repository"] == "owner/repo"
+    assert exc.value.details["branch"] == "feature"
 
 
 def test_inclusive_ranges_sharing_a_line_are_rejected():

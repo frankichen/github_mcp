@@ -1,6 +1,6 @@
 # MyGithub10 大文件与增量编辑开发契约
 
-版本：`10.0.0`。本文件面向 AI 开发代理和部署审查人员。
+版本：`10.0.2`。本文件面向 AI 开发代理和部署审查人员。
 
 ## 能力边界
 
@@ -14,7 +14,7 @@ MyGithub10 通过 Git Blob API 获取精确字节，不把大文件正文塞入�
 | `read_github_file_chunk` | 按 UTF-8 合法边界读取最多 65536 字节 |
 | `open_github_file_resource` / `read_github_file_resource` | 打开并分页读取资源 |
 | `apply_github_patch` | 严格 unified diff，默认 dry-run，支持多文件原子 commit |
-| `edit_github_file_ranges` | 按 1-based 行号执行 hash 校验后的非重叠编辑 |
+| `edit_github_file_ranges` | 按 1-based inclusive 行号执行 hash 校验后的非重叠编辑；范围基于原始内容计算并按降序应用 |
 | `begin/append/finalize/commit/abort_github_file_upload` | 严格 offset、chunk SHA、总大小和总 SHA 的分块上传 |
 
 ## 读取协议
@@ -36,7 +36,7 @@ MyGithub10 通过 Git Blob API 获取精确字节，不把大文件正文塞入�
 5. 使用唯一 `idempotency_key` 真实提交；
 6. 回读 commit/tree/blob SHA。
 
-HEAD 改变返回 `PATCH_HEAD_CHANGED`；文件 blob 改变返回 `PATCH_FILE_CHANGED`。失败时不更新任何 branch ref。
+HEAD 改变返回 `PATCH_HEAD_CHANGED`（details.error_code=`HEAD_CHANGED`，包含 expected/actual/repository/branch/phase）；文件 blob 改变返回 `BLOB_CHANGED`。失败时不更新任何 branch ref。
 
 ## 幂等与审计
 
@@ -65,7 +65,7 @@ python3 scripts/validate_tool_manifest.py
 pytest -q services/github-action-service/tests
 ```
 
-默认禁止写默认分支；生产环境需要通过 Secret 文件注入 GitHub Token，并设置最小 `ALLOWED_REPOSITORIES`。本 PR 不部署、不重启现网、不修改 `frankichen/sxt`，也不改变现有 MyGithub09 兼容工具。
+默认禁止写默认分支；生产环境需要通过 Secret 文件注入 GitHub Token，并设置最小 `ALLOWED_REPOSITORIES`。本修复不部署、不重启现网、不修改 `frankichen/sxt`，也不改变现有兼容工具字段含义。
 
 ## 回滚
 
