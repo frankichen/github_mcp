@@ -77,7 +77,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, default=Path(__file__).parents[1])
     parser.add_argument("--source-commit", default=None)
-    parser.add_argument("--service-name", default="MyGithub09")
+    parser.add_argument("--service-name", default="MyGithub10")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     manifest = asyncio.run(build_manifest(args.source.resolve(), args.source_commit, args.service_name))

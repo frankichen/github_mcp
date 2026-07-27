@@ -71,14 +71,18 @@ def _db() -> sqlite3.Connection:
             request_sha256 TEXT NOT NULL, tool_name TEXT NOT NULL, repository TEXT NOT NULL,
             branch TEXT NOT NULL, expected_head_sha TEXT NOT NULL, status TEXT NOT NULL,
             result_commit_sha TEXT, created_at REAL NOT NULL, finished_at REAL,
-            error_code TEXT
+            error_code TEXT, result_json TEXT, request_json TEXT
         )"""
     )
+    columns = {item[1] for item in db.execute("PRAGMA table_info(mygithub10_operations)")}
+    for name, definition in (("result_json", "TEXT"), ("request_json", "TEXT")):
+        if name not in columns:
+            db.execute(f"ALTER TABLE mygithub10_operations ADD COLUMN {name} {definition}")
     db.commit()
     return db
 
 
-def _idempotent_start(tool_name: str, key: str, request: dict[str, Any]) -> tuple[str, str | None]:
+def _idempotent_start(tool_name: str, key: str, request: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
     if not key:
         return "", None
     request_hash = _sha256(_json(request).encode())
@@ -92,13 +96,17 @@ def _idempotent_start(tool_name: str, key: str, request: dict[str, Any]) -> tupl
         if old["status"] == "running":
             raise MyGithub10Error("IDEMPOTENCY_IN_PROGRESS", "operation with this key is still running")
         if old["status"] == "succeeded":
-            return "replay", old["result_commit_sha"]
+            if old.get("result_json"):
+                result = json.loads(old["result_json"])
+                result["replayed"] = True
+                return "replay", result
+            raise MyGithub10Error("IDEMPOTENCY_RESULT_UNAVAILABLE", "the original idempotent result is unavailable")
         raise MyGithub10Error(old["error_code"] or "IDEMPOTENCY_FAILED", "previous operation failed")
     operation_id = str(uuid.uuid4())
     try:
         db.execute(
-            "INSERT INTO mygithub10_operations(operation_id,idempotency_key,request_sha256,tool_name,repository,branch,expected_head_sha,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (operation_id, key, request_hash, tool_name, request.get("repository", ""), request.get("branch", ""), request.get("expected_head_sha", ""), "running", time.time()),
+            "INSERT INTO mygithub10_operations(operation_id,idempotency_key,request_sha256,tool_name,repository,branch,expected_head_sha,status,created_at,request_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (operation_id, key, request_hash, tool_name, request.get("repository", ""), request.get("branch", ""), request.get("expected_head_sha", ""), "running", time.time(), _json(request)),
         )
         db.commit()
     except sqlite3.IntegrityError:
@@ -107,12 +115,24 @@ def _idempotent_start(tool_name: str, key: str, request: dict[str, Any]) -> tupl
     return operation_id, None
 
 
-def _idempotent_finish(operation_id: str, status: str, commit_sha: str | None = None, error_code: str | None = None) -> None:
+def _idempotent_finish(operation_id: str, status: str, commit_sha: str | None = None, error_code: str | None = None, result: dict[str, Any] | None = None) -> None:
     if not operation_id or operation_id == "replay":
         return
     db = _db()
-    db.execute("UPDATE mygithub10_operations SET status=?,result_commit_sha=?,finished_at=?,error_code=? WHERE operation_id=?", (status, commit_sha, time.time(), error_code, operation_id))
+    db.execute("UPDATE mygithub10_operations SET status=?,result_commit_sha=?,finished_at=?,error_code=?,result_json=? WHERE operation_id=?", (status, commit_sha, time.time(), error_code, _json(result) if result is not None else None, operation_id))
     db.commit()
+
+
+def _idempotent_existing(key: str) -> dict[str, Any] | None:
+    """Read an existing operation without requiring any remote/file state."""
+    if not key:
+        return None
+    db = _db()
+    row = db.execute("SELECT * FROM mygithub10_operations WHERE idempotency_key = ?", (key,)).fetchone()
+    if not row:
+        return None
+    columns = [item[1] for item in db.execute("PRAGMA table_info(mygithub10_operations)")]
+    return dict(zip(columns, row))
 
 
 def _repo(client, repository: str):
@@ -269,12 +289,19 @@ def _parse_patch(patch: str) -> list[tuple[str, str, list[tuple[int, int, list[s
     return result
 
 
-def _apply_file_patch(old: bytes, hunks: list[tuple[int, int, list[str], list[str]]]) -> bytes:
+def _apply_file_patch(old: bytes, hunks: list[tuple[int, int, list[str], list[str]]], allow_empty_old: bool = False) -> bytes:
     source = _text(old).splitlines(keepends=True) if old else []
     cursor = 0
     output: list[str] = []
     for old_start, _, expected, replacement in hunks:
-        position = old_start - 1
+        if allow_empty_old:
+            if old or old_start != 0 or expected:
+                raise MyGithub10Error("PATCH_INVALID_FORMAT", "new-file patch must start at old line 0 with an empty old file")
+            position = 0
+        else:
+            if old_start < 1:
+                raise MyGithub10Error("PATCH_INVALID_FORMAT", "old line 0 is valid only for a new-file patch")
+            position = old_start - 1
         if position < cursor or source[position:position + len(expected)] != expected:
             context = "".join(expected[:3])[:240]
             raise MyGithub10Error("PATCH_DOES_NOT_APPLY", f"hunk at old line {old_start} does not match exactly", {"old_line": old_start, "context": context})
@@ -303,7 +330,9 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
         try:
             entry = repo.get_contents(path, ref=actual_head)
             old_sha = None if isinstance(entry, list) else entry.sha
-        except Exception:
+        except Exception as exc:
+            if getattr(exc, "status", None) != 404:
+                raise MyGithub10Error("GITHUB_READ_FAILED", f"GitHub failed while checking {path} before write", {"path": path, "repository": repository, "branch": branch, "retryable": True}) from exc
             old_sha = None
         old_shas[path] = old_sha
         expected = expected_blob_shas.get(path, "")
@@ -364,32 +393,45 @@ def apply_patch(client, repository: str, branch: str, expected_head_sha: str, ex
         raise MyGithub10Error("PATCH_INVALID_FORMAT", "expected_blob_shas_json must be valid JSON") from exc
     if not isinstance(expected, dict):
         raise MyGithub10Error("PATCH_INVALID_FORMAT", "expected_blob_shas_json must be an object")
+    request = {"tool_name": "apply_github_patch", "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "expected_blob_shas": expected, "patch_sha256": _sha256(patch.encode()), "commit_message": commit_message}
+    operation_id, replay = ("", None) if dry_run else _idempotent_start("apply_github_patch", idempotency_key, request)
+    if replay:
+        return replay
     repo = _repo(client, repository)
     actual_head, _ = _resolve_commit(repo, branch)
     if expected_head_sha and actual_head != expected_head_sha:
+        if operation_id:
+            _idempotent_finish(operation_id, "failed", error_code="HEAD_CHANGED")
         raise MyGithub10Error("PATCH_HEAD_CHANGED", f"branch HEAD changed before patch for {repository}:{branch}", {"expected": expected_head_sha, "actual": actual_head, "repository": repository, "branch": branch, "phase": "before_write", "error_code": "HEAD_CHANGED"})
     changed: dict[str, bytes | None] = {}
     previews = []
     for path, operation, hunks in parsed:
         old = b""
         old_sha = None
-        if operation != "add":
-            old, old_sha, _ = _read_blob(repo, path, branch)
+        if operation == "add":
+            try:
+                existing = repo.get_contents(path, ref=actual_head)
+                if existing is not None:
+                    raise MyGithub10Error("PATCH_TARGET_EXISTS", f"new-file patch target already exists: {path}", {"path": path, "error_code": "FILE_ALREADY_EXISTS"})
+            except MyGithub10Error:
+                raise
+            except Exception as exc:
+                if getattr(exc, "status", None) != 404:
+                    raise MyGithub10Error("GITHUB_READ_FAILED", f"GitHub failed while checking patch target {path}", {"path": path, "retryable": True}) from exc
+        elif operation != "delete":
+            old, old_sha, _ = _read_blob(repo, path, actual_head)
             if expected.get(path) and expected[path] != old_sha:
                 raise MyGithub10Error("BLOB_CHANGED", f"file blob changed before patch: {path}", {"expected": expected[path], "actual": old_sha, "repository": repository, "branch": branch, "path": path})
-        new = None if operation == "delete" else _apply_file_patch(old, hunks)
+        new = None if operation == "delete" else _apply_file_patch(old, hunks, allow_empty_old=operation == "add")
         changed[path] = new
         previews.append({"path": path, "operation": operation, "old_blob_sha": old_sha, "new_content_sha256": _sha256(new or b""), "added_lines": 0, "deleted_lines": 0})
     fingerprint = _sha256(_json({"repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "patch": patch, "commit_message": commit_message}).encode())
     result = {"ok": True, "dry_run": dry_run, "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "changed_files": previews, "diff_preview": patch[:MAX_INLINE_RESPONSE_BYTES], "diff_truncated": len(patch.encode()) > MAX_INLINE_RESPONSE_BYTES, "operation_fingerprint": fingerprint}
     if dry_run:
         return result
-    operation_id, replay = _idempotent_start("apply_github_patch", idempotency_key, {"tool_name": "apply_github_patch", "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "expected_blob_shas": expected, "patch_sha256": _sha256(patch.encode()), "commit_message": commit_message})
-    if replay:
-        return {**result, "replayed_commit_sha": replay}
     try:
         result.update(_commit_files(client, repository, branch, expected_head_sha, changed, expected, commit_message))
-        _idempotent_finish(operation_id, "succeeded", result["commit_sha"])
+        _idempotent_finish(operation_id, "succeeded", result["commit_sha"], result=result)
         return result
     except MyGithub10Error as exc:
         _idempotent_finish(operation_id, "failed", error_code=exc.code)
@@ -405,9 +447,15 @@ def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, op
         raise MyGithub10Error("PATCH_EMPTY", "at least one range edit operation is required")
     if len(operations) > 1000:
         raise MyGithub10Error("PATCH_SCOPE_EXCEEDED", "too many range edit operations")
+    request = {"tool_name": "edit_github_file_ranges", "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "operations": operations, "commit_message": commit_message}
+    operation_id, replay = ("", None) if dry_run else _idempotent_start("edit_github_file_ranges", idempotency_key, request)
+    if replay:
+        return replay
     repo = _repo(client, repository)
     actual_head, _ = _resolve_commit(repo, branch)
     if expected_head_sha and actual_head != expected_head_sha:
+        if operation_id:
+            _idempotent_finish(operation_id, "failed", error_code="HEAD_CHANGED")
         raise MyGithub10Error("PATCH_HEAD_CHANGED", f"branch HEAD changed before range edit for {repository}:{branch}", {"expected": expected_head_sha, "actual": actual_head, "repository": repository, "branch": branch, "phase": "before_write", "error_code": "HEAD_CHANGED"})
     changed = {}
     expected = {}
@@ -460,11 +508,9 @@ def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, op
         expected[path] = blob_sha
     result = {"ok": True, "dry_run": dry_run, "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "resolved_head_sha": actual_head, "changed_files": [{"path": p, "operation": "modify", "old_blob_sha": expected[p]} for p in changed], "new_content_sha256": {p: _sha256(v) for p, v in changed.items()}, "operation_count": len(operations)}
     if dry_run: return result
-    operation_id, replay = _idempotent_start("edit_github_file_ranges", idempotency_key, {"tool_name": "edit_github_file_ranges", "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "operations_sha256": _sha256(operations_json.encode()), "commit_message": commit_message})
-    if replay: return {**result, "replayed_commit_sha": replay}
     try:
         result.update(_commit_files(client, repository, branch, expected_head_sha, changed, expected, commit_message))
-        _idempotent_finish(operation_id, "succeeded", result["commit_sha"])
+        _idempotent_finish(operation_id, "succeeded", result["commit_sha"], result=result)
         return result
     except MyGithub10Error as exc:
         _idempotent_finish(operation_id, "failed", error_code=exc.code)
@@ -472,6 +518,7 @@ def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, op
 
 
 def capabilities(build_sha: str = "unknown", version: str = "10.0.2") -> dict[str, Any]:
+    build_sha_source = "environment" if re.fullmatch(r"[0-9a-f]{40}", build_sha or "") else "vcs_fallback"
     if not re.fullmatch(r"[0-9a-f]{40}", build_sha or ""):
         try:
             repo_root = Path(__file__).resolve().parents[3]
@@ -481,7 +528,7 @@ def capabilities(build_sha: str = "unknown", version: str = "10.0.2") -> dict[st
             build_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True, stderr=subprocess.DEVNULL).strip()
         except (OSError, subprocess.CalledProcessError):
             build_sha = "unknown"
-    return {"name": "MyGithub10", "version": version, "build_sha": build_sha, "source_repository": "frankichen/github_mcp", "max_inline_response_bytes": MAX_INLINE_RESPONSE_BYTES, "max_file_chunk_bytes": MAX_FILE_CHUNK_BYTES, "max_patch_bytes": MAX_PATCH_BYTES, "max_upload_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES, "supports_file_manifest": True, "supports_byte_chunks": True, "supports_mcp_resources": True, "supports_incremental_patch": True, "supports_range_edit": True, "range_edit_semantics": {"start_line": "1-based inclusive", "end_line": "1-based inclusive", "encoding": "UTF-8 text lines; original LF/CRLF and final-newline state are preserved"}, "supports_chunked_upload": True, "supports_dry_run": True, "supports_expected_head_sha": True, "supports_expected_blob_sha": True, "supports_idempotency_key": True, "supports_operation_audit": True, "supports_tree_attestation": True, "supports_artifact_deployment": False, "supports_gofmt_autofix": True, "supports_real_ci_performance_validation": False, "recommended_large_file_workflow": ["get_github_file_manifest", "read_github_file_chunk", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "commit_github_uploaded_files"], "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT"], "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}]}
+    return {"name": "MyGithub10", "version": version, "build_sha": build_sha, "build_sha_source": build_sha_source, "runtime_mode": os.environ.get("MYGITHUB10_RUNTIME_MODE", "development"), "source_repository": "frankichen/github_mcp", "max_inline_response_bytes": MAX_INLINE_RESPONSE_BYTES, "max_file_chunk_bytes": MAX_FILE_CHUNK_BYTES, "max_patch_bytes": MAX_PATCH_BYTES, "max_upload_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES, "supports_file_manifest": True, "supports_byte_chunks": True, "supports_mcp_resources": True, "supports_incremental_patch": True, "supports_range_edit": True, "range_edit_semantics": {"start_line": "1-based inclusive", "end_line": "1-based inclusive", "encoding": "UTF-8 text lines; original LF/CRLF and final-newline state are preserved"}, "supports_chunked_upload": True, "supports_dry_run": True, "supports_expected_head_sha": True, "supports_expected_blob_sha": True, "supports_idempotency_key": True, "supports_operation_audit": True, "supports_tree_attestation": True, "supports_artifact_deployment": False, "supports_gofmt_autofix": True, "supports_real_ci_performance_validation": False, "recommended_large_file_workflow": ["get_github_file_manifest", "read_github_file_chunk", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "commit_github_uploaded_files"], "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_IN_PROGRESS"], "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}]}
 
 
 _UPLOAD_ROOT = Path(os.environ.get("MYGITHUB10_UPLOAD_DIR", tempfile.gettempdir())) / "mygithub10-uploads"
@@ -570,19 +617,33 @@ def finalize_upload(upload_id: str, expected_size_bytes: int, expected_sha256: s
 
 
 def commit_upload(client, repository: str, branch: str, expected_head_sha: str, path: str, expected_blob_sha: str, upload_id: str, commit_message: str, idempotency_key: str = "") -> dict[str, Any]:
+    _safe_path(path)
+    existing = _idempotent_existing(idempotency_key)
+    if existing and existing.get("status") == "succeeded":
+        stored_request = json.loads(existing.get("request_json") or "{}")
+        scope = {"repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "path": path, "expected_blob_sha": expected_blob_sha, "upload_id": upload_id, "commit_message": commit_message}
+        stored_scope = {key: stored_request.get(key) for key in scope}
+        if stored_scope != scope:
+            raise MyGithub10Error("IDEMPOTENCY_CONFLICT", "idempotency key was used for a different upload request")
+        if existing.get("result_json"):
+            replay = json.loads(existing["result_json"])
+            replay["replayed"] = True
+            return replay
+        raise MyGithub10Error("IDEMPOTENCY_RESULT_UNAVAILABLE", "the original idempotent upload result is unavailable")
     data_path, _, meta = _load_upload(upload_id)
     if not meta.get("finalized"):
         raise MyGithub10Error("UPLOAD_NOT_FINALIZED", "finalize the upload before committing")
-    _safe_path(path)
     data = data_path.read_bytes()
-    operation_id, replay = _idempotent_start("commit_github_uploaded_files", idempotency_key, {"repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "path": path, "upload_sha256": meta["sha256"]})
+    request = {"tool_name": "commit_github_uploaded_files", "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "path": path, "expected_blob_sha": expected_blob_sha, "upload_id": upload_id, "upload_sha256": meta["sha256"], "upload_size": meta["size"], "commit_message": commit_message}
+    operation_id, replay = _idempotent_start("commit_github_uploaded_files", idempotency_key, request)
     if replay:
-        return {"ok": True, "replayed_commit_sha": replay, "upload_id": upload_id}
+        return replay
     try:
         result = _commit_files(client, repository, branch, expected_head_sha, {path: data}, {path: expected_blob_sha}, commit_message)
-        _idempotent_finish(operation_id, "succeeded", result["commit_sha"])
+        result = {"ok": True, **result, "upload_id": upload_id}
+        _idempotent_finish(operation_id, "succeeded", result["commit_sha"], result=result)
         abort_upload(upload_id)
-        return {"ok": True, **result, "upload_id": upload_id}
+        return result
     except MyGithub10Error as exc:
         _idempotent_finish(operation_id, "failed", error_code=exc.code)
         raise

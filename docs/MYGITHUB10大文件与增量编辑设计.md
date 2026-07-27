@@ -13,7 +13,7 @@ MyGithub10 通过 Git Blob API 获取精确字节，不把大文件正文塞入�
 | `get_github_file_manifest` | 返回 commit、blob、大小、编码、行数和完整 SHA256，不返回正文 |
 | `read_github_file_chunk` | 按 UTF-8 合法边界读取最多 65536 字节 |
 | `open_github_file_resource` / `read_github_file_resource` | 打开并分页读取资源 |
-| `apply_github_patch` | 严格 unified diff，默认 dry-run，支持多文件原子 commit |
+| `apply_github_patch` | 严格 unified diff，默认 dry-run，支持多文件原子 commit；新增文件使用 `--- /dev/null` 与 `@@ -0,0 +1,N @@` |
 | `edit_github_file_ranges` | 按 1-based inclusive 行号执行 hash 校验后的非重叠编辑；范围基于原始内容计算并按降序应用 |
 | `begin/append/finalize/commit/abort_github_file_upload` | 严格 offset、chunk SHA、总大小和总 SHA 的分块上传 |
 
@@ -40,7 +40,7 @@ HEAD 改变返回 `PATCH_HEAD_CHANGED`（details.error_code=`HEAD_CHANGED`，包
 
 ## 幂等与审计
 
-写操作使用 `mygithub10_operations` 表，记录 operation id、请求 SHA、工具名、仓库、分支、期望 HEAD、状态、结果 commit 和错误码。相同 key 与相同请求返回原结果；相同 key 的不同请求返回 `IDEMPOTENCY_CONFLICT`；执行中的重复请求返回 `IDEMPOTENCY_IN_PROGRESS`。
+写操作使用 `mygithub10_operations` 表，记录 operation id、请求 SHA、脱敏请求摘要、工具名、仓库、分支、期望 HEAD、状态、结果 commit、错误码和脱敏 `result_json`。请求摘要覆盖工具、仓库、分支、expected HEAD、目标路径、expected blob、操作内容摘要/上传 SHA 和提交消息。相同 key 与相同请求返回原始完整结果（不重新读取 HEAD、上传临时文件或创建 Commit）；相同 key 的不同请求返回 `IDEMPOTENCY_CONFLICT`；执行中的重复请求返回 `IDEMPOTENCY_IN_PROGRESS`。
 
 数据库不保存 Token、Authorization Header、完整 patch、完整文件正文或上传内容。上传内容只暂存在权限 `0600` 的临时文件中，成功提交后删除，过期上传由 abort/清理流程删除。
 

@@ -25,6 +25,13 @@ class ReadRepo:
         return SimpleNamespace(encoding="base64", content=base64.b64encode(self.data).decode())
 
 
+class MissingRepo(ReadRepo):
+    def get_contents(self, path, ref=None):
+        error = RuntimeError("missing")
+        error.status = 404
+        raise error
+
+
 class ReadService:
     def __init__(self, repo):
         self.client = SimpleNamespace(_pygithub=SimpleNamespace(get_repo=lambda _: repo))
@@ -90,6 +97,36 @@ def test_patch_context_mismatch_never_returns_bytes():
     assert exc.value.code == "PATCH_DOES_NOT_APPLY"
 
 
+def test_new_file_patch_accepts_zero_old_range_and_preserves_bytes():
+    patch = "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+中文🙂\n+\tline2"
+    path, operation, hunks = mygithub10._parse_patch(patch)[0]
+    assert (path, operation) == ("new.txt", "add")
+    assert mygithub10._apply_file_patch(b"", hunks, allow_empty_old=True) == "中文🙂\n\tline2".encode()
+
+
+def test_zero_old_range_is_rejected_for_modify_patch():
+    patch = "--- a/x.txt\n+++ b/x.txt\n@@ -0,0 +1,1 @@\n+new\n"
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        mygithub10._apply_file_patch(b"old\n", mygithub10._parse_patch(patch)[0][2])
+    assert exc.value.code == "PATCH_INVALID_FORMAT"
+
+
+def test_new_file_patch_rejects_existing_target_and_commits_exact_bytes(monkeypatch):
+    repo = MissingRepo(b"")
+    service = ReadService(repo)
+    captured = {}
+
+    def commit_files(*args):
+        captured["changed"] = args[4]
+        return {"commit_sha": "c1", "old_head_sha": "h1", "new_head_sha": "c1", "tree_sha": "t1", "changed_files": []}
+
+    monkeypatch.setattr(mygithub10, "_commit_files", commit_files)
+    patch = "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+line1\n+line2\n"
+    result = mygithub10.apply_patch(service, "owner/repo", "feature", "head-1", "{}", patch, "add", False)
+    assert result["commit_sha"] == "c1"
+    assert captured["changed"]["new.txt"] == b"line1\nline2\n"
+
+
 def test_idempotency_key_is_scoped_to_full_request(tmp_path, monkeypatch):
     db_path = tmp_path / "ops.db"
     monkeypatch.setattr(mygithub10.settings, "IDEMPOTENCY_DB_PATH", str(db_path))
@@ -105,6 +142,37 @@ def test_idempotency_key_is_scoped_to_full_request(tmp_path, monkeypatch):
             {"tool_name": "edit_github_file_ranges", "repository": "a/r", "branch": "two", "expected_head_sha": "h1", "operations_sha256": "p1", "commit_message": "m"},
         )
     assert exc.value.code == "IDEMPOTENCY_CONFLICT"
+
+
+def test_idempotency_replays_complete_result_without_remote_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(mygithub10.settings, "IDEMPOTENCY_DB_PATH", str(tmp_path / "replay.db"))
+    request = {"tool_name": "edit_github_file_ranges", "repository": "a/r", "branch": "one", "expected_head_sha": "h1", "operations": [{"path": "x", "operation": "replace"}], "commit_message": "m"}
+    operation_id, replay = mygithub10._idempotent_start("edit_github_file_ranges", "replay-key", request)
+    assert operation_id and replay is None
+    original = {"ok": True, "commit_sha": "commit-1", "old_head_sha": "h1", "new_head_sha": "commit-1", "changed_files": [{"path": "x", "content_sha256": "abc", "size_bytes": 3}]}
+    mygithub10._idempotent_finish(operation_id, "succeeded", "commit-1", result=original)
+    operation_id, replay = mygithub10._idempotent_start("edit_github_file_ranges", "replay-key", request)
+    assert operation_id == "replay"
+    assert replay["commit_sha"] == "commit-1"
+    assert replay["replayed"] is True
+
+
+def test_upload_replay_survives_body_cleanup(tmp_path, monkeypatch):
+    monkeypatch.setattr(mygithub10, "_UPLOAD_ROOT", tmp_path / "uploads")
+    monkeypatch.setattr(mygithub10.settings, "IDEMPOTENCY_DB_PATH", str(tmp_path / "upload-ops.db"))
+    upload = mygithub10.begin_upload()
+    data = b"upload content\n"
+    mygithub10.append_upload(upload["upload_id"], 0, data, digest(data.decode()))
+    mygithub10.finalize_upload(upload["upload_id"], len(data), digest(data.decode()))
+    result = {"ok": True, "commit_sha": "upload-commit", "old_head_sha": "h1", "new_head_sha": "upload-commit", "tree_sha": "t1", "changed_files": [{"path": "upload.txt", "content_sha256": digest(data.decode()), "size_bytes": len(data)}], "upload_id": upload["upload_id"]}
+    monkeypatch.setattr(mygithub10, "_commit_files", lambda *args: {key: value for key, value in result.items() if key != "ok" and key != "upload_id"})
+    service = ReadService(ReadRepo(b""))
+    first = mygithub10.commit_upload(service, "owner/repo", "feature", "head-1", "upload.txt", "", upload["upload_id"], "upload", "upload-key")
+    assert first["commit_sha"] == "upload-commit"
+    assert not mygithub10._upload_paths(upload["upload_id"])[0].exists()
+    replay = mygithub10.commit_upload(service, "owner/repo", "feature", "head-1", "upload.txt", "", upload["upload_id"], "upload", "upload-key")
+    assert replay["commit_sha"] == "upload-commit"
+    assert replay["replayed"] is True
 
 
 def test_concurrent_same_idempotency_key_has_one_owner(tmp_path, monkeypatch):
