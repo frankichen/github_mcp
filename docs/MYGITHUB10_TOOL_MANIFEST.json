@@ -1,6 +1,6 @@
 {
   "service_name": "MyGithub10",
-  "source_commit": "2f2fb65958bbeaa54c56f165818baf6a62180aac",
+  "source_commit": "19dbb92ffeaf072c9faeba80e5594cf3ab4a7ccd",
   "controller_image": "not-read-from-runtime",
   "pygithub_version": "2.5.0",
   "mcp_sdk_version": "1.28.1",
@@ -2236,7 +2236,7 @@
       "read_only": false,
       "consequential": true,
       "category": "github",
-      "description": "Apply non-overlapping exact-text line range edits as one atomic commit. Each replace/delete item may provide expected_blob_sha and expected_old_text; start_line/end_line are 1-based inclusive. Dry-run and commit use the same computed UTF-8 bytes, and the commit is read back and verified.",
+      "description": "Apply non-overlapping exact-text line range edits as one atomic commit. Each replace/delete item must provide expected_blob_sha and expected_old_text, and replace uses replacement_text; start_line/end_line are 1-based inclusive. Dry-run and commit use the same computed UTF-8 bytes, and the commit is read back and verified.",
       "input_schema": {
         "properties": {
           "repository": {
@@ -2304,16 +2304,6 @@
           "replacement_text": {
             "title": "Replacement Text",
             "type": "string"
-          },
-          "start_line": {
-            "default": 1,
-            "title": "Start Line",
-            "type": "integer"
-          },
-          "end_line": {
-            "default": 0,
-            "title": "End Line",
-            "type": "integer"
           }
         },
         "required": [

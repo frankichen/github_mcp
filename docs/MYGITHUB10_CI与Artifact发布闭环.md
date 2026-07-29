@@ -34,6 +34,6 @@ main SHA CI 通过 → 构建 artifact → manifest/checksums/tar.zst
 
 ## Go 安全自动修复与回滚
 
-`gofmt_safe.sh` 默认只检查；只有明确设置 `GOFMT_AUTO_FIX=true` 才执行 `gofmt -w`。自动修复必须在独立工作区完成并重新运行完整 CI。
+`gofmt_safe.sh` 只检查并在发现未格式化文件时失败；CI 不修改工作区、不创建提交、不推送。
 
 回滚使用已验证的上一 release、manifest 和 checksums，恢复 `current` 指针并重新 health check；不删除 release、不执行 destructive migration、不 force push。本 PR 未部署、未重启服务、未修改数据库和 `frankichen/sxt`。

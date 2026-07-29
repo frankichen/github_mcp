@@ -597,8 +597,7 @@ def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, op
         raise
 
 
-def build_patch(path: str, expected_blob_sha: str, original_text: str, replacement_text: str,
-                start_line: int = 1, end_line: int = 0) -> dict[str, Any]:
+def build_patch(path: str, expected_blob_sha: str, original_text: str, replacement_text: str) -> dict[str, Any]:
     """Build a deterministic, local-only unified diff; never contacts GitHub."""
     _safe_path(path)
     if not isinstance(original_text, str) or not isinstance(replacement_text, str):
@@ -608,13 +607,11 @@ def build_patch(path: str, expected_blob_sha: str, original_text: str, replaceme
         raise MyGithub10Error("PATCH_TOO_LARGE", "text exceeds the patch builder limit")
     if expected_blob_sha and expected_blob_sha != _git_blob_sha(old_bytes):
         raise MyGithub10Error("BLOB_CHANGED", "expected_blob_sha does not match original_text", {"expected": expected_blob_sha, "actual": _git_blob_sha(old_bytes), "path": path})
-    if start_line < 1 or end_line < 0 or (end_line and end_line < start_line):
-        raise MyGithub10Error("PATCH_INVALID_FORMAT", "range line numbers are invalid")
     old_lines = original_text.splitlines(keepends=True)
     new_lines = replacement_text.splitlines(keepends=True)
-    old_start = start_line
+    old_start = 1
     old_count = len(old_lines)
-    new_start = start_line
+    new_start = 1
     new_count = len(new_lines)
     def diff_side(prefix: str, lines: list[str]) -> list[str]:
         result = []
@@ -628,7 +625,7 @@ def build_patch(path: str, expected_blob_sha: str, original_text: str, replaceme
     body.extend(diff_side("-", old_lines))
     body.extend(diff_side("+", new_lines))
     patch = f"--- a/{path}\n+++ b/{path}\n" + "".join(body)
-    fingerprint = _sha256(_json({"path": path, "expected_blob_sha": expected_blob_sha, "original_text": original_text, "replacement_text": replacement_text, "start_line": start_line, "end_line": end_line}).encode())
+    fingerprint = _sha256(_json({"path": path, "expected_blob_sha": expected_blob_sha, "original_text": original_text, "replacement_text": replacement_text}).encode())
     return {"ok": True, "dry_run": True, "path": path, "patch": patch, "diff_preview": patch[:MAX_INLINE_RESPONSE_BYTES],
             "operation_fingerprint": fingerprint, "old_blob_sha": _git_blob_sha(old_bytes), "new_blob_sha": _git_blob_sha(replacement_text.encode()),
             "old_count": old_count, "new_count": new_count}
@@ -645,7 +642,7 @@ def capabilities(build_sha: str = "unknown", version: str = "10.0.3") -> dict[st
             build_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True, stderr=subprocess.DEVNULL).strip()
         except (OSError, subprocess.CalledProcessError):
             build_sha = "unknown"
-    return {"name": "MyGithub10", "version": version, "build_sha": build_sha, "build_sha_source": build_sha_source, "runtime_mode": os.environ.get("MYGITHUB10_RUNTIME_MODE", "development"), "source_repository": "frankichen/github_mcp", "max_inline_response_bytes": MAX_INLINE_RESPONSE_BYTES, "max_file_chunk_bytes": MAX_FILE_CHUNK_BYTES, "max_patch_bytes": MAX_PATCH_BYTES, "max_upload_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES, "supports_file_manifest": True, "supports_byte_chunks": True, "supports_mcp_resources": True, "supports_incremental_patch": True, "supports_range_edit": True, "range_edit_semantics": {"start_line": "1-based inclusive", "end_line": "1-based inclusive", "encoding": "UTF-8 text lines; original LF/CRLF and final-newline state are preserved"}, "supports_chunked_upload": True, "supports_dry_run": True, "supports_expected_head_sha": True, "supports_expected_blob_sha": True, "supports_idempotency_key": True, "supports_operation_audit": True, "supports_tree_attestation": True, "supports_artifact_deployment": False, "supports_gofmt_autofix": True, "supports_real_ci_performance_validation": False, "recommended_large_file_workflow": ["get_github_file_manifest", "read_github_file_chunk", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "commit_github_uploaded_files"], "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_IN_PROGRESS"], "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}]}
+    return {"name": "MyGithub10", "version": version, "build_sha": build_sha, "build_sha_source": build_sha_source, "runtime_mode": os.environ.get("MYGITHUB10_RUNTIME_MODE", "development"), "source_repository": "frankichen/github_mcp", "max_inline_response_bytes": MAX_INLINE_RESPONSE_BYTES, "max_file_chunk_bytes": MAX_FILE_CHUNK_BYTES, "max_patch_bytes": MAX_PATCH_BYTES, "max_upload_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES, "supports_file_manifest": True, "supports_byte_chunks": True, "supports_mcp_resources": True, "supports_incremental_patch": True, "supports_range_edit": True, "range_edit_semantics": {"start_line": "1-based inclusive", "end_line": "1-based inclusive", "encoding": "UTF-8 text lines; original LF/CRLF and final-newline state are preserved"}, "supports_chunked_upload": True, "supports_dry_run": True, "supports_expected_head_sha": True, "supports_expected_blob_sha": True, "supports_idempotency_key": True, "supports_operation_audit": True, "supports_tree_attestation": True, "supports_artifact_deployment": False, "supports_gofmt_autofix": False, "supports_real_ci_performance_validation": False, "recommended_large_file_workflow": ["get_github_file_manifest", "read_github_file_chunk", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "commit_github_uploaded_files"], "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_IN_PROGRESS"], "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}]}
 
 
 _UPLOAD_ROOT = Path(os.environ.get("MYGITHUB10_UPLOAD_DIR", tempfile.gettempdir())) / "mygithub10-uploads"
