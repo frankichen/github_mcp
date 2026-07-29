@@ -14,6 +14,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import AuthSettings
 from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.transport_security import TransportSecuritySettings
 
 from app.config import settings as app_settings
 from app.github_client import GitHubClient
@@ -105,6 +106,23 @@ Development History & Reports:
     auth=AuthSettings(
         issuer_url=app_settings.SERVICE_URL,
         resource_server_url=app_settings.SERVICE_URL,
+    ),
+    # The application listens on localhost behind nginx, so FastMCP would
+    # otherwise auto-enable localhost-only DNS rebinding protection.  The
+    # public MCP endpoint is intentionally served through this exact domain.
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "github.555044.xyz",
+            "github.555044.xyz:443",
+            "127.0.0.1:*",
+            "localhost:*",
+            "[::1]:*",
+        ],
+        allowed_origins=[
+            "https://github.555044.xyz",
+            "https://github.555044.xyz:443",
+        ],
     ),
     stateless_http=True,
 )
@@ -796,11 +814,11 @@ def _mygithub10_error(exc: Exception) -> str:
     return json.dumps({"ok": False, "error": {"code": "INTERNAL_ERROR", "message": "MyGithub10 operation failed", "details": {}}}, ensure_ascii=False)
 
 
-@mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithub10 capability and compatibility contract.")
+@mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithut11 capability and compatibility contract.")
 async def get_mygithub_capabilities() -> str:
     return json.dumps(mygithub10.capabilities(
         os.environ.get("MYGITHUB10_BUILD_SHA") or "unknown",
-        os.environ.get("MYGITHUB10_VERSION") or "10.0.3",
+        os.environ.get("MYGITHUB10_VERSION") or "10.1.1",
     ), ensure_ascii=False)
 
 
