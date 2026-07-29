@@ -3,6 +3,8 @@ from typing import Any, Optional
 import httpx
 
 from app.config import settings
+from app.github_auth import credential_provider
+from app.github_policy import ensure_repository_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -10,7 +12,7 @@ GITHUB_API_URL = "https://api.github.com"
 
 
 def _get_headers() -> dict:
-    token = settings.GITHUB_TOKEN.get_secret_value()
+    token = credential_provider.token()
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
@@ -35,6 +37,7 @@ async def _github_request(method: str, path: str, json_data: Optional[dict] = No
 
 
 def _parse_repo(repository: str) -> tuple:
+    ensure_repository_allowed(repository)
     parts = repository.split("/")
     if len(parts) != 2:
         raise ValueError(f"Invalid repository format: {repository}. Expected owner/repo.")

@@ -1,7 +1,9 @@
+import os
 from types import SimpleNamespace
 
 from private_ci_agent.executor import JobExecutor
 from private_ci_agent.models import Job
+from private_ci_agent.podman import PodmanRunner
 from private_ci_agent.workspace import WorkspaceManager
 
 
@@ -15,8 +17,14 @@ class FakeLogManager:
     def get_total(self, _job_id):
         return 0
 
+    def is_truncated(self, _job_id):
+        return False
+
 
 class FakeClient:
+    def update_job_status(self, _job_id, _status):
+        pass
+
     def start_step(self, _job_id, _step_name):
         return None
 
@@ -153,11 +161,25 @@ class AlwaysFailPodman(FakePodman):
         return {"exit_code": exit_code, "stdout": "", "stderr": "", "timed_out": False}
 
 
-def test_gofmt_autofix_success_makes_workspace_pass(tmp_path):
+def test_gofmt_autofix_success_makes_workspace_pass(tmp_path, monkeypatch):
     """gofmt check fails → autofix formats + verifies → workspace passes, step=autofixed."""
     (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
     podman = OnceFailingPodman("gofmt -l")
-    result = make_executor(podman)._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
+    executor = make_executor(podman)
+    monkeypatch.setattr(
+        executor,
+        "_git_push_autofix",
+        lambda _job, _source: {
+            "committed": True,
+            "pushed": True,
+            "verified": True,
+            "reason": "ok",
+        },
+    )
+    job = make_job(tmp_path)
+    job.repository = "frankichen/sxt"
+    job.branch = "feature/gofmt"
+    result = executor._execute_workspace(job, {"path": ".", "stack": "go"})
 
     assert result["passed"] is True
     gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
@@ -176,7 +198,7 @@ def test_gofmt_autofix_failure_still_fails_workspace(tmp_path):
     assert result["passed"] is False
     gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
     assert gofmt_step["status"] in ("failed", "timed_out")
-    assert gofmt_step.get("autofix") is None
+    assert gofmt_step["autofix"]["reason"] == "repository_not_allowed"
 
 
 def test_setup_failure_blocks_gofmt_autofix(tmp_path):
@@ -189,7 +211,7 @@ def test_setup_failure_blocks_gofmt_autofix(tmp_path):
     assert result["passed"] is False
     gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
     # gofmt should still have run (not blocked) but autofix skipped due to setup_failed
-    assert gofmt_step["status"] == "failed"
+    assert gofmt_step["status"] == "passed"
     assert gofmt_step.get("autofix") is None
 
 
@@ -221,9 +243,33 @@ class FakeFastCheckClient(FakeClient):
 
 def make_fast_check_executor(subprocess_runner=None):
     """Build a JobExecutor with everything needed for _execute_fast_check."""
+    class FastCheckPodman:
+        def image_available(self, _image, allow_pull=False):
+            return not allow_pull
+
+        def image_digest(self, _image):
+            return "sha256:test"
+
+        def resource_summary(self):
+            return {"mode": "test"}
+
+        def run_command(self, _image, _job_id, source_dir, _caches, _command, _timeout, **_kwargs):
+            runner = subprocess_runner or sp_mod.run
+            result = runner(
+                ["make", "-C", source_dir, "ai-integrity-check"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            return {
+                "exit_code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "timed_out": False,
+            }
+
     e = object.__new__(JobExecutor)
-    e.podman = PodmanRunner.__new__(PodmanRunner)  # not used by fast-check
-    e.podman.podman = "/usr/bin/podman"
+    e.podman = FastCheckPodman()
     e.services = SimpleNamespace(
         prepare=lambda _jid, _ws: None,
         cleanup=lambda _jid, _ws: None,

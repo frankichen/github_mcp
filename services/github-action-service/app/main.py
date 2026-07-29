@@ -9,8 +9,10 @@ from fastapi.openapi.utils import get_openapi
 from app.routers import health, github, ci_worker, deployments
 from app.config import settings
 from app.exceptions import AppError
-from app.idempotency import IdempotencyMiddleware
+from app.idempotency import IdempotencyMiddleware, ensure_idempotency_storage
 from app.oauth import get_oauth_protected_resource_metadata
+from app.observability import RequestObservabilityMiddleware
+from app.version import SERVICE_NAME, SERVICE_VERSION
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL, "INFO"),
@@ -26,6 +28,7 @@ async def lifespan(app: FastAPI):
         from app.ci_database import init_db
         from app.deployment_service import init_deployment_db
         from app.attestation_registry import init_registry_db
+        ensure_idempotency_storage()
         init_db()
         init_deployment_db()
         init_registry_db()
@@ -61,9 +64,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="GitHub Action Service",
+    title=SERVICE_NAME,
     description="Private GitHub code write service for ChatGPT Custom GPT Actions and MCP",
-    version="2.0.0",
+    version=SERVICE_VERSION,
     lifespan=lifespan,
 )
 
@@ -79,6 +82,7 @@ async def oauth_protected_resource():
 
 
 app.add_middleware(IdempotencyMiddleware)
+app.add_middleware(RequestObservabilityMiddleware)
 
 
 @app.exception_handler(AppError)
@@ -91,7 +95,10 @@ async def app_error_handler(request: Request, exc: AppError):
 
 @app.get("/privacy")
 async def privacy():
-    return {"message": "This service does not store or log any user data."}
+    return {
+        "message": "This private service stores bounded operational metadata needed for idempotency, CI logs, deployment state, and audit evidence. It does not intentionally store GitHub credentials or full MyGithub10 request bodies in audit records.",
+        "retention": "Retention is controlled by the operator's database, log, artifact, and idempotency policies.",
+    }
 
 
 _ACTIONS_SCHEMA = None
@@ -108,7 +115,7 @@ async def actions_openapi():
         "info": {
             "title": "GitHub Action Service",
             "description": "Write and read code on GitHub repositories via API",
-            "version": "1.0.0",
+            "version": SERVICE_VERSION,
         },
         "servers": [
             {"url": "https://github.555044.xyz", "description": "Production server"},

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from importlib.metadata import PackageNotFoundError, version
 import json
 import os
 import subprocess
@@ -30,6 +31,25 @@ def git_value(path: Path, *args: str) -> str:
         return subprocess.check_output(["git", "-C", str(path), *args], text=True).strip()
     except Exception:
         return "unknown"
+
+
+def package_version(name: str) -> str:
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def declared_version(source: Path, name: str) -> str:
+    """Prefer the deployable direct pin over whichever package is in the caller venv."""
+    requirements = source / "requirements.txt"
+    if requirements.is_file():
+        prefix = f"{name.lower()}=="
+        for line in requirements.read_text(encoding="utf-8").splitlines():
+            normalized = line.strip()
+            if normalized.lower().startswith(prefix):
+                return normalized.split("==", 1)[1]
+    return package_version(name)
 
 
 async def build_manifest(source: Path, source_commit: str | None = None, service_name: str = "MyGithub10") -> dict:
@@ -66,8 +86,8 @@ async def build_manifest(source: Path, source_commit: str | None = None, service
         "service_name": service_name,
         "source_commit": source_commit or git_value(source, "rev-parse", "HEAD"),
         "controller_image": os.environ.get("MYGITHUB09_CONTROLLER_IMAGE", "not-read-from-runtime"),
-        "pygithub_version": "2.5.0",
-        "mcp_sdk_version": "mcp>=1.7.0 (requirements baseline)",
+        "pygithub_version": declared_version(source, "PyGithub"),
+        "mcp_sdk_version": declared_version(source, "mcp"),
         "tool_count": len(tools),
         "tools": tools,
     }
