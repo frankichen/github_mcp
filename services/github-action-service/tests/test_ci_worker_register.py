@@ -148,6 +148,31 @@ def test_register_response_does_not_expose_token(client):
     assert "token" not in response.text.lower()
 
 
+def test_job_lease_recovers_expired_leases(client, monkeypatch):
+    recovered = []
+
+    async def accept(_request):
+        return "wsl-ci-test"
+
+    monkeypatch.setattr(ci_worker, "verify_ci_worker", accept)
+    monkeypatch.setattr(
+        ci_worker,
+        "get_worker",
+        lambda worker_id: {
+            "worker_id": worker_id,
+            "supported_profiles": ["repo-auto-check"],
+            "max_concurrent": 1,
+        },
+    )
+    monkeypatch.setattr(ci_worker, "recover_expired_leases", lambda: recovered.append(True))
+    monkeypatch.setattr(ci_worker, "lease_job", lambda *_args: None)
+
+    response = client.post("/internal/ci/jobs/lease", headers={"Authorization": "Bearer test", "X-Worker-ID": "wsl-ci-test"})
+
+    assert response.status_code == 200
+    assert recovered == [True]
+
+
 def test_missing_worker_auth_is_401(client):
     response = client.post("/internal/ci/workers/heartbeat", json={})
     assert response.status_code == 401

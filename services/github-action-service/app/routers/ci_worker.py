@@ -35,6 +35,7 @@ from app.ci_database import (
     add_step,
     finish_step,
     get_steps,
+    recover_expired_leases,
     recover_worker_jobs,
 )
 
@@ -120,6 +121,7 @@ async def job_lease(request: Request):
     if not worker:
         raise HTTPException(status_code=404, detail={"error": "worker_not_found"})
 
+    recover_expired_leases()
     result = lease_job(worker_id, worker["supported_profiles"], worker["max_concurrent"])
     if result:
         logger.info(

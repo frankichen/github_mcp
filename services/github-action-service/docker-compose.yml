@@ -9,6 +9,8 @@ services:
       DEPLOYMENT_DB_PATH: /data/private-ci/deployments.db
       DEPLOY_STATUS_FILE: /data/private-ci/gongshi-test-status.json
       DEPLOY_CALLBACK_API_KEY_FILE: /run/secrets/deploy_callback_api_key
+      MYGITHUB10_RUNTIME_MODE: production
+      MYGITHUB10_BUILD_SHA: 8b19103bb12e12373fdfda2b9763f52b8dc6ff25
     ports:
       - "127.0.0.1:8765:8000"
       - "100.118.124.97:8788:8000"

@@ -111,9 +111,9 @@ Development History & Reports:
         issuer_url=app_settings.SERVICE_URL,
         resource_server_url=app_settings.SERVICE_URL,
     ),
-    # The SDK enables DNS-rebinding protection for its localhost default.
-    # The public reverse proxy preserves the external Host, so allow that
-    # exact production hostname without disabling the protection.
+    # The application listens on localhost behind nginx, so FastMCP would
+    # otherwise auto-enable localhost-only DNS rebinding protection.  The
+    # public MCP endpoint is intentionally served through this exact domain.
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=[
@@ -820,7 +820,7 @@ def _mygithub10_error(exc: Exception) -> str:
     return json.dumps({"ok": False, "error": {"code": "INTERNAL_ERROR", "message": "MyGithub10 operation failed", "details": {}, "trace_id": str(uuid.uuid4())}}, ensure_ascii=False)
 
 
-@mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithub10 capability and compatibility contract.")
+@mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithut11 capability and compatibility contract.")
 async def get_mygithub_capabilities() -> str:
     return json.dumps(mygithub10.capabilities(runtime_build_sha()), ensure_ascii=False)
 

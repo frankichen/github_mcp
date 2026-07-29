@@ -21,6 +21,10 @@ DB_PATH = os.environ.get("CI_DB_PATH", "/data/ci.db")
 
 _local = threading.local()
 _job_change_condition = threading.Condition()
+# SQLite serializes writers.  The controller runs one Uvicorn process, so a
+# small in-process lock keeps request threads from competing for the same
+# write transaction.  WAL still allows concurrent readers.
+_db_write_lock = threading.RLock()
 
 
 def _notify_job_change(job_id: str) -> None:
@@ -33,7 +37,6 @@ def _get_db():
     if not hasattr(_local, "db") or _local.db is None:
         db = sqlite3.connect(DB_PATH, timeout=15)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA busy_timeout=15000")
         db.execute("PRAGMA foreign_keys=ON")
         _local.db = db
@@ -42,6 +45,9 @@ def _get_db():
 
 def init_db():
     db = _get_db()
+    # Set this once during startup.  Running journal_mode=WAL on every new
+    # request-thread connection can itself require a database write lock.
+    db.execute("PRAGMA journal_mode=WAL")
     db.executescript("""
         CREATE TABLE IF NOT EXISTS ci_workers (
             worker_id TEXT PRIMARY KEY,
@@ -210,21 +216,20 @@ def verify_worker_token(worker_id: str, token: str) -> bool:
 def update_worker_heartbeat(worker_id: str) -> bool:
     db = _get_db()
     ts = now_ts()
-    db.execute("UPDATE ci_workers SET last_heartbeat = ? WHERE worker_id = ?", (ts, worker_id))
-    db.commit()
+    with _db_write_lock:
+        db.execute("UPDATE ci_workers SET last_heartbeat = ? WHERE worker_id = ?", (ts, worker_id))
+        db.commit()
     return True
 
 
 def set_worker_busy(worker_id: str, job_id: str):
     db = _get_db()
     db.execute("UPDATE ci_workers SET status = 'busy', current_job_id = ? WHERE worker_id = ?", (job_id, worker_id))
-    db.commit()
 
 
 def set_worker_idle(worker_id: str):
     db = _get_db()
     db.execute("UPDATE ci_workers SET status = 'idle', current_job_id = NULL WHERE worker_id = ?", (worker_id,))
-    db.commit()
 
 
 def get_workers() -> list[dict]:
@@ -288,6 +293,29 @@ def create_or_get_job(
     idem_key = make_idempotency_key(repository, commit_sha, profile)
     ts = now_ts()
 
+    # The idempotency read and insert must be one transaction.  Otherwise two
+    # concurrent starts can both pass the read, and a writer such as a worker
+    # heartbeat can leave the request with a partially completed operation.
+    with _db_write_lock:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            return _create_or_get_job_in_transaction(
+                db, repository, branch, commit_sha, profile, priority,
+                timeout_seconds, force_rerun, supersede_previous, base_sha,
+                changed_files, changed_files_total, changed_files_truncated,
+                idem_key, ts,
+            )
+        except Exception:
+            db.rollback()
+            raise
+
+
+def _create_or_get_job_in_transaction(
+    db, repository, branch, commit_sha, profile, priority, timeout_seconds,
+    force_rerun, supersede_previous, base_sha, changed_files,
+    changed_files_total, changed_files_truncated, idem_key, ts,
+) -> dict:
+
     if not force_rerun:
         row = db.execute(
             """SELECT * FROM ci_jobs WHERE idempotency_key = ? AND status IN ('queued', 'leased', 'downloading', 'preparing', 'running', 'passed')
@@ -295,7 +323,7 @@ def create_or_get_job(
             (idem_key,),
         ).fetchone()
         if row:
-            return {
+            result = {
                 "job_id": row["job_id"],
                 "idempotency_key": idem_key,
                 "repository": row["repository"],
@@ -315,6 +343,8 @@ def create_or_get_job(
                 "queued_count": _count_queued(db),
                 "created_at": datetime.fromtimestamp(row["created_at"], tz=timezone.utc).isoformat(),
             }
+            db.commit()
+            return result
 
     if supersede_previous:
         db.execute(
@@ -334,6 +364,13 @@ def create_or_get_job(
     )
     _upsert_repo_queue_state(db, repository, queued_delta=1)
     db.commit()
+
+    # Verify the durable row on the same connection before reporting success.
+    # This turns any unexpected persistence failure into an error response,
+    # never a false-positive job id.
+    persisted = db.execute("SELECT 1 FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
+    if not persisted:
+        raise sqlite3.OperationalError("CI job commit verification failed")
 
     return {
         "job_id": job_id,
@@ -695,11 +732,17 @@ def renew_lease(job_id: str, lease_token: str) -> bool:
     db = _get_db()
     expected_hash = hashlib.sha256(lease_token.encode()).hexdigest()
     ts = now_ts()
-    db.execute(
-        "UPDATE ci_jobs SET lease_expires_at = ? WHERE job_id = ? AND lease_token_hash = ?",
-        (ts + 120, job_id, expected_hash),
-    )
-    return db.total_changes > 0
+    with _db_write_lock:
+        db.execute(
+            "UPDATE ci_jobs SET lease_expires_at = ? WHERE job_id = ? AND lease_token_hash = ?",
+            (ts + 120, job_id, expected_hash),
+        )
+        changed = db.total_changes > 0
+        # This endpoint is called by every Worker heartbeat.  Leaving this
+        # UPDATE uncommitted keeps a write transaction open on the thread-local
+        # SQLite connection and blocks registration/job creation in others.
+        db.commit()
+    return changed
 
 
 def need_heartbeat(job_id: str) -> bool:
@@ -1013,9 +1056,12 @@ def reconcile_stale_workers():
         (offline_cutoff,),
     )
 
-    if changed > 0:
-        db.commit()
-        logger.info(f"Reconciled {changed} stale current_job entries")
+    # Commit even when only the offline-status cleanup changed rows.  The old
+    # conditional commit left that UPDATE open on the request thread.
+    offline_changed = db.total_changes
+    db.commit()
+    if changed > 0 or offline_changed > 0:
+        logger.info(f"Reconciled {changed} stale current_job entries and {offline_changed} offline workers")
 
     return changed
 

@@ -26,5 +26,5 @@ def test_runtime_version_must_match_authoritative_version(monkeypatch):
 
 
 def test_authoritative_version_is_1011():
-    assert version.SERVICE_NAME == "MyGithub10"
+    assert version.SERVICE_NAME == "MyGithut11"
     assert version.SERVICE_VERSION == "10.1.1"
