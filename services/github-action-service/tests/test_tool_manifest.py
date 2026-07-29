@@ -3,7 +3,7 @@ import pytest
 from app.mcp_server import mcp
 
 
-EXPECTED_TOOL_COUNT = 84
+EXPECTED_TOOL_COUNT = 85
 
 
 @pytest.mark.asyncio

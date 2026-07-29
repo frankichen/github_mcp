@@ -97,6 +97,49 @@ def test_patch_context_mismatch_never_returns_bytes():
     assert exc.value.code == "PATCH_DOES_NOT_APPLY"
 
 
+def test_hunk_counts_are_normalized_without_changing_business_lines():
+    patch = "--- a/x\n+++ b/x\n@@ -1,99 +1,88 @@\n-old\n+new\n"
+    parsed, details = mygithub10._parse_patch_details(patch)
+    assert details["patch_normalized"] is True
+    assert details["normalized_hunks"][0]["normalized"] == "@@ -1,1 +1,1 @@"
+    assert mygithub10._apply_file_patch(b"old\n", parsed[0][2]) == b"new\n"
+
+
+def test_context_diagnostic_reports_unique_candidate_but_does_not_apply_it():
+    patch = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n"
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        mygithub10._apply_file_patch(b"prefix\nold\nsuffix\n", mygithub10._parse_patch(patch)[0][2])
+    assert exc.value.code == "PATCH_DOES_NOT_APPLY"
+    assert exc.value.details["nearest_candidate_start"] == 2
+    assert exc.value.details["exact_match_count"] == 1
+
+
+def test_context_diagnostic_rejects_multiple_candidates():
+    patch = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n"
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        mygithub10._apply_file_patch(b"prefix\nold\nold\n", mygithub10._parse_patch(patch)[0][2])
+    assert exc.value.code == "PATCH_CONTEXT_AMBIGUOUS"
+    assert exc.value.details["exact_match_count"] == 2
+
+
+def test_build_patch_is_pure_and_preserves_no_final_newline_and_unicode_path():
+    old, new = "旧🙂", "新🙂"
+    result = mygithub10.build_patch("目录/文件.txt", mygithub10._git_blob_sha(old.encode()), old, new)
+    assert result["dry_run"] is True
+    assert result["old_blob_sha"] == mygithub10._git_blob_sha(old.encode())
+    parsed = mygithub10._parse_patch(result["patch"])
+    assert mygithub10._apply_file_patch(old.encode(), parsed[0][2]) == new.encode()
+
+
+def test_range_edit_requires_exact_old_text_and_blob_sha():
+    service = ReadService(ReadRepo(b"one\r\ntwo\r\n"))
+    ops = [{"path": "x", "operation": "replace", "start_line": 2, "end_line": 2,
+            "expected_blob_sha": "wrong", "expected_old_text": "two\r\n", "replacement_text": "二\r\n"}]
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        mygithub10.edit_ranges(service, "owner/repo", "feature", "head-1", json.dumps(ops), "edit", True)
+    assert exc.value.code == "BLOB_CHANGED"
+
+
 def test_new_file_patch_accepts_zero_old_range_and_preserves_bytes():
     patch = "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+中文🙂\n+\tline2"
     path, operation, hunks = mygithub10._parse_patch(patch)[0]
