@@ -4,9 +4,8 @@
 
 ## 设计边界
 
-- 只处理固定仓库 `frankichen/sxt`；
-- 只处理固定环境 `gongshi-test`；
-- 只处理固定 scope `fullstack`；
+- 只处理代码内固定契约中的 `frankichen/sxt` 和 `frankichen/auto_gupiao`；
+- 环境、scope、工作区和脚本均来自对应的固定契约；
 - 部署脚本路径由代码和受控工作区决定，不接受 MCP 参数传入任意路径；
 - `claim_only` 模式只领取任务并交给受控 WSL 流程；
 - 运行状态写入受控的 `/var/lib/private-ci`；
@@ -19,6 +18,8 @@
 `deploy-contracts/sxt/` 保存 Worker 依赖的最小发布契约：测试环境 Compose、Nginx 模板、`deploy_gongshi_test.sh` 和 `sync_test_env.sh`。完整的 `frankichen/sxt` 应用源码仍需从它自己的仓库获取；本目录不替代业务应用仓库。
 
 ## 依赖
+
+Worker 运行时只使用 Python 标准库；保留空的 `requirements.txt` 作为统一部署入口。
 
 ```bash
 python3 -m venv venv

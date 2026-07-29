@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import sqlite3
 import time
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -13,6 +14,33 @@ _RESERVED_CHARS = frozenset({0x00, 0x0A, 0x0D})
 
 _IDEMPOTENCY_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 _MAX_KEY_LENGTH = 256
+
+
+def ensure_idempotency_storage() -> None:
+    """Create/migrate the idempotency store before readiness is reported."""
+    database = sqlite3.connect(settings.IDEMPOTENCY_DB_PATH, timeout=15)
+    database.execute(
+        """CREATE TABLE IF NOT EXISTS idempotency (
+            key TEXT PRIMARY KEY,
+            request_hash TEXT NOT NULL,
+            status_code INTEGER NOT NULL,
+            response_json TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'completed',
+            created_at REAL NOT NULL
+        )"""
+    )
+    columns = {
+        row[1] for row in database.execute("PRAGMA table_info(idempotency)").fetchall()
+    }
+    if "state" not in columns:
+        database.execute(
+            "ALTER TABLE idempotency ADD COLUMN state TEXT NOT NULL DEFAULT 'completed'"
+        )
+    database.execute(
+        "CREATE INDEX IF NOT EXISTS idx_idempotency_created_at ON idempotency(created_at)"
+    )
+    database.commit()
+    database.close()
 
 
 def _validate_idempotency_key(key: str) -> bool:
@@ -28,26 +56,30 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
         super().__init__(app)
         self._db = None
+        self._last_cleanup_at = 0.0
 
     async def _get_db(self):
         if self._db is None:
             import aiosqlite
+            ensure_idempotency_storage()
             self._db = await aiosqlite.connect(settings.IDEMPOTENCY_DB_PATH)
             self._db.row_factory = aiosqlite.Row
-            await self._db.execute(
-                """CREATE TABLE IF NOT EXISTS idempotency (
-                    key TEXT PRIMARY KEY,
-                    request_hash TEXT NOT NULL,
-                    status_code INTEGER NOT NULL,
-                    response_json TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                )"""
-            )
-            await self._db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_idempotency_created_at ON idempotency(created_at)"
-            )
-            await self._db.commit()
         return self._db
+
+    async def _cleanup_if_due(self, db, now: float) -> None:
+        if now - self._last_cleanup_at < 3600:
+            return
+        cutoff = now - (settings.IDEMPOTENCY_TTL_HOURS * 3600)
+        await db.execute("DELETE FROM idempotency WHERE created_at < ?", (cutoff,))
+        await db.commit()
+        self._last_cleanup_at = now
+
+    async def _release_claim(self, db, idempotency_key: str, request_hash: str) -> None:
+        await db.execute(
+            "DELETE FROM idempotency WHERE key = ? AND request_hash = ? AND state = 'running'",
+            (idempotency_key, request_hash),
+        )
+        await db.commit()
 
     async def dispatch(self, request: Request, call_next):
         if request.method not in _IDEMPOTENCY_METHODS:
@@ -71,18 +103,45 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
 
         db = await self._get_db()
 
-        async with db.execute(
-            "SELECT status_code, response_json, request_hash FROM idempotency WHERE key = ?",
-            (idempotency_key,),
-        ) as cursor:
-            row = await cursor.fetchone()
+        now = time.time()
+        await self._cleanup_if_due(db, now)
+        claimed = False
+        try:
+            await db.execute(
+                """INSERT INTO idempotency
+                   (key, request_hash, status_code, response_json, state, created_at)
+                   VALUES (?, ?, 0, '', 'running', ?)""",
+                (idempotency_key, request_hash, now),
+            )
+            await db.commit()
+            claimed = True
+        except sqlite3.IntegrityError:
+            await db.rollback()
 
-        if row is not None:
+        if not claimed:
+            async with db.execute(
+                "SELECT status_code, response_json, request_hash, state FROM idempotency WHERE key = ?",
+                (idempotency_key,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return Response(
+                    content=json.dumps({"error": "idempotency_unavailable", "message": "Idempotency state changed; retry the request"}),
+                    status_code=409,
+                    media_type="application/json",
+                )
             if row["request_hash"] != request_hash:
                 return Response(
                     content=json.dumps({"error": "idempotency_key_reuse", "message": "Idempotency-Key reused with different request content"}),
                     status_code=422,
                     media_type="application/json",
+                )
+            if row["state"] == "running":
+                return Response(
+                    content=json.dumps({"error": "idempotency_in_progress", "message": "A request with this Idempotency-Key is still running"}),
+                    status_code=409,
+                    media_type="application/json",
+                    headers={"Retry-After": "1"},
                 )
             return Response(
                 content=row["response_json"],
@@ -95,19 +154,24 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
 
         request._receive = receive
 
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:
+            await self._release_claim(db, idempotency_key, request_hash)
+            raise
 
-        if 200 <= response.status_code < 600:
+        if 200 <= response.status_code < 500:
             response_body = b""
             async for chunk in response.body_iterator:
                 response_body += chunk
 
             response_json = response_body.decode("utf-8", errors="replace")
 
-            now = time.time()
             await db.execute(
-                "INSERT INTO idempotency (key, request_hash, status_code, response_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                (idempotency_key, request_hash, response.status_code, response_json, now),
+                """UPDATE idempotency
+                   SET status_code = ?, response_json = ?, state = 'completed'
+                   WHERE key = ? AND request_hash = ? AND state = 'running'""",
+                (response.status_code, response_json, idempotency_key, request_hash),
             )
             await db.commit()
 
@@ -118,6 +182,7 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
                 media_type=response.media_type,
             )
 
+        await self._release_claim(db, idempotency_key, request_hash)
         return response
 
     async def cleanup(self):

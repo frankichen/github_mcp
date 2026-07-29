@@ -14,9 +14,12 @@ class Settings(BaseSettings):
     GITHUB_AUTH_MODE: str = "legacy"
     GITHUB_TOKEN_FILE: Optional[str] = None
     GITHUB_TOKEN: SecretStr = SecretStr("")
+    GITHUB_APP_ID: Optional[int] = None
+    GITHUB_APP_INSTALLATION_ID: Optional[int] = None
+    GITHUB_APP_PRIVATE_KEY_FILE: Optional[str] = None
     ACTION_API_KEY: SecretStr = SecretStr("")
     GITHUB_API_URL: str = "https://api.github.com"
-    ALLOWED_REPOSITORIES: str = "*"
+    ALLOWED_REPOSITORIES: str = ""
     ALLOW_DEFAULT_BRANCH_WRITE: bool = False
     MAX_FILE_CHARACTERS: int = 60000
     MAX_TOTAL_CHARACTERS: int = 80000
@@ -60,8 +63,18 @@ class Settings(BaseSettings):
             if self.GITHUB_TOKEN.get_secret_value():
                 logger.warning("GITHUB_TOKEN_FILE is configured; the legacy GITHUB_TOKEN value is ignored")
             self.GITHUB_TOKEN = SecretStr(token)
-        elif self.GITHUB_AUTH_MODE == "classic_pat" and not self.GITHUB_TOKEN.get_secret_value():
-            raise ValueError("classic_pat authentication requires GITHUB_TOKEN_FILE or GITHUB_TOKEN")
+        elif self.GITHUB_AUTH_MODE in {"classic_pat", "fine_grained_pat"} and not self.GITHUB_TOKEN.get_secret_value():
+            raise ValueError(f"{self.GITHUB_AUTH_MODE} authentication requires GITHUB_TOKEN_FILE or GITHUB_TOKEN")
+        if self.GITHUB_AUTH_MODE == "github_app":
+            if not self.GITHUB_APP_ID or not self.GITHUB_APP_INSTALLATION_ID:
+                raise ValueError("github_app authentication requires GITHUB_APP_ID and GITHUB_APP_INSTALLATION_ID")
+            key_file = Path((self.GITHUB_APP_PRIVATE_KEY_FILE or "").strip())
+            try:
+                metadata = key_file.stat()
+            except OSError as exc:
+                raise ValueError("GITHUB_APP_PRIVATE_KEY_FILE is not readable") from exc
+            if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise ValueError("GITHUB_APP_PRIVATE_KEY_FILE must be a mode 0600 regular file")
         callback_file = (self.DEPLOY_CALLBACK_API_KEY_FILE or "").strip()
         if callback_file:
             path = Path(callback_file)

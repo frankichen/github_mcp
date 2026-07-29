@@ -1,4 +1,1 @@
-pydantic==2.10.4
-pydantic-settings==2.7.0
-PyGithub==2.5.0
-PyYAML==6.0.2
+# The worker runtime intentionally uses only the Python standard library.

@@ -11,11 +11,10 @@ RUN apt-get update \
 
 RUN mkdir -p /data /app/config
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir --no-input -r requirements.txt
+COPY requirements.txt constraints.txt ./
+RUN pip install --no-cache-dir --no-input -c constraints.txt -r requirements.txt
 
 COPY app/ ./app/
-COPY tests/ ./tests/
 COPY config/ ./config/
 COPY scripts/ ./scripts/
 

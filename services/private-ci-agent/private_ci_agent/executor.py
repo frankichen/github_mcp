@@ -18,6 +18,7 @@ from private_ci_agent.profiles import (
     get_commands_for_profile,
     get_repository_overrides,
     node_commands_for_workspace,
+    python_commands_for_workspace,
 )
 from private_ci_agent.podman import PodmanRunner
 from private_ci_agent.logs import LogManager
@@ -44,16 +45,18 @@ class JobExecutor:
         self.client.update_job_status(job_id, "preparing")
 
         repo_config = get_repository_overrides(job.repository, job.profile)
-
-        # Fast path: repo-fast-check runs make ai-integrity-check in Podman
         if job.profile == "repo-fast-check":
-            self.log_manager.upload(job_id, "[fast-check] entering repo-fast-check Podman path\n")
+            self.log_manager.upload(job_id, "[fast-check] entering isolated repo-fast-check path\n")
             summary = self._execute_fast_check(job)
             self.log_manager.flush(job_id)
-            self.client.finish_job(job_id, summary["exit_code"], summary["status"],
-                                   summary=summary,
-                                   error_code=summary.get("error_code"),
-                                   error_message=summary.get("error_message"))
+            self.client.finish_job(
+                job_id,
+                summary["exit_code"],
+                summary["status"],
+                summary=summary,
+                error_code=summary.get("error_code"),
+                error_message=summary.get("error_message"),
+            )
             return summary
 
         if job.profile == "repo-auto-check":
@@ -223,7 +226,7 @@ class JobExecutor:
         if stack == "go":
             return go_commands_for_workspace(source_dir)
         if stack == "python":
-            return PYTHON_COMMANDS
+            return python_commands_for_workspace(source_dir)
         return {"error": "unsupported", "message": f"Unsupported stack: {stack}"}
 
     def _execute_workspace(self, job: Job, workspace: dict) -> dict:
@@ -249,6 +252,16 @@ class JobExecutor:
             os.makedirs(cache_root, mode=0o700, exist_ok=True)
             os.chmod(cache_root, 0o700)
             caches = {"go": cache_root}
+        elif workspace["stack"] == "python":
+            # Python venv must persist across container steps.
+            cache_root = os.path.join(job.workspace or os.path.dirname(job.source_dir), "python-venv")
+            os.makedirs(cache_root, mode=0o700, exist_ok=True)
+            os.chmod(cache_root, 0o700)
+            caches = {"python_venv": cache_root}
+            # Also include pip cache if configured
+            for cache_name in commands.get("cache_dirs", {}):
+                if cache_name == "pip" and cache_name in CACHE_MAP:
+                    caches[cache_name] = CACHE_MAP[cache_name]
         else:
             caches = {name: CACHE_MAP[name] for name in commands.get("cache_dirs", {}) if name in CACHE_MAP}
         steps = []
@@ -268,7 +281,8 @@ class JobExecutor:
         for setup in commands.get("setup", []):
             name = setup.get("name", "setup") if isinstance(setup, dict) else "setup"
             command = setup.get("command") if isinstance(setup, dict) else setup
-            step = self._run_setup(job, label, image, source_dir, caches, name, command, service_env)
+            step = self._run_setup(job, label, image, source_dir, caches, name, command, service_env,
+                                   pass_proxy=(workspace["stack"] == "python"))
             steps.append(step)
             if step["exit_code"] != 0:
                 setup_failed = True
@@ -295,44 +309,73 @@ class JobExecutor:
                 steps.append(step)
                 self.log_manager.upload(job.job_id, f"[{step['step_name']}] BLOCKED_BY_SETUP\n")
                 continue
+            if setup_failed and workspace["stack"] == "python":
+                step = {
+                    "step_name": f"{label}:{check['name']}",
+                    "command": check["command"],
+                    "status": "blocked_by_setup",
+                    "exit_code": None,
+                    "duration_seconds": 0,
+                }
+                steps.append(step)
+                self.log_manager.upload(job.job_id, f"[{step['step_name']}] BLOCKED_BY_SETUP\n")
+                continue
             extra_env = None
             if check["name"] == "ai-integrity":
                 extra_env = {
                     "AI_INTEGRITY_BASE_SHA": job.base_sha,
                     "AI_INTEGRITY_REPORT": "/tmp/ai-integrity-report.json",
                 }
-                # Only pass changed_files if list is NOT truncated; otherwise
-                # the project script uses git diff base...HEAD.
-                if job.changed_files and not getattr(job, 'changed_files_truncated', False):
+                if job.changed_files and not getattr(job, "changed_files_truncated", False):
                     extra_env["AI_INTEGRITY_CHANGED_FILES"] = "\n".join(job.changed_files)
-            step = self._run_check(job, label, image, source_dir, caches, check["name"], check["command"], service_env, extra_env=extra_env)
+            step = self._run_check(
+                job,
+                label,
+                image,
+                source_dir,
+                caches,
+                check["name"],
+                check["command"],
+                service_env,
+                extra_env=extra_env,
+                pass_proxy=(workspace["stack"] == "python"),
+            )
             steps.append(step)
             if step["exit_code"] != 0:
-                # gofmt auto-fix: format + commit + push, then treat as non-failure
                 if check["name"] == "gofmt" and not setup_failed:
                     autofix = self._gofmt_autofix(job, label, image, source_dir, caches, step, service_env)
-                    if autofix and autofix.get("formatted"):
-                        step["status"] = "autofixed"
+                    if autofix:
                         step["autofix"] = autofix
-                        self.log_manager.upload(job.job_id, f"[{step['step_name']}] AUTOFIXED: {autofix.get('message', '')}\n")
+                    if autofix and autofix.get("pushed") and autofix.get("verified"):
+                        step["status"] = "autofixed"
+                        self.log_manager.upload(
+                            job.job_id,
+                            f"[{step['step_name']}] AUTOFIXED: {autofix.get('message', '')}\n",
+                        )
                         continue
+                    reason = (autofix or {}).get("reason", "autofix_not_completed")
+                    self.log_manager.upload(
+                        job.job_id,
+                        f"[{step['step_name']}] AUTOFIX_FAILED: {reason}\n",
+                    )
                 passed = False
                 exit_code = exit_code or step["exit_code"]
 
         return {"passed": passed, "exit_code": exit_code, "steps": steps}
 
-    def _run_setup(self, job, label, image, source_dir, caches, step_name, command, service_env=None):
+    def _run_setup(self, job, label, image, source_dir, caches, step_name, command, service_env=None, pass_proxy=False):
         name = f"{label}:{step_name}"
         self.log_manager.upload(job.job_id, f"[{name}] Starting: {command}\n")
         start = time.time()
         result = self.podman.run_command(image, job.job_id, source_dir, caches, command, 300, network=True,
-                                         env=self._service_env(service_env), network_name=service_env.network if service_env else None)
+                                         env=self._service_env(service_env), network_name=service_env.network if service_env else None,
+                                         pass_proxy=pass_proxy)
         self._upload_output(job.job_id, result)
         status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else "failed")
         self.log_manager.upload(job.job_id, f"[{name}] {status.upper()} (exit={result['exit_code']})\n")
         return {"step_name": name, "command": command, "status": status, "exit_code": result["exit_code"], "duration_seconds": time.time() - start}
 
-    def _run_check(self, job, label, image, source_dir, caches, name, command, service_env=None, extra_env=None):
+    def _run_check(self, job, label, image, source_dir, caches, name, command, service_env=None, extra_env=None, pass_proxy=False):
         step_name = f"{label}:{name}"
         self.log_manager.upload(job.job_id, f"[{step_name}] Starting: {command}\n")
         step_id = self.client.start_step(job.job_id, step_name)
@@ -342,7 +385,8 @@ class JobExecutor:
             env.update(extra_env)
         result = self.podman.run_command(image, job.job_id, source_dir, caches, command, job.timeout_seconds,
                                          network=True if service_env else False, env=env if env else None,
-                                         network_name=service_env.network if service_env else None)
+                                         network_name=service_env.network if service_env else None,
+                                         pass_proxy=pass_proxy)
         self._upload_output(job.job_id, result)
         status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else "failed")
         duration = time.time() - start
@@ -368,272 +412,379 @@ class JobExecutor:
                 self.log_manager.upload(job_id, "\n")
 
     def _gofmt_autofix(self, job, label, image, source_dir, caches, step, service_env):
-        """Run gofmt -w inside container, verify, then git push on host.
+        """Format Go files and accept the repair only after a verified remote push."""
+        base_result = {
+            "attempted": False,
+            "formatted": False,
+            "committed": False,
+            "pushed": False,
+            "verified": False,
+        }
+        if job.repository != "frankichen/sxt":
+            return {**base_result, "reason": "repository_not_allowed",
+                    "message": "gofmt auto-fix is not allowed for this repository"}
+        if not job.branch or job.branch in {"main", "master"}:
+            return {**base_result, "reason": "default_branch_protected",
+                    "message": "gofmt auto-fix never writes a default branch"}
 
-        Returns dict with keys: formatted (bool), pushed (bool), message (str).
-        """
         step_name = f"{label}:gofmt-autofix"
         self.log_manager.upload(job.job_id, f"[{step_name}] Running gofmt -w ...\n")
-
-        # 1. Format in container (source_dir is bind-mounted rw)
         fix_cmd = 'gofmt -w . 2>&1 && echo "GOFMT_AUTOFIX_DONE"'
-        fix_result = self.podman.run_command(image, job.job_id, source_dir, caches, fix_cmd, 120,
-                                             network=False, env=self._service_env(service_env))
+        fix_result = self.podman.run_command(
+            image,
+            job.job_id,
+            source_dir,
+            caches,
+            fix_cmd,
+            120,
+            network=False,
+            env=self._service_env(service_env),
+        )
         if fix_result["exit_code"] != 0:
-            self.log_manager.upload(job.job_id,
-                                    f"[{step_name}] FAILED: gofmt -w returned {fix_result['exit_code']}\n")
-            return {"formatted": False, "pushed": False,
-                    "message": f"gofmt -w failed (exit {fix_result['exit_code']})"}
+            reason = "gofmt_failed"
+            self.log_manager.upload(
+                job.job_id,
+                f"[{step_name}] FAILED: gofmt -w returned {fix_result['exit_code']}\n",
+            )
+            return {
+                **base_result,
+                "attempted": True,
+                "reason": reason,
+                "message": f"gofmt -w failed (exit {fix_result['exit_code']})",
+            }
 
-        # 2. Verify no remaining unformatted files
-        verify_cmd = ('UNFORMATTED=$(gofmt -l . 2>&1); '
-                      'if [ -n "$UNFORMATTED" ]; then echo "UNFORMATTED FILES:"; echo "$UNFORMATTED"; exit 1; fi; '
-                      'echo "All Go files properly formatted"')
-        verify_result = self.podman.run_command(image, job.job_id, source_dir, caches, verify_cmd, 60,
-                                                network=False, env=self._service_env(service_env))
+        verify_cmd = (
+            'UNFORMATTED=$(gofmt -l . 2>&1); '
+            'if [ -n "$UNFORMATTED" ]; then '
+            'echo "UNFORMATTED FILES:"; echo "$UNFORMATTED"; exit 1; fi; '
+            'echo "All Go files properly formatted"'
+        )
+        verify_result = self.podman.run_command(
+            image,
+            job.job_id,
+            source_dir,
+            caches,
+            verify_cmd,
+            60,
+            network=False,
+            env=self._service_env(service_env),
+        )
         if verify_result["exit_code"] != 0:
-            self.log_manager.upload(job.job_id,
-                                    f"[{step_name}] VERIFY_FAILED: fmt still needed after gofmt -w\n")
-            return {"formatted": False, "pushed": False,
-                    "message": "verification failed after gofmt -w"}
+            self.log_manager.upload(
+                job.job_id,
+                f"[{step_name}] VERIFY_FAILED: fmt still needed after gofmt -w\n",
+            )
+            return {
+                **base_result,
+                "attempted": True,
+                "reason": "gofmt_verification_failed",
+                "message": "verification failed after gofmt -w",
+            }
 
-        # 3. Git add + commit + push on host
-        pushed = self._git_push_autofix(job, source_dir)
-        message = "gofmt auto-fixed and pushed" if pushed else "gofmt auto-fixed (push skipped)"
-
-        if step.get("step_id"):
-            self.client.finish_step(job.job_id, step["step_id"], "autofixed", 0,
-                                    self.log_manager.get_total(job.job_id))
-
-        return {"formatted": True, "pushed": pushed, "message": message}
+        git_result = self._git_push_autofix(job, source_dir)
+        result = {
+            **base_result,
+            "attempted": True,
+            "formatted": True,
+            **git_result,
+        }
+        if result.get("pushed") and result.get("verified"):
+            result["message"] = "gofmt auto-fixed, pushed, and remotely verified"
+            if step.get("step_id"):
+                self.client.finish_step(
+                    job.job_id,
+                    step["step_id"],
+                    "autofixed",
+                    0,
+                    self.log_manager.get_total(job.job_id),
+                )
+        else:
+            reason = result.get("reason", "remote_commit_not_verified")
+            result["message"] = f"gofmt formatted but remote commit was not verified ({reason})"
+        return result
 
     def _git_push_autofix(self, job, source_dir):
-        """Commit gofmt changes to local git and push to origin. Returns True on success."""
+        """Create and verify a non-force gofmt commit on the exact feature branch."""
+        failed = {"committed": False, "pushed": False, "verified": False}
+        repository_parts = job.repository.split("/")
+        if (
+            len(repository_parts) != 2
+            or not all(repository_parts)
+            or not all(
+                all(char.isalnum() or char in "._-" for char in part)
+                for part in repository_parts
+            )
+        ):
+            return {**failed, "reason": "invalid_repository"}
+        if not job.branch or job.branch in {"main", "master"}:
+            return {**failed, "reason": "default_branch_protected"}
+
         git_dir = os.path.join(source_dir, ".git")
         if not os.path.isdir(git_dir) and not os.path.isfile(git_dir):
-            self.log_manager.upload(job.job_id, "[gofmt-autofix] No .git directory — skipping push\n")
-            return False
+            return {**failed, "reason": "git_metadata_missing"}
+
+        def run_git(arguments, timeout=30, env=None):
+            return subprocess.run(
+                ["git", "-C", source_dir, *arguments],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
 
         try:
-            status = subprocess.run(
-                ["git", "-C", source_dir, "status", "--porcelain", "--", "*.go"],
-                capture_output=True, text=True, timeout=30,
+            branch_check = subprocess.run(
+                ["git", "check-ref-format", "--branch", job.branch],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
+            if branch_check.returncode != 0:
+                return {**failed, "reason": "invalid_branch"}
+
+            head = run_git(["rev-parse", "HEAD"], timeout=10)
+            if head.returncode != 0:
+                return {**failed, "reason": "git_head_unavailable"}
+            if head.stdout.strip() != job.commit_sha:
+                return {**failed, "reason": "source_head_mismatch"}
+
+            pathspec = ":(glob)**/*.go"
+            status = run_git(["status", "--porcelain", "--", pathspec])
+            if status.returncode != 0:
+                return {**failed, "reason": "git_status_failed"}
             if not status.stdout.strip():
-                self.log_manager.upload(job.job_id, "[gofmt-autofix] No Go file changes to commit\n")
-                return False
+                return {**failed, "reason": "no_changes_after_format"}
 
-            add = subprocess.run(
-                ["git", "-C", source_dir, "add", "--", "*.go"],
-                capture_output=True, text=True, timeout=30,
-            )
+            token = os.environ.get("CI_GITHUB_TOKEN", "")
+            if not token:
+                return {**failed, "reason": "push_token_unavailable"}
+
+            add = run_git(["add", "--all", "--", pathspec])
             if add.returncode != 0:
-                self.log_manager.upload(job.job_id, "[gofmt-autofix] git add failed\n")
-                return False
+                return {**failed, "reason": "git_add_failed"}
 
-            commit = subprocess.run(
-                ["git", "-C", source_dir, "commit", "-m", "gofmt auto-fix"],
-                capture_output=True, text=True, timeout=30,
-            )
+            commit = run_git([
+                "-c",
+                "user.name=LensHub CI",
+                "-c",
+                "user.email=lenshub-ci@users.noreply.github.com",
+                "commit",
+                "-m",
+                "style: gofmt automatic formatting [skip ci]",
+                "--",
+                pathspec,
+            ])
             if commit.returncode != 0:
-                # "nothing to commit" is also a non-zero exit in some git versions
-                if "nothing to commit" in (commit.stdout + commit.stderr).lower():
-                    return True
-                self.log_manager.upload(job.job_id, f"[gofmt-autofix] git commit failed: {commit.stderr[-200:]}\n")
-                return False
-            self.log_manager.upload(job.job_id, f"[gofmt-autofix] Committed: {commit.stdout.strip()}\n")
+                return {**failed, "reason": "git_commit_failed"}
 
-            push_branch = job.branch
+            local_head = run_git(["rev-parse", "HEAD"], timeout=10)
+            if local_head.returncode != 0 or not local_head.stdout.strip():
+                return {**failed, "reason": "git_commit_sha_unavailable"}
+            commit_sha = local_head.stdout.strip()
 
-            # Inject token for HTTPS push when CI_GITHUB_TOKEN is set
-            token = os.environ.get("CI_GITHUB_TOKEN")
-            origin_restore = None
-            if token:
-                origin_url = subprocess.run(
-                    ["git", "-C", source_dir, "remote", "get-url", "origin"],
-                    capture_output=True, text=True, timeout=10,
-                ).stdout.strip()
-                if origin_url.startswith("https://"):
-                    origin_restore = origin_url
-                    auth_url = origin_url.replace("https://", f"https://x-access-token:{token}@")
-                    subprocess.run(
-                        ["git", "-C", source_dir, "remote", "set-url", "origin", auth_url],
-                        capture_output=True, text=True, timeout=10,
-                    )
-
-            push = subprocess.run(
-                ["git", "-C", source_dir, "push", "origin", f"HEAD:{push_branch}"],
-                capture_output=True, text=True, timeout=120,
+            git_env = os.environ.copy()
+            git_env["GIT_TERMINAL_PROMPT"] = "0"
+            credential_helper = (
+                "!f() { echo username=x-access-token; "
+                "echo password=$CI_GITHUB_TOKEN; }; f"
             )
-
-            # Restore original URL
-            if origin_restore and token:
-                subprocess.run(
-                    ["git", "-C", source_dir, "remote", "set-url", "origin", origin_restore],
-                    capture_output=True, text=True, timeout=10,
-                )
-
+            auth_options = [
+                "-c",
+                f"credential.helper={credential_helper}",
+                "-c",
+                "credential.useHttpPath=true",
+            ]
+            push_url = f"https://github.com/{job.repository}.git"
+            push = run_git(
+                [
+                    *auth_options,
+                    "push",
+                    push_url,
+                    f"HEAD:refs/heads/{job.branch}",
+                ],
+                timeout=120,
+                env=git_env,
+            )
             if push.returncode != 0:
-                self.log_manager.upload(job.job_id,
-                                        f"[gofmt-autofix] git push failed: {push.stderr[-200:]}\n")
-                return False
+                return {
+                    **failed,
+                    "committed": True,
+                    "commit_sha": commit_sha,
+                    "reason": "git_push_failed",
+                }
 
-            self.log_manager.upload(job.job_id, f"[gofmt-autofix] Pushed to origin/{push_branch}\n")
-            return True
-        except Exception as exc:
-            self.log_manager.upload(job.job_id, f"[gofmt-autofix] Exception: {exc}\n")
-            return False
+            remote = run_git(
+                [
+                    *auth_options,
+                    "ls-remote",
+                    "--exit-code",
+                    push_url,
+                    f"refs/heads/{job.branch}",
+                ],
+                timeout=60,
+                env=git_env,
+            )
+            remote_sha = remote.stdout.split(None, 1)[0] if remote.stdout.strip() else ""
+            if remote.returncode != 0 or remote_sha != commit_sha:
+                return {
+                    **failed,
+                    "committed": True,
+                    "pushed": True,
+                    "commit_sha": commit_sha,
+                    "remote_sha": remote_sha,
+                    "reason": "remote_verification_failed",
+                }
 
-    # ---- repo-fast-check ----
+            self.log_manager.upload(
+                job.job_id,
+                f"[gofmt-autofix] Pushed and verified {commit_sha[:12]} "
+                f"on {job.branch}\n",
+            )
+            return {
+                "committed": True,
+                "pushed": True,
+                "verified": True,
+                "commit_sha": commit_sha,
+                "remote_sha": remote_sha,
+                "reason": "ok",
+            }
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.exception(
+                "gofmt auto-fix git operation failed: job=%s error=%s",
+                job.job_id,
+                type(exc).__name__,
+            )
+            return {**failed, "reason": "git_operation_error"}
 
-    # Stable error codes for fast-check failures.
     FAST_CHECK_ERROR_CODES = {
         "missing_make": "FAST_CHECK_MAKE_MISSING",
-        "missing_python3": "FAST_CHECK_PYTHON_MISSING",
         "entrypoint_missing": "FAST_CHECK_ENTRYPOINT_MISSING",
-        "sha_not_found": "FAST_CHECK_SHA_NOT_FOUND",
         "timeout": "FAST_CHECK_TIMEOUT",
         "integrity_failed": "FAST_CHECK_INTEGRITY_FAILED",
     }
 
     def _execute_fast_check(self, job: Job) -> dict:
-        """Execute repo-fast-check in Podman container.
-
-        Runs make ai-integrity-check inside container with network=none,
-        using the fast-check image.  Artifacts are written to a mounted
-        directory that survives container --rm.
-        """
+        """Run the repository integrity target without network access."""
         job_id = job.job_id
         source_dir = job.source_dir
-        start = time.time()
-
+        started = time.time()
         self.client.update_job_status(job_id, "running")
-        image = FAST_CHECK_COMMANDS.get("image", "docker.io/library/golang:1.26.4")
-        if not self.podman.image_available(image, allow_pull=False):
-            self.log_manager.upload(job_id, f"[repo-fast-check] IMAGE_UNAVAILABLE: {image}\n")
-            return {
-                "status": "failed", "exit_code": 2,
-                "error_code": "FAST_CHECK_IMAGE_UNAVAILABLE",
-                "error_message": f"Image {image} not prewarmed",
-                "steps": [], "log_truncated": self.log_manager.is_truncated(job_id),
-            }
 
-        # Artifact directory (survives container --rm)
-        artifacts_dir = os.path.join(job.workspace or os.path.dirname(source_dir), "artifacts")
-        os.makedirs(artifacts_dir, exist_ok=True)
-        report_path = "/ci-artifacts/ai-integrity-report.json"
-
-        # Build ai-integrity env: prefer base SHA for Git diff, fall back to
-        # newline-separated changed files only when list is NOT truncated.
-        ai_env = {"AI_INTEGRITY_BASE_SHA": job.base_sha,
-                  "AI_INTEGRITY_REPORT": report_path}
-        if job.changed_files and not getattr(job, 'changed_files_truncated', False):
-            ai_env["AI_INTEGRITY_CHANGED_FILES"] = "\n".join(job.changed_files)
-
-        image_digest = self.podman.image_digest(image)
-
-        # ---- Execute in Podman ----
-        step_name = "repo-fast-check:ai-integrity"
-        self.log_manager.upload(job_id, f"[{step_name}] Starting in Podman: make ai-integrity-check\n")
-        step_id = self.client.start_step(job_id, step_name)
-        step_start = time.time()
-        step_exit_code = -1
-        step_status = "internal_error"
-
-        try:
-            result = self.podman.run_command(
-                image, job_id, source_dir, {"go": None},  # no go cache for fast-check
-                "make ai-integrity-check 2>&1",
-                timeout_seconds=60,
-                env=ai_env,
-                network=False,  # fast-check: network=none
-                extra_mounts=[f"{artifacts_dir}:/ci-artifacts:Z"],
-                pass_proxy=False,
+        make = subprocess.run(["which", "make"], capture_output=True, text=True, timeout=10)
+        if make.returncode != 0:
+            return self._fast_check_configuration_error(
+                job_id, "FAST_CHECK_MAKE_MISSING", "make is not installed"
             )
-            step_exit_code = result["exit_code"]
-            timed_out = result.get("timed_out", False)
 
-            output = result.get("stdout", "")
-            if result.get("stderr"):
-                output += "\n" + result["stderr"]
-            if output:
-                self.log_manager.upload(job_id, output)
-                if not output.endswith("\n"):
-                    self.log_manager.upload(job_id, "\n")
+        target = subprocess.run(
+            ["make", "-C", source_dir, "-n", "ai-integrity-check"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if target.returncode != 0:
+            return self._fast_check_configuration_error(
+                job_id,
+                "FAST_CHECK_ENTRYPOINT_MISSING",
+                "Make target ai-integrity-check is unavailable",
+            )
 
-            if timed_out:
-                step_status = "timed_out"
-                step_exit_code = -1
-                self.log_manager.upload(job_id, f"[{step_name}] TIMED_OUT\n")
-            elif step_exit_code == 0:
-                step_status = "passed"
-            else:
-                step_status = "failed"
-        except Exception as exc:
-            step_status = "internal_error"
-            step_exit_code = -1
-            self.log_manager.upload(job_id, f"[{step_name}] EXCEPTION: {type(exc).__name__}\n")
-        finally:
-            step_duration = time.time() - step_start
-            self.log_manager.upload(job_id,
-                                    f"[{step_name}] {step_status.upper()} (exit={step_exit_code}, {step_duration:.1f}s)\n")
-            if step_id:
-                self.client.finish_step(job_id, step_id, step_status, step_exit_code,
-                                        self.log_manager.get_total(job_id))
+        image = FAST_CHECK_COMMANDS["image"]
+        if not self.podman.image_available(image, allow_pull=False):
+            return self._fast_check_configuration_error(
+                job_id, "FAST_CHECK_IMAGE_UNAVAILABLE", f"Image {image} is not prewarmed"
+            )
+
+        artifacts_dir = os.path.join(
+            job.workspace or os.path.dirname(source_dir), "artifacts"
+        )
+        os.makedirs(artifacts_dir, mode=0o700, exist_ok=True)
+        env = {
+            "AI_INTEGRITY_BASE_SHA": job.base_sha,
+            "AI_INTEGRITY_REPORT": "/ci-artifacts/ai-integrity-report.json",
+        }
+        if job.changed_files and not getattr(job, "changed_files_truncated", False):
+            env["AI_INTEGRITY_CHANGED_FILES"] = "\n".join(job.changed_files)
+
+        step_name = "repo-fast-check:ai-integrity"
+        step_id = self.client.start_step(job_id, step_name)
+        step_started = time.time()
+        result = self.podman.run_command(
+            image,
+            job_id,
+            source_dir,
+            {},
+            "make ai-integrity-check 2>&1",
+            60,
+            env=env,
+            network=False,
+            extra_mounts=[f"{artifacts_dir}:/ci-artifacts:Z"],
+            pass_proxy=False,
+        )
+        self._upload_output(job_id, result)
+        timed_out = bool(result.get("timed_out"))
+        exit_code = -1 if timed_out else int(result.get("exit_code", -1))
+        status = "timed_out" if timed_out else ("passed" if exit_code == 0 else "failed")
+        duration = time.time() - step_started
+        if step_id:
+            self.client.finish_step(
+                job_id, step_id, status, exit_code, self.log_manager.get_total(job_id)
+            )
 
         steps = [{
             "step_name": step_name,
-            "command": f"make -C /workspace ai-integrity-check",
-            "status": step_status,
-            "exit_code": step_exit_code,
-            "duration_seconds": round(step_duration, 3),
+            "command": "make ai-integrity-check",
+            "status": status,
+            "exit_code": exit_code,
+            "duration_seconds": round(duration, 3),
         }]
-
-        error_code = None
-        if step_status == "timed_out":
-            error_code = self.FAST_CHECK_ERROR_CODES["timeout"]
-        elif step_status == "failed":
-            error_code = self.FAST_CHECK_ERROR_CODES["integrity_failed"]
-        elif step_status == "internal_error":
-            error_code = "FAST_CHECK_INTERNAL_ERROR"
-
-        # Collect JSON report from artifacts dir
-        report_available = False
-        host_report = os.path.join(artifacts_dir, "ai-integrity-report.json")
-        if os.path.isfile(host_report):
+        report_path = os.path.join(artifacts_dir, "ai-integrity-report.json")
+        if os.path.isfile(report_path):
             try:
-                with open(host_report, "r", encoding="utf-8") as fh:
-                    report_data = json.load(fh)
-                report_available = True
+                with open(report_path, encoding="utf-8") as handle:
+                    report = json.load(handle)
                 steps.append({
                     "step_name": "repo-fast-check:report",
-                    "status": "collected", "exit_code": None,
+                    "status": "collected",
+                    "exit_code": None,
                     "report_summary": {
-                        k: report_data.get(k) for k in ("status", "errors", "warnings", "details")
-                        if k in report_data
-                    } if isinstance(report_data, dict) else {},
+                        key: report.get(key)
+                        for key in ("status", "errors", "warnings", "details")
+                        if isinstance(report, dict) and key in report
+                    },
                 })
-            except (json.JSONDecodeError, OSError):
+            except (OSError, json.JSONDecodeError):
                 pass
 
-        total = time.time() - start
         summary = {
-            "status": "passed" if step_exit_code == 0 else "failed",
-            "exit_code": step_exit_code,
+            "status": "passed" if exit_code == 0 else "failed",
+            "exit_code": exit_code,
             "profile": "repo-fast-check",
             "base_sha": job.base_sha,
             "commit_sha": job.commit_sha,
             "image": image,
-            "image_digest": image_digest,
+            "image_digest": self.podman.image_digest(image),
             "source_mirror_hit": bool(self.config.get("source_mirror_enabled")),
             "resource_policy": self.podman.resource_summary(),
-            "ai_integrity_seconds": round(step_duration, 3),
-            "total_duration_seconds": round(total, 3),
+            "ai_integrity_seconds": round(duration, 3),
+            "total_duration_seconds": round(time.time() - started, 3),
             "steps": steps,
             "log_truncated": self.log_manager.is_truncated(job_id),
         }
-        if report_available:
-            summary["report_available"] = True
-        if error_code:
-            summary["error_code"] = error_code
+        if timed_out:
+            summary["error_code"] = self.FAST_CHECK_ERROR_CODES["timeout"]
+        elif exit_code != 0:
+            summary["error_code"] = self.FAST_CHECK_ERROR_CODES["integrity_failed"]
         return summary
+
+    def _fast_check_configuration_error(self, job_id, error_code, message):
+        self.log_manager.upload(job_id, f"[repo-fast-check] {error_code}: {message}\n")
+        return {
+            "status": "failed",
+            "exit_code": 2,
+            "profile": "repo-fast-check",
+            "error_code": error_code,
+            "error_message": message,
+            "steps": [],
+            "log_truncated": self.log_manager.is_truncated(job_id),
+        }

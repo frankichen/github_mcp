@@ -2,8 +2,10 @@ import hmac
 import json
 import logging
 import base64
+import asyncio
 import os
 import subprocess
+import inspect
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +20,8 @@ from app.github_client import GitHubClient
 from app.services.github_service import GitHubService
 from app.services.ci_service import get_ci_service
 from app.ci_mcp import register_private_ci_mcp_tools
+from app.github_extended_mcp import register_github_extended_tools
+from app.github_policy import ensure_repository_allowed
 from app import github_utils
 from app import mygithub10
 from app import attestation_registry
@@ -27,6 +31,22 @@ logger = logging.getLogger(__name__)
 _client = GitHubClient()
 _service = GitHubService(_client)
 _ci_service = get_ci_service()
+
+
+async def _github_call(function, *args, **kwargs):
+    """Keep synchronous PyGithub/requests work off the MCP event loop."""
+    if getattr(function, "__module__", "") == "app.github_utils":
+        bound = inspect.signature(function).bind_partial(*args, **kwargs).arguments
+        repository = bound.get("repository")
+        if repository:
+            ensure_repository_allowed(repository)
+        repositories = bound.get("repositories")
+        if repositories:
+            if not isinstance(repositories, (list, tuple)):
+                raise ValueError("repositories must be an array")
+            for item in repositories:
+                ensure_repository_allowed(item)
+    return await asyncio.to_thread(function, *args, **kwargs)
 
 
 class ApiKeyVerifier:
@@ -104,7 +124,14 @@ async def get_github_file(
     try:
         sl = start_line if start_line > 0 else None
         el = end_line if end_line > 0 else None
-        result = _service.get_file(repository=repository, path=path, ref=ref, start_line=sl, end_line=el)
+        result = await _github_call(
+            _service.get_file,
+            repository=repository,
+            path=path,
+            ref=ref,
+            start_line=sl,
+            end_line=el,
+        )
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": type(e).__name__, "message": str(e)})
@@ -116,7 +143,9 @@ async def get_github_file(
 )
 async def list_github_directory(repository: str, path: str, ref: str = "") -> str:
     try:
-        result = _service.list_directory(repository=repository, path=path, ref=ref)
+        result = await _github_call(
+            _service.list_directory, repository=repository, path=path, ref=ref
+        )
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": type(e).__name__, "message": str(e)})
@@ -128,7 +157,12 @@ async def list_github_directory(repository: str, path: str, ref: str = "") -> st
 )
 async def create_github_branch(repository: str, branch: str, base_branch: str = "main") -> str:
     try:
-        result = _service.create_branch(repository=repository, branch=branch, base_branch=base_branch)
+        result = await _github_call(
+            _service.create_branch,
+            repository=repository,
+            branch=branch,
+            base_branch=base_branch,
+        )
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": type(e).__name__, "message": str(e)})
@@ -181,7 +215,7 @@ async def commit_github_files(
             commit_message=commit_message, expected_head_sha=expected_head_sha if expected_head_sha else None,
             files=file_ops, pull_request=pr_config,
         )
-        result = _service.commit_files(request)
+        result = await _github_call(_service.commit_files, request)
         return json.dumps(result, ensure_ascii=False)
     except json.JSONDecodeError as e:
         return json.dumps({"error": "json_parse_error", "message": f"files_json is not valid JSON (pos {e.pos}: {e.msg})", "received_len": len(files_json), "preview": files_json[:200]})
@@ -202,7 +236,15 @@ async def create_github_pull_request(
     title: str = "", body: str = "", draft: bool = True,
 ) -> str:
     try:
-        result = _service.create_pull_request(repository=repository, head_branch=head_branch, base_branch=base_branch, title=title, body=body, draft=draft)
+        result = await _github_call(
+            _service.create_pull_request,
+            repository=repository,
+            head_branch=head_branch,
+            base_branch=base_branch,
+            title=title,
+            body=body,
+            draft=draft,
+        )
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": type(e).__name__, "message": str(e)})
@@ -316,7 +358,7 @@ async def cancel_ci_job(repository: str, run_id: str) -> str:
 )
 async def get_github_repository(repository: str) -> str:
     try:
-        return json.dumps(github_utils.get_github_repository(repository), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.get_github_repository, repository), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -329,7 +371,7 @@ async def list_github_branches(
     repository: str, protected_only: bool = False, limit: int = 100, page: int = 1,
 ) -> str:
     try:
-        return json.dumps(github_utils.list_github_branches(repository, protected_only, limit, page), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.list_github_branches, repository, protected_only, limit, page), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -340,7 +382,7 @@ async def list_github_branches(
 )
 async def get_github_branch(repository: str, branch: str, base_branch: str = "") -> str:
     try:
-        return json.dumps(github_utils.get_github_branch(repository, branch, base_branch), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.get_github_branch, repository, branch, base_branch), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -351,7 +393,7 @@ async def get_github_branch(repository: str, branch: str, base_branch: str = "")
 )
 async def get_github_commit(repository: str, commit_sha: str, file_limit: int = 100) -> str:
     try:
-        return json.dumps(github_utils.get_github_commit(repository, commit_sha, file_limit), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.get_github_commit, repository, commit_sha, file_limit), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -364,7 +406,7 @@ async def compare_github_commits(
     repository: str, base: str, head: str, file_limit: int = 100,
 ) -> str:
     try:
-        return json.dumps(github_utils.compare_github_commits(repository, base, head, file_limit), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.compare_github_commits, repository, base, head, file_limit), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -378,7 +420,7 @@ async def list_github_pull_requests(
     sort: str = "updated", direction: str = "desc", limit: int = 30, page: int = 1,
 ) -> str:
     try:
-        return json.dumps(github_utils.list_github_pull_requests(repository, state, head_branch, base_branch, sort, direction, limit, page), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.list_github_pull_requests, repository, state, head_branch, base_branch, sort, direction, limit, page), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -389,7 +431,7 @@ async def list_github_pull_requests(
 )
 async def get_github_pull_request(repository: str, pull_number: int) -> str:
     try:
-        return json.dumps(github_utils.get_github_pull_request(repository, pull_number), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.get_github_pull_request, repository, pull_number), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -402,7 +444,7 @@ async def list_github_pull_request_files(
     repository: str, pull_number: int, limit: int = 100, page: int = 1, include_patch: bool = True,
 ) -> str:
     try:
-        return json.dumps(github_utils.list_github_pull_request_files(repository, pull_number, limit, page, include_patch), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.list_github_pull_request_files, repository, pull_number, limit, page, include_patch), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -422,7 +464,7 @@ async def update_github_pull_request(
         if state: kwargs["state"] = state
         if base_branch: kwargs["base_branch"] = base_branch
         if expected_head_sha: kwargs["expected_head_sha"] = expected_head_sha
-        return json.dumps(github_utils.update_github_pull_request(repository, pull_number, **kwargs), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.update_github_pull_request, repository, pull_number, **kwargs), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -433,7 +475,7 @@ async def update_github_pull_request(
 )
 async def get_github_pull_request_checks(repository: str, pull_number: int) -> str:
     try:
-        return json.dumps(github_utils.get_github_pull_request_checks(repository, pull_number), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.get_github_pull_request_checks, repository, pull_number), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -446,7 +488,7 @@ async def list_github_pull_request_comments(
     repository: str, pull_number: int, comment_type: str = "all", limit: int = 100, page: int = 1,
 ) -> str:
     try:
-        return json.dumps(github_utils.list_github_pull_request_comments(repository, pull_number, comment_type, limit, page), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.list_github_pull_request_comments, repository, pull_number, comment_type, limit, page), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -459,7 +501,7 @@ async def create_github_pull_request_comment(
     repository: str, pull_number: int, body: str, expected_head_sha: str = "",
 ) -> str:
     try:
-        return json.dumps(github_utils.create_github_pull_request_comment(repository, pull_number, body, expected_head_sha), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.create_github_pull_request_comment, repository, pull_number, body, expected_head_sha), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -467,7 +509,7 @@ async def create_github_pull_request_comment(
 @mcp.tool(name="get_github_pull_request_merge_readiness", description="Aggregate safe PR merge readiness: exact head SHA, reviews, GitHub Checks, repository merge methods, and private CI gate.")
 async def get_github_pull_request_merge_readiness(repository: str, pull_number: int, expected_head_sha: str = "", required_private_ci_job_id: str = "", expected_base_branch: str = "main") -> str:
     try:
-        return json.dumps(github_utils.get_github_pull_request_merge_readiness(repository, pull_number, expected_head_sha, required_private_ci_job_id, expected_base_branch), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.get_github_pull_request_merge_readiness, repository, pull_number, expected_head_sha, required_private_ci_job_id, expected_base_branch), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -475,7 +517,7 @@ async def get_github_pull_request_merge_readiness(repository: str, pull_number: 
 @mcp.tool(name="get_github_pull_request_conflicts", description="Read-only PR conflict diagnosis. Never updates the branch or force-pushes.")
 async def get_github_pull_request_conflicts(repository: str, pull_number: int, expected_head_sha: str = "") -> str:
     try:
-        return json.dumps(github_utils.get_github_pull_request_conflicts(repository, pull_number, expected_head_sha), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.get_github_pull_request_conflicts, repository, pull_number, expected_head_sha), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -483,7 +525,7 @@ async def get_github_pull_request_conflicts(repository: str, pull_number: int, e
 @mcp.tool(name="plan_github_pull_request_merge", description="Read-only merge preflight with exact SHA, review, Checks, private CI, and merge-method gates. Never merges.")
 async def plan_github_pull_request_merge(repository: str, pull_number: int, merge_method: str = "squash", expected_head_sha: str = "", required_private_ci_job_id: str = "", expected_base_branch: str = "main") -> str:
     try:
-        return json.dumps(github_utils.plan_github_pull_request_merge(repository, pull_number, merge_method, expected_head_sha, required_private_ci_job_id, expected_base_branch), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.plan_github_pull_request_merge, repository, pull_number, merge_method, expected_head_sha, required_private_ci_job_id, expected_base_branch), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -493,50 +535,50 @@ async def merge_github_pull_request(repository: str, pull_number: int, merge_met
     try:
         if delete_head_branch:
             return json.dumps(github_utils._error_response("HEAD_BRANCH_DELETE_REQUIRES_SEPARATE_AUTHORIZATION", "Automatic head branch deletion is disabled; use delete_github_branch separately."))
-        return json.dumps(github_utils.merge_github_pull_request(repository, pull_number, merge_method, expected_head_sha, required_private_ci_job_id, expected_base_branch, commit_title, commit_message, delete_head_branch, confirm), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.merge_github_pull_request, repository, pull_number, merge_method, expected_head_sha, required_private_ci_job_id, expected_base_branch, commit_title, commit_message, delete_head_branch, confirm), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
 
 @mcp.tool(name="mark_github_pull_request_ready", description="Convert a draft PR to ready-for-review with exact head SHA protection.")
 async def mark_github_pull_request_ready(repository: str, pull_number: int, expected_head_sha: str) -> str:
-    try: return json.dumps(github_utils.mark_github_pull_request_ready(repository, pull_number, expected_head_sha), ensure_ascii=False)
+    try: return json.dumps(await _github_call(github_utils.mark_github_pull_request_ready, repository, pull_number, expected_head_sha), ensure_ascii=False)
     except Exception as e: return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
 
 @mcp.tool(name="convert_github_pull_request_to_draft", description="Convert an open PR to draft with exact head SHA protection.")
 async def convert_github_pull_request_to_draft(repository: str, pull_number: int, expected_head_sha: str) -> str:
-    try: return json.dumps(github_utils.convert_github_pull_request_to_draft(repository, pull_number, expected_head_sha), ensure_ascii=False)
+    try: return json.dumps(await _github_call(github_utils.convert_github_pull_request_to_draft, repository, pull_number, expected_head_sha), ensure_ascii=False)
     except Exception as e: return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
 
 @mcp.tool(name="update_github_pull_request_branch", description="Request GitHub's official update-branch operation; never force-pushes locally.")
 async def update_github_pull_request_branch(repository: str, pull_number: int, expected_head_sha: str) -> str:
-    try: return json.dumps(github_utils.update_github_pull_request_branch(repository, pull_number, expected_head_sha), ensure_ascii=False)
+    try: return json.dumps(await _github_call(github_utils.update_github_pull_request_branch, repository, pull_number, expected_head_sha), ensure_ascii=False)
     except Exception as e: return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
 
 @mcp.tool(name="list_github_pull_request_reviews", description="List submitted PR reviews, distinct from requested reviewers.")
 async def list_github_pull_request_reviews(repository: str, pull_number: int, limit: int = 100, page: int = 1) -> str:
-    try: return json.dumps(github_utils.list_github_pull_request_reviews(repository, pull_number, limit, page), ensure_ascii=False)
+    try: return json.dumps(await _github_call(github_utils.list_github_pull_request_reviews, repository, pull_number, limit, page), ensure_ascii=False)
     except Exception as e: return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
 
 @mcp.tool(name="request_github_pull_request_reviewers", description="Request user and team reviewers with exact head SHA protection.")
 async def request_github_pull_request_reviewers(repository: str, pull_number: int, reviewers_json: str = "[]", team_reviewers_json: str = "[]", expected_head_sha: str = "") -> str:
-    try: return json.dumps(github_utils.request_github_pull_request_reviewers(repository, pull_number, reviewers_json, team_reviewers_json, expected_head_sha), ensure_ascii=False)
+    try: return json.dumps(await _github_call(github_utils.request_github_pull_request_reviewers, repository, pull_number, reviewers_json, team_reviewers_json, expected_head_sha), ensure_ascii=False)
     except Exception as e: return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
 
 @mcp.tool(name="remove_github_pull_request_reviewers", description="Remove requested user and team reviewers with exact head SHA protection.")
 async def remove_github_pull_request_reviewers(repository: str, pull_number: int, reviewers_json: str = "[]", team_reviewers_json: str = "[]", expected_head_sha: str = "") -> str:
-    try: return json.dumps(github_utils.remove_github_pull_request_reviewers(repository, pull_number, reviewers_json, team_reviewers_json, expected_head_sha), ensure_ascii=False)
+    try: return json.dumps(await _github_call(github_utils.remove_github_pull_request_reviewers, repository, pull_number, reviewers_json, team_reviewers_json, expected_head_sha), ensure_ascii=False)
     except Exception as e: return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
 
 @mcp.tool(name="delete_github_branch", description="Delete a non-default, non-protected branch only with exact SHA and confirm=true. Never follows merge automatically.")
 async def delete_github_branch(repository: str, branch: str, expected_head_sha: str, confirm: bool = False) -> str:
-    try: return json.dumps(github_utils.delete_github_branch(repository, branch, expected_head_sha, confirm), ensure_ascii=False)
+    try: return json.dumps(await _github_call(github_utils.delete_github_branch, repository, branch, expected_head_sha, confirm), ensure_ascii=False)
     except Exception as e: return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
 
@@ -549,7 +591,7 @@ async def plan_test_deployment(repository: str, environment: str, commit_sha: st
     try:
         if artifact_id and os.environ.get("MYGITHUB10_ARTIFACT_DEPLOY_ENABLED", "false").lower() not in {"1", "true", "yes", "on"}: return json.dumps({"ok": False, "error_code": "FEATURE_DISABLED"})
         from app import deployment_service
-        return json.dumps(deployment_service.plan_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes, artifact_id), ensure_ascii=False)
+        return json.dumps(await _github_call(deployment_service.plan_test_deployment, repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes, artifact_id), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
 
 
@@ -558,7 +600,7 @@ async def start_test_deployment(repository: str, environment: str, commit_sha: s
     try:
         if artifact_id and os.environ.get("MYGITHUB10_ARTIFACT_DEPLOY_ENABLED", "false").lower() not in {"1", "true", "yes", "on"}: return json.dumps({"ok": False, "error_code": "FEATURE_DISABLED"})
         from app import deployment_service
-        return json.dumps(deployment_service.start_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes, force_redeploy, confirm, "mcp", artifact_id), ensure_ascii=False)
+        return json.dumps(await _github_call(deployment_service.start_test_deployment, repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes, force_redeploy, confirm, "mcp", artifact_id), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
 
 
@@ -566,7 +608,7 @@ async def start_test_deployment(repository: str, environment: str, commit_sha: s
 async def get_test_deployment(deployment_id: str) -> str:
     try:
         from app import deployment_service
-        return json.dumps(deployment_service.get_test_deployment(deployment_id), ensure_ascii=False)
+        return json.dumps(await _github_call(deployment_service.get_test_deployment, deployment_id), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
 
 
@@ -574,7 +616,7 @@ async def get_test_deployment(deployment_id: str) -> str:
 async def get_test_deployment_logs(deployment_id: str, offset: int = 0, limit: int = 200) -> str:
     try:
         from app import deployment_service
-        return json.dumps(deployment_service.get_test_deployment_logs(deployment_id, offset, limit), ensure_ascii=False)
+        return json.dumps(await _github_call(deployment_service.get_test_deployment_logs, deployment_id, offset, limit), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
 
 
@@ -582,7 +624,7 @@ async def get_test_deployment_logs(deployment_id: str, offset: int = 0, limit: i
 async def wait_test_deployment(deployment_id: str, timeout_seconds: int = 55, last_known_status: str = "", last_known_step: str = "", last_known_revision: int = 0) -> str:
     try:
         from app import deployment_service
-        return json.dumps(deployment_service.wait_test_deployment(deployment_id, timeout_seconds, last_known_status, last_known_step, last_known_revision), ensure_ascii=False)
+        return json.dumps(await _github_call(deployment_service.wait_test_deployment, deployment_id, timeout_seconds, last_known_status, last_known_step, last_known_revision), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
 
 
@@ -590,7 +632,7 @@ async def wait_test_deployment(deployment_id: str, timeout_seconds: int = 55, la
 async def get_test_deployment_log_tail(deployment_id: str, lines: int = 100) -> str:
     try:
         from app import deployment_service
-        return json.dumps(deployment_service.get_test_deployment_log_tail(deployment_id, lines), ensure_ascii=False)
+        return json.dumps(await _github_call(deployment_service.get_test_deployment_log_tail, deployment_id, lines), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
 
 
@@ -598,7 +640,7 @@ async def get_test_deployment_log_tail(deployment_id: str, lines: int = 100) -> 
 async def list_test_deployments(repository: str = "", environment: str = "", commit_sha: str = "", status: str = "", limit: int = 20, offset: int = 0) -> str:
     try:
         from app import deployment_service
-        return json.dumps(deployment_service.list_test_deployments(repository, environment, commit_sha, status, limit, offset), ensure_ascii=False)
+        return json.dumps(await _github_call(deployment_service.list_test_deployments, repository, environment, commit_sha, status, limit, offset), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
 
 
@@ -606,7 +648,7 @@ async def list_test_deployments(repository: str = "", environment: str = "", com
 async def cancel_test_deployment(deployment_id: str) -> str:
     try:
         from app import deployment_service
-        return json.dumps(deployment_service.cancel_test_deployment(deployment_id), ensure_ascii=False)
+        return json.dumps(await _github_call(deployment_service.cancel_test_deployment, deployment_id), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
 
 
@@ -614,7 +656,7 @@ async def cancel_test_deployment(deployment_id: str) -> str:
 async def get_test_environment_status(repository: str, environment: str) -> str:
     try:
         from app import deployment_service
-        return json.dumps(deployment_service.get_test_environment_status(repository, environment), ensure_ascii=False)
+        return json.dumps(await _github_call(deployment_service.get_test_environment_status, repository, environment), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
 
 
@@ -622,7 +664,7 @@ async def get_test_environment_status(repository: str, environment: str) -> str:
 async def list_test_releases(repository: str, environment: str, limit: int = 20) -> str:
     try:
         from app import deployment_service
-        return json.dumps(deployment_service.list_test_releases(repository, environment, limit), ensure_ascii=False)
+        return json.dumps(await _github_call(deployment_service.list_test_releases, repository, environment, limit), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
 
 
@@ -630,7 +672,7 @@ async def list_test_releases(repository: str, environment: str, limit: int = 20)
 async def rollback_test_deployment(repository: str, environment: str, target_release_id: str, expected_current_release_id: str, confirm: bool = False) -> str:
     try:
         from app import deployment_service
-        return json.dumps(deployment_service.rollback_test_deployment(repository, environment, target_release_id, expected_current_release_id, confirm), ensure_ascii=False)
+        return json.dumps(await _github_call(deployment_service.rollback_test_deployment, repository, environment, target_release_id, expected_current_release_id, confirm), ensure_ascii=False)
     except Exception as e: return _deployment_tool_error(e)
 
 
@@ -648,7 +690,7 @@ async def list_github_commits_tool(
     include_merge_commits: bool = False, limit: int = 100, page: int = 1,
 ) -> str:
     try:
-        return json.dumps(github_utils.list_github_commits(repository, branch, author, identity, since, until, path, include_merge_commits, limit, page), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.list_github_commits, repository, branch, author, identity, since, until, path, include_merge_commits, limit, page), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -664,7 +706,7 @@ async def search_github_pull_request_history_tool(
 ) -> str:
     try:
         repos = json.loads(repositories_json) if repositories_json else []
-        return json.dumps(github_utils.search_github_pull_request_history(repos, identity, activity, since, until, state, include_drafts, limit, offset), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.search_github_pull_request_history, repos, identity, activity, since, until, state, include_drafts, limit, offset), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -680,7 +722,7 @@ async def list_github_review_history_tool(
     try:
         repos = json.loads(repositories_json) if repositories_json else []
         states = json.loads(states_json) if states_json else None
-        return json.dumps(github_utils.list_github_review_history(repos, identity, since, until, states, limit, offset), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.list_github_review_history, repos, identity, since, until, states, limit, offset), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -696,7 +738,7 @@ async def list_github_issue_history_tool(
 ) -> str:
     try:
         repos = json.loads(repositories_json) if repositories_json else []
-        return json.dumps(github_utils.list_github_issue_history(repos, identity, activity, since, until, state, limit, offset), ensure_ascii=False)
+        return json.dumps(await _github_call(github_utils.list_github_issue_history, repos, identity, activity, since, until, state, limit, offset), ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -713,7 +755,7 @@ async def get_github_development_history_tool(
     try:
         repos = json.loads(repositories_json) if repositories_json else None
         include = json.loads(include_json) if include_json else None
-        result = github_utils.get_github_development_history(identity, repos, since, until, include, include_details, max_items_per_section)
+        result = await _github_call(github_utils.get_github_development_history, identity, repos, since, until, include, include_details, max_items_per_section)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"ok": False, "error": {"code": "INTERNAL_ERROR", "message": str(e)}}, ensure_ascii=False)
@@ -732,7 +774,8 @@ async def get_github_weekly_report_data_tool(
 ) -> str:
     try:
         repos = json.loads(repositories_json) if repositories_json else None
-        result = github_utils.get_github_weekly_report_data(
+        result = await _github_call(
+            github_utils.get_github_weekly_report_data,
             identity, repos, week, week_start, timezone,
             include_weekend, include_open_work, include_ci_failures, include_code_statistics, since, until
         )
@@ -764,7 +807,7 @@ async def get_mygithub_capabilities() -> str:
 @mcp.tool(name="get_github_file_manifest", description="Return exact Git Blob metadata for a file without returning file content.")
 async def get_github_file_manifest(repository: str, path: str, ref: str = "") -> str:
     try:
-        return json.dumps(mygithub10.file_manifest(_service, repository, path, ref), ensure_ascii=False)
+        return json.dumps(await _github_call(mygithub10.file_manifest, _service, repository, path, ref), ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
 
@@ -772,7 +815,7 @@ async def get_github_file_manifest(repository: str, path: str, ref: str = "") ->
 @mcp.tool(name="read_github_file_chunk", description="Read an exact UTF-8 byte chunk with SHA and continuation metadata.")
 async def read_github_file_chunk(repository: str, path: str, ref: str = "", offset_bytes: int = 0, limit_bytes: int = mygithub10.MAX_FILE_CHUNK_BYTES, expected_blob_sha: str = "") -> str:
     try:
-        return json.dumps(mygithub10.file_chunk(_service, repository, path, ref, offset_bytes, limit_bytes, expected_blob_sha), ensure_ascii=False)
+        return json.dumps(await _github_call(mygithub10.file_chunk, _service, repository, path, ref, offset_bytes, limit_bytes, expected_blob_sha), ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
 
@@ -780,7 +823,7 @@ async def read_github_file_chunk(repository: str, path: str, ref: str = "", offs
 @mcp.tool(name="open_github_file_resource", description="Open a file resource handle for paginated reads instead of returning a large JSON body.")
 async def open_github_file_resource(repository: str, path: str, ref: str = "") -> str:
     try:
-        manifest = mygithub10.file_manifest(_service, repository, path, ref)
+        manifest = await _github_call(mygithub10.file_manifest, _service, repository, path, ref)
         token = base64.urlsafe_b64encode(json.dumps({"repository": repository, "path": path, "commit": manifest["resolved_commit_sha"]}, separators=(",", ":")).encode()).decode().rstrip("=")
         return json.dumps({"resource_uri": f"mygithub10://blob/{token}", **{key: manifest[key] for key in ("repository", "path", "resolved_commit_sha", "blob_sha", "size_bytes", "content_sha256")}}, ensure_ascii=False)
     except Exception as exc:
@@ -793,7 +836,7 @@ async def read_github_file_resource(resource_uri: str, offset_bytes: int = 0, li
         token = resource_uri.rsplit("/", 1)[-1]
         token += "=" * (-len(token) % 4)
         item = json.loads(base64.urlsafe_b64decode(token).decode())
-        return json.dumps(mygithub10.file_chunk(_service, item["repository"], item["path"], item["commit"], offset_bytes, limit_bytes), ensure_ascii=False)
+        return json.dumps(await _github_call(mygithub10.file_chunk, _service, item["repository"], item["path"], item["commit"], offset_bytes, limit_bytes), ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
 
@@ -801,7 +844,7 @@ async def read_github_file_resource(resource_uri: str, offset_bytes: int = 0, li
 @mcp.tool(name="apply_github_patch", description="Apply a strict unified diff atomically with exact HEAD/blob checks and optional dry-run/idempotency.")
 async def apply_github_patch(repository: str, branch: str, expected_head_sha: str, expected_blob_shas_json: str, patch: str, commit_message: str, dry_run: bool = True, idempotency_key: str = "", create_pull_request: bool = False, pull_request_json: str = "{}") -> str:
     try:
-        return json.dumps(mygithub10.apply_patch(_service, repository, branch, expected_head_sha, expected_blob_shas_json, patch, commit_message, dry_run, idempotency_key), ensure_ascii=False)
+        return json.dumps(await _github_call(mygithub10.apply_patch, _service, repository, branch, expected_head_sha, expected_blob_shas_json, patch, commit_message, dry_run, idempotency_key), ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
 
@@ -809,14 +852,14 @@ async def apply_github_patch(repository: str, branch: str, expected_head_sha: st
 @mcp.tool(name="edit_github_file_ranges", description="Apply non-overlapping, hash-checked line range edits as one atomic commit. start_line and end_line are 1-based inclusive; dry-run and commit use the same computed UTF-8 bytes, and the commit is read back and verified.")
 async def edit_github_file_ranges(repository: str, branch: str, expected_head_sha: str, operations_json: str, commit_message: str, dry_run: bool = True, idempotency_key: str = "") -> str:
     try:
-        return json.dumps(mygithub10.edit_ranges(_service, repository, branch, expected_head_sha, operations_json, commit_message, dry_run, idempotency_key), ensure_ascii=False)
+        return json.dumps(await _github_call(mygithub10.edit_ranges, _service, repository, branch, expected_head_sha, operations_json, commit_message, dry_run, idempotency_key), ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
 
 
 @mcp.tool(name="begin_github_file_upload", description="Begin a bounded, permission-0600 chunked file upload.")
 async def begin_github_file_upload() -> str:
-    try: return json.dumps(mygithub10.begin_upload(), ensure_ascii=False)
+    try: return json.dumps(await _github_call(mygithub10.begin_upload), ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
 
 
@@ -824,51 +867,57 @@ async def begin_github_file_upload() -> str:
 async def append_github_file_upload_chunk(upload_id: str, offset: int, content_base64: str = "", text: str = "", chunk_sha256: str = "", idempotency_key: str = "") -> str:
     try:
         content = base64.b64decode(content_base64) if content_base64 else text.encode("utf-8")
-        return json.dumps(mygithub10.append_upload(upload_id, offset, content, chunk_sha256, idempotency_key), ensure_ascii=False)
+        return json.dumps(await _github_call(mygithub10.append_upload, upload_id, offset, content, chunk_sha256, idempotency_key), ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
 
 
 @mcp.tool(name="finalize_github_file_upload", description="Finalize an upload only after exact size and SHA256 validation.")
 async def finalize_github_file_upload(upload_id: str, expected_size_bytes: int, expected_sha256: str) -> str:
-    try: return json.dumps(mygithub10.finalize_upload(upload_id, expected_size_bytes, expected_sha256), ensure_ascii=False)
+    try: return json.dumps(await _github_call(mygithub10.finalize_upload, upload_id, expected_size_bytes, expected_sha256), ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
 
 
 @mcp.tool(name="commit_github_uploaded_files", description="Commit one finalized upload to a branch with exact HEAD/blob checks.")
 async def commit_github_uploaded_files(repository: str, branch: str, expected_head_sha: str, path: str, expected_blob_sha: str, upload_id: str, commit_message: str, idempotency_key: str = "") -> str:
-    try: return json.dumps(mygithub10.commit_upload(_service, repository, branch, expected_head_sha, path, expected_blob_sha, upload_id, commit_message, idempotency_key), ensure_ascii=False)
+    try: return json.dumps(await _github_call(mygithub10.commit_upload, _service, repository, branch, expected_head_sha, path, expected_blob_sha, upload_id, commit_message, idempotency_key), ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
 
 
 @mcp.tool(name="abort_github_file_upload", description="Abort and remove only the selected temporary upload.")
 async def abort_github_file_upload(upload_id: str) -> str:
-    try: return json.dumps(mygithub10.abort_upload(upload_id), ensure_ascii=False)
+    try: return json.dumps(await _github_call(mygithub10.abort_upload, upload_id), ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
 
 
 @mcp.tool(name="create_attestation_for_passed_job", description="Create a Tree SHA attestation from server-side CI evidence; callers may only choose job_id and bounded expiry.")
 async def create_attestation_for_passed_job(job_id: str, expires_in_seconds: int = 604800) -> str:
     try:
-        return json.dumps({"ok": True, "attestation": attestation_registry.create_attestation_for_passed_job(job_id=job_id, expires_in_seconds=expires_in_seconds)}, ensure_ascii=False)
+        item = await _github_call(
+            attestation_registry.create_attestation_for_passed_job,
+            job_id=job_id,
+            expires_in_seconds=expires_in_seconds,
+        )
+        return json.dumps({"ok": True, "attestation": item}, ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
 
 
 @mcp.tool(name="get_attestation", description="Read a persisted Tree SHA attestation by id.")
 async def get_attestation(attestation_id: str) -> str:
-    item = attestation_registry.get_attestation(attestation_id)
+    item = await _github_call(attestation_registry.get_attestation, attestation_id)
     return json.dumps({"ok": bool(item), "attestation": item}, ensure_ascii=False)
 
 
 @mcp.tool(name="validate_attestation", description="Validate every identity, job, toolchain, dependency, config, expiry and revocation gate before CI reuse.")
 async def validate_attestation(attestation_id: str) -> str:
     try:
-        return json.dumps(attestation_registry.validate_attestation(attestation_id), ensure_ascii=False)
+        return json.dumps(await _github_call(attestation_registry.validate_attestation, attestation_id), ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
 
 
 @mcp.tool(name="revoke_attestation", description="Revoke one persisted attestation so it can never be reused.")
 async def revoke_attestation(attestation_id: str) -> str:
-    return json.dumps({"ok": True, "attestation": attestation_registry.revoke_attestation(attestation_id)}, ensure_ascii=False)
+    item = await _github_call(attestation_registry.revoke_attestation, attestation_id)
+    return json.dumps({"ok": True, "attestation": item}, ensure_ascii=False)
 
 
 def _register_release_artifact(metadata: dict) -> dict:
@@ -881,7 +930,7 @@ async def build_release_artifact(repository: str, commit_sha: str, private_ci_jo
         from app.feature_flags import ARTIFACT_BUILD, enabled
         if not enabled(ARTIFACT_BUILD): return json.dumps({"ok": False, "error_code": "FEATURE_DISABLED"})
         if repository != "frankichen/sxt": return json.dumps({"ok": False, "error_code": "REPOSITORY_NOT_ALLOWED"})
-        branch_state = github_utils.get_github_branch(repository, "main")
+        branch_state = await _github_call(github_utils.get_github_branch, repository, "main")
         if not branch_state.get("ok") or branch_state.get("commit_sha") != commit_sha: return json.dumps({"ok": False, "error_code": "COMMIT_NOT_CURRENT_MAIN"})
         job = attestation_registry.get_job(private_ci_job_id) if hasattr(attestation_registry, "get_job") else None
         attestation = attestation_registry.get_attestation(source_attestation_id)
@@ -914,23 +963,26 @@ async def build_release_artifact(repository: str, commit_sha: str, private_ci_jo
 
 @mcp.tool(name="get_release_artifact", description="Read one registered artifact without exposing arbitrary filesystem contents.")
 async def get_release_artifact(artifact_id: str) -> str:
-    item = attestation_registry.get_artifact(artifact_id)
+    item = await _github_call(attestation_registry.get_artifact, artifact_id)
     return json.dumps({"ok": bool(item), "artifact": item}, ensure_ascii=False)
 
 
 @mcp.tool(name="list_release_artifacts", description="List registered artifact metadata by repository and status.")
 async def list_release_artifacts(repository: str = "", status: str = "", limit: int = 50) -> str:
-    return json.dumps({"ok": True, "artifacts": attestation_registry.list_artifacts(repository, status, limit)}, ensure_ascii=False)
+    items = await _github_call(attestation_registry.list_artifacts, repository, status, limit)
+    return json.dumps({"ok": True, "artifacts": items}, ensure_ascii=False)
 
 
 @mcp.tool(name="validate_release_artifact", description="Validate artifact readiness, expiry, provenance, exact main identity and current private CI status.")
 async def validate_release_artifact(artifact_id: str, repository: str, branch: str, commit_sha: str, tree_sha: str, private_ci_job_id: str) -> str:
-    return json.dumps(attestation_registry.validate_artifact(artifact_id, repository=repository, branch=branch, commit_sha=commit_sha, tree_sha=tree_sha, private_ci_job_id=private_ci_job_id), ensure_ascii=False)
+    result = await _github_call(attestation_registry.validate_artifact, artifact_id, repository=repository, branch=branch, commit_sha=commit_sha, tree_sha=tree_sha, private_ci_job_id=private_ci_job_id)
+    return json.dumps(result, ensure_ascii=False)
 
 
 @mcp.tool(name="revoke_release_artifact", description="Revoke a registered artifact; revoked artifacts cannot be deployed.")
 async def revoke_release_artifact(artifact_id: str) -> str:
-    return json.dumps({"ok": True, "artifact": attestation_registry.revoke_artifact(artifact_id)}, ensure_ascii=False)
+    item = await _github_call(attestation_registry.revoke_artifact, artifact_id)
+    return json.dumps({"ok": True, "artifact": item}, ensure_ascii=False)
 
 
 @mcp.tool(name="get_repository_operation_policy", description="Return the operation policy for a repository: what MyGithub10 operations are allowed (GitHub read/write, private CI, test deploy, self deploy).")
@@ -974,6 +1026,7 @@ async def get_repository_operation_policy(repository: str) -> str:
     }, ensure_ascii=False)
 
 
+register_github_extended_tools(mcp, _github_call)
 register_private_ci_mcp_tools(mcp)
 
 

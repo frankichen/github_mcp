@@ -1,5 +1,6 @@
 import logging
 from fastapi import APIRouter, Request, Query, Depends, HTTPException
+from starlette.concurrency import run_in_threadpool
 from typing import Optional
 
 from app.auth import verify_api_key
@@ -36,7 +37,8 @@ async def get_file(
 ):
     verify_api_key(request)
     try:
-        result = _service.get_file(
+        result = await run_in_threadpool(
+            _service.get_file,
             repository=repository,
             path=path,
             ref=ref,
@@ -57,7 +59,9 @@ async def list_directory(
 ):
     verify_api_key(request)
     try:
-        result = _service.list_directory(repository=repository, path=path, ref=ref)
+        result = await run_in_threadpool(
+            _service.list_directory, repository=repository, path=path, ref=ref
+        )
         return result
     except AppError as e:
         raise HTTPException(status_code=e.status_code, detail={"error": e.error, "message": e.message, "details": e.details})
@@ -67,7 +71,8 @@ async def list_directory(
 async def create_branch(request: Request, body: BranchCreateRequest):
     verify_api_key(request)
     try:
-        result = _service.create_branch(
+        result = await run_in_threadpool(
+            _service.create_branch,
             repository=body.repository,
             branch=body.branch,
             base_branch=body.base_branch,
@@ -81,7 +86,7 @@ async def create_branch(request: Request, body: BranchCreateRequest):
 async def commit_files(request: Request, body: CommitRequest):
     verify_api_key(request)
     try:
-        result = _service.commit_files(body)
+        result = await run_in_threadpool(_service.commit_files, body)
         return result
     except AppError as e:
         raise HTTPException(status_code=e.status_code, detail={"error": e.error, "message": e.message, "details": e.details})
@@ -91,7 +96,8 @@ async def commit_files(request: Request, body: CommitRequest):
 async def create_pull_request(request: Request, body: PullRequestCreateRequest):
     verify_api_key(request)
     try:
-        result = _service.create_pull_request(
+        result = await run_in_threadpool(
+            _service.create_pull_request,
             repository=body.repository,
             head_branch=body.head_branch,
             base_branch=body.base_branch,
