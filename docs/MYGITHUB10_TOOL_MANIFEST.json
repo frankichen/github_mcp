@@ -4,7 +4,7 @@
   "controller_image": "not-read-from-runtime",
   "pygithub_version": "2.5.0",
   "mcp_sdk_version": "1.28.1",
-  "tool_count": 117,
+  "tool_count": 118,
   "tools": [
     {
       "name": "get_github_file",
@@ -2236,7 +2236,7 @@
       "read_only": false,
       "consequential": true,
       "category": "github",
-      "description": "Apply non-overlapping, hash-checked line range edits as one atomic commit. start_line and end_line are 1-based inclusive; dry-run and commit use the same computed UTF-8 bytes, and the commit is read back and verified.",
+      "description": "Apply non-overlapping exact-text line range edits as one atomic commit. Each replace/delete item may provide expected_blob_sha and expected_old_text; start_line/end_line are 1-based inclusive. Dry-run and commit use the same computed UTF-8 bytes, and the commit is read back and verified.",
       "input_schema": {
         "properties": {
           "repository": {
@@ -2278,6 +2278,51 @@
           "commit_message"
         ],
         "title": "edit_github_file_rangesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "build_github_patch",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Build a deterministic unified diff locally from UTF-8 text. Pure dry-run: never writes GitHub.",
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "expected_blob_sha": {
+            "title": "Expected Blob Sha",
+            "type": "string"
+          },
+          "original_text": {
+            "title": "Original Text",
+            "type": "string"
+          },
+          "replacement_text": {
+            "title": "Replacement Text",
+            "type": "string"
+          },
+          "start_line": {
+            "default": 1,
+            "title": "Start Line",
+            "type": "integer"
+          },
+          "end_line": {
+            "default": 0,
+            "title": "End Line",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path",
+          "expected_blob_sha",
+          "original_text",
+          "replacement_text"
+        ],
+        "title": "build_github_patchArguments",
         "type": "object"
       }
     },

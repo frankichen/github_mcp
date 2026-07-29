@@ -6,6 +6,7 @@ import asyncio
 import os
 import subprocess
 import inspect
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -791,9 +792,10 @@ async def get_github_weekly_report_data_tool(
 
 def _mygithub10_error(exc: Exception) -> str:
     if isinstance(exc, mygithub10.MyGithub10Error):
-        return json.dumps({"ok": False, "error": {"code": exc.code, "message": exc.message, "details": exc.details}}, ensure_ascii=False)
+        code = {"PATCH_HEAD_CHANGED": "HEAD_CHANGED", "FILE_BINARY_UNSUPPORTED": "BINARY_FILE_UNSUPPORTED", "PATCH_UNSAFE_PATH": "INVALID_REPOSITORY_PATH"}.get(exc.code, exc.code)
+        return json.dumps({"ok": False, "error": {"code": code, "message": exc.message, "details": exc.details, "trace_id": exc.trace_id}}, ensure_ascii=False)
     logger.exception("MyGithub10 tool failed")
-    return json.dumps({"ok": False, "error": {"code": "INTERNAL_ERROR", "message": "MyGithub10 operation failed", "details": {}}}, ensure_ascii=False)
+    return json.dumps({"ok": False, "error": {"code": "INTERNAL_ERROR", "message": "MyGithub10 operation failed", "details": {}, "trace_id": str(uuid.uuid4())}}, ensure_ascii=False)
 
 
 @mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithub10 capability and compatibility contract.")
@@ -849,10 +851,18 @@ async def apply_github_patch(repository: str, branch: str, expected_head_sha: st
         return _mygithub10_error(exc)
 
 
-@mcp.tool(name="edit_github_file_ranges", description="Apply non-overlapping, hash-checked line range edits as one atomic commit. start_line and end_line are 1-based inclusive; dry-run and commit use the same computed UTF-8 bytes, and the commit is read back and verified.")
+@mcp.tool(name="edit_github_file_ranges", description="Apply non-overlapping exact-text line range edits as one atomic commit. Each replace/delete item may provide expected_blob_sha and expected_old_text; start_line/end_line are 1-based inclusive. Dry-run and commit use the same computed UTF-8 bytes, and the commit is read back and verified.")
 async def edit_github_file_ranges(repository: str, branch: str, expected_head_sha: str, operations_json: str, commit_message: str, dry_run: bool = True, idempotency_key: str = "") -> str:
     try:
         return json.dumps(await _github_call(mygithub10.edit_ranges, _service, repository, branch, expected_head_sha, operations_json, commit_message, dry_run, idempotency_key), ensure_ascii=False)
+    except Exception as exc:
+        return _mygithub10_error(exc)
+
+
+@mcp.tool(name="build_github_patch", description="Build a deterministic unified diff locally from UTF-8 text. Pure dry-run: never writes GitHub.")
+async def build_github_patch(path: str, expected_blob_sha: str, original_text: str, replacement_text: str, start_line: int = 1, end_line: int = 0) -> str:
+    try:
+        return json.dumps(mygithub10.build_patch(path, expected_blob_sha, original_text, replacement_text, start_line, end_line), ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
 
