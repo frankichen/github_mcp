@@ -19,8 +19,16 @@ ENV PYTHONUNBUFFERED=1 \
     MYGITHUB10_BUILD_SHA="$VCS_REF" \
     MYGITHUB10_VERSION="$SERVICE_VERSION"
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
+RUN apt-get \
+        -o Acquire::Retries=3 \
+        -o Acquire::http::Timeout=30 \
+        -o Acquire::https::Timeout=30 \
+        update \
+    && apt-get \
+        -o Acquire::Retries=3 \
+        -o Acquire::http::Timeout=30 \
+        -o Acquire::https::Timeout=30 \
+        install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /data /app/config
