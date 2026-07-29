@@ -8,13 +8,16 @@ import subprocess
 import inspect
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 
 import httpx
+from pydantic import Field
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import AuthSettings
 from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 
 from app.config import settings as app_settings
 from app.github_client import GitHubClient
@@ -26,6 +29,7 @@ from app.github_policy import ensure_repository_allowed
 from app import github_utils
 from app import mygithub10
 from app import attestation_registry
+from app.version import runtime_build_sha
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +110,24 @@ Development History & Reports:
     auth=AuthSettings(
         issuer_url=app_settings.SERVICE_URL,
         resource_server_url=app_settings.SERVICE_URL,
+    ),
+    # The SDK enables DNS-rebinding protection for its localhost default.
+    # The public reverse proxy preserves the external Host, so allow that
+    # exact production hostname without disabling the protection.
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "github.555044.xyz",
+            "github.555044.xyz:*",
+            "127.0.0.1:*",
+            "localhost:*",
+        ],
+        allowed_origins=[
+            "https://github.555044.xyz",
+            "https://github.555044.xyz:*",
+            "http://127.0.0.1:*",
+            "http://localhost:*",
+        ],
     ),
     stateless_http=True,
 )
@@ -800,10 +822,7 @@ def _mygithub10_error(exc: Exception) -> str:
 
 @mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithub10 capability and compatibility contract.")
 async def get_mygithub_capabilities() -> str:
-    return json.dumps(mygithub10.capabilities(
-        os.environ.get("MYGITHUB10_BUILD_SHA") or "unknown",
-        os.environ.get("MYGITHUB10_VERSION") or "10.0.3",
-    ), ensure_ascii=False)
+    return json.dumps(mygithub10.capabilities(runtime_build_sha()), ensure_ascii=False)
 
 
 @mcp.tool(name="get_github_file_manifest", description="Return exact Git Blob metadata for a file without returning file content.")
@@ -851,18 +870,45 @@ async def apply_github_patch(repository: str, branch: str, expected_head_sha: st
         return _mygithub10_error(exc)
 
 
-@mcp.tool(name="edit_github_file_ranges", description="Apply non-overlapping exact-text line range edits as one atomic commit. Each replace/delete item may provide expected_blob_sha and expected_old_text; start_line/end_line are 1-based inclusive. Dry-run and commit use the same computed UTF-8 bytes, and the commit is read back and verified.")
-async def edit_github_file_ranges(repository: str, branch: str, expected_head_sha: str, operations_json: str, commit_message: str, dry_run: bool = True, idempotency_key: str = "") -> str:
+@mcp.tool(name="edit_github_file_ranges", description="Apply non-overlapping exact-text line range edits as one atomic commit. Each item uses expected_blob_sha and replacement_text; replace/delete must explicitly provide expected_old_text or compatibility field expected_old_text_sha256. start_line/end_line are 1-based inclusive. Dry-run and commit use identical computed UTF-8 bytes.")
+async def edit_github_file_ranges(
+    repository: str,
+    branch: str,
+    expected_head_sha: str,
+    operations_json: Annotated[
+        str,
+        Field(
+            description=(
+                "JSON array of exact range edits. Each item includes path, operation, "
+                "start_line/end_line, expected_blob_sha, replacement_text, and either "
+                "expected_old_text or the explicit compatibility field "
+                "expected_old_text_sha256."
+            )
+        ),
+    ],
+    commit_message: str,
+    dry_run: bool = True,
+    idempotency_key: str = "",
+) -> str:
     try:
         return json.dumps(await _github_call(mygithub10.edit_ranges, _service, repository, branch, expected_head_sha, operations_json, commit_message, dry_run, idempotency_key), ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
 
 
-@mcp.tool(name="build_github_patch", description="Build a deterministic unified diff locally from UTF-8 text. Pure dry-run: never writes GitHub.")
-async def build_github_patch(path: str, expected_blob_sha: str, original_text: str, replacement_text: str, start_line: int = 1, end_line: int = 0) -> str:
+@mcp.tool(
+    name="build_github_patch",
+    description="Build a deterministic minimal unified diff from complete old/new UTF-8 file text. Pure dry-run: never reads or writes GitHub.",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def build_github_patch(path: str, expected_blob_sha: str, original_text: str, replacement_text: str) -> str:
     try:
-        return json.dumps(mygithub10.build_patch(path, expected_blob_sha, original_text, replacement_text, start_line, end_line), ensure_ascii=False)
+        return json.dumps(mygithub10.build_patch(path, expected_blob_sha, original_text, replacement_text), ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
 

@@ -1,6 +1,6 @@
 # MyGithub10 大文件与增量编辑开发契约
 
-版本：`10.0.3`。本文件面向 AI 开发代理和部署审查人员。
+版本：`10.1.1`。本文件面向 AI 开发代理和部署审查人员。
 
 ## 能力边界
 
@@ -14,7 +14,8 @@ MyGithub10 通过 Git Blob API 获取精确字节，不把大文件正文塞入�
 | `read_github_file_chunk` | 按 UTF-8 合法边界读取最多 65536 字节 |
 | `open_github_file_resource` / `read_github_file_resource` | 打开并分页读取资源 |
 | `apply_github_patch` | 严格 unified diff，默认 dry-run，支持多文件原子 commit；新增文件使用 `--- /dev/null` 与 `@@ -0,0 +1,N @@` |
-| `edit_github_file_ranges` | 按 1-based inclusive 行号执行 hash 校验后的非重叠编辑；范围基于原始内容计算并按降序应用 |
+| `edit_github_file_ranges` | 按 1-based inclusive 行号执行 blob + exact-text（或显式 SHA256 兼容字段）校验后的非重叠编辑；范围基于原始内容计算并按降序应用 |
+| `build_github_patch` | 根据完整旧/新 UTF-8 文件文本纯计算最小 unified diff；不读取或写入 GitHub |
 | `begin/append/finalize/commit/abort_github_file_upload` | 严格 offset、chunk SHA、总大小和总 SHA 的分块上传 |
 
 ## 读取协议
@@ -49,14 +50,14 @@ HEAD 改变返回 `PATCH_HEAD_CHANGED`（details.error_code=`HEAD_CHANGED`，包
 部署前由管理员配置 Secret，AI 不读取或回显 Secret：
 
 ```bash
-cd services/github-action-service
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-export MYGITHUB10_BUILD_SHA="$(git rev-parse HEAD)"
-uvicorn app.main:app --host 127.0.0.1 --port 8000
+git status --short
+git fetch origin
+git rev-parse HEAD
+git cat-file -t "$(git rev-parse HEAD)"
+scripts/build_mygithub10_image.sh
 ```
+
+构建脚本拒绝脏工作区，并要求当前 HEAD 已由远端引用且可通过 GitHub Commit API 查询。镜像中的 `MYGITHUB10_BUILD_SHA` 和 OCI revision label 由脚本自动注入，不接受手工伪造的发布 SHA。
 
 部署前必须执行：
 

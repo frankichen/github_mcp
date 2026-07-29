@@ -71,7 +71,16 @@ async def build_manifest(source: Path, source_commit: str | None = None, service
             raise SystemExit(f"duplicate MCP tool: {tool.name}")
         seen.add(tool.name)
         name = tool.name
-        read_only = name.startswith(READ_PREFIXES) and not name.startswith(WRITE_PREFIXES)
+        annotation_read_only = (
+            tool.annotations.readOnlyHint
+            if tool.annotations and tool.annotations.readOnlyHint is not None
+            else None
+        )
+        read_only = (
+            annotation_read_only
+            if annotation_read_only is not None
+            else name.startswith(READ_PREFIXES) and not name.startswith(WRITE_PREFIXES)
+        )
         tools.append(
             {
                 "name": name,
@@ -82,8 +91,11 @@ async def build_manifest(source: Path, source_commit: str | None = None, service
                 "input_schema": tool.inputSchema,
             }
         )
+    from app.version import SERVICE_VERSION  # noqa: PLC0415
+
     return {
         "service_name": service_name,
+        "service_version": SERVICE_VERSION,
         "source_commit": source_commit or git_value(source, "rev-parse", "HEAD"),
         "controller_image": os.environ.get("MYGITHUB09_CONTROLLER_IMAGE", "not-read-from-runtime"),
         "pygithub_version": declared_version(source, "PyGithub"),

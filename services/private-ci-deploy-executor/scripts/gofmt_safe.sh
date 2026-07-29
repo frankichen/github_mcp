@@ -8,14 +8,9 @@ if ((${#files[@]} == 0)); then
   echo 'no Go files found'
   exit 0
 fi
-if [[ "${GOFMT_AUTO_FIX:-false}" == "true" ]]; then
-  gofmt -w -- "${files[@]}"
-  echo "gofmt auto-fix applied to ${#files[@]} files"
-else
-  unformatted="$(gofmt -l -- "${files[@]}")"
-  if [[ -n "$unformatted" ]]; then
-    printf '%s\n' "$unformatted"
-    exit 1
-  fi
-  echo 'all Go files are formatted'
+unformatted="$(gofmt -l -- "${files[@]}")"
+if [[ -n "$unformatted" ]]; then
+  printf 'UNFORMATTED FILES:\n%s\n' "$unformatted"
+  exit 1
 fi
+echo 'all Go files are formatted'

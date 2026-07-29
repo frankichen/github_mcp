@@ -1,6 +1,7 @@
 {
   "service_name": "MyGithub10",
-  "source_commit": "2f2fb65958bbeaa54c56f165818baf6a62180aac",
+  "service_version": "10.1.1",
+  "source_commit": "b0549973bb1ce1811101f88186008319d40cc121",
   "controller_image": "not-read-from-runtime",
   "pygithub_version": "2.5.0",
   "mcp_sdk_version": "1.28.1",
@@ -2236,7 +2237,7 @@
       "read_only": false,
       "consequential": true,
       "category": "github",
-      "description": "Apply non-overlapping exact-text line range edits as one atomic commit. Each replace/delete item may provide expected_blob_sha and expected_old_text; start_line/end_line are 1-based inclusive. Dry-run and commit use the same computed UTF-8 bytes, and the commit is read back and verified.",
+      "description": "Apply non-overlapping exact-text line range edits as one atomic commit. Each item uses expected_blob_sha and replacement_text; replace/delete must explicitly provide expected_old_text or compatibility field expected_old_text_sha256. start_line/end_line are 1-based inclusive. Dry-run and commit use identical computed UTF-8 bytes.",
       "input_schema": {
         "properties": {
           "repository": {
@@ -2252,6 +2253,7 @@
             "type": "string"
           },
           "operations_json": {
+            "description": "JSON array of exact range edits. Each item includes path, operation, start_line/end_line, expected_blob_sha, replacement_text, and either expected_old_text or the explicit compatibility field expected_old_text_sha256.",
             "title": "Operations Json",
             "type": "string"
           },
@@ -2283,10 +2285,10 @@
     },
     {
       "name": "build_github_patch",
-      "read_only": false,
-      "consequential": true,
+      "read_only": true,
+      "consequential": false,
       "category": "github",
-      "description": "Build a deterministic unified diff locally from UTF-8 text. Pure dry-run: never writes GitHub.",
+      "description": "Build a deterministic minimal unified diff from complete old/new UTF-8 file text. Pure dry-run: never reads or writes GitHub.",
       "input_schema": {
         "properties": {
           "path": {
@@ -2304,16 +2306,6 @@
           "replacement_text": {
             "title": "Replacement Text",
             "type": "string"
-          },
-          "start_line": {
-            "default": 1,
-            "title": "Start Line",
-            "type": "integer"
-          },
-          "end_line": {
-            "default": 0,
-            "title": "End Line",
-            "type": "integer"
           }
         },
         "required": [

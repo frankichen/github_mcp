@@ -32,6 +32,55 @@ def auth_headers():
 
 class TestMCPTools:
     @pytest.mark.asyncio
+    async def test_mcp_transport_security_uses_explicit_public_host(self):
+        from app.mcp_server import mcp
+
+        from mcp.server.transport_security import TransportSecurityMiddleware
+
+        security = mcp.settings.transport_security
+        middleware = TransportSecurityMiddleware(security)
+        assert security.enable_dns_rebinding_protection is True
+        assert "github.555044.xyz" in security.allowed_hosts
+        assert "*" not in security.allowed_hosts
+        assert middleware._validate_host("github.555044.xyz") is True
+        assert middleware._validate_host("evil.example") is False
+        assert middleware._validate_host("github.555044.xyz:443") is True
+        assert middleware._validate_origin("https://github.555044.xyz") is True
+        assert middleware._validate_origin("https://evil.example") is False
+
+    @pytest.mark.asyncio
+    async def test_mygithub10_schema_and_gofmt_contract(self):
+        from app.mcp_server import mcp
+
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        for name in ("build_github_patch", "edit_github_file_ranges", "apply_github_patch", "get_mygithub_capabilities"):
+            assert name in tools
+        assert "expected_blob_sha" in tools["edit_github_file_ranges"].description
+        assert "expected_old_text" in tools["edit_github_file_ranges"].description
+        assert "replacement_text" in tools["edit_github_file_ranges"].description
+        assert "start_line" not in tools["build_github_patch"].description
+        operations_schema = tools["edit_github_file_ranges"].inputSchema["properties"]["operations_json"]
+        for field in (
+            "expected_blob_sha",
+            "expected_old_text",
+            "expected_old_text_sha256",
+            "replacement_text",
+        ):
+            assert field in operations_schema["description"]
+        annotations = tools["build_github_patch"].annotations
+        assert annotations.readOnlyHint is True
+        assert annotations.destructiveHint is False
+        assert annotations.idempotentHint is True
+        assert annotations.openWorldHint is False
+        import json
+        from app.mcp_server import get_mygithub_capabilities
+        capabilities = json.loads(await get_mygithub_capabilities())
+        assert capabilities["name"] == "MyGithub10"
+        assert capabilities["version"] == "10.1.1"
+        assert len(capabilities["build_sha"]) == 40
+        assert capabilities["supports_gofmt_autofix"] is False
+
+    @pytest.mark.asyncio
     async def test_mcp_tools_are_registered(self):
         from app.mcp_server import mcp
         tools = await mcp.list_tools()

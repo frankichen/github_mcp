@@ -8,11 +8,14 @@ from private_ci_agent.workspace import WorkspaceManager
 
 
 class FakeLogManager:
+    def __init__(self):
+        self.messages = []
+
     def reset(self, _job_id):
         pass
 
-    def upload(self, _job_id, _message):
-        pass
+    def upload(self, _job_id, message):
+        self.messages.append(message)
 
     def get_total(self, _job_id):
         return 0
@@ -22,8 +25,11 @@ class FakeLogManager:
 
 
 class FakeClient:
+    def __init__(self):
+        self.statuses = []
+
     def update_job_status(self, _job_id, _status):
-        pass
+        self.statuses.append(_status)
 
     def start_step(self, _job_id, _step_name):
         return None
@@ -161,58 +167,42 @@ class AlwaysFailPodman(FakePodman):
         return {"exit_code": exit_code, "stdout": "", "stderr": "", "timed_out": False}
 
 
-def test_gofmt_autofix_success_makes_workspace_pass(tmp_path, monkeypatch):
-    """gofmt check fails → autofix formats + verifies → workspace passes, step=autofixed."""
+def test_gofmt_failure_is_read_only_and_fails_job(tmp_path):
     (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
-    podman = OnceFailingPodman("gofmt -l")
+    go_file = tmp_path / "bad.go"
+    go_file.write_text("package main\nfunc main(){ }\n", encoding="utf-8")
+    before = go_file.read_bytes()
+
+    class GofmtFailPodman(FakePodman):
+        def run_command(self, image, job_id, source_dir, caches, command, timeout, network=False, **kwargs):
+            self.commands.append((command, network))
+            if "gofmt -l" in command:
+                return {
+                    "exit_code": 1,
+                    "stdout": "UNFORMATTED FILES:\n./bad.go\n",
+                    "stderr": "",
+                    "timed_out": False,
+                }
+            return {"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}
+
+    podman = GofmtFailPodman()
     executor = make_executor(podman)
-    monkeypatch.setattr(
-        executor,
-        "_git_push_autofix",
-        lambda _job, _source: {
-            "committed": True,
-            "pushed": True,
-            "verified": True,
-            "reason": "ok",
-        },
-    )
-    job = make_job(tmp_path)
-    job.repository = "frankichen/sxt"
-    job.branch = "feature/gofmt"
-    result = executor._execute_workspace(job, {"path": ".", "stack": "go"})
-
-    assert result["passed"] is True
-    gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
-    assert gofmt_step["status"] == "autofixed"
-    assert gofmt_step.get("autofix", {}).get("formatted") is True
-    # Verify gofmt -w was called in container
-    assert any("gofmt -w" in cmd for cmd, _ in podman.commands)
-
-
-def test_gofmt_autofix_failure_still_fails_workspace(tmp_path):
-    """gofmt check fails → autofix also fails (gofmt -w errors) → workspace still fails."""
-    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
-    podman = AlwaysFailPodman("gofmt -l")
-    result = make_executor(podman)._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
+    result = executor._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
 
     assert result["passed"] is False
     gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
-    assert gofmt_step["status"] in ("failed", "timed_out")
-    assert gofmt_step["autofix"]["reason"] == "repository_not_allowed"
+    assert gofmt_step["status"] == "failed"
+    assert go_file.read_bytes() == before
+    commands = [command for command, _ in podman.commands]
+    assert not any("gofmt -w" in command for command in commands)
+    assert not any("git commit" in command or "git push" in command for command in commands)
+    assert any("./bad.go" in message for message in executor.log_manager.messages)
 
 
-def test_setup_failure_blocks_gofmt_autofix(tmp_path):
-    """setup failure → gofmt still runs but autofix is skipped (not setup_failed guard)."""
-    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
-    # "go mod download" in the setup step fails → setup_failed = True
-    podman = FakePodman("go mod download")
-    result = make_executor(podman)._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
+def test_executor_has_no_gofmt_writeback_entrypoints():
+    assert not hasattr(JobExecutor, "_gofmt_autofix")
+    assert not hasattr(JobExecutor, "_git_push_autofix")
 
-    assert result["passed"] is False
-    gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
-    # gofmt should still have run (not blocked) but autofix skipped due to setup_failed
-    assert gofmt_step["status"] == "passed"
-    assert gofmt_step.get("autofix") is None
 
 
 # ---- repo-fast-check tests ----
