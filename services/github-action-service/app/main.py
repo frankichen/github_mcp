@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.openapi.utils import get_openapi
 
-from app.routers import health, github, ci_worker, deployments
+from app.routers import health, github, ci_worker, deployments, ci_monitor
 from app.config import settings
 from app.exceptions import AppError
 from app.idempotency import IdempotencyMiddleware, ensure_idempotency_storage
@@ -75,6 +75,7 @@ app.include_router(health.router, tags=["Health"])
 app.include_router(github.router, tags=["GitHub"])
 app.include_router(ci_worker.router, tags=["CI Worker"])
 app.include_router(deployments.router, tags=["Deployments"])
+app.include_router(ci_monitor.router, tags=["CI Monitor"])
 
 
 @app.get("/.well-known/oauth-protected-resource")

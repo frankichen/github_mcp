@@ -512,6 +512,111 @@ def list_jobs(
     return [_job_row_to_dict(r, db) for r in rows]
 
 
+def get_monitor_snapshot(active_limit: int = 50, recent_limit: int = 20) -> dict:
+    """Return a read-only CI monitor snapshot for the web dashboard."""
+    db = _get_db()
+    ts = now_ts()
+    active_limit = min(max(int(active_limit), 1), 100)
+    recent_limit = min(max(int(recent_limit), 1), 100)
+    active_statuses = ("queued", "leased", "downloading", "preparing", "running", "cancel_requested")
+    terminal_statuses = ("passed", "failed", "timed_out", "cancelled", "worker_lost", "internal_error", "superseded")
+
+    counts = {
+        row["status"]: row["count"]
+        for row in db.execute("SELECT status, COUNT(*) AS count FROM ci_jobs GROUP BY status").fetchall()
+    }
+    active_rows = db.execute(
+        f"""SELECT * FROM ci_jobs
+            WHERE status IN ({",".join(["?"] * len(active_statuses))})
+            ORDER BY
+                CASE WHEN status = 'queued' THEN 1 ELSE 0 END,
+                priority DESC,
+                created_at ASC
+            LIMIT ?""",
+        (*active_statuses, active_limit),
+    ).fetchall()
+    recent_rows = db.execute(
+        f"""SELECT * FROM ci_jobs
+            WHERE status IN ({",".join(["?"] * len(terminal_statuses))})
+            ORDER BY COALESCE(finished_at, created_at) DESC
+            LIMIT ?""",
+        (*terminal_statuses, recent_limit),
+    ).fetchall()
+
+    workers = get_workers()
+    active_jobs = [_monitor_job_row_to_dict(row, db, ts) for row in active_rows]
+    recent_jobs = [_monitor_job_row_to_dict(row, db, ts) for row in recent_rows]
+
+    return {
+        "ok": True,
+        "generated_at": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+        "summary": {
+            "queued": counts.get("queued", 0),
+            "active": sum(counts.get(status, 0) for status in active_statuses if status != "queued"),
+            "running": counts.get("running", 0),
+            "leased": counts.get("leased", 0),
+            "downloading": counts.get("downloading", 0),
+            "preparing": counts.get("preparing", 0),
+            "terminal": sum(counts.get(status, 0) for status in terminal_statuses),
+            "total": sum(counts.values()),
+            "by_status": counts,
+            "workers_online": sum(1 for worker in workers if worker.get("online")),
+            "workers_total": len(workers),
+        },
+        "workers": workers,
+        "active_jobs": active_jobs,
+        "recent_jobs": recent_jobs,
+    }
+
+
+def _monitor_job_row_to_dict(row, db, ts: float) -> dict:
+    job = _job_row_to_dict(row, db)
+    steps = get_steps(row["job_id"])
+    running_step_index = None
+    current_step = None
+    current_step_elapsed_seconds = None
+    completed_steps = 0
+
+    for index, step in enumerate(steps, start=1):
+        status = step.get("status")
+        if status == "running" and running_step_index is None:
+            running_step_index = index
+            current_step = step.get("step_name")
+            started_at = _parse_iso_ts(step.get("started_at"))
+            current_step_elapsed_seconds = max(0.0, ts - started_at) if started_at else None
+        if status in {"passed", "failed", "timed_out", "cancelled", "completed", "skipped", "autofixed"}:
+            completed_steps += 1
+
+    started_ts = row["started_at"]
+    finished_ts = row["finished_at"]
+    if row["duration_seconds"] is not None:
+        elapsed = row["duration_seconds"]
+    elif started_ts:
+        elapsed = max(0.0, (finished_ts or ts) - started_ts)
+    else:
+        elapsed = None
+
+    job.update({
+        "current_step": current_step,
+        "current_step_index": running_step_index,
+        "current_step_elapsed_seconds": current_step_elapsed_seconds,
+        "completed_steps": completed_steps,
+        "total_steps": len(steps),
+        "elapsed_seconds": elapsed,
+        "steps": steps,
+    })
+    return job
+
+
+def _parse_iso_ts(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
+
+
 def _job_row_to_dict(row, db) -> dict:
     qpos = _get_queue_position(db, row["job_id"]) if row["status"] == "queued" else None
     summary = None
