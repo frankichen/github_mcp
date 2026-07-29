@@ -12,7 +12,7 @@ from app.exceptions import AppError
 from app.idempotency import IdempotencyMiddleware, ensure_idempotency_storage
 from app.oauth import get_oauth_protected_resource_metadata
 from app.observability import RequestObservabilityMiddleware
-from app.version import SERVICE_NAME, SERVICE_VERSION
+from app.version import SERVICE_NAME, SERVICE_VERSION, validate_runtime_metadata
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL, "INFO"),
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_runtime_metadata()
     os.makedirs(os.path.dirname(settings.IDEMPOTENCY_DB_PATH), exist_ok=True)
     try:
         from app.ci_database import init_db

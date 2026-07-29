@@ -15,7 +15,6 @@ import re
 import secrets
 import sqlite3
 import tempfile
-import subprocess
 import time
 import uuid
 import logging
@@ -25,6 +24,7 @@ from typing import Any
 
 from app.config import settings
 from app.exceptions import ValidationError
+from app.version import SERVICE_VERSION
 
 MAX_INLINE_RESPONSE_BYTES = 65536
 MAX_FILE_CHUNK_BYTES = 65536
@@ -65,6 +65,70 @@ def _safe_path(path: str) -> str:
     if any(ord(char) < 32 for char in path):
         raise MyGithub10Error("PATCH_UNSAFE_PATH", "path contains control characters")
     return path
+
+
+def _truncate_utf8(value: str, limit_bytes: int | None = None) -> tuple[str, bool]:
+    limit_bytes = MAX_INLINE_RESPONSE_BYTES if limit_bytes is None else limit_bytes
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit_bytes:
+        return value, False
+    boundary = encoded[:limit_bytes]
+    while boundary:
+        try:
+            return boundary.decode("utf-8"), True
+        except UnicodeDecodeError:
+            boundary = boundary[:-1]
+    return "", True
+
+
+def _format_unified_range(start: int, stop: int) -> str:
+    length = stop - start
+    beginning = start + 1
+    if length == 0:
+        beginning -= 1
+    if length == 1:
+        return str(beginning)
+    return f"{beginning},{length}"
+
+
+def _diff_line(prefix: str, line: str) -> list[str]:
+    if line.endswith("\n"):
+        return [prefix + line]
+    return [prefix + line + "\n", "\\ No newline at end of file\n"]
+
+
+def _minimal_unified_diff(path: str, old_text: str, new_text: str, context: int = 3) -> tuple[str, int, int]:
+    """Return a bounded-context unified diff that preserves exact line bytes."""
+    _safe_path(path)
+    old_lines = old_text.splitlines(keepends=True)
+    new_lines = new_text.splitlines(keepends=True)
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+    groups = list(matcher.get_grouped_opcodes(context))
+    if not groups:
+        return "", 0, 0
+    output = [f"--- a/{path}\n", f"+++ b/{path}\n"]
+    added = 0
+    deleted = 0
+    for group in groups:
+        old_start, old_stop = group[0][1], group[-1][2]
+        new_start, new_stop = group[0][3], group[-1][4]
+        output.append(
+            f"@@ -{_format_unified_range(old_start, old_stop)} "
+            f"+{_format_unified_range(new_start, new_stop)} @@\n"
+        )
+        for tag, i1, i2, j1, j2 in group:
+            if tag == "equal":
+                for line in old_lines[i1:i2]:
+                    output.extend(_diff_line(" ", line))
+            if tag in {"replace", "delete"}:
+                deleted += i2 - i1
+                for line in old_lines[i1:i2]:
+                    output.extend(_diff_line("-", line))
+            if tag in {"replace", "insert"}:
+                added += j2 - j1
+                for line in new_lines[j1:j2]:
+                    output.extend(_diff_line("+", line))
+    return "".join(output), added, deleted
 
 
 def _db() -> sqlite3.Connection:
@@ -295,12 +359,13 @@ def _parse_patch_details(patch: str) -> tuple[list[tuple[str, str, list[tuple[in
             actual_old_count = len(old_lines)
             actual_new_count = len(new_lines)
             normalized_header = f"@@ -{old_start},{actual_old_count} +{new_start},{actual_new_count} @@"
+            hunk_index = len(hunks) + 1
             if old_count != actual_old_count or new_count != actual_new_count:
                 normalization_warnings.append({
-                    "path": path, "hunk_index": len(normalized_hunks) + 1,
+                    "path": path, "hunk_index": hunk_index,
                     "message": "hunk line counts were corrected from parsed content",
                 })
-            normalized_hunks.append({"path": path, "hunk_index": len(normalized_hunks) + 1,
+            normalized_hunks.append({"path": path, "hunk_index": hunk_index,
                                      "original": raw_header.rstrip("\r\n"),
                                      "normalized": normalized_header})
             hunks.append((old_start, new_start, old_lines, new_lines))
@@ -318,7 +383,48 @@ def _parse_patch(patch: str) -> list[tuple[str, str, list[tuple[int, int, list[s
     return _parse_patch_details(patch)[0]
 
 
-def _patch_mismatch_details(source: list[str], position: int, expected: list[str], old_start: int) -> dict[str, Any]:
+def _canonical_patch_request(
+    repository: str,
+    branch: str,
+    expected_head_sha: str,
+    expected_blob_shas: dict[str, str],
+    parsed: list[tuple[str, str, list[tuple[int, int, list[str], list[str]]]]],
+    commit_message: str,
+) -> dict[str, Any]:
+    files = []
+    for path, operation, hunks in parsed:
+        files.append({
+            "path": path,
+            "operation": operation,
+            "expected_blob_sha": expected_blob_shas.get(path, ""),
+            "hunks": [
+                {
+                    "old_start": old_start,
+                    "new_start": new_start,
+                    "old_lines": old_lines,
+                    "new_lines": new_lines,
+                }
+                for old_start, new_start, old_lines, new_lines in hunks
+            ],
+        })
+    return {
+        "tool_name": "apply_github_patch",
+        "repository": repository,
+        "branch": branch,
+        "expected_head_sha": expected_head_sha,
+        "commit_message": commit_message,
+        "files": sorted(files, key=lambda item: item["path"]),
+    }
+
+
+def _patch_mismatch_details(
+    source: list[str],
+    position: int,
+    expected: list[str],
+    old_start: int,
+    hunk_index: int,
+    path: str,
+) -> dict[str, Any]:
     candidates = [index for index in range(0, len(source) - len(expected) + 1)
                   if source[index:index + len(expected)] == expected]
     relative = 1
@@ -329,8 +435,10 @@ def _patch_mismatch_details(source: list[str], position: int, expected: list[str
             actual = actual_line
             break
     details = {
-        "old_line": old_start, "context": "".join(expected[:3])[:240],
-        "hunk_index": None, "nearest_candidate_start": (candidates[0] + 1 if len(candidates) == 1 else None),
+        "path": path,
+        "hunk_index": hunk_index,
+        "expected_old_start": old_start,
+        "nearest_candidate_start": (candidates[0] + 1 if len(candidates) == 1 else None),
         "exact_match_count": len(candidates),
         "mismatch": {"relative_line": relative, "expected": expected[relative - 1] if expected else "", "actual": actual},
         "suggested_action": "REFETCH_FILE_OR_USE_RANGE_EDIT",
@@ -340,11 +448,16 @@ def _patch_mismatch_details(source: list[str], position: int, expected: list[str
     return details
 
 
-def _apply_file_patch(old: bytes, hunks: list[tuple[int, int, list[str], list[str]]], allow_empty_old: bool = False) -> bytes:
+def _apply_file_patch(
+    old: bytes,
+    hunks: list[tuple[int, int, list[str], list[str]]],
+    allow_empty_old: bool = False,
+    path: str = "",
+) -> bytes:
     source = _text(old).splitlines(keepends=True) if old else []
     cursor = 0
     output: list[str] = []
-    for old_start, _, expected, replacement in hunks:
+    for hunk_index, (old_start, _, expected, replacement) in enumerate(hunks, 1):
         if allow_empty_old:
             if old or old_start != 0 or expected:
                 raise MyGithub10Error("PATCH_INVALID_FORMAT", "new-file patch must start at old line 0 with an empty old file")
@@ -353,8 +466,8 @@ def _apply_file_patch(old: bytes, hunks: list[tuple[int, int, list[str], list[st
             if old_start < 1:
                 raise MyGithub10Error("PATCH_INVALID_FORMAT", "old line 0 is valid only for a new-file patch")
             position = old_start - 1
-        if position < cursor or source[position:position + len(expected)] != expected:
-            details = _patch_mismatch_details(source, position, expected, old_start)
+        if position < cursor or position > len(source) or source[position:position + len(expected)] != expected:
+            details = _patch_mismatch_details(source, position, expected, old_start, hunk_index, path)
             code = details.pop("code", "PATCH_DOES_NOT_APPLY")
             raise MyGithub10Error(code, f"hunk at old line {old_start} does not match exactly", details)
         output.extend(source[cursor:position])
@@ -445,7 +558,14 @@ def apply_patch(client, repository: str, branch: str, expected_head_sha: str, ex
         raise MyGithub10Error("PATCH_INVALID_FORMAT", "expected_blob_shas_json must be valid JSON") from exc
     if not isinstance(expected, dict):
         raise MyGithub10Error("PATCH_INVALID_FORMAT", "expected_blob_shas_json must be an object")
-    request = {"tool_name": "apply_github_patch", "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "expected_blob_shas": expected, "patch_sha256": _sha256(patch.encode()), "commit_message": commit_message}
+    request = _canonical_patch_request(
+        repository,
+        branch,
+        expected_head_sha,
+        expected,
+        parsed,
+        commit_message,
+    )
     operation_id, replay = ("", None) if dry_run else _idempotent_start("apply_github_patch", idempotency_key, request)
     if replay:
         return replay
@@ -476,17 +596,23 @@ def apply_patch(client, repository: str, branch: str, expected_head_sha: str, ex
                 raise MyGithub10Error("FILE_TOO_LARGE", f"text edit target exceeds the file limit: {path}", {"path": path, "limit_bytes": MAX_TEXT_EDIT_FILE_BYTES})
             if expected.get(path) and expected[path] != old_sha:
                 raise MyGithub10Error("BLOB_CHANGED", f"file blob changed before patch: {path}", {"expected": expected[path], "actual": old_sha, "repository": repository, "branch": branch, "path": path})
-        new = None if operation == "delete" else _apply_file_patch(old, hunks, allow_empty_old=operation == "add")
+        new = None if operation == "delete" else _apply_file_patch(
+            old,
+            hunks,
+            allow_empty_old=operation == "add",
+            path=path,
+        )
         changed[path] = new
         previews.append({"path": path, "operation": operation, "old_blob_sha": old_sha,
                          "new_blob_sha": None if new is None else _git_blob_sha(new),
                          "new_content_sha256": None if new is None else _sha256(new),
                          "added_lines": sum(len(h[3]) for h in hunks),
                          "deleted_lines": sum(len(h[2]) for h in hunks)})
-    fingerprint = _sha256(_json({"repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "patch": patch, "commit_message": commit_message}).encode())
+    fingerprint = _sha256(_json(request).encode())
+    diff_preview, diff_truncated = _truncate_utf8(patch)
     result = {"ok": True, "dry_run": dry_run, "repository": repository, "branch": branch,
               "expected_head_sha": expected_head_sha, "changed_files": previews,
-              "diff_preview": patch[:MAX_INLINE_RESPONSE_BYTES], "diff_truncated": len(patch.encode()) > MAX_INLINE_RESPONSE_BYTES,
+              "diff_preview": diff_preview, "diff_truncated": diff_truncated,
               "operation_fingerprint": fingerprint, **patch_metadata}
     if dry_run:
         return result
@@ -550,17 +676,52 @@ def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, op
             if item["operation"] == "insert_after" and (start < 1 or end < start or end > len(lines)):
                 raise MyGithub10Error("PATCH_SCOPE_EXCEEDED", f"operation {order} insert_after range is outside the file")
             old_text = "".join(lines[start - 1:end]) if item["operation"] in {"replace", "delete"} else ""
-            expected_old_text = item.get("expected_old_text", item.get("expected_old_text_sha256"))
             if item["operation"] in {"replace", "delete"}:
-                if not isinstance(expected_old_text, str):
-                    raise MyGithub10Error("PATCH_INVALID_FORMAT", f"operation {order} requires expected_old_text")
-                if re.fullmatch(r"[0-9a-f]{64}", expected_old_text):
-                    expected_old_text = None
-                    if _sha256(old_text.encode()) != item.get("expected_old_text_sha256", ""):
-                        raise MyGithub10Error("PATCH_TEXT_MISMATCH", f"old range text does not match for {path}:{start}-{end}", {"path": path, "start_line": start, "end_line": end, "relative_line": 1})
-                elif expected_old_text != old_text:
-                    mismatch = next((i for i, (expected_line, actual_line) in enumerate(zip(expected_old_text.splitlines(keepends=True), old_text.splitlines(keepends=True)), 1) if expected_line != actual_line), 1)
-                    raise MyGithub10Error("PATCH_TEXT_MISMATCH", f"old range text does not match for {path}:{start}-{end}", {"path": path, "start_line": start, "end_line": end, "relative_line": mismatch, "expected": expected_old_text.splitlines(keepends=True)[mismatch - 1] if expected_old_text.splitlines(keepends=True) else "", "actual": old_text.splitlines(keepends=True)[mismatch - 1] if old_text.splitlines(keepends=True) else ""})
+                has_text = "expected_old_text" in item
+                has_hash = "expected_old_text_sha256" in item
+                if not has_text and not has_hash:
+                    raise MyGithub10Error(
+                        "PATCH_INVALID_FORMAT",
+                        f"operation {order} requires expected_old_text or expected_old_text_sha256",
+                    )
+                if has_text and not isinstance(item["expected_old_text"], str):
+                    raise MyGithub10Error("PATCH_INVALID_FORMAT", f"operation {order} expected_old_text must be a string")
+                if has_hash and not re.fullmatch(r"[0-9a-f]{64}", str(item["expected_old_text_sha256"])):
+                    raise MyGithub10Error("PATCH_INVALID_FORMAT", f"operation {order} expected_old_text_sha256 must be a lowercase SHA-256")
+                expected_old_text = item.get("expected_old_text")
+                if has_text and expected_old_text != old_text:
+                    expected_lines = expected_old_text.splitlines(keepends=True)
+                    actual_lines = old_text.splitlines(keepends=True)
+                    mismatch = next(
+                        (
+                            index
+                            for index in range(1, max(len(expected_lines), len(actual_lines)) + 1)
+                            if (
+                                expected_lines[index - 1] if index <= len(expected_lines) else ""
+                            ) != (
+                                actual_lines[index - 1] if index <= len(actual_lines) else ""
+                            )
+                        ),
+                        1,
+                    )
+                    raise MyGithub10Error(
+                        "PATCH_TEXT_MISMATCH",
+                        f"old range text does not match for {path}:{start}-{end}",
+                        {
+                            "path": path,
+                            "start_line": start,
+                            "end_line": end,
+                            "relative_line": mismatch,
+                            "expected": expected_lines[mismatch - 1] if mismatch <= len(expected_lines) else "",
+                            "actual": actual_lines[mismatch - 1] if mismatch <= len(actual_lines) else "",
+                        },
+                    )
+                if has_hash and _sha256(old_text.encode()) != item["expected_old_text_sha256"]:
+                    raise MyGithub10Error(
+                        "PATCH_TEXT_MISMATCH",
+                        f"old range hash does not match for {path}:{start}-{end}",
+                        {"path": path, "start_line": start, "end_line": end, "relative_line": 1},
+                    )
             if item["operation"] == "insert_before": splice = (start - 1, start - 1)
             elif item["operation"] == "insert_after": splice = (end, end)
             else: splice = (start - 1, end)
@@ -583,10 +744,21 @@ def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, op
         changed[path] = "".join(lines).encode()
         expected[path] = blob_sha
     fingerprint = _sha256(_json({"tool_name": "edit_github_file_ranges", "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "operations": operations, "commit_message": commit_message}).encode())
-    diff_preview = "".join(build_patch(path, "", old_texts[path], changed[path].decode("utf-8"))["patch"] for path in sorted(changed))
+    diffs = []
+    diff_stats = {}
+    for path in sorted(changed):
+        patch, added_lines, deleted_lines = _minimal_unified_diff(
+            path,
+            old_texts[path],
+            changed[path].decode("utf-8"),
+        )
+        diffs.append(patch)
+        diff_stats[path] = (added_lines, deleted_lines)
+    full_diff = "".join(diffs)
+    diff_preview, diff_truncated = _truncate_utf8(full_diff)
     result = {"ok": True, "dry_run": dry_run, "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "resolved_head_sha": actual_head,
-              "changed_files": [{"path": p, "operation": "modify", "old_blob_sha": expected[p], "new_blob_sha": _git_blob_sha(changed[p]), "content_sha256": _sha256(changed[p]), "size_bytes": len(changed[p])} for p in changed],
-              "new_content_sha256": {p: _sha256(v) for p, v in changed.items()}, "diff_preview": diff_preview[:MAX_INLINE_RESPONSE_BYTES], "diff_truncated": len(diff_preview.encode()) > MAX_INLINE_RESPONSE_BYTES, "operation_count": len(operations), "operation_fingerprint": fingerprint}
+              "changed_files": [{"path": p, "operation": "modify", "old_blob_sha": expected[p], "new_blob_sha": _git_blob_sha(changed[p]), "content_sha256": _sha256(changed[p]), "size_bytes": len(changed[p]), "added_lines": diff_stats[p][0], "deleted_lines": diff_stats[p][1]} for p in changed],
+              "new_content_sha256": {p: _sha256(v) for p, v in changed.items()}, "diff_preview": diff_preview, "diff_truncated": diff_truncated, "operation_count": len(operations), "operation_fingerprint": fingerprint}
     if dry_run: return result
     try:
         result.update(_commit_files(client, repository, branch, expected_head_sha, changed, expected, commit_message))
@@ -607,42 +779,19 @@ def build_patch(path: str, expected_blob_sha: str, original_text: str, replaceme
         raise MyGithub10Error("PATCH_TOO_LARGE", "text exceeds the patch builder limit")
     if expected_blob_sha and expected_blob_sha != _git_blob_sha(old_bytes):
         raise MyGithub10Error("BLOB_CHANGED", "expected_blob_sha does not match original_text", {"expected": expected_blob_sha, "actual": _git_blob_sha(old_bytes), "path": path})
-    old_lines = original_text.splitlines(keepends=True)
-    new_lines = replacement_text.splitlines(keepends=True)
-    old_start = 1
-    old_count = len(old_lines)
-    new_start = 1
-    new_count = len(new_lines)
-    def diff_side(prefix: str, lines: list[str]) -> list[str]:
-        result = []
-        for line in lines:
-            if line.endswith(("\n", "\r")):
-                result.append(prefix + line)
-            else:
-                result.extend((prefix + line + "\n", "\\ No newline at end of file\n"))
-        return result
-    body = [f"@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"]
-    body.extend(diff_side("-", old_lines))
-    body.extend(diff_side("+", new_lines))
-    patch = f"--- a/{path}\n+++ b/{path}\n" + "".join(body)
+    patch, added_lines, deleted_lines = _minimal_unified_diff(path, original_text, replacement_text)
+    diff_preview, diff_truncated = _truncate_utf8(patch)
     fingerprint = _sha256(_json({"path": path, "expected_blob_sha": expected_blob_sha, "original_text": original_text, "replacement_text": replacement_text}).encode())
-    return {"ok": True, "dry_run": True, "path": path, "patch": patch, "diff_preview": patch[:MAX_INLINE_RESPONSE_BYTES],
+    return {"ok": True, "dry_run": True, "path": path, "patch": patch, "diff_preview": diff_preview, "diff_truncated": diff_truncated,
             "operation_fingerprint": fingerprint, "old_blob_sha": _git_blob_sha(old_bytes), "new_blob_sha": _git_blob_sha(replacement_text.encode()),
-            "old_count": old_count, "new_count": new_count}
+            "old_count": len(original_text.splitlines()), "new_count": len(replacement_text.splitlines()),
+            "added_lines": added_lines, "deleted_lines": deleted_lines}
 
 
-def capabilities(build_sha: str = "unknown", version: str = "10.0.3") -> dict[str, Any]:
-    build_sha_source = "environment" if re.fullmatch(r"[0-9a-f]{40}", build_sha or "") else "vcs_fallback"
+def capabilities(build_sha: str) -> dict[str, Any]:
     if not re.fullmatch(r"[0-9a-f]{40}", build_sha or ""):
-        try:
-            repo_root = Path(__file__).resolve().parents[3]
-        except IndexError:
-            repo_root = Path(__file__).resolve().parent
-        try:
-            build_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True, stderr=subprocess.DEVNULL).strip()
-        except (OSError, subprocess.CalledProcessError):
-            build_sha = "unknown"
-    return {"name": "MyGithub10", "version": version, "build_sha": build_sha, "build_sha_source": build_sha_source, "runtime_mode": os.environ.get("MYGITHUB10_RUNTIME_MODE", "development"), "source_repository": "frankichen/github_mcp", "max_inline_response_bytes": MAX_INLINE_RESPONSE_BYTES, "max_file_chunk_bytes": MAX_FILE_CHUNK_BYTES, "max_patch_bytes": MAX_PATCH_BYTES, "max_upload_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES, "supports_file_manifest": True, "supports_byte_chunks": True, "supports_mcp_resources": True, "supports_incremental_patch": True, "supports_range_edit": True, "range_edit_semantics": {"start_line": "1-based inclusive", "end_line": "1-based inclusive", "encoding": "UTF-8 text lines; original LF/CRLF and final-newline state are preserved"}, "supports_chunked_upload": True, "supports_dry_run": True, "supports_expected_head_sha": True, "supports_expected_blob_sha": True, "supports_idempotency_key": True, "supports_operation_audit": True, "supports_tree_attestation": True, "supports_artifact_deployment": False, "supports_gofmt_autofix": False, "supports_real_ci_performance_validation": False, "recommended_large_file_workflow": ["get_github_file_manifest", "read_github_file_chunk", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "commit_github_uploaded_files"], "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_IN_PROGRESS"], "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}]}
+        raise RuntimeError("build_sha must be a full lowercase 40-character Git commit SHA")
+    return {"name": "MyGithub10", "version": SERVICE_VERSION, "build_sha": build_sha, "build_sha_source": "environment" if os.environ.get("MYGITHUB10_BUILD_SHA") else "vcs_fallback", "runtime_mode": os.environ.get("MYGITHUB10_RUNTIME_MODE", "development"), "source_repository": "frankichen/github_mcp", "max_inline_response_bytes": MAX_INLINE_RESPONSE_BYTES, "max_file_chunk_bytes": MAX_FILE_CHUNK_BYTES, "max_patch_bytes": MAX_PATCH_BYTES, "max_upload_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES, "supports_file_manifest": True, "supports_byte_chunks": True, "supports_mcp_resources": True, "supports_incremental_patch": True, "supports_range_edit": True, "range_edit_semantics": {"start_line": "1-based inclusive", "end_line": "1-based inclusive", "encoding": "UTF-8 text lines; original LF/CRLF and final-newline state are preserved"}, "supports_chunked_upload": True, "supports_dry_run": True, "supports_expected_head_sha": True, "supports_expected_blob_sha": True, "supports_idempotency_key": True, "supports_operation_audit": True, "supports_tree_attestation": True, "supports_artifact_deployment": False, "supports_gofmt_autofix": False, "supports_real_ci_performance_validation": False, "recommended_large_file_workflow": ["get_github_file_manifest", "read_github_file_chunk", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "commit_github_uploaded_files"], "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_IN_PROGRESS"], "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}]}
 
 
 _UPLOAD_ROOT = Path(os.environ.get("MYGITHUB10_UPLOAD_DIR", tempfile.gettempdir())) / "mygithub10-uploads"

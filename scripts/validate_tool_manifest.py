@@ -30,10 +30,26 @@ async def main() -> int:
         raise SystemExit(f"manifest mismatch: actual={actual_names!r} manifest={manifest_names!r}")
     if manifest["tool_count"] != len(actual_names):
         raise SystemExit("manifest tool_count mismatch")
-    required = {"get_github_file", "commit_github_files", "start_private_ci_job", "wait_test_deployment"}
+    from app.version import SERVICE_NAME, SERVICE_VERSION  # noqa: PLC0415
+    if manifest.get("service_name") != SERVICE_NAME or manifest.get("service_version") != SERVICE_VERSION:
+        raise SystemExit("manifest service name/version mismatch")
+    required = {
+        "get_github_file",
+        "commit_github_files",
+        "start_private_ci_job",
+        "wait_test_deployment",
+        "apply_github_patch",
+        "edit_github_file_ranges",
+        "build_github_patch",
+        "get_mygithub_capabilities",
+    }
     missing = required - set(actual_names)
     if missing:
         raise SystemExit(f"required tools missing: {sorted(missing)}")
+    manifest_by_name = {tool["name"]: tool for tool in manifest["tools"]}
+    builder = manifest_by_name["build_github_patch"]
+    if not builder["read_only"] or builder["consequential"]:
+        raise SystemExit("build_github_patch must be read-only and non-consequential")
     print(f"manifest matches {len(actual_names)} registered tools")
     return 0
 

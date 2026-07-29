@@ -59,9 +59,25 @@ class TestMCPTools:
         assert "expected_old_text" in tools["edit_github_file_ranges"].description
         assert "replacement_text" in tools["edit_github_file_ranges"].description
         assert "start_line" not in tools["build_github_patch"].description
+        operations_schema = tools["edit_github_file_ranges"].inputSchema["properties"]["operations_json"]
+        for field in (
+            "expected_blob_sha",
+            "expected_old_text",
+            "expected_old_text_sha256",
+            "replacement_text",
+        ):
+            assert field in operations_schema["description"]
+        annotations = tools["build_github_patch"].annotations
+        assert annotations.readOnlyHint is True
+        assert annotations.destructiveHint is False
+        assert annotations.idempotentHint is True
+        assert annotations.openWorldHint is False
         import json
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
+        assert capabilities["name"] == "MyGithub10"
+        assert capabilities["version"] == "10.1.1"
+        assert len(capabilities["build_sha"]) == 40
         assert capabilities["supports_gofmt_autofix"] is False
 
     @pytest.mark.asyncio

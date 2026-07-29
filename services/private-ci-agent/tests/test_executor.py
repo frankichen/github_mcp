@@ -8,11 +8,14 @@ from private_ci_agent.workspace import WorkspaceManager
 
 
 class FakeLogManager:
+    def __init__(self):
+        self.messages = []
+
     def reset(self, _job_id):
         pass
 
-    def upload(self, _job_id, _message):
-        pass
+    def upload(self, _job_id, message):
+        self.messages.append(message)
 
     def get_total(self, _job_id):
         return 0
@@ -22,8 +25,11 @@ class FakeLogManager:
 
 
 class FakeClient:
+    def __init__(self):
+        self.statuses = []
+
     def update_job_status(self, _job_id, _status):
-        pass
+        self.statuses.append(_status)
 
     def start_step(self, _job_id, _step_name):
         return None
@@ -159,6 +165,43 @@ class AlwaysFailPodman(FakePodman):
         self.commands.append((command, network))
         exit_code = 1 if self._failing and self._failing in command else 0
         return {"exit_code": exit_code, "stdout": "", "stderr": "", "timed_out": False}
+
+
+def test_gofmt_failure_is_read_only_and_fails_job(tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    go_file = tmp_path / "bad.go"
+    go_file.write_text("package main\nfunc main(){ }\n", encoding="utf-8")
+    before = go_file.read_bytes()
+
+    class GofmtFailPodman(FakePodman):
+        def run_command(self, image, job_id, source_dir, caches, command, timeout, network=False, **kwargs):
+            self.commands.append((command, network))
+            if "gofmt -l" in command:
+                return {
+                    "exit_code": 1,
+                    "stdout": "UNFORMATTED FILES:\n./bad.go\n",
+                    "stderr": "",
+                    "timed_out": False,
+                }
+            return {"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}
+
+    podman = GofmtFailPodman()
+    executor = make_executor(podman)
+    result = executor._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
+
+    assert result["passed"] is False
+    gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
+    assert gofmt_step["status"] == "failed"
+    assert go_file.read_bytes() == before
+    commands = [command for command, _ in podman.commands]
+    assert not any("gofmt -w" in command for command in commands)
+    assert not any("git commit" in command or "git push" in command for command in commands)
+    assert any("./bad.go" in message for message in executor.log_manager.messages)
+
+
+def test_executor_has_no_gofmt_writeback_entrypoints():
+    assert not hasattr(JobExecutor, "_gofmt_autofix")
+    assert not hasattr(JobExecutor, "_git_push_autofix")
 
 
 
