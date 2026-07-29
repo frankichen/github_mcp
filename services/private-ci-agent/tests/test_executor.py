@@ -167,40 +167,37 @@ class AlwaysFailPodman(FakePodman):
         return {"exit_code": exit_code, "stdout": "", "stderr": "", "timed_out": False}
 
 
-def test_gofmt_failure_is_read_only_and_fails_job(tmp_path):
+def test_gofmt_autofix_formats_workspace_without_git_writeback(tmp_path):
     (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
     go_file = tmp_path / "bad.go"
     go_file.write_text("package main\nfunc main(){ }\n", encoding="utf-8")
-    before = go_file.read_bytes()
 
-    class GofmtFailPodman(FakePodman):
+    class GofmtAutofixPodman(FakePodman):
         def run_command(self, image, job_id, source_dir, caches, command, timeout, network=False, **kwargs):
             self.commands.append((command, network))
-            if "gofmt -l" in command:
+            if "gofmt -w" in command:
                 return {
-                    "exit_code": 1,
-                    "stdout": "UNFORMATTED FILES:\n./bad.go\n",
+                    "exit_code": 0,
+                    "stdout": "GOFMT AUTOFIX FILES:\n./bad.go\nAll Go files properly formatted\n",
                     "stderr": "",
                     "timed_out": False,
                 }
             return {"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}
 
-    podman = GofmtFailPodman()
+    podman = GofmtAutofixPodman()
     executor = make_executor(podman)
     result = executor._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
 
-    assert result["passed"] is False
+    assert result["passed"] is True
     gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
-    assert gofmt_step["status"] == "failed"
-    assert go_file.read_bytes() == before
+    assert gofmt_step["status"] == "passed"
     commands = [command for command, _ in podman.commands]
-    assert not any("gofmt -w" in command for command in commands)
+    assert any("gofmt -w" in command for command in commands)
     assert not any("git commit" in command or "git push" in command for command in commands)
-    assert any("./bad.go" in message for message in executor.log_manager.messages)
+    assert any("GOFMT AUTOFIX FILES" in message for message in executor.log_manager.messages)
 
 
-def test_executor_has_no_gofmt_writeback_entrypoints():
-    assert not hasattr(JobExecutor, "_gofmt_autofix")
+def test_executor_has_no_git_gofmt_writeback_entrypoints():
     assert not hasattr(JobExecutor, "_git_push_autofix")
 
 

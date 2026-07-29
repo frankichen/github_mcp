@@ -75,10 +75,10 @@ class TestMCPTools:
         import json
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
-        assert capabilities["name"] == "MyGithub10"
+        assert capabilities["name"] == "MyGithut11"
         assert capabilities["version"] == "10.1.1"
         assert len(capabilities["build_sha"]) == 40
-        assert capabilities["supports_gofmt_autofix"] is False
+        assert capabilities["supports_gofmt_autofix"] is True
 
     @pytest.mark.asyncio
     async def test_mcp_tools_are_registered(self):
