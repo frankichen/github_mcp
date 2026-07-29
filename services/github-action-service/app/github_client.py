@@ -1,7 +1,7 @@
-from github import Github, GithubIntegration
 from github.GithubException import GithubException
 from github.InputGitTreeElement import InputGitTreeElement
 from app.config import settings
+from app.github_auth import credential_provider
 from app.exceptions import (
     GitHubApiError,
     RateLimitError,
@@ -11,14 +11,9 @@ from app.exceptions import (
 
 class GitHubClient:
     def __init__(self):
-        token = settings.GITHUB_TOKEN.get_secret_value()
-        self._token = token
-        self._configured = bool(token and token != "REPLACE_WITH_FINE_GRAINED_GITHUB_TOKEN")
+        self._configured = credential_provider.configured
         if self._configured:
-            if settings.GITHUB_API_URL != "https://api.github.com":
-                self._pygithub = Github(token, base_url=settings.GITHUB_API_URL)
-            else:
-                self._pygithub = Github(token)
+            self._pygithub = credential_provider.github()
 
     @property
     def configured(self) -> bool:

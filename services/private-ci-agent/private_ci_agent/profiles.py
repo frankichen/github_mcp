@@ -28,6 +28,8 @@ LOCK_FILES = {
 SAFE_NODE_SCRIPTS = ("lint", "typecheck", "test:run", "test:ci", "test", "build")
 UNSAFE_SCRIPT_WORDS = ("dev", "serve", "start", "preview", "watch")
 
+_PYTHON_PACKAGE_DIRS = ("app", "private_ci_agent", "private_deploy_agent", "src")
+
 GO_COMMANDS = {
     "setup": [
         {
@@ -41,7 +43,7 @@ GO_COMMANDS = {
     ],
     "check": [
         {"name": "ai-integrity", "command": "make ai-integrity-check 2>&1"},
-        {"name": "gofmt", "command": 'UNFORMATTED=$(gofmt -l . 2>&1); if [ -n "$UNFORMATTED" ]; then echo "UNFORMATTED FILES:"; echo "$UNFORMATTED"; exit 1; fi; echo "All Go files properly formatted"'},
+        {"name": "gofmt", "command": "UNFORMATTED=$(gofmt -l . 2>&1); if [ -n \"$UNFORMATTED\" ]; then echo \"UNFORMATTED FILES:\"; echo \"$UNFORMATTED\"; exit 1; fi; echo \"All Go files properly formatted\""},
         {"name": "govet", "command": "go vet ./... 2>&1"},
         {"name": "gotest", "command": "go test -p 6 -count=1 ./... 2>&1"},
         {"name": "gobuild", "command": "go build ./... 2>&1"},
@@ -52,9 +54,7 @@ GO_COMMANDS = {
 
 FAST_CHECK_COMMANDS = {
     "setup": [],
-    "check": [
-        {"name": "ai-integrity", "command": "make ai-integrity-check 2>&1"},
-    ],
+    "check": [{"name": "ai-integrity", "command": "make ai-integrity-check 2>&1"}],
     "image": "docker.io/library/golang:1.26.4",
     "cache_dirs": {},
 }
@@ -114,9 +114,7 @@ def go_commands_for_workspace(source_dir: str, workspace_path: str = ".") -> dic
     except ValueError as exc:
         return {"error": "configuration_error", "message": str(exc)}
     source_image = f"docker.io/library/golang:{selected_version}"
-    image_prefix = os.environ.get(
-        "PRIVATE_CI_GO_IMAGE_PREFIX", "docker.io/library/golang:"
-    )
+    image_prefix = os.environ.get("PRIVATE_CI_GO_IMAGE_PREFIX", "docker.io/library/golang:")
     if not image_prefix.endswith(":"):
         image_prefix = f"{image_prefix}:"
     image = go_image_for_version(f"{image_prefix}{selected_version}")
@@ -132,19 +130,13 @@ def go_commands_for_workspace(source_dir: str, workspace_path: str = ".") -> dic
         "toolchain": toolchain_version,
     }
 
+
 PYTHON_COMMANDS = {
-    "setup": [
-        "pip install --no-input ruff pytest 2>&1",
-        '[ -f requirements.txt ] && pip install --no-input -r requirements.txt 2>&1 || true',
-        '[ -f pyproject.toml ] && pip install --no-input -e ".[dev,test]" 2>&1 || true',
-    ],
-    "check": [
-        {"name": "ruff", "command": "python -m ruff check . 2>&1"},
-        {"name": "compileall", "command": "python -m compileall -q . 2>&1"},
-        {"name": "pytest", "command": "python -m pytest -q -p no:warnings 2>&1"},
-    ],
+    "setup": [],
+    "check": [],
+    "skipped": [],
     "image": "docker.io/library/python:3.12-slim",
-    "cache_dirs": {"pip": "/root/.cache/pip"},
+    "cache_dirs": {"pip": "/srv/private-ci/cache/pip"},
 }
 
 PROFILE_COMMANDS = {
@@ -156,12 +148,80 @@ PROFILE_COMMANDS = {
 }
 
 
+def python_commands_for_workspace(source_dir: str, workspace_dir: str | None = None) -> dict:
+    """Generate strict Python setup/check commands from real workspace files."""
+    root = Path(source_dir)
+    if workspace_dir not in (None, "", "."):
+        root = root / workspace_dir
+    if not root.is_dir():
+        return {"error": "configuration_error", "message": "Python workspace directory does not exist"}
+
+    try:
+        files = {path.name for path in root.iterdir() if path.is_file()}
+        dirs = {path.name for path in root.iterdir() if path.is_dir()}
+        workspace_identity = str(root.resolve(strict=True))
+    except OSError as exc:
+        return {"error": "configuration_error", "message": f"cannot inspect Python workspace: {exc}"}
+
+    has_requirements = "requirements.txt" in files
+    has_requirements_dev = "requirements-dev.txt" in files
+    has_pyproject = "pyproject.toml" in files
+    has_setup = "setup.py" in files or "setup.cfg" in files
+    has_pipfile = "Pipfile" in files
+
+    if not (has_requirements or has_requirements_dev or has_pyproject or has_setup or has_pipfile):
+        return {"error": "configuration_error", "message": "Python workspace missing a supported manifest"}
+    if has_pipfile and not (has_requirements or has_requirements_dev or has_pyproject or has_setup):
+        return {"error": "configuration_error", "message": "Pipfile-only workspaces are not supported by the controlled Python profile"}
+
+    package_dir = next((candidate for candidate in _PYTHON_PACKAGE_DIRS if candidate in dirs), None)
+    if package_dir is None:
+        return {"error": "configuration_error", "message": "Python workspace has no approved package directory"}
+
+    workspace_key = __import__("hashlib").sha256(workspace_identity.encode("utf-8")).hexdigest()[:16]
+    venv_root = f"/ci-venv/{workspace_key}"
+    python = f"{venv_root}/bin/python"
+    pip_cache = f"{venv_root}/pip-cache"
+
+    install_commands = [
+        f"python -m venv {venv_root}",
+        f"PIP_CACHE_DIR={pip_cache} {python} -m pip install --no-input --quiet ruff pytest",
+    ]
+    if has_requirements_dev:
+        install_commands.append(f"PIP_CACHE_DIR={pip_cache} {python} -m pip install --no-input --quiet -r requirements-dev.txt")
+    elif has_requirements:
+        install_commands.append(f"PIP_CACHE_DIR={pip_cache} {python} -m pip install --no-input --quiet -r requirements.txt")
+    if has_pyproject or has_setup:
+        install_commands.append(f"PIP_CACHE_DIR={pip_cache} {python} -m pip install --no-input --quiet -e .")
+
+    has_tests = "tests" in dirs
+    targets = [package_dir] + (["tests"] if has_tests else [])
+    target_text = " ".join(targets)
+    checks = [
+        {"name": "ruff", "command": f"{python} -m ruff check {target_text} 2>&1"},
+        {"name": "compileall", "command": f"{python} -m compileall -q {target_text} 2>&1"},
+    ]
+    skipped = []
+    if has_tests:
+        checks.append({"name": "pytest", "command": f"{python} -m pytest -q -p no:warnings 2>&1"})
+    else:
+        skipped.append({"name": "pytest", "status": "skipped", "reason": "no_tests_directory"})
+
+    return {
+        "setup": [{"name": "bootstrap", "command": " && ".join(install_commands) + " 2>&1"}],
+        "check": checks,
+        "skipped": skipped,
+        "image": PYTHON_COMMANDS["image"],
+        "cache_dirs": dict(PYTHON_COMMANDS["cache_dirs"]),
+        "workspace_key": workspace_key,
+    }
+
+
 def _relative_depth(path: str) -> int:
     return 0 if path in ("", ".") else len(Path(path).parts)
 
 
 def _walk_manifest_dirs(source_dir: str):
-    """只遍历受控深度，并在遍历前剪枝生成物和示例目录。"""
     root = Path(source_dir)
     for current, dirs, files in os.walk(root, topdown=True):
         rel = os.path.relpath(current, root).replace(os.sep, "/")
@@ -214,7 +274,6 @@ def _node_workspace(source_dir: str, rel: str, files: set[str], explicit: dict |
 
 
 def discover_workspaces(source_dir: str, repository_config: dict | None = None) -> dict:
-    """发现 Go/Node/Python Manifest，返回可审计的工作区计划。"""
     configured = (repository_config or {}).get("workspaces") or []
     found: dict[tuple[str, str], dict] = {}
 
@@ -223,7 +282,6 @@ def discover_workspaces(source_dir: str, repository_config: dict | None = None) 
         if key not in found:
             found[key] = workspace
 
-    # 显式工作区优先；auto 入口仍会用受控扫描补齐其它 Manifest。
     for item in configured:
         rel = (item.get("path") or ".").strip("/") or "."
         directory = Path(source_dir) / ("" if rel == "." else rel)
@@ -233,24 +291,21 @@ def discover_workspaces(source_dir: str, repository_config: dict | None = None) 
         kind = item.get("type", "auto")
         if kind in ("auto", "go") and "go.mod" in files:
             add_workspace({"path": rel, "stack": "go"})
-        if kind in ("auto", "node") and "package.json" in files and not (
-            kind == "auto" and rel == "." and "go.mod" in files and not any(lock in files for lock in LOCK_FILES)
-        ):
+        if kind in ("auto", "node") and "package.json" in files and not (kind == "auto" and rel == "." and "go.mod" in files and not any(lock in files for lock in LOCK_FILES)):
             node = _node_workspace(source_dir, rel, files, item)
             if item.get("package_manager"):
                 node["package_manager"] = item["package_manager"]
             add_workspace(node)
-        if kind in ("auto", "python") and any(name in files for name in ("pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile")):
+        if kind in ("auto", "python") and any(name in files for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg", "Pipfile")):
             add_workspace({"path": rel, "stack": "python"})
 
     for directory, rel, files in _walk_manifest_dirs(source_dir):
         if "go.mod" in files:
             add_workspace({"path": rel or ".", "stack": "go"})
         if "package.json" in files:
-            # 根目录既是 Go 模块又是无锁的 npm 元数据时，不创建一个会触发 npm install 的伪工作区。
             if not (rel in ("", ".") and "go.mod" in files and not any(lock in files for lock in LOCK_FILES)):
                 add_workspace(_node_workspace(source_dir, rel, files))
-        if any(name in files for name in ("pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile")):
+        if any(name in files for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg", "Pipfile")):
             add_workspace({"path": rel or ".", "stack": "python"})
 
     workspaces = sorted(found.values(), key=lambda value: (value["path"], value["stack"]))
@@ -298,7 +353,6 @@ def select_node_scripts(workspace: dict, required_default: list[str] | None = No
         if name not in required:
             choose(name, False)
 
-    # Generic node-check: choose only scripts that really exist.
     if not required and not optional:
         if "lint" in scripts:
             choose("lint", False)
@@ -348,6 +402,8 @@ def get_commands_for_profile(profile: str, source_dir: str = "") -> dict:
         return node_commands_for_workspace(node or {"path": ".", "stack": "node"})
     if profile == "go-check" and source_dir:
         return go_commands_for_workspace(source_dir)
+    if profile == "python-check" and source_dir:
+        return python_commands_for_workspace(source_dir)
     return PROFILE_COMMANDS[profile]
 
 

@@ -548,8 +548,32 @@ def _upload_lock(upload_id: str):
     return handle
 
 
+def cleanup_expired_uploads(now: float | None = None) -> int:
+    """Remove expired upload data and orphan lock files without following links."""
+    if not _UPLOAD_ROOT.is_dir():
+        return 0
+    now = now or time.time()
+    removed = 0
+    for meta_path in _UPLOAD_ROOT.glob("*.json"):
+        upload_id = meta_path.stem
+        if not re.fullmatch(r"[0-9a-f-]{36}", upload_id):
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if float(meta.get("expires_at", 0)) > now:
+                continue
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        data_path, checked_meta_path = _upload_paths(upload_id)
+        data_path.unlink(missing_ok=True)
+        checked_meta_path.unlink(missing_ok=True)
+        removed += 1
+    return removed
+
+
 def begin_upload() -> dict[str, Any]:
     _UPLOAD_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cleanup_expired_uploads()
     upload_id = str(uuid.uuid4())
     data_path, meta_path = _upload_paths(upload_id)
     fd = os.open(data_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)

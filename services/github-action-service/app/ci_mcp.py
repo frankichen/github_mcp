@@ -71,8 +71,8 @@ NOT for GitHub Actions self-hosted runners (use list_ci_workers for that).""",
     async def list_private_ci_workers(online_only: bool = False) -> str:
         try:
             from app.ci_database import reconcile_stale_workers
-            reconcile_stale_workers()
-            workers = db_get_workers()
+            await asyncio.to_thread(reconcile_stale_workers)
+            workers = await asyncio.to_thread(db_get_workers)
             if online_only:
                 workers = [w for w in workers if w.get("online")]
             return json.dumps({"ok": True, "workers": workers}, ensure_ascii=False)
@@ -117,7 +117,8 @@ This is for the private CI system. NOT for GitHub Actions runs (use list_ci_jobs
         offset: int = 0,
     ) -> str:
         try:
-            jobs = db_list_jobs(
+            jobs = await asyncio.to_thread(
+                db_list_jobs,
                 repository=repository if repository else None,
                 branch=branch if branch else None,
                 commit_sha=commit_sha if commit_sha else None,
@@ -181,12 +182,15 @@ This is for the private WSL CI system. NOT for GitHub Actions dispatch (use star
             changed = {"changed_files": [], "total_count": 0, "truncated": False}
             if profile in ("repo-auto-check", "repo-fast-check"):
                 from app.github_utils import get_github_changed_files_result
-                changed = get_github_changed_files_result(repository, base_sha, commit_sha)
+                changed = await asyncio.to_thread(
+                    get_github_changed_files_result, repository, base_sha, commit_sha
+                )
                 if not changed.get("ok"):
                     return _error_response(changed["error_code"], changed.get("message", "changed files compare failed"), details=changed.get("details", {}))
 
             effective_queue_priority = effective_priority(branch, profile, ALLOWED_PRIORITIES[priority])
-            result = create_or_get_job(
+            result = await asyncio.to_thread(
+                create_or_get_job,
                 repository=repository, branch=branch, commit_sha=commit_sha,
                 profile=profile, priority=effective_queue_priority,
                 timeout_seconds=timeout_seconds, force_rerun=force_rerun,
@@ -210,10 +214,10 @@ This is for the private CI system. NOT for GitHub Actions runs (use get_ci_job f
     )
     async def get_private_ci_job(job_id: str) -> str:
         try:
-            job = get_job(job_id)
+            job = await asyncio.to_thread(get_job, job_id)
             if not job:
                 return _error_response("PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found")
-            steps = get_steps(job_id)
+            steps = await asyncio.to_thread(get_steps, job_id)
             current_step = None
             for s in steps:
                 if s.get("status") == "running":
@@ -255,10 +259,10 @@ This is for the private CI system. NOT for GitHub Actions logs (use get_ci_logs 
         job_id: str, offset: int = 0, limit: int = 200,
     ) -> str:
         try:
-            job = get_job(job_id)
+            job = await asyncio.to_thread(get_job, job_id)
             if not job:
                 return _error_response("PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found")
-            result = get_log_chunks(job_id, offset, limit)
+            result = await asyncio.to_thread(get_log_chunks, job_id, offset, limit)
             result["repository"] = job.get("repository")
             result["branch"] = job.get("branch")
             result["commit_sha"] = job.get("commit_sha")
@@ -274,11 +278,11 @@ This is for the private CI system. NOT for GitHub Actions logs (use get_ci_logs 
     )
     async def get_private_ci_log_tail(job_id: str, lines: int = 100) -> str:
         try:
-            job = get_job(job_id)
+            job = await asyncio.to_thread(get_job, job_id)
             if not job:
                 return _error_response("PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found")
             lines = min(max(lines, 1), 1000)
-            result = get_log_tail(job_id, lines)
+            result = await asyncio.to_thread(get_log_tail, job_id, lines)
             return json.dumps({
                 "ok": True, "job_id": job_id, "repository": job.get("repository"),
                 "branch": job.get("branch"), "commit_sha": job.get("commit_sha"),
@@ -301,15 +305,15 @@ This is for the private CI system. NOT for GitHub Actions (use cancel_ci_job for
     )
     async def cancel_private_ci_job(job_id: str) -> str:
         try:
-            job = get_job(job_id)
+            job = await asyncio.to_thread(get_job, job_id)
             if not job:
                 return _error_response("PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found")
             status = job.get("status", "")
             if status == "queued":
-                ok = cancel_queued_job(job_id)
+                ok = await asyncio.to_thread(cancel_queued_job, job_id)
                 return json.dumps({"ok": True, "status": "cancelled", "job_id": job_id} if ok else _error_response("INTERNAL_ERROR", "cancel failed"))
             if status in ("leased", "downloading", "preparing", "running"):
-                request_cancel_job(job_id)
+                await asyncio.to_thread(request_cancel_job, job_id)
                 return json.dumps({"ok": True, "status": "cancel_requested", "job_id": job_id, "message": "Cancel signal sent to worker"})
             if status in ("passed", "failed", "cancelled", "timed_out", "superseded", "worker_lost"):
                 return _error_response("PRIVATE_CI_JOB_ALREADY_FINISHED", f"Cannot cancel job in status '{status}'")

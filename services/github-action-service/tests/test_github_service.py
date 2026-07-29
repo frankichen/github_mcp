@@ -85,6 +85,18 @@ class TestAuth:
     def test_privacy_no_auth(self, client):
         response = client.get("/privacy")
         assert response.status_code == 200
+        assert "stores bounded operational metadata" in response.json()["message"]
+
+    def test_readiness_reports_initialized_dependencies(self, client):
+        response = client.get("/ready")
+        assert response.status_code == 200
+        assert response.json()["status"] == "ready"
+
+    def test_metrics_requires_auth_and_exposes_bounded_routes(self, client):
+        assert client.get("/metrics").status_code == 401
+        response = client.get("/metrics", headers=auth_headers())
+        assert response.status_code == 200
+        assert "mygithub_http_requests_total" in response.text
 
 
 class TestRepositoryAccess:

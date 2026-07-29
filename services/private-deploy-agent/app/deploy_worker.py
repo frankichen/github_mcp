@@ -12,7 +12,7 @@ import logging
 import secrets
 import fcntl
 
-from app.deployment_service import init_deployment_db, _get_deploy_db
+from app.deployment_store import get_deploy_db, init_deployment_db
 
 CONTRACTS = {
     "frankichen/sxt": {
@@ -104,7 +104,7 @@ def write_status(agent_status: str, current_step: str = "idle", current_release_
 
 def process_once() -> bool:
     global _status_repository
-    init_deployment_db(); db = _get_deploy_db()
+    init_deployment_db(); db = get_deploy_db()
     rows = db.execute(
         "SELECT deployment_id FROM deployments "
         "WHERE status='queued' AND repository IN (?, ?) "

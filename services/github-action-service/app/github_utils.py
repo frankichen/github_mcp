@@ -18,13 +18,16 @@ from functools import lru_cache
 
 import requests
 
-from github import Github
+from github import Auth, Github
 from github.GithubException import GithubException, RateLimitExceededException
 from github.Repository import Repository
 from github.PullRequest import PullRequest
 
 from app.config import settings
+from app.github_auth import credential_provider
+from app.github_policy import ensure_repository_allowed
 from app.exceptions import GitHubApiError, RateLimitError
+from app.github_pagination import bounded_page, normalize_page
 
 logger = logging.getLogger(__name__)
 
@@ -91,10 +94,7 @@ def _github_auth_capabilities(credential_type: str, oauth_scopes: list[str], che
     }
 
 def _get_gh() -> Github:
-    token = settings.GITHUB_TOKEN.get_secret_value()
-    if not token or token == "REPLACE_WITH_FINE_GRAINED_GITHUB_TOKEN":
-        raise GitHubApiError(401, "GitHub token not configured")
-    return Github(token)
+    return credential_provider.github()
 
 
 def _github_response_headers(response) -> dict:
@@ -128,7 +128,7 @@ def _github_endpoint_error_code(kind: str, status: int, headers) -> str:
 
 def _github_get_json(path: str) -> tuple[int, object, dict]:
     """Make a read-only GitHub request with the current supported headers."""
-    token = settings.GITHUB_TOKEN.get_secret_value()
+    token = credential_provider.token()
     try:
         response = requests.get(
             f"{settings.GITHUB_API_URL.rstrip('/')}{path}",
@@ -150,7 +150,7 @@ def _github_get_json(path: str) -> tuple[int, object, dict]:
 
 def github_graphql_request(query: str, variables: dict, operation_name: str) -> dict:
     """Execute a redacted GitHub GraphQL request and preserve request diagnostics."""
-    token = settings.GITHUB_TOKEN.get_secret_value()
+    token = credential_provider.token()
     try:
         response = requests.post(
             f"{settings.GITHUB_API_URL.rstrip('/')}/graphql",
@@ -251,16 +251,19 @@ def list_github_branches(repository: str, protected_only: bool = False, limit: i
     gh = _get_gh()
     try:
         repo = gh.get_repo(repository)
-        branches = list(repo.get_branches())
-        total = len(branches)
+        limit, page = normalize_page(limit, page)
+        branches_page = repo.get_branches()
 
         if protected_only:
-            branches = [b for b in branches if b.protected]
+            branches = [b for b in branches_page if b.protected]
             total = len(branches)
-
-        start = (page - 1) * limit
-        end = start + limit
-        page_branches = branches[start:end]
+            start = (page - 1) * limit
+            end = start + limit
+            page_branches = branches[start:end]
+        else:
+            page_branches, total, limit, page = bounded_page(branches_page, limit, page)
+            start = (page - 1) * limit
+            end = start + limit
 
         return {
             "ok": True,
@@ -444,11 +447,11 @@ def list_github_pull_requests(
         if base_branch:
             kwargs["base"] = base_branch
 
-        all_prs = list(repo.get_pulls(**kwargs))
-        total = len(all_prs)
+        limit, page = normalize_page(limit, page)
+        all_prs = repo.get_pulls(**kwargs)
+        page_prs, total, limit, page = bounded_page(all_prs, limit, page)
         start = (page - 1) * limit
         end = start + limit
-        page_prs = all_prs[start:end]
 
         return {
             "ok": True,
@@ -873,7 +876,7 @@ def get_github_pull_request_merge_readiness(repository: str, pull_number: int, e
 def _local_conflict_analysis(repository: str, base_sha: str, head_sha: str) -> dict:
     """Use an ephemeral bare repository for exact-SHA, read-only conflict analysis."""
     owner, name = _parse_repo(repository)
-    token = settings.GITHUB_TOKEN.get_secret_value()
+    token = credential_provider.token()
     remote = f"https://github.com/{owner}/{name}.git"
     env = os.environ.copy()
     # Keep the credential out of argv and never log the environment. Git's
@@ -1084,6 +1087,14 @@ def merge_github_pull_request(repository: str, pull_number: int, merge_method: s
         if status == 409: return _error_response("GITHUB_MERGE_REJECTED", "GitHub rejected the merge because the head or mergeability changed", retryable=True, details=details)
         if status and status >= 500: return _error_response("GITHUB_API_FAILED", "GitHub merge API failed", retryable=True, details=details)
         return _error_response("GITHUB_API_FAILED", "GitHub merge API failed", retryable=True, details=details)
+    except Exception as e:
+        logger.exception("Unexpected GitHub merge adapter failure")
+        return _error_response(
+            "GITHUB_API_FAILED",
+            "GitHub merge adapter failed",
+            retryable=False,
+            details={"error_type": type(e).__name__},
+        )
 
 
 def list_github_pull_request_reviews(repository: str, pull_number: int, limit: int = 100, page: int = 1) -> dict:
@@ -1265,11 +1276,11 @@ def list_github_pull_request_files(
         except GithubException:
             return {"ok": False, "error": {"code": "PULL_REQUEST_NOT_FOUND", "message": f"PR #{pull_number} not found", "retryable": False}}
 
-        files = list(pr.get_files())
-        total = len(files)
+        limit, page = normalize_page(limit, page)
+        files = pr.get_files()
+        page_files, total, limit, page = bounded_page(files, limit, page)
         start = (page - 1) * limit
         end = start + limit
-        page_files = files[start:end]
 
         MAX_PATCH_LEN = 3000
         MAX_TOTAL_PATCH = 50000
@@ -1406,7 +1417,7 @@ def get_github_pull_request_checks(repository: str, pull_number: int) -> dict:
         oauth_scopes = _parse_oauth_scopes(checks_headers)
         if not oauth_scopes:
             oauth_scopes = _parse_oauth_scopes(statuses_headers)
-        credential_type = _classify_github_credential_type(settings.GITHUB_TOKEN.get_secret_value())
+        credential_type = _classify_github_credential_type(credential_provider.token())
         capabilities = _github_auth_capabilities(credential_type, oauth_scopes, checks_status, statuses_status)
         diagnostic_code = None
         if checks_status == 403:

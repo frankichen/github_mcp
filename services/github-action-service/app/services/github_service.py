@@ -6,6 +6,7 @@ from github.GithubException import GithubException, UnknownObjectException
 
 from app.config import settings
 from app.github_client import GitHubClient
+from app.github_policy import ensure_repository_allowed
 from app.exceptions import (
     RepositoryNotAllowedError,
     DefaultBranchWriteDeniedError,
@@ -32,12 +33,7 @@ class GitHubService:
         self.client = client
 
     def _check_repository_allowed(self, repository: str):
-        allowed = settings.ALLOWED_REPOSITORIES.strip()
-        if allowed == "*":
-            return
-        allowed_list = [r.strip() for r in allowed.split(",") if r.strip()]
-        if repository not in allowed_list:
-            raise RepositoryNotAllowedError(repository)
+        ensure_repository_allowed(repository)
 
     def _check_default_branch_write(self, repository: str, branch: str):
         if settings.ALLOW_DEFAULT_BRANCH_WRITE:
@@ -164,7 +160,7 @@ class GitHubService:
             if f.operation not in ("upsert", "delete"):
                 raise ValidationError(f"Invalid operation '{f.operation}'. Supported: upsert, delete")
             if f.operation == "upsert":
-                if not f.content:
+                if f.content is None:
                     raise ValidationError(f"Content is required for upsert operation on '{f.path}'")
                 if len(f.content) > settings.MAX_FILE_CHARACTERS:
                     raise ContentTooLargeError(
@@ -197,10 +193,10 @@ class GitHubService:
         for f in request.files:
             old_shas[f.path] = self.client.get_file_sha(repository, f.path, branch)
             if f.operation == "delete":
+                actual_sha = old_shas[f.path]
+                if actual_sha is None:
+                    raise NotFoundError(f"File '{f.path}' not found for deletion")
                 if f.expected_sha:
-                    actual_sha = old_shas[f.path]
-                    if actual_sha is None:
-                        raise NotFoundError(f"File '{f.path}' not found for deletion")
                     if actual_sha != f.expected_sha:
                         raise ShaConflictError(path=f.path, expected=f.expected_sha, actual=actual_sha)
                 tree_elements.append({
@@ -212,7 +208,7 @@ class GitHubService:
             else:
                 if f.expected_sha:
                     actual_sha = old_shas[f.path]
-                    if actual_sha is not None and actual_sha != f.expected_sha:
+                    if actual_sha != f.expected_sha:
                         raise ShaConflictError(path=f.path, expected=f.expected_sha, actual=actual_sha)
                 blob = self.client.create_blob(repository, f.content)
                 tree_elements.append({

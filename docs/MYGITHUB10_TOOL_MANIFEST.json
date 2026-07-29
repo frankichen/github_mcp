@@ -1,10 +1,10 @@
 {
   "service_name": "MyGithub10",
-  "source_commit": "fc883af71568c6f7b2cd41c009bfa35c3c3afec5",
+  "source_commit": "2f2fb65958bbeaa54c56f165818baf6a62180aac",
   "controller_image": "not-read-from-runtime",
   "pygithub_version": "2.5.0",
-  "mcp_sdk_version": "mcp>=1.7.0 (requirements baseline)",
-  "tool_count": 84,
+  "mcp_sdk_version": "1.28.1",
+  "tool_count": 117,
   "tools": [
     {
       "name": "get_github_file",
@@ -2693,6 +2693,1144 @@
           "repository"
         ],
         "title": "get_repository_operation_policyArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_issues",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List bounded GitHub issues and pull requests with state and label filters.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "state": {
+            "default": "open",
+            "title": "State",
+            "type": "string"
+          },
+          "labels": {
+            "default": "",
+            "title": "Labels",
+            "type": "string"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          },
+          "per_page": {
+            "default": 30,
+            "title": "Per Page",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "list_github_issuesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_issue",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Get one GitHub issue or pull request issue record.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "issue_number": {
+            "title": "Issue Number",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "issue_number"
+        ],
+        "title": "get_github_issueArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "create_github_issue",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Create a GitHub issue. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "body": {
+            "default": "",
+            "title": "Body",
+            "type": "string"
+          },
+          "labels_json": {
+            "default": "[]",
+            "title": "Labels Json",
+            "type": "string"
+          },
+          "assignees_json": {
+            "default": "[]",
+            "title": "Assignees Json",
+            "type": "string"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "title"
+        ],
+        "title": "create_github_issueArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "update_github_issue",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Update title, body, state, labels, assignees, or milestone on an issue. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "issue_number": {
+            "title": "Issue Number",
+            "type": "integer"
+          },
+          "changes_json": {
+            "title": "Changes Json",
+            "type": "string"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "issue_number",
+          "changes_json"
+        ],
+        "title": "update_github_issueArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "create_github_issue_comment",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Add a comment to an issue or pull request. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "issue_number": {
+            "title": "Issue Number",
+            "type": "integer"
+          },
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "issue_number",
+          "body"
+        ],
+        "title": "create_github_issue_commentArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "create_github_pull_request_review",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Create a PR review, including optional inline comments. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "body": {
+            "default": "",
+            "title": "Body",
+            "type": "string"
+          },
+          "event": {
+            "default": "COMMENT",
+            "title": "Event",
+            "type": "string"
+          },
+          "commit_id": {
+            "default": "",
+            "title": "Commit Id",
+            "type": "string"
+          },
+          "comments_json": {
+            "default": "[]",
+            "title": "Comments Json",
+            "type": "string"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "create_github_pull_request_reviewArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "reply_github_review_comment",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Reply to an inline pull-request review comment. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "comment_id": {
+            "title": "Comment Id",
+            "type": "integer"
+          },
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number",
+          "comment_id",
+          "body"
+        ],
+        "title": "reply_github_review_commentArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_review_threads",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List inline PR review threads with resolution and outdated state.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "first": {
+            "default": 50,
+            "title": "First",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "list_github_review_threadsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "set_github_review_thread_resolved",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Resolve or unresolve an inline PR review thread by GraphQL node ID. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "thread_id": {
+            "title": "Thread Id",
+            "type": "string"
+          },
+          "resolved": {
+            "default": true,
+            "title": "Resolved",
+            "type": "boolean"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "thread_id"
+        ],
+        "title": "set_github_review_thread_resolvedArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_actions_artifacts",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List workflow artifacts with bounded pagination.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          },
+          "per_page": {
+            "default": 30,
+            "title": "Per Page",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "list_github_actions_artifactsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_actions_artifact",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Get metadata for one workflow artifact.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "artifact_id": {
+            "title": "Artifact Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "artifact_id"
+        ],
+        "title": "get_github_actions_artifactArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_actions_artifact_download",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Get the short-lived redirect URL for an artifact zip without embedding binary data.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "artifact_id": {
+            "title": "Artifact Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "artifact_id"
+        ],
+        "title": "get_github_actions_artifact_downloadArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_actions_run_jobs",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List jobs and steps for a workflow run.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "integer"
+          },
+          "filter_name": {
+            "default": "latest",
+            "title": "Filter Name",
+            "type": "string"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          },
+          "per_page": {
+            "default": 30,
+            "title": "Per Page",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "run_id"
+        ],
+        "title": "list_github_actions_run_jobsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "rerun_github_actions",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Rerun a workflow run, its failed jobs, or one job. target is run, failed, or job. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          },
+          "identifier": {
+            "title": "Identifier",
+            "type": "integer"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "target",
+          "identifier"
+        ],
+        "title": "rerun_github_actionsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_actions_job_logs",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Get the short-lived redirect URL for one Actions job log.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "job_id": {
+            "title": "Job Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "job_id"
+        ],
+        "title": "get_github_actions_job_logsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_releases",
+      "read_only": true,
+      "consequential": false,
+      "category": "release",
+      "description": "List repository releases with bounded pagination.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          },
+          "per_page": {
+            "default": 30,
+            "title": "Per Page",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "list_github_releasesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "create_github_release",
+      "read_only": false,
+      "consequential": true,
+      "category": "release",
+      "description": "Create a draft, prerelease, or published GitHub release. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "tag_name": {
+            "title": "Tag Name",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
+          },
+          "body": {
+            "default": "",
+            "title": "Body",
+            "type": "string"
+          },
+          "target_commitish": {
+            "default": "",
+            "title": "Target Commitish",
+            "type": "string"
+          },
+          "draft": {
+            "default": false,
+            "title": "Draft",
+            "type": "boolean"
+          },
+          "prerelease": {
+            "default": false,
+            "title": "Prerelease",
+            "type": "boolean"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "tag_name"
+        ],
+        "title": "create_github_releaseArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "update_github_release",
+      "read_only": false,
+      "consequential": true,
+      "category": "release",
+      "description": "Update a GitHub release using a bounded changes object. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "release_id": {
+            "title": "Release Id",
+            "type": "integer"
+          },
+          "changes_json": {
+            "title": "Changes Json",
+            "type": "string"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "release_id",
+          "changes_json"
+        ],
+        "title": "update_github_releaseArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "delete_github_release",
+      "read_only": false,
+      "consequential": true,
+      "category": "release",
+      "description": "Delete a GitHub release record. Requires confirm=true; this does not delete its Git tag.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "release_id": {
+            "title": "Release Id",
+            "type": "integer"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "release_id"
+        ],
+        "title": "delete_github_releaseArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_tags",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List repository Git tags with bounded pagination.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          },
+          "per_page": {
+            "default": 30,
+            "title": "Per Page",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "list_github_tagsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "create_github_tag",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Create a lightweight or annotated Git tag. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "tag": {
+            "title": "Tag",
+            "type": "string"
+          },
+          "target_sha": {
+            "title": "Target Sha",
+            "type": "string"
+          },
+          "message": {
+            "default": "",
+            "title": "Message",
+            "type": "string"
+          },
+          "tagger_json": {
+            "default": "{}",
+            "title": "Tagger Json",
+            "type": "string"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "tag",
+          "target_sha"
+        ],
+        "title": "create_github_tagArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "create_github_deployment",
+      "read_only": false,
+      "consequential": true,
+      "category": "deployment",
+      "description": "Create a GitHub deployment for a ref and environment. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "ref": {
+            "title": "Ref",
+            "type": "string"
+          },
+          "environment": {
+            "title": "Environment",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "transient": {
+            "default": false,
+            "title": "Transient",
+            "type": "boolean"
+          },
+          "production": {
+            "default": false,
+            "title": "Production",
+            "type": "boolean"
+          },
+          "required_contexts_json": {
+            "default": "[]",
+            "title": "Required Contexts Json",
+            "type": "string"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "ref",
+          "environment"
+        ],
+        "title": "create_github_deploymentArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "create_github_deployment_status",
+      "read_only": false,
+      "consequential": true,
+      "category": "deployment",
+      "description": "Create a status for a GitHub deployment. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "deployment_id": {
+            "title": "Deployment Id",
+            "type": "integer"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "environment_url": {
+            "default": "",
+            "title": "Environment Url",
+            "type": "string"
+          },
+          "log_url": {
+            "default": "",
+            "title": "Log Url",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "deployment_id",
+          "state"
+        ],
+        "title": "create_github_deployment_statusArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_environments",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List repository environments and protection metadata.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          },
+          "per_page": {
+            "default": 30,
+            "title": "Per Page",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "list_github_environmentsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_repository_governance",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Read repository settings, rulesets, and optional branch protection in one bounded response.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "default": "",
+            "title": "Branch",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "get_github_repository_governanceArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_webhooks",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List repository webhooks without revealing configured secrets.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          },
+          "per_page": {
+            "default": 30,
+            "title": "Per Page",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "list_github_webhooksArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "create_github_webhook",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Create a repository webhook; its secret is sent to GitHub and never returned by this service. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "events_json": {
+            "default": "[\"push\"]",
+            "title": "Events Json",
+            "type": "string"
+          },
+          "content_type": {
+            "default": "json",
+            "title": "Content Type",
+            "type": "string"
+          },
+          "secret": {
+            "default": "",
+            "title": "Secret",
+            "type": "string"
+          },
+          "active": {
+            "default": true,
+            "title": "Active",
+            "type": "boolean"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "url"
+        ],
+        "title": "create_github_webhookArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "delete_github_webhook",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Delete a repository webhook. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "hook_id": {
+            "title": "Hook Id",
+            "type": "integer"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "hook_id"
+        ],
+        "title": "delete_github_webhookArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_repository_events",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List recent public repository events with bounded pagination.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          },
+          "per_page": {
+            "default": 30,
+            "title": "Per Page",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository"
+        ],
+        "title": "list_github_repository_eventsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_github_notifications",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "List authenticated-user notifications globally or for one allowed repository.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "default": "",
+            "title": "Repository",
+            "type": "string"
+          },
+          "all_items": {
+            "default": false,
+            "title": "All Items",
+            "type": "boolean"
+          },
+          "participating": {
+            "default": false,
+            "title": "Participating",
+            "type": "boolean"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          },
+          "per_page": {
+            "default": 30,
+            "title": "Per Page",
+            "type": "integer"
+          }
+        },
+        "title": "list_github_notificationsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "mark_github_notification_read",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Mark one notification thread read. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "thread_id": {
+            "title": "Thread Id",
+            "type": "string"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "thread_id"
+        ],
+        "title": "mark_github_notification_readArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_github_auth_status",
+      "read_only": true,
+      "consequential": false,
+      "category": "github",
+      "description": "Return redacted GitHub PAT/App authentication mode, cache, and expiry status.",
+      "input_schema": {
+        "properties": {},
+        "title": "get_github_auth_statusArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "refresh_github_app_installation_token",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Force refresh the configured GitHub App installation token without returning credential material. Requires confirm=true.",
+      "input_schema": {
+        "properties": {
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "title": "refresh_github_app_installation_tokenArguments",
         "type": "object"
       }
     },

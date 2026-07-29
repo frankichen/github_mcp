@@ -3,6 +3,7 @@
 Only accessible via Tailscale internal network.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -13,6 +14,8 @@ from typing import Optional
 from fastapi import APIRouter, Request, HTTPException, Query, Depends
 
 from app.ci_worker_auth import verify_ci_worker
+from app.github_auth import credential_provider
+from app.version import SERVICE_VERSION
 from app.ci_database import (
     register_worker,
     update_worker_heartbeat,
@@ -45,7 +48,7 @@ async def ci_health():
     return {
         "status": "ok",
         "service": "ci-controller",
-        "version": "1.0.0",
+        "version": SERVICE_VERSION,
     }
 
 
@@ -132,7 +135,6 @@ async def job_get_source(job_id: str, request: Request):
     """Download source archive from GitHub and stream to worker."""
     from fastapi.responses import StreamingResponse
     from app.ci_source_proxy import download_github_archive
-    from app.config import settings
     import os
     import tempfile
 
@@ -145,16 +147,28 @@ async def job_get_source(job_id: str, request: Request):
     if job["worker_id"] != worker_id:
         raise HTTPException(status_code=403, detail={"error": "forbidden", "message": "Job not leased to you"})
 
-    gh_token = settings.GITHUB_TOKEN.get_secret_value()
-    if not gh_token:
+    try:
+        gh_token = credential_provider.token()
+    except Exception:
         raise HTTPException(status_code=500, detail={"error": "config_error", "message": "GITHUB_TOKEN not configured"})
 
     try:
-        tmp_file = tempfile.mktemp(suffix=".tar.gz")
-        result = download_github_archive(
-            job["repository"], job["commit_sha"], gh_token, tmp_file
+        temporary = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
+        tmp_file = temporary.name
+        temporary.close()
+        result = await asyncio.to_thread(
+            download_github_archive,
+            job["repository"],
+            job["commit_sha"],
+            gh_token,
+            tmp_file,
         )
     except Exception as e:
+        if "tmp_file" in locals():
+            try:
+                os.unlink(tmp_file)
+            except OSError:
+                pass
         raise HTTPException(status_code=502, detail={"error": "download_failed", "message": str(e)[:500]})
 
     # Store source info
