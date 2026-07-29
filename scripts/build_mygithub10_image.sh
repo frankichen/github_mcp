@@ -30,8 +30,20 @@ if [[ "$remote_sha" != "$target_sha" ]]; then
 fi
 
 service_version="$(
-  PYTHONPATH=services/github-action-service python3 -c \
-    'from app.version import SERVICE_VERSION; print(SERVICE_VERSION)'
+  python3 -c '
+import ast
+from pathlib import Path
+tree = ast.parse(Path("services/github-action-service/app/version.py").read_text(encoding="utf-8"))
+for node in tree.body:
+    if isinstance(node, ast.Assign) and any(
+        isinstance(target, ast.Name) and target.id == "SERVICE_VERSION"
+        for target in node.targets
+    ):
+        print(ast.literal_eval(node.value))
+        break
+else:
+    raise SystemExit("SERVICE_VERSION not found")
+'
 )"
 build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 image_tag="github-action-service:${target_sha}"
