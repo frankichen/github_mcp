@@ -13,6 +13,8 @@ import urllib.error
 import subprocess
 import fcntl
 import shutil
+import re
+import yaml
 
 from private_ci_agent.security import safe_extract_tar
 
@@ -22,7 +24,23 @@ DOWNLOAD_CONNECT_TIMEOUT = 20
 DOWNLOAD_TOTAL_TIMEOUT = 300
 DOWNLOAD_MAX_RETRIES = 2
 DOWNLOAD_RETRY_BACKOFF = [5, 15]
-AUTHORITATIVE_REPOSITORY_URL = "https://github.com/frankichen/sxt.git"
+REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+REPOSITORY_CONFIG_PATH = "/etc/private-ci/repositories.yml"
+
+
+def _authoritative_repository_url(repository: str) -> str | None:
+    """Return the GitHub mirror URL only for an enabled worker allowlist entry."""
+    if not REPOSITORY_RE.fullmatch(repository):
+        return None
+    try:
+        with open(REPOSITORY_CONFIG_PATH, encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+        entry = (config.get("repositories") or {}).get(repository) or {}
+        if not entry.get("enabled", False):
+            return None
+    except (OSError, TypeError, yaml.YAMLError):
+        return None
+    return f"https://github.com/{repository}.git"
 
 
 def _error_code(error: Exception) -> str:
@@ -40,9 +58,10 @@ def _error_code(error: Exception) -> str:
 
 def prepare_source_from_mirror(repository: str, commit_sha: str, dest_dir: str, mirror_root: str) -> dict:
     """Refresh an independent bare mirror and create an exact detached worktree."""
-    if repository != "frankichen/sxt":
+    authoritative_url = _authoritative_repository_url(repository)
+    if not authoritative_url:
         return {"ok": False, "error_code": "SOURCE_REPOSITORY_NOT_ALLOWED"}
-    mirror = os.path.join(mirror_root, "frankichen-sxt.git")
+    mirror = os.path.join(mirror_root, repository.replace("/", "-") + ".git")
     os.makedirs(mirror_root, mode=0o700, exist_ok=True)
     lock_path = mirror + ".lock"
     try:
@@ -52,11 +71,11 @@ def prepare_source_from_mirror(repository: str, commit_sha: str, dest_dir: str, 
             except BlockingIOError:
                 return {"ok": False, "error_code": "SOURCE_MIRROR_LOCK_TIMEOUT"}
             if not os.path.isdir(os.path.join(mirror, "objects")):
-                result = subprocess.run(["git", "clone", "--mirror", AUTHORITATIVE_REPOSITORY_URL, mirror], capture_output=True, text=True, timeout=180)
+                result = subprocess.run(["git", "clone", "--mirror", authoritative_url, mirror], capture_output=True, text=True, timeout=180)
                 if result.returncode:
                     return {"ok": False, "error_code": "SOURCE_MIRROR_FETCH_FAILED", "message": result.stderr[-500:]}
             origin = subprocess.run(["git", "-C", mirror, "remote", "get-url", "origin"], capture_output=True, text=True, timeout=20)
-            if origin.returncode or origin.stdout.strip() != AUTHORITATIVE_REPOSITORY_URL:
+            if origin.returncode or origin.stdout.strip() != authoritative_url:
                 return {"ok": False, "error_code": "SOURCE_ORIGIN_MISMATCH"}
             fetched = subprocess.run(["git", "-C", mirror, "remote", "update", "--prune"], capture_output=True, text=True, timeout=180)
             if fetched.returncode:
@@ -70,6 +89,7 @@ def prepare_source_from_mirror(repository: str, commit_sha: str, dest_dir: str, 
             if os.path.exists(dest_dir):
                 shutil.rmtree(dest_dir)
             os.makedirs(os.path.dirname(dest_dir), mode=0o700, exist_ok=True)
+            subprocess.run(["git", "-C", mirror, "worktree", "prune"], capture_output=True, text=True, timeout=20)
             checked = subprocess.run(["git", "-C", mirror, "worktree", "add", "--detach", dest_dir, commit_sha], capture_output=True, text=True, timeout=120)
             if checked.returncode:
                 return {"ok": False, "error_code": "SOURCE_WORKTREE_CREATE_FAILED", "message": checked.stderr[-500:]}
@@ -87,7 +107,16 @@ def prepare_source_from_mirror(repository: str, commit_sha: str, dest_dir: str, 
 
 
 def remove_source_worktree(dest_dir: str, mirror_root: str):
-    mirror = os.path.join(mirror_root, "frankichen-sxt.git")
+    repository = ""
+    try:
+        git_common = subprocess.run(["git", "-C", dest_dir, "rev-parse", "--git-common-dir"], capture_output=True, text=True, timeout=20)
+        if git_common.returncode == 0:
+            common_dir = os.path.realpath(os.path.join(dest_dir, git_common.stdout.strip()))
+            if common_dir.endswith(".git"):
+                repository = os.path.basename(common_dir)[:-4]
+    except Exception:
+        repository = ""
+    mirror = os.path.join(mirror_root, (repository or "frankichen-sxt") + ".git")
     if not os.path.isdir(mirror):
         return
     subprocess.run(["git", "-C", mirror, "worktree", "remove", "--force", dest_dir], capture_output=True, text=True, timeout=30)

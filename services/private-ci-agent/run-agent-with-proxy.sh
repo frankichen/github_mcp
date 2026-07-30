@@ -12,6 +12,7 @@ PROXY_CONF="/etc/private-ci/proxy.conf"
 RUNTIME_PROXY_CONF="/srv/private-ci/run/proxy.runtime.conf"
 LOG_DIR="/srv/private-ci/logs"
 LOCKFILE="/srv/private-ci/run/private-ci-agent.lock"
+PODMAN_TMPDIR="/srv/private-ci/run/tmp"
 
 log() {
     local level="$1"; shift
@@ -48,7 +49,7 @@ resolve_proxy() {
 
     # Attempt to resolve Windows host from WSL gateway or resolver
     # WSL mirrored mode: use localhost
-    if grep -Eiq '^[[:space:]]*networkingMode[[:space:]]*=[[:space:]]*mirrored' /mnt/c/Users/*/.wslconfig 2>/dev/null; then
+    if [ "${PROXY_HOST_MODE:-auto}" = "local" ] || grep -Eiq '^[[:space:]]*networkingMode[[:space:]]*=[[:space:]]*mirrored' /mnt/c/Users/*/.wslconfig 2>/dev/null; then
         proxy_host="127.0.0.1"
         log "INFO" "Detected WSL mirrored network mode, using localhost"
     else
@@ -67,8 +68,8 @@ resolve_proxy() {
         fi
     fi
 
-    log "INFO" "Resolved proxy target: ${proxy_host}:${proxy_port}"
     proxy_port="${PROXY_PORT:-10808}"
+    log "INFO" "Resolved proxy target: ${proxy_host}:${proxy_port}"
     echo "${proxy_host}" "${proxy_port}" "${gateway}" "${resolver}"
     return 0
 }
@@ -184,12 +185,15 @@ fi
 
 # Ensure perms
 chmod 640 "${RUNTIME_PROXY_CONF}"
+mkdir -p "${PODMAN_TMPDIR}"
+chmod 700 "${PODMAN_TMPDIR}"
 
 # Source the final proxy config for current shell
 set -a
 # shellcheck source=/dev/null
 source "${RUNTIME_PROXY_CONF}"
 set +a
+export TMPDIR="${PODMAN_TMPDIR}"
 
 log "INFO" "Launching agent: ${VENV_PYTHON} -m private_ci_agent.main"
 

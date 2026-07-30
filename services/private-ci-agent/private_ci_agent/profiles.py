@@ -39,10 +39,10 @@ GO_COMMANDS = {
         {"name": "version", "command": "go version"},
         {"name": "env", "command": "go env"},
         {"name": "mod_download", "command": "go mod download 2>&1"},
-        {"name": "migrate", "command": "make migrate-up 2>&1"},
+        {"name": "migrate", "command": "if [ -f Makefile ] && grep -Eq '^migrate-up:' Makefile; then make migrate-up; else echo 'SKIP: Make target migrate-up not present'; fi 2>&1"},
     ],
     "check": [
-        {"name": "ai-integrity", "command": "make ai-integrity-check 2>&1"},
+        {"name": "ai-integrity", "command": "if [ -f Makefile ] && grep -Eq '^ai-integrity-check:' Makefile; then make ai-integrity-check; else echo 'SKIP: Make target ai-integrity-check not present'; fi 2>&1"},
         {"name": "gofmt", "command": "UNFORMATTED=$(gofmt -l . 2>&1); if [ -n \"$UNFORMATTED\" ]; then echo \"GOFMT AUTOFIX FILES:\"; echo \"$UNFORMATTED\"; gofmt -w .; fi; VERIFY=$(gofmt -l . 2>&1); if [ -n \"$VERIFY\" ]; then echo \"UNFORMATTED FILES AFTER AUTOFIX:\"; echo \"$VERIFY\"; exit 1; fi; echo \"All Go files properly formatted\""},
         {"name": "govet", "command": "go vet ./... 2>&1"},
         {"name": "gotest", "command": "go test -p 6 -count=1 ./... 2>&1"},

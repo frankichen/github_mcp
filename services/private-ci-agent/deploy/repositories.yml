@@ -46,3 +46,20 @@ repositories:
       - repo-fast-check
       - python-check
     max_timeout_seconds: 900
+
+  frankichen/auto_gupiao:
+    enabled: true
+    private_ci: true
+    auto_detect: true
+    allowed_profiles:
+      - repo-auto-check
+      - go-check
+    max_timeout_seconds: 900
+    deployment:
+      enabled: true
+      environment: auto-gupiao-test
+      scope: reports
+      private_ci: false
+      script: scripts/deploy_auto_gupiao.sh
+      workspace_env: AUTO_GUPIAO_DEPLOY_WORKSPACE
+      status_file_env: AUTO_GUPIAO_DEPLOY_STATUS_FILE
