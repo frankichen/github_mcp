@@ -11,7 +11,6 @@ repositories:
     auto_detect: true
     allowed_profiles:
       - repo-auto-check
-      - go-check
       - repo-fast-check
       - go-check
       - node-check
@@ -23,6 +22,15 @@ repositories:
       allow_non_required_check_failures: true
       allow_quota_or_infrastructure_failures: true
       required_workflows: []
+    deployment:
+      enabled: true
+      self_deploy: false
+      environment: gongshi-test
+      scope: fullstack
+      private_ci: true
+      profile: repo-auto-check
+      script: scripts/deploy_gongshi_test.sh
+      status_file_env: DEPLOY_STATUS_FILE
     workspaces:
       - path: .
         type: auto
@@ -52,6 +60,7 @@ repositories:
       required_workflows: []
     deployment:
       enabled: true
+      self_deploy: true
       environment: auto-gupiao-test
       scope: reports
       private_ci: false

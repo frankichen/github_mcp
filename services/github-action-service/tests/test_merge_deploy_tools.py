@@ -59,6 +59,7 @@ def test_deployment_id_is_distinct_from_ci_job_id(monkeypatch, tmp_path):
 
 
 def test_auto_gupiao_deployment_contract_is_config_backed(monkeypatch, tmp_path):
+    ci_repository_config.reload_config()
     monkeypatch.setenv("CI_DB_PATH", str(tmp_path / "ci.db"))
     monkeypatch.setenv("DEPLOYMENT_DB_PATH", str(tmp_path / "deployments.db"))
     deployment_service._local.db = None
@@ -82,12 +83,17 @@ def test_auto_gupiao_deployment_contract_is_config_backed(monkeypatch, tmp_path)
     assert result["status"] == "queued"
 
 
-def test_auto_gupiao_policy_is_deployable_but_not_self_deploy():
+def test_auto_gupiao_policy_explicitly_allows_self_deploy():
+    ci_repository_config.reload_config()
     assert ci_repository_config.is_private_ci_enabled("frankichen/auto_gupiao") is True
     assert ci_repository_config.is_test_deploy_enabled("frankichen/auto_gupiao") is True
+    assert ci_repository_config.is_self_deploy_enabled("frankichen/auto_gupiao") is True
+    assert ci_repository_config.is_test_deploy_enabled("frankichen/sxt") is True
+    assert ci_repository_config.is_self_deploy_enabled("frankichen/sxt") is False
 
 
 def test_delegated_deployments_default_lists_all_deployable_repositories(monkeypatch, tmp_path):
+    ci_repository_config.reload_config()
     monkeypatch.setenv("DEPLOYMENT_DB_PATH", str(tmp_path / "deployments.db"))
     deployment_service._local.db = None
     deployment_service.init_deployment_db()

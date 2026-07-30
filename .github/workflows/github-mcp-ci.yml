@@ -1,0 +1,38 @@
+name: GitHub MCP CI
+
+on:
+  push:
+    branches:
+      - main
+      - "codex/**"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: services/github-action-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/github-action-service/requirements-dev.txt
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run tests
+        run: |
+          export CI_DB_PATH="$RUNNER_TEMP/ci.db"
+          export DEPLOYMENT_DB_PATH="$RUNNER_TEMP/deployments.db"
+          export DEPLOY_STATUS_FILE="$RUNNER_TEMP/gongshi-test-status.json"
+          export AUTO_GUPIAO_DEPLOY_STATUS_FILE="$RUNNER_TEMP/auto-gupiao-status.json"
+          export IDEMPOTENCY_DB_PATH="$RUNNER_TEMP/idempotency.db"
+          pytest -q

@@ -1044,7 +1044,11 @@ async def revoke_release_artifact(artifact_id: str) -> str:
 @mcp.tool(name="get_repository_operation_policy", description="Return the operation policy for a repository: what MyGithub10 operations are allowed (GitHub read/write, private CI, test deploy, self deploy).")
 async def get_repository_operation_policy(repository: str) -> str:
     """Return allowed operations for a repository based on authoritative policy sources."""
-    from app.ci_repository_config import is_private_ci_enabled, is_test_deploy_enabled
+    from app.ci_repository_config import (
+        is_private_ci_enabled,
+        is_self_deploy_enabled,
+        is_test_deploy_enabled,
+    )
 
     github_allowed = False
     private_ci_allowed = False
@@ -1065,8 +1069,8 @@ async def get_repository_operation_policy(repository: str) -> str:
     # Test deploy: same config-backed allowlist as plan_test_deployment / start_test_deployment.
     test_deploy_allowed = is_test_deploy_enabled(repository)
 
-    # Self deploy: no self-deploy code path exists
-    self_deploy_allowed = False
+    # Self deploy: only repositories with an explicit fixed self-deploy contract.
+    self_deploy_allowed = is_self_deploy_enabled(repository)
 
     return json.dumps({
         "ok": True,
