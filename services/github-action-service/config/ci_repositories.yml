@@ -11,6 +11,7 @@ repositories:
     auto_detect: true
     allowed_profiles:
       - repo-auto-check
+      - go-check
       - repo-fast-check
       - go-check
       - node-check

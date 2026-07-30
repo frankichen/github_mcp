@@ -28,11 +28,20 @@ _DEFAULT_CONFIG = {
             "enabled": True,
             "private_ci": True,
             "auto_detect": True,
-            "allowed_profiles": ["repo-auto-check"],
+            "allowed_profiles": ["repo-auto-check", "go-check"],
             "max_timeout_seconds": 900,
             "merge_policy": {
                 "private_ci_authoritative": True,
                 "required_private_ci_profile": "repo-auto-check",
+            },
+            "deployment": {
+                "enabled": True,
+                "environment": "auto-gupiao-test",
+                "scope": "reports",
+                "private_ci": False,
+                "script": "scripts/deploy_auto_gupiao.sh",
+                "workspace_env": "AUTO_GUPIAO_DEPLOY_WORKSPACE",
+                "status_file_env": "AUTO_GUPIAO_DEPLOY_STATUS_FILE",
             },
         },
     }
@@ -129,3 +138,10 @@ def get_deployment_config(repository: str) -> dict:
     """Return the fixed, repository-scoped deployment contract."""
     entry = get_repository_config(repository)
     return dict(entry.get("deployment") or {})
+
+
+def is_test_deploy_enabled(repository: str) -> bool:
+    """Return whether repository has an enabled fixed deployment contract."""
+    entry = get_repository_config(repository)
+    deployment = entry.get("deployment") or {}
+    return bool(entry.get("enabled", False) and deployment.get("enabled", False))

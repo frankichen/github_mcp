@@ -16,7 +16,7 @@ from pathlib import Path
 
 from app.ci_database import get_job
 from app.github_utils import SHA_RE, _get_gh, _error_response
-from app.ci_repository_config import get_deployment_config, is_private_ci_enabled
+from app.ci_repository_config import get_deployment_config, is_private_ci_enabled, get_allowed_repositories
 
 REPOSITORY = "frankichen/sxt"
 ENVIRONMENT = "gongshi-test"
@@ -38,7 +38,24 @@ def _deployment_spec(repository: str) -> dict:
         "private_ci": configured.get("private_ci", is_private_ci_enabled(repository)) is True,
         "profile": configured.get("profile", PROFILE),
         "script": configured.get("script", "scripts/deploy_gongshi_test.sh"),
+        "status_file_env": configured.get("status_file_env", "DEPLOY_STATUS_FILE"),
     }
+
+
+def _deployable_repositories() -> list[str]:
+    """Return repositories with fixed deployment contracts."""
+    return [repo for repo in get_allowed_repositories() if _deployment_spec(repo)]
+
+
+def _deployment_status_path(repository: str) -> str:
+    spec = _deployment_spec(repository)
+    status_env = spec.get("status_file_env") or ""
+    if status_env and os.environ.get(status_env):
+        return os.environ[status_env]
+    if repository == REPOSITORY:
+        return os.environ.get("DEPLOY_STATUS_FILE", "/data/gongshi-test-status.json")
+    environment = spec.get("environment") or repository.replace("/", "-")
+    return f"/data/{environment}-status.json"
 
 
 def _get_deploy_db():
@@ -201,7 +218,7 @@ def complete_test_deployment(deployment_id: str, exit_code: int, message: str = 
         init_deployment_db(); db = _get_deploy_db(); now = _now()
         db.execute("UPDATE deployments SET finished_at=?,updated_at=?,current_step=? WHERE deployment_id=?", (now, now, "completed", deployment_id)); db.commit()
         result["deployment"] = _row(db.execute("SELECT * FROM deployments WHERE deployment_id=?", (deployment_id,)).fetchone())
-        _persist_release_snapshot(release)
+        _persist_release_snapshot(release, row["repository"])
     return result
 
 
@@ -214,7 +231,7 @@ def fail_test_deployment(deployment_id: str, exit_code: int, error_code: str, er
     return result
 
 
-def _persist_release_snapshot(release: dict) -> None:
+def _persist_release_snapshot(release: dict, repository: str = REPOSITORY) -> None:
     """Persist only verified release metadata; never persist environment secrets."""
     release_id = str(release.get("release_id") or "")
     release_path = str(release.get("current_release_path") or "")
@@ -224,8 +241,9 @@ def _persist_release_snapshot(release: dict) -> None:
             or not release.get("health_verified")
             or not release.get("services_healthy")):
         return
-    path = os.environ.get("DEPLOY_STATUS_FILE", "/data/gongshi-test-status.json")
-    current = _status_snapshot() or {}
+    spec = _deployment_spec(repository)
+    path = _deployment_status_path(repository)
+    current = _status_snapshot(repository) or {}
     releases = current.get("releases") or []
     by_id = {
         item.get("release_id"): item for item in releases
@@ -248,8 +266,8 @@ def _persist_release_snapshot(release: dict) -> None:
         value["is_current"] = value.get("release_id") == item.get("release_id")
         value["is_previous"] = value.get("release_id") == previous and value.get("release_id") != item.get("release_id")
     current.update({
-        "environment": ENVIRONMENT,
-        "repository": REPOSITORY,
+        "environment": spec.get("environment", ENVIRONMENT),
+        "repository": repository,
         "current_release_id": item.get("release_id"),
         "previous_release_id": previous,
         "current_git_sha": item.get("git_sha"),
@@ -432,11 +450,25 @@ def get_test_deployment_log_tail(deployment_id: str, lines: int = 100) -> dict:
     return {"ok": True, "deployment_id": deployment_id, "lines": safe_lines, "content": content}
 
 
-def list_delegated_deployments(repository=REPOSITORY, environment=ENVIRONMENT):
+def list_delegated_deployments(repository="", environment=""):
     init_deployment_db()
+    clauses = ["status IN ('running','claimed')", "current_step='claimed'"]
+    params = []
+    if repository:
+        clauses.append("repository=?")
+        params.append(repository)
+    else:
+        allowed = _deployable_repositories()
+        if not allowed:
+            return []
+        clauses.append("repository IN (" + ",".join("?" for _ in allowed) + ")")
+        params.extend(allowed)
+    if environment:
+        clauses.append("environment=?")
+        params.append(environment)
     rows = _get_deploy_db().execute(
-        "SELECT * FROM deployments WHERE repository=? AND environment=? AND status IN ('running','claimed') AND current_step='claimed' ORDER BY created_at",
-        (repository, environment),
+        "SELECT * FROM deployments WHERE " + " AND ".join(clauses) + " ORDER BY created_at",
+        params,
     ).fetchall()
     return [_row(row) for row in rows]
 
@@ -460,11 +492,7 @@ def cancel_test_deployment(deployment_id):
 
 
 def _status_snapshot(repository=""):
-    spec = _deployment_spec(repository) if repository else {}
-    status_env = get_deployment_config(repository).get("status_file_env") if repository else ""
-    path = os.environ.get(status_env, "") if status_env else ""
-    if not path:
-        path = os.environ.get("DEPLOY_STATUS_FILE", "/data/gongshi-test-status.json")
+    path = _deployment_status_path(repository) if repository else os.environ.get("DEPLOY_STATUS_FILE", "/data/gongshi-test-status.json")
     try:
         with open(path, encoding="utf-8") as handle:
             value = json.load(handle)
@@ -519,10 +547,10 @@ def _release_snapshot(snapshot: dict) -> tuple[dict | None, list[dict]]:
 
 
 def get_test_environment_status(repository, environment):
-    reason = _validate_common(repository, environment, SCOPE, "0" * 40)
+    spec = _deployment_spec(repository)
+    reason = _validate_common(repository, environment, spec.get("scope", SCOPE), "0" * 40)
     if reason == "INVALID_COMMIT_SHA": reason = None
-    if repository != REPOSITORY: return _error_response("REPOSITORY_NOT_ALLOWED", "repository is not allowed")
-    if environment != ENVIRONMENT: return _error_response("ENVIRONMENT_NOT_ALLOWED", "environment is not allowed")
+    if reason: return _error_response(reason, "repository, environment or scope is not allowed")
     snapshot = _status_snapshot(repository) or {}
     current, releases = _release_snapshot(snapshot)
     status = dict(snapshot)
@@ -538,8 +566,9 @@ def get_test_environment_status(repository, environment):
 
 
 def list_test_releases(repository, environment, limit=20):
-    if repository != REPOSITORY: return _error_response("REPOSITORY_NOT_ALLOWED", "repository is not allowed")
-    if environment != ENVIRONMENT: return _error_response("ENVIRONMENT_NOT_ALLOWED", "environment is not allowed")
+    spec = _deployment_spec(repository)
+    if not spec: return _error_response("REPOSITORY_NOT_ALLOWED", "repository is not allowed")
+    if environment != spec.get("environment"): return _error_response("ENVIRONMENT_NOT_ALLOWED", "environment is not allowed")
     snapshot = _status_snapshot(repository) or {}
     _, releases = _release_snapshot(snapshot)
     return {"ok": True, "items": releases[:min(max(limit, 1), 100)]}
@@ -547,8 +576,9 @@ def list_test_releases(repository, environment, limit=20):
 
 def rollback_test_deployment(repository, environment, target_release_id, expected_current_release_id, confirm=False, requested_by="mcp"):
     if not confirm: return _error_response("CONFIRM_REQUIRED", "confirm must be true")
-    if repository != REPOSITORY: return _error_response("REPOSITORY_NOT_ALLOWED", "repository is not allowed")
-    if environment != ENVIRONMENT: return _error_response("ENVIRONMENT_NOT_ALLOWED", "environment is not allowed")
+    spec = _deployment_spec(repository)
+    if not spec: return _error_response("REPOSITORY_NOT_ALLOWED", "repository is not allowed")
+    if environment != spec.get("environment"): return _error_response("ENVIRONMENT_NOT_ALLOWED", "environment is not allowed")
     snapshot = _status_snapshot(repository) or {}
     current = snapshot.get("current_release_id")
     if not current: return _error_response("ENVIRONMENT_STATUS_UNAVAILABLE", "deploy worker status is unavailable")
