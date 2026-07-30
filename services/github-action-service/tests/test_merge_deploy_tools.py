@@ -82,9 +82,12 @@ def test_auto_gupiao_deployment_contract_is_config_backed(monkeypatch, tmp_path)
     assert result["status"] == "queued"
 
 
-def test_auto_gupiao_policy_is_deployable_but_not_self_deploy():
+def test_auto_gupiao_policy_explicitly_allows_self_deploy():
     assert ci_repository_config.is_private_ci_enabled("frankichen/auto_gupiao") is True
     assert ci_repository_config.is_test_deploy_enabled("frankichen/auto_gupiao") is True
+    assert ci_repository_config.is_self_deploy_enabled("frankichen/auto_gupiao") is True
+    assert ci_repository_config.is_test_deploy_enabled("frankichen/sxt") is True
+    assert ci_repository_config.is_self_deploy_enabled("frankichen/sxt") is False
 
 
 def test_delegated_deployments_default_lists_all_deployable_repositories(monkeypatch, tmp_path):

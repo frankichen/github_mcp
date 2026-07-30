@@ -23,6 +23,16 @@ _DEFAULT_CONFIG = {
             "enabled": True,
             "allowed_profiles": ["repo-auto-check", "repo-fast-check", "python-check"],
             "max_timeout_seconds": 900,
+            "deployment": {
+                "enabled": True,
+                "self_deploy": False,
+                "environment": "gongshi-test",
+                "scope": "fullstack",
+                "private_ci": True,
+                "profile": "repo-auto-check",
+                "script": "scripts/deploy_gongshi_test.sh",
+                "status_file_env": "DEPLOY_STATUS_FILE",
+            },
         },
         "frankichen/auto_gupiao": {
             "enabled": True,
@@ -36,6 +46,7 @@ _DEFAULT_CONFIG = {
             },
             "deployment": {
                 "enabled": True,
+                "self_deploy": True,
                 "environment": "auto-gupiao-test",
                 "scope": "reports",
                 "private_ci": False,
@@ -145,3 +156,14 @@ def is_test_deploy_enabled(repository: str) -> bool:
     entry = get_repository_config(repository)
     deployment = entry.get("deployment") or {}
     return bool(entry.get("enabled", False) and deployment.get("enabled", False))
+
+
+def is_self_deploy_enabled(repository: str) -> bool:
+    """Return whether a fixed deployment contract explicitly allows self deployment."""
+    entry = get_repository_config(repository)
+    deployment = entry.get("deployment") or {}
+    return bool(
+        entry.get("enabled", False)
+        and deployment.get("enabled", False)
+        and deployment.get("self_deploy", False)
+    )

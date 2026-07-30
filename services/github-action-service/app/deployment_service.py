@@ -332,7 +332,7 @@ def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id,
     infra_changed = any(path == spec.get("script") or path == "scripts/deploy_gongshi_test.sh" or path == "scripts/sync_test_env.sh" or path.startswith("deploy/") for path in files)
     if infra_changed and not allow_deploy_infrastructure_changes: reasons.append("DEPLOY_INFRASTRUCTURE_CHANGE_REQUIRES_EXPLICIT_ALLOW")
     migrations_changed = any(path.startswith("db/migrations/") for path in files)
-    snapshot = _status_snapshot() or {}
+    snapshot = _status_snapshot(repository) or {}
     current_release, _ = _release_snapshot(snapshot)
     current_release_id = (current_release or {}).get("release_id")
     return {"ok": True, "ready": not reasons, "reasons": reasons, "repository": repository, "environment": environment,
