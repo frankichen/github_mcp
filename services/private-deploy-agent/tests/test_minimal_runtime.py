@@ -1,6 +1,6 @@
 import sqlite3
 
-from app import deployment_store
+from app import deploy_worker, deployment_store
 
 
 def test_minimal_store_initializes_worker_columns(tmp_path, monkeypatch):
@@ -39,3 +39,17 @@ def test_minimal_store_migrates_legacy_schema(tmp_path, monkeypatch):
         "SELECT log_revision FROM deployments"
     ).fetchall() == []
 
+
+
+def test_claim_only_delegates_sxt_but_executes_auto_gupiao_locally(monkeypatch):
+    monkeypatch.setenv("DEPLOY_EXECUTION_MODE", "claim_only")
+
+    assert deploy_worker._should_delegate_to_wsl("frankichen/sxt") is True
+    assert deploy_worker._should_delegate_to_wsl("frankichen/auto_gupiao") is False
+
+
+def test_execute_mode_never_delegates(monkeypatch):
+    monkeypatch.setenv("DEPLOY_EXECUTION_MODE", "execute")
+
+    assert deploy_worker._should_delegate_to_wsl("frankichen/sxt") is False
+    assert deploy_worker._should_delegate_to_wsl("frankichen/auto_gupiao") is False
