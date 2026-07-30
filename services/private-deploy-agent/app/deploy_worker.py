@@ -48,6 +48,14 @@ def _status_path(contract):
     return os.environ.get(contract["status_file"], contract["status_default"])
 
 
+def _should_delegate_to_wsl(repository):
+    """Delegate only sxt claim-only jobs; auto_gupiao executes its fixed local contract."""
+    return (
+        os.environ.get("DEPLOY_EXECUTION_MODE") == "claim_only"
+        and repository == "frankichen/sxt"
+    )
+
+
 WORKSPACE = os.environ.get("DEPLOY_WORKSPACE", "/srv/private-ci/deploy-workspace/sxt")
 SCRIPT = "scripts/deploy_gongshi_test.sh"
 SECRET_RE = re.compile(r"(?i)(token|authorization|password|secret|database_url|cookie|private_key)=\S+")
@@ -142,7 +150,7 @@ def process_once() -> bool:
     # verified current release untouched until the complete callback proves a
     # successful symlink switch and health check.
     write_status("busy", "claimed", retained_release, retained_previous, f"claimed deployment {dep_id}")
-    if os.environ.get("DEPLOY_EXECUTION_MODE") == "claim_only":
+    if _should_delegate_to_wsl(row["repository"]):
         prior_log = row["log_text"] or ""
         log_text = (prior_log + ("\n" if prior_log else "") + f"agent claimed deployment {dep_id}; execution delegated to WSL")[-200000:]
         db.execute(
