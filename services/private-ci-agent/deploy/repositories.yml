@@ -4,6 +4,15 @@ repositories:
     auto_detect: true
     allowed_profiles:
       - repo-auto-check
+      - repo-fast-check
+      - python-check
+    max_timeout_seconds: 900
+
+  frankichen/lenshub-diag-mcp:
+    enabled: true
+    auto_detect: true
+    allowed_profiles:
+      - repo-auto-check
       - python-check
     max_timeout_seconds: 900
 
@@ -12,6 +21,7 @@ repositories:
     auto_detect: true
     allowed_profiles:
       - repo-auto-check
+      - repo-fast-check
       - go-check
       - node-check
     max_timeout_seconds: 900
@@ -27,3 +37,12 @@ repositories:
           - build
         optional_scripts:
           - lint
+
+  frankichen/github_mcp:
+    enabled: true
+    auto_detect: true
+    allowed_profiles:
+      - repo-auto-check
+      - repo-fast-check
+      - python-check
+    max_timeout_seconds: 900

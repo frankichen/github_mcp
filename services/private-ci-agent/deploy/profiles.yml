@@ -1,4 +1,9 @@
 profiles:
+  repo-fast-check:
+    description: "Conservative changed-file fast feedback; never merge eligible"
+    execution_mode: bounded_parallel
+    merge_eligible: false
+
   repo-auto-check:
     description: "Scan controlled Manifest workspaces and orchestrate approved checks"
     execution_mode: sequential
