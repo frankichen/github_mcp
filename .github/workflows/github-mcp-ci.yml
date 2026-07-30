@@ -16,6 +16,12 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      CI_DB_PATH: ${{ runner.temp }}/ci.db
+      DEPLOYMENT_DB_PATH: ${{ runner.temp }}/deployments.db
+      DEPLOY_STATUS_FILE: ${{ runner.temp }}/gongshi-test-status.json
+      AUTO_GUPIAO_DEPLOY_STATUS_FILE: ${{ runner.temp }}/auto-gupiao-status.json
+      IDEMPOTENCY_DB_PATH: ${{ runner.temp }}/idempotency.db
     defaults:
       run:
         working-directory: services/github-action-service
