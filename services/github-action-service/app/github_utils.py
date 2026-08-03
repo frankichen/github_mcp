@@ -290,7 +290,10 @@ def list_github_branches(repository: str, protected_only: bool = False, limit: i
 def get_github_branch(repository: str, branch: str, base_branch: str = "") -> dict:
     gh = _get_gh()
     try:
-        repo = gh.get_repo(repository)
+        # The branch endpoint supplies the commit and protection state.  A
+        # lazy repository avoids an otherwise redundant repository metadata
+        # request on this latency-sensitive read path.
+        repo = gh.get_repo(repository, lazy=True)
         try:
             b = repo.get_branch(branch)
         except GithubException as exc:
@@ -310,8 +313,9 @@ def get_github_branch(repository: str, branch: str, base_branch: str = "") -> di
 
         if base_branch:
             try:
-                base = repo.get_branch(base_branch)
-                comparison = repo.compare(base.commit.sha, b.commit.sha)
+                # GitHub Compare accepts a branch/ref as the base directly;
+                # fetching base_branch first added one full API round trip.
+                comparison = repo.compare(base_branch, b.commit.sha)
                 result["base_branch"] = base_branch
                 result["ahead_by"] = comparison.ahead_by
                 result["behind_by"] = comparison.behind_by

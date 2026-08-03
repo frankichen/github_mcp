@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -27,6 +28,32 @@ def test_extended_read_enforces_repository_allowlist(monkeypatch):
     with pytest.raises(Exception) as exc:
         service.list_issues("owner/denied")
     assert exc.value.error == "repository_not_allowed"
+
+
+def test_get_github_branch_avoids_redundant_base_branch_request(monkeypatch):
+    head_sha = "a" * 40
+    branch = SimpleNamespace(
+        name="feature",
+        protected=False,
+        commit=SimpleNamespace(sha=head_sha, html_url="https://github.com/owner/allowed/commit/" + head_sha),
+    )
+    comparison = SimpleNamespace(ahead_by=7, behind_by=2)
+    repo = MagicMock()
+    repo.get_branch.return_value = branch
+    repo.compare.return_value = comparison
+    gh = MagicMock()
+    gh.get_repo.return_value = repo
+    monkeypatch.setattr(github_utils, "_get_gh", lambda: gh)
+
+    result = github_utils.get_github_branch("owner/allowed", "feature", "main")
+
+    assert result["ok"] is True
+    assert result["commit_sha"] == head_sha
+    assert result["ahead_by"] == 7
+    assert result["behind_by"] == 2
+    gh.get_repo.assert_called_once_with("owner/allowed", lazy=True)
+    repo.get_branch.assert_called_once_with("feature")
+    repo.compare.assert_called_once_with("main", head_sha)
 
 
 @pytest.mark.asyncio

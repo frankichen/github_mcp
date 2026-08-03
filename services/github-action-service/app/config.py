@@ -3,7 +3,7 @@ import stat
 from pathlib import Path
 from typing import Optional
 
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     GITHUB_APP_PRIVATE_KEY_FILE: Optional[str] = None
     ACTION_API_KEY: SecretStr = SecretStr("")
     GITHUB_API_URL: str = "https://api.github.com"
+    # Bound GitHub API reads so a transient network failure cannot block an
+    # MCP request for the default PyGithub retry budget (up to ten retries).
+    GITHUB_API_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=60)
+    GITHUB_API_RETRY_TOTAL: int = Field(default=1, ge=0, le=3)
     ALLOWED_REPOSITORIES: str = ""
     ALLOW_DEFAULT_BRANCH_WRITE: bool = False
     MAX_FILE_CHARACTERS: int = 60000

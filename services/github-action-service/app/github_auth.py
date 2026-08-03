@@ -6,7 +6,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from github import Auth, Github, GithubIntegration
+from github import Auth, Github, GithubIntegration, GithubRetry
 
 from app.config import settings
 from app.exceptions import NotConfiguredError
@@ -69,9 +69,22 @@ class GitHubCredentialProvider:
 
     def github(self) -> Github:
         auth = Auth.Token(self.token())
+        retry = GithubRetry(
+            total=settings.GITHUB_API_RETRY_TOTAL,
+            connect=settings.GITHUB_API_RETRY_TOTAL,
+            read=settings.GITHUB_API_RETRY_TOTAL,
+            redirect=1,
+            status=settings.GITHUB_API_RETRY_TOTAL,
+            backoff_factor=0.2,
+        )
+        kwargs = {
+            "auth": auth,
+            "timeout": settings.GITHUB_API_TIMEOUT_SECONDS,
+            "retry": retry,
+        }
         if settings.GITHUB_API_URL != "https://api.github.com":
-            return Github(auth=auth, base_url=settings.GITHUB_API_URL)
-        return Github(auth=auth)
+            kwargs["base_url"] = settings.GITHUB_API_URL
+        return Github(**kwargs)
 
     def status(self) -> dict:
         mode = settings.GITHUB_AUTH_MODE
