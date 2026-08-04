@@ -28,6 +28,7 @@ from app.github_extended_mcp import register_github_extended_tools
 from app.github_policy import ensure_repository_allowed
 from app import github_utils
 from app import mygithub10
+from app import mygithub12
 from app import attestation_registry
 from app.version import runtime_build_sha
 from app.mygithub12_mcp import register_mygithub12_tools
@@ -225,9 +226,11 @@ async def commit_github_files(
     repository: str, branch: str, commit_message: str, files_json: str,
     base_branch: str = "main", create_branch_if_missing: bool = False,
     expected_head_sha: str = "", pull_request_json: str = "{}",
+    workspace_id: str = "", expected_workspace_revision: int = 0,
 ) -> str:
     from app.models import CommitRequest, FileOperation, PullRequestConfig
     try:
+        await _github_call(mygithub12.workspace_write_preflight, _service, repository, branch, expected_head_sha, workspace_id, expected_workspace_revision)
         logger.info("MCP commit_github_files: repo=%s branch=%s files_json_len=%d", repository, branch, len(files_json))
         files_data = json.loads(files_json)
         pr_data = json.loads(pull_request_json) if pull_request_json else {}
@@ -240,10 +243,14 @@ async def commit_github_files(
             files=file_ops, pull_request=pr_config,
         )
         result = await _github_call(_service.commit_files, request)
+        if workspace_id:
+            result["workspace"] = await _github_call(mygithub12.workspace_write_complete, workspace_id, expected_workspace_revision, result["new_head_sha"], result["tree_sha"])
         return json.dumps(result, ensure_ascii=False)
     except json.JSONDecodeError as e:
         return json.dumps({"error": "json_parse_error", "message": f"files_json is not valid JSON (pos {e.pos}: {e.msg})", "received_len": len(files_json), "preview": files_json[:200]})
     except Exception as e:
+        if isinstance(e, mygithub12.MyGithub12Error):
+            return _mygithub10_error(e)
         if hasattr(e, "error") and getattr(e, "error", "") == "head_sha_conflict":
             details = dict(getattr(e, "details", None) or {})
             details.update({"repository": repository, "branch": branch, "phase": "before_write", "error_code": "HEAD_CHANGED"})
@@ -814,14 +821,16 @@ async def get_github_weekly_report_data_tool(
 
 
 def _mygithub10_error(exc: Exception) -> str:
+    if isinstance(exc, mygithub12.MyGithub12Error):
+        return json.dumps({"ok": False, "error": {"code": exc.code, "message": exc.message, "details": exc.details, "trace_id": exc.trace_id}}, ensure_ascii=False)
     if isinstance(exc, mygithub10.MyGithub10Error):
         code = {"PATCH_HEAD_CHANGED": "HEAD_CHANGED", "FILE_BINARY_UNSUPPORTED": "BINARY_FILE_UNSUPPORTED", "PATCH_UNSAFE_PATH": "INVALID_REPOSITORY_PATH"}.get(exc.code, exc.code)
         return json.dumps({"ok": False, "error": {"code": code, "message": exc.message, "details": exc.details, "trace_id": exc.trace_id}}, ensure_ascii=False)
-    logger.exception("MyGithub10 tool failed")
-    return json.dumps({"ok": False, "error": {"code": "INTERNAL_ERROR", "message": "MyGithub10 operation failed", "details": {}, "trace_id": str(uuid.uuid4())}}, ensure_ascii=False)
+    logger.exception("MyGithut write tool failed")
+    return json.dumps({"ok": False, "error": {"code": "INTERNAL_ERROR", "message": "MyGithut operation failed", "details": {}, "trace_id": str(uuid.uuid4())}}, ensure_ascii=False)
 
 
-@mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithut11 capability and compatibility contract.")
+@mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithut12 capability and compatibility contract.")
 async def get_mygithub_capabilities() -> str:
     return json.dumps(mygithub10.capabilities(runtime_build_sha()), ensure_ascii=False)
 
@@ -863,15 +872,19 @@ async def read_github_file_resource(resource_uri: str, offset_bytes: int = 0, li
         return _mygithub10_error(exc)
 
 
-@mcp.tool(name="apply_github_patch", description="Apply a strict unified diff atomically with exact HEAD/blob checks and optional dry-run/idempotency.")
-async def apply_github_patch(repository: str, branch: str, expected_head_sha: str, expected_blob_shas_json: str, patch: str, commit_message: str, dry_run: bool = True, idempotency_key: str = "", create_pull_request: bool = False, pull_request_json: str = "{}") -> str:
+@mcp.tool(name="apply_github_patch", description="Apply a strict unified diff atomically with exact HEAD/blob checks, optional workspace CAS, dry-run and idempotency.")
+async def apply_github_patch(repository: str, branch: str, expected_head_sha: str, expected_blob_shas_json: str, patch: str, commit_message: str, dry_run: bool = True, idempotency_key: str = "", create_pull_request: bool = False, pull_request_json: str = "{}", workspace_id: str = "", expected_workspace_revision: int = 0) -> str:
     try:
-        return json.dumps(await _github_call(mygithub10.apply_patch, _service, repository, branch, expected_head_sha, expected_blob_shas_json, patch, commit_message, dry_run, idempotency_key), ensure_ascii=False)
+        await _github_call(mygithub12.workspace_write_preflight, _service, repository, branch, expected_head_sha, workspace_id, expected_workspace_revision)
+        result = await _github_call(mygithub10.apply_patch, _service, repository, branch, expected_head_sha, expected_blob_shas_json, patch, commit_message, dry_run, idempotency_key)
+        if workspace_id and not dry_run:
+            result["workspace"] = await _github_call(mygithub12.workspace_write_complete, workspace_id, expected_workspace_revision, result["new_head_sha"], result["tree_sha"])
+        return json.dumps(result, ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
 
 
-@mcp.tool(name="edit_github_file_ranges", description="Apply non-overlapping exact-text line range edits as one atomic commit. Each item uses expected_blob_sha and replacement_text; replace/delete must explicitly provide expected_old_text or compatibility field expected_old_text_sha256. start_line/end_line are 1-based inclusive. Dry-run and commit use identical computed UTF-8 bytes.")
+@mcp.tool(name="edit_github_file_ranges", description="Apply non-overlapping exact-text line range edits as one atomic commit. Each item uses expected_blob_sha and replacement_text; replace/delete must explicitly provide expected_old_text or compatibility field expected_old_text_sha256. start_line/end_line are 1-based inclusive. Supports optional workspace CAS. Dry-run and commit use identical computed UTF-8 bytes.")
 async def edit_github_file_ranges(
     repository: str,
     branch: str,
@@ -890,9 +903,15 @@ async def edit_github_file_ranges(
     commit_message: str,
     dry_run: bool = True,
     idempotency_key: str = "",
+    workspace_id: str = "",
+    expected_workspace_revision: int = 0,
 ) -> str:
     try:
-        return json.dumps(await _github_call(mygithub10.edit_ranges, _service, repository, branch, expected_head_sha, operations_json, commit_message, dry_run, idempotency_key), ensure_ascii=False)
+        await _github_call(mygithub12.workspace_write_preflight, _service, repository, branch, expected_head_sha, workspace_id, expected_workspace_revision)
+        result = await _github_call(mygithub10.edit_ranges, _service, repository, branch, expected_head_sha, operations_json, commit_message, dry_run, idempotency_key)
+        if workspace_id and not dry_run:
+            result["workspace"] = await _github_call(mygithub12.workspace_write_complete, workspace_id, expected_workspace_revision, result["new_head_sha"], result["tree_sha"])
+        return json.dumps(result, ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
 
@@ -934,10 +953,16 @@ async def finalize_github_file_upload(upload_id: str, expected_size_bytes: int, 
     except Exception as exc: return _mygithub10_error(exc)
 
 
-@mcp.tool(name="commit_github_uploaded_files", description="Commit one finalized upload to a branch with exact HEAD/blob checks.")
-async def commit_github_uploaded_files(repository: str, branch: str, expected_head_sha: str, path: str, expected_blob_sha: str, upload_id: str, commit_message: str, idempotency_key: str = "") -> str:
-    try: return json.dumps(await _github_call(mygithub10.commit_upload, _service, repository, branch, expected_head_sha, path, expected_blob_sha, upload_id, commit_message, idempotency_key), ensure_ascii=False)
-    except Exception as exc: return _mygithub10_error(exc)
+@mcp.tool(name="commit_github_uploaded_files", description="Commit one finalized upload to a branch with exact HEAD/blob checks and optional workspace CAS.")
+async def commit_github_uploaded_files(repository: str, branch: str, expected_head_sha: str, path: str, expected_blob_sha: str, upload_id: str, commit_message: str, idempotency_key: str = "", workspace_id: str = "", expected_workspace_revision: int = 0) -> str:
+    try:
+        await _github_call(mygithub12.workspace_write_preflight, _service, repository, branch, expected_head_sha, workspace_id, expected_workspace_revision)
+        result = await _github_call(mygithub10.commit_upload, _service, repository, branch, expected_head_sha, path, expected_blob_sha, upload_id, commit_message, idempotency_key)
+        if workspace_id:
+            result["workspace"] = await _github_call(mygithub12.workspace_write_complete, workspace_id, expected_workspace_revision, result["new_head_sha"], result["tree_sha"])
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        return _mygithub10_error(exc)
 
 
 @mcp.tool(name="abort_github_file_upload", description="Abort and remove only the selected temporary upload.")
