@@ -3,7 +3,45 @@ import pytest
 from app.mcp_server import mcp
 
 
-EXPECTED_TOOL_COUNT = 118
+EXPECTED_TOOL_COUNT = 154
+MYGITHUB12_TOOLS = {
+    "get_repository_index_status",
+    "request_repository_index_build",
+    "get_repository_index_job",
+    "wait_repository_index_job",
+    "cancel_repository_index_job",
+    "list_repository_indexes",
+    "create_development_workspace",
+    "get_development_workspace",
+    "list_development_workspaces",
+    "renew_development_workspace_lease",
+    "refresh_development_workspace",
+    "close_development_workspace",
+    "declare_development_scope",
+    "analyze_development_workspace_overlap",
+    "plan_development_workspace_sync",
+    "list_repository_tree",
+    "search_repository_files",
+    "get_github_files_batch",
+    "search_repository_text",
+    "search_repository_semantic",
+    "search_repository_symbols",
+    "get_symbol_definition",
+    "find_symbol_references",
+    "get_symbol_call_hierarchy",
+    "get_symbol_implementations",
+    "get_symbol_type_hierarchy",
+    "get_symbol_diagnostics",
+    "get_symbol_history",
+    "get_repository_dependency_graph",
+    "get_repository_agent_instructions",
+    "build_repository_context_pack",
+    "build_change_context_pack",
+    "analyze_repository_change_impact",
+    "analyze_repository_patch",
+    "get_affected_tests",
+    "detect_repository_contract_changes",
+}
 
 
 @pytest.mark.asyncio
@@ -15,4 +53,7 @@ async def test_registered_tool_manifest_is_stable_and_unique():
     assert len(actual_names) == len(set(actual_names))
     assert all(name and name.strip() == name for name in actual_names)
     tools = {tool.name: tool for tool in actual}
+    assert MYGITHUB12_TOOLS <= set(actual_names)
+    assert len(MYGITHUB12_TOOLS) == 36
     assert tools["build_github_patch"].annotations.readOnlyHint is True
+    assert tools["search_repository_text"].annotations.readOnlyHint is True
