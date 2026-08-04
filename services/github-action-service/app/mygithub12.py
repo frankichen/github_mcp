@@ -90,6 +90,10 @@ def init_db() -> None:
           error_code TEXT, error_message TEXT, created_at REAL, started_at REAL,
           finished_at REAL, idempotency_key TEXT);
         CREATE INDEX IF NOT EXISTS idx_jobs_target ON jobs(repository,commit_sha,status);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_active_index_job
+          ON jobs(repository,commit_sha,tree_sha,version)
+          WHERE status IN ('queued','running');
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_index_job_idempotency ON jobs(repository,idempotency_key) WHERE idempotency_key IS NOT NULL;
         CREATE TABLE IF NOT EXISTS workspaces(
           workspace_id TEXT PRIMARY KEY, repository TEXT, branch TEXT, base_branch TEXT,
           base_commit_sha TEXT, head_sha TEXT, tree_sha TEXT, status TEXT, revision INTEGER,
@@ -233,18 +237,47 @@ def request_index_build(service: Any, repository: str, commit_sha: str, strategy
         running=db.execute("SELECT * FROM jobs WHERE repository=? AND commit_sha=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1",(repository,commit_sha)).fetchone()
         if running: return {"ok":True,"deduplicated":True,**_public_job(dict(running))}
         job_id=str(uuid.uuid4()); now=_now()
-        db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(job_id,repository,identity["commit_sha"],identity["tree_sha"],INDEX_VERSION,strategy,base_commit_sha or None,"running","snapshot",1,0,0,0,0,0,None,None,now,now,None,idempotency_key or None))
+        try:
+            db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(job_id,repository,identity["commit_sha"],identity["tree_sha"],INDEX_VERSION,strategy,base_commit_sha or None,"queued","queued",1,0,0,0,0,0,None,None,now,None,None,idempotency_key or None))
+        except sqlite3.IntegrityError:
+            row=db.execute("SELECT * FROM jobs WHERE repository=? AND commit_sha=? AND tree_sha=? AND version=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1",(repository,identity["commit_sha"],identity["tree_sha"],INDEX_VERSION)).fetchone()
+            if row: return {"ok":True,"deduplicated":True,**_public_job(dict(row))}
+            raise
+    worker=threading.Thread(target=_run_index_build,args=(service,identity,job_id,strategy,base_commit_sha),name=f"mygithub12-index-{job_id[:8]}",daemon=True)
+    worker.start()
+    return {"ok":True,"deduplicated":False,**get_index_job(job_id)}
+
+
+def _job_cancelled(job_id: str) -> bool:
+    with _db() as db:
+        row=db.execute("SELECT cancel_requested FROM jobs WHERE job_id=?",(job_id,)).fetchone()
+    return bool(row and row["cancel_requested"])
+
+
+def _finish_cancelled_job(job_id: str) -> None:
+    with _LOCK,_db() as db:
+        db.execute("UPDATE jobs SET status='cancelled',step='cancelled',finished_at=?,revision=revision+1 WHERE job_id=?",(_now(),job_id))
+
+
+def _run_index_build(service: Any, identity: dict[str,str], job_id: str, strategy: str, base_commit_sha: str) -> None:
+    repository=identity["repository"]; commit_sha=identity["commit_sha"]
     try:
+        with _LOCK,_db() as db:
+            db.execute("UPDATE jobs SET status='running',step='snapshot',started_at=?,revision=revision+1 WHERE job_id=?",(_now(),job_id))
         repo=_service_repo(service,repository); commit=repo.get_commit(identity["commit_sha"]); tree=repo.get_git_tree(_tree_sha(commit),recursive=True)
         entries=[e for e in tree.tree if e.type=="blob" and not _excluded(str(e.path)) and int(getattr(e,"size",0) or 0)<=MAX_FILE_BYTES]
         if len(entries)>MAX_INDEX_FILES: raise MyGithub12Error("INDEX_QUOTA_EXCEEDED","repository file limit exceeded",{"limit":MAX_INDEX_FILES})
         with _LOCK,_db() as db:
-            db.execute("DELETE FROM files WHERE repository=? AND commit_sha=?",(repository,commit_sha)); db.execute("DELETE FROM symbols WHERE repository=? AND commit_sha=?",(repository,commit_sha)); db.execute("UPDATE jobs SET step='indexing',progress_total=?,revision=revision+1 WHERE job_id=?",(len(entries),job_id))
+            db.execute("UPDATE jobs SET step='indexing',progress_total=?,revision=revision+1 WHERE job_id=?",(len(entries),job_id))
         total=0; symbol_count=0; languages=set(); reused=0; reindexed=0
         base_files: dict[str,sqlite3.Row]={}
         if base_commit_sha and strategy in {"auto","incremental"}:
             with _db() as db: base_files={r["path"]:r for r in db.execute("SELECT * FROM files WHERE repository=? AND commit_sha=?",(repository,base_commit_sha))}
+        file_rows=[]; symbol_rows=[]
         for idx,e in enumerate(entries,1):
+            if _job_cancelled(job_id):
+                _finish_cancelled_job(job_id)
+                return
             size=int(getattr(e,"size",0) or 0)
             if total+size>MAX_INDEX_BYTES: raise MyGithub12Error("INDEX_QUOTA_EXCEEDED","repository byte limit exceeded",{"limit":MAX_INDEX_BYTES})
             base=base_files.get(str(e.path)); language=_lang(str(e.path))
@@ -253,24 +286,32 @@ def request_index_build(service: Any, repository: str, commit_sha: str, strategy
             else:
                 data=_decode_blob(repo,e.sha)
                 try: content=data.decode("utf-8")
-                except UnicodeDecodeError: continue
+                except UnicodeDecodeError:
+                    with _LOCK,_db() as db: db.execute("UPDATE jobs SET progress_current=?,revision=revision+1 WHERE job_id=?",(idx,job_id))
+                    continue
                 digest=hashlib.sha256(data).hexdigest(); line_count=len(content.splitlines()); reindexed+=1
-            total+=len(content.encode()); languages.add(language); syms=_symbols(repository,commit_sha,str(e.path),e.sha,language,content); symbol_count+=len(syms)
+            content_bytes=len(content.encode()); total+=content_bytes; languages.add(language); syms=_symbols(repository,commit_sha,str(e.path),e.sha,language,content); symbol_count+=len(syms)
+            file_rows.append((repository,commit_sha,str(e.path),e.sha,content_bytes,language,digest,line_count,content))
+            for s in syms:
+                symbol_rows.append((repository,commit_sha,s["symbol_id"],s["name"],s["qualified_name"],s["kind"],s["language"],s["path"],s["blob_sha"],s["start_line"],s["end_line"],s["signature"],s["parent_name"],s["bases_json"]))
             with _LOCK,_db() as db:
-                db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?,?,?)",(repository,commit_sha,str(e.path),e.sha,size,language,digest,line_count,content))
-                for s in syms: db.execute("INSERT OR REPLACE INTO symbols VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(repository,commit_sha,s["symbol_id"],s["name"],s["qualified_name"],s["kind"],s["language"],s["path"],s["blob_sha"],s["start_line"],s["end_line"],s["signature"],s["parent_name"],s["bases_json"]))
                 db.execute("UPDATE jobs SET progress_current=?,revision=revision+1 WHERE job_id=?",(idx,job_id))
-        manifest={**identity,"index_version":INDEX_VERSION,"file_count":len(entries),"symbol_count":symbol_count,"size_bytes":total,"languages":sorted(languages),"reused_file_count":reused,"reindexed_file_count":reindexed,"build_strategy":"incremental" if reused else "full","base_commit_sha":base_commit_sha or None}
+        if _job_cancelled(job_id):
+            _finish_cancelled_job(job_id)
+            return
+        manifest={**identity,"index_version":INDEX_VERSION,"file_count":len(file_rows),"symbol_count":symbol_count,"size_bytes":total,"languages":sorted(languages),"reused_file_count":reused,"reindexed_file_count":reindexed,"build_strategy":"incremental" if reused else "full","base_commit_sha":base_commit_sha or None}
         with _LOCK,_db() as db:
-            now=_now(); db.execute("INSERT OR REPLACE INTO indexes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(repository,commit_sha,identity["tree_sha"],INDEX_VERSION,"ready",manifest["build_strategy"],base_commit_sha or None,len(entries),symbol_count,total,now,now,json.dumps(manifest)))
+            now=_now()
+            db.execute("DELETE FROM files WHERE repository=? AND commit_sha=?",(repository,commit_sha))
+            db.execute("DELETE FROM symbols WHERE repository=? AND commit_sha=?",(repository,commit_sha))
+            db.executemany("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?)",file_rows)
+            db.executemany("INSERT INTO symbols VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",symbol_rows)
+            db.execute("INSERT OR REPLACE INTO indexes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(repository,commit_sha,identity["tree_sha"],INDEX_VERSION,"ready",manifest["build_strategy"],base_commit_sha or None,len(file_rows),symbol_count,total,now,now,json.dumps(manifest)))
             db.execute("UPDATE jobs SET status='completed',step='completed',progress_current=progress_total,reused_files=?,reindexed_files=?,finished_at=?,revision=revision+1 WHERE job_id=?",(reused,reindexed,now,job_id))
-        return {"ok":True,"deduplicated":False,**get_index_job(job_id)}
     except MyGithub12Error as exc:
         with _LOCK,_db() as db: db.execute("UPDATE jobs SET status='failed',step='failed',error_code=?,error_message=?,finished_at=?,revision=revision+1 WHERE job_id=?",(exc.code,exc.message,_now(),job_id))
-        raise
     except Exception as exc:
         with _LOCK,_db() as db: db.execute("UPDATE jobs SET status='failed',step='failed',error_code='INDEX_BUILD_FAILED',error_message=?,finished_at=?,revision=revision+1 WHERE job_id=?",(str(exc)[:1000],_now(),job_id))
-        raise MyGithub12Error("INDEX_BUILD_FAILED","index build failed",{"cause":type(exc).__name__}) from exc
 
 
 def _public_job(row: dict[str,Any]) -> dict[str,Any]:
