@@ -75,8 +75,12 @@ class TestMCPTools:
         import json
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
-        assert capabilities["name"] == "MyGithut11"
-        assert capabilities["version"] == "10.1.1"
+        assert capabilities["name"] == "MyGithut12"
+        assert capabilities["version"] == "12.0.0"
+        assert capabilities["tool_count"] == 154
+        assert capabilities["supports_repository_text_search"] is True
+        assert capabilities["supports_development_workspaces"] is True
+        assert capabilities["supports_workspace_revision_cas"] is True
         assert len(capabilities["build_sha"]) == 40
         assert capabilities["supports_gofmt_autofix"] is True
 
