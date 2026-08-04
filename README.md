@@ -35,6 +35,11 @@ private-deploy-agent（服务器端）
 
 - AI 重新部署：[`docs/AI重新部署指南.md`](docs/AI重新部署指南.md)
 - 迁移与部署说明：[`docs/迁移与部署说明.md`](docs/迁移与部署说明.md)
+- MyGithut12 规划总览：[`docs/MYGITHUB12规划总览.md`](docs/MYGITHUB12规划总览.md)
+- MyGithut12 需求文档：[`docs/MYGITHUB12需求文档.md`](docs/MYGITHUB12需求文档.md)
+- MyGithut12 开发设计：[`docs/MYGITHUB12开发设计.md`](docs/MYGITHUB12开发设计.md)
+- MyGithut12 开发清单：[`docs/MYGITHUB12开发清单.md`](docs/MYGITHUB12开发清单.md)
+- MyGithut12 验收清单：[`docs/MYGITHUB12验收清单.md`](docs/MYGITHUB12验收清单.md)
 - 安全说明：[`SECURITY.md`](SECURITY.md)
 - GitHub/MCP 服务：[`services/github-action-service`](services/github-action-service)
 - Private CI Agent：[`services/private-ci-agent`](services/private-ci-agent)
@@ -70,6 +75,10 @@ docker compose up -d --build
 
 必须配置 PAT（优先 `GITHUB_TOKEN_FILE`）或 GitHub App 三项配置、`ACTION_API_KEY`，并按最小权限设置 `ALLOWED_REPOSITORIES` 和 `ALLOW_DEFAULT_BRANCH_WRITE`。
 `ALLOWED_REPOSITORIES` 默认拒绝全部仓库；只有显式设置为逗号分隔仓库列表或明确设置为 `*` 才会放行。`/health` 仅表示进程存活，`/ready` 检查 GitHub 配置和 Controller 数据库，受 API Key 保护的 `/metrics` 提供低基数请求计数与累计耗时。
+
+## MyGithut12 规划状态
+
+当前现网仍是 `MyGithut11 / 10.1.1`。MyGithut12 计划升级为 `12.0.0`，新增精确 Commit 的仓库树、文本搜索、批量读取、符号定义、引用、调用层级和上下文包能力。规划目标是在保留现有 118 个工具兼容性的基础上新增 12 个工具，总数达到 130。此处仅表示需求和开发基线已经建立，不表示功能已经实现或部署。
 
 ## Private Deploy Agent
 
