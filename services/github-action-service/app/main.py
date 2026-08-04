@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.openapi.utils import get_openapi
 
-from app.routers import health, github, ci_worker, deployments, ci_monitor
+from app.routers import health, github, ci_worker, deployments, ci_monitor, index_v12
 from app.config import settings
 from app.exceptions import AppError
 from app.idempotency import IdempotencyMiddleware, ensure_idempotency_storage
@@ -29,10 +29,12 @@ async def lifespan(app: FastAPI):
         from app.ci_database import init_db
         from app.deployment_service import init_deployment_db
         from app.attestation_registry import init_registry_db
+        from app.mygithub12 import init_db as init_mygithub12_db
         ensure_idempotency_storage()
         init_db()
         init_deployment_db()
         init_registry_db()
+        init_mygithub12_db()
     except Exception:
         logger.exception("Controller database initialization failed")
         raise
@@ -77,6 +79,7 @@ app.include_router(ci_worker.router, tags=["CI Worker"])
 app.include_router(deployments.router, tags=["Deployments"])
 app.include_router(ci_monitor.router, tags=["CI Monitor"])
 
+app.include_router(index_v12.router, prefix="/internal/mygithub12", tags=["MyGithut12 Index"])
 
 @app.get("/.well-known/oauth-protected-resource")
 async def oauth_protected_resource():

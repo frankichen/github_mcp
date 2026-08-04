@@ -30,6 +30,7 @@ from app import github_utils
 from app import mygithub10
 from app import attestation_registry
 from app.version import runtime_build_sha
+from app.mygithub12_mcp import register_mygithub12_tools
 
 logger = logging.getLogger(__name__)
 
@@ -1086,6 +1087,7 @@ async def get_repository_operation_policy(repository: str) -> str:
 
 register_github_extended_tools(mcp, _github_call)
 register_private_ci_mcp_tools(mcp)
+register_mygithub12_tools(mcp, _github_call, _service)
 
 
 # ========================================================================
