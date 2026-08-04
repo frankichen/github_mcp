@@ -51,3 +51,31 @@ def test_public_job_does_not_expose_idempotency_key():
     assert result["status"] == "completed"
     assert "idempotency_key" not in result
     json.dumps(result)
+
+
+def test_workspace_is_required_for_ai_writes_when_enabled(monkeypatch):
+    monkeypatch.setenv("REQUIRE_WORKSPACE_FOR_AI_WRITES", "true")
+    with pytest.raises(mygithub12.MyGithub12Error) as exc:
+        mygithub12.workspace_write_preflight(object(), "o/r", "ai/task", "a" * 40)
+    assert exc.value.code == "WORKSPACE_LEASE_REQUIRED"
+
+
+def test_workspace_completion_uses_revision_cas(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "workspace.db"))
+    mygithub12.init_db()
+    timestamp = mygithub12._now()
+    with mygithub12._db() as db:
+        db.execute(
+            "INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "ws_test", "o/r", "ai/task", "main", "a" * 40,
+                "a" * 40, "b" * 40, "active", 1, "test", timestamp + 600,
+                "a" * 40, "{}", None, None, timestamp, timestamp,
+            ),
+        )
+    result = mygithub12.workspace_write_complete("ws_test", 1, "c" * 40, "d" * 40)
+    assert result["revision"] == 2
+    assert result["head_sha"] == "c" * 40
+    with pytest.raises(mygithub12.MyGithub12Error) as exc:
+        mygithub12.workspace_write_complete("ws_test", 1, "e" * 40, "f" * 40)
+    assert exc.value.code == "WORKSPACE_REVISION_MISMATCH"
