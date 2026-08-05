@@ -21,18 +21,12 @@ async def main() -> int:
     from app.mcp_server import mcp  # noqa: PLC0415
 
     actual = await mcp.list_tools()
-    manifest = json.loads((root / "docs/MYGITHUB10_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     actual_names = [tool.name for tool in actual]
-    manifest_names = [tool["name"] for tool in manifest["tools"]]
     if len(actual_names) != len(set(actual_names)):
         raise SystemExit("actual MCP registration contains duplicate names")
-    if actual_names != manifest_names:
-        raise SystemExit(f"manifest mismatch: actual={actual_names!r} manifest={manifest_names!r}")
-    if manifest["tool_count"] != len(actual_names):
-        raise SystemExit("manifest tool_count mismatch")
+
     from app.version import SERVICE_NAME, SERVICE_VERSION  # noqa: PLC0415
-    if manifest.get("service_name") != SERVICE_NAME or manifest.get("service_version") != SERVICE_VERSION:
-        raise SystemExit("manifest service name/version mismatch")
+
     required = {
         "get_github_file",
         "commit_github_files",
@@ -46,9 +40,49 @@ async def main() -> int:
     missing = required - set(actual_names)
     if missing:
         raise SystemExit(f"required tools missing: {sorted(missing)}")
+
+    builder = next(tool for tool in actual if tool.name == "build_github_patch")
+    annotations = builder.annotations
+    if annotations is None or annotations.readOnlyHint is not True:
+        raise SystemExit("build_github_patch must be read-only")
+    if annotations.destructiveHint is True:
+        raise SystemExit("build_github_patch must be non-destructive")
+
+    manifest12_path = root / "docs/MYGITHUB12_TOOL_MANIFEST.json"
+    if manifest12_path.exists():
+        manifest12 = json.loads(manifest12_path.read_text(encoding="utf-8"))
+        legacy_manifest_name = manifest12.get("legacy_manifest")
+        if not isinstance(legacy_manifest_name, str):
+            raise SystemExit("MyGithut12 manifest legacy_manifest must be a filename")
+        legacy_path = root / "docs" / legacy_manifest_name
+        legacy_manifest = json.loads(legacy_path.read_text(encoding="utf-8"))
+        legacy_names = [tool["name"] for tool in legacy_manifest["tools"]]
+        new_names = manifest12["new_tools"]
+        manifest_names = legacy_names + new_names
+        if actual_names != manifest_names:
+            raise SystemExit(f"MyGithut12 manifest mismatch: actual={actual_names!r} manifest={manifest_names!r}")
+        if manifest12["legacy_tool_count"] != len(legacy_names):
+            raise SystemExit("MyGithut12 legacy_tool_count mismatch")
+        if manifest12["new_tool_count"] != len(new_names):
+            raise SystemExit("MyGithut12 new_tool_count mismatch")
+        if manifest12["tool_count"] != len(actual_names):
+            raise SystemExit("MyGithut12 tool_count mismatch")
+        if manifest12.get("service_name") != SERVICE_NAME or manifest12.get("service_version") != SERVICE_VERSION:
+            raise SystemExit("MyGithut12 manifest service name/version mismatch")
+        print(f"MyGithut12 manifest matches {len(actual_names)} registered tools ({len(new_names)} new)")
+        return 0
+
+    manifest = json.loads((root / "docs/MYGITHUB10_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
+    manifest_names = [tool["name"] for tool in manifest["tools"]]
+    if actual_names != manifest_names:
+        raise SystemExit(f"manifest mismatch: actual={actual_names!r} manifest={manifest_names!r}")
+    if manifest["tool_count"] != len(actual_names):
+        raise SystemExit("manifest tool_count mismatch")
+    if manifest.get("service_name") != SERVICE_NAME or manifest.get("service_version") != SERVICE_VERSION:
+        raise SystemExit("manifest service name/version mismatch")
     manifest_by_name = {tool["name"]: tool for tool in manifest["tools"]}
-    builder = manifest_by_name["build_github_patch"]
-    if not builder["read_only"] or builder["consequential"]:
+    builder_manifest = manifest_by_name["build_github_patch"]
+    if not builder_manifest["read_only"] or builder_manifest["consequential"]:
         raise SystemExit("build_github_patch must be read-only and non-consequential")
     print(f"manifest matches {len(actual_names)} registered tools")
     return 0
