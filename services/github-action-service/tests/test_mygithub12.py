@@ -29,6 +29,40 @@ def test_index_database_schema_and_job_round_trip(tmp_path, monkeypatch):
     assert {"indexes", "files", "symbols", "jobs", "workspaces"} <= tables
 
 
+def test_request_index_build_persists_queued_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "index.db"))
+    identity = {
+        "repository": "o/r",
+        "commit_sha": "a" * 40,
+        "tree_sha": "b" * 40,
+    }
+    monkeypatch.setattr(mygithub12, "resolve_identity", lambda *args, **kwargs: identity)
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(mygithub12.threading, "Thread", FakeThread)
+
+    result = mygithub12.request_index_build(
+        object(),
+        "o/r",
+        "a" * 40,
+        idempotency_key="index-job-test",
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "queued"
+    assert result["job_id"]
+    with mygithub12._db() as db:
+        row = db.execute("SELECT * FROM jobs WHERE job_id=?", (result["job_id"],)).fetchone()
+    assert row["repository"] == "o/r"
+    assert row["idempotency_key"] == "index-job-test"
+
+
 def test_public_job_does_not_expose_idempotency_key():
     row = {
         "job_id": "job",

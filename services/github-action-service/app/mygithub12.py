@@ -238,7 +238,23 @@ def request_index_build(service: Any, repository: str, commit_sha: str, strategy
         if running: return {"ok":True,"deduplicated":True,**_public_job(dict(running))}
         job_id=str(uuid.uuid4()); now=_now()
         try:
-            db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(job_id,repository,identity["commit_sha"],identity["tree_sha"],INDEX_VERSION,strategy,base_commit_sha or None,"queued","queued",1,0,0,0,0,0,None,None,now,None,None,idempotency_key or None))
+            db.execute(
+                """
+                INSERT INTO jobs (
+                    job_id, repository, commit_sha, tree_sha, version, strategy,
+                    base_commit_sha, status, step, revision, progress_current,
+                    progress_total, reused_files, reindexed_files, cancel_requested,
+                    error_code, error_message, created_at, started_at, finished_at,
+                    idempotency_key
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    job_id, repository, identity["commit_sha"], identity["tree_sha"],
+                    INDEX_VERSION, strategy, base_commit_sha or None, "queued",
+                    "queued", 1, 0, 0, 0, 0, 0, None, None, now, None, None,
+                    idempotency_key or None,
+                ),
+            )
         except sqlite3.IntegrityError:
             row=db.execute("SELECT * FROM jobs WHERE repository=? AND commit_sha=? AND tree_sha=? AND version=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1",(repository,identity["commit_sha"],identity["tree_sha"],INDEX_VERSION)).fetchone()
             if row: return {"ok":True,"deduplicated":True,**_public_job(dict(row))}
