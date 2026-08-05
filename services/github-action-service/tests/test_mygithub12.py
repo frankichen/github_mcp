@@ -164,14 +164,14 @@ def test_find_references_distinguishes_declarations_and_qualified_calls(tmp_path
 
     assert [(item["line"], item["reference_kind"]) for item in result["items"]] == [
         (1, "definition"),
-        (10, "unknown"),
-        (11, "call"),
+        (11, "unknown"),
+        (12, "call"),
     ]
     hierarchy = mygithub12.call_hierarchy(
         object(), repository, commit_sha, target["symbol_id"], direction="callers"
     )
     assert [(edge["from"], edge["line"]) for edge in hierarchy["edges"]] == [
-        (caller["symbol_id"], 11),
+        (caller["symbol_id"], 12),
     ]
 
 
