@@ -113,3 +113,79 @@ def test_workspace_completion_uses_revision_cas(tmp_path, monkeypatch):
     with pytest.raises(mygithub12.MyGithub12Error) as exc:
         mygithub12.workspace_write_complete("ws_test", 1, "e" * 40, "f" * 40)
     assert exc.value.code == "WORKSPACE_REVISION_MISMATCH"
+
+
+def _seed_symbol_index(tmp_path, monkeypatch, files):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "symbols.db"))
+    mygithub12.init_db()
+    repository = "o/r"
+    commit_sha = "a" * 40
+    identity = {"repository": repository, "commit_sha": commit_sha, "tree_sha": "b" * 40}
+    symbols = {}
+    with mygithub12._db() as db:
+        for index, (path, content) in enumerate(files, 1):
+            blob_sha = f"{index:040x}"
+            digest = f"{index:064x}"
+            db.execute(
+                "INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?)",
+                (repository, commit_sha, path, blob_sha, len(content.encode()), "python", digest, len(content.splitlines()), content),
+            )
+            for symbol in mygithub12._symbols(repository, commit_sha, path, blob_sha, "python", content):
+                db.execute(
+                    "INSERT INTO symbols VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        repository, commit_sha, symbol["symbol_id"], symbol["name"],
+                        symbol["qualified_name"], symbol["kind"], symbol["language"],
+                        symbol["path"], symbol["blob_sha"], symbol["start_line"],
+                        symbol["end_line"], symbol["signature"], symbol["parent_name"],
+                        symbol["bases_json"],
+                    ),
+                )
+                symbols[(path, symbol["qualified_name"])] = symbol
+    monkeypatch.setattr(mygithub12, "_ready", lambda *args, **kwargs: identity)
+    return repository, commit_sha, symbols
+
+
+def test_find_references_labels_declaration_before_call(tmp_path, monkeypatch):
+    repository, commit_sha, symbols = _seed_symbol_index(
+        tmp_path,
+        monkeypatch,
+        [("main.py", "def target():\n    return True\n\n\ndef caller():\n    return target()\n")],
+    )
+    target = symbols[("main.py", "target")]
+
+    result = mygithub12.find_references(
+        object(), repository, commit_sha, target["symbol_id"], include_definition=True
+    )
+
+    assert [(item["line"], item["reference_kind"]) for item in result["items"]] == [
+        (1, "definition"),
+        (6, "call"),
+    ]
+
+
+def test_call_hierarchy_resolves_only_unambiguous_local_callees(tmp_path, monkeypatch):
+    repository, commit_sha, symbols = _seed_symbol_index(
+        tmp_path,
+        monkeypatch,
+        [
+            ("other.py", "def helper():\n    return 2\n"),
+            (
+                "main.py",
+                "def helper():\n    return 1\n\n\ndef execute():\n    return 0\n\n\ndef root():\n    db.execute()\n    return helper()\n",
+            ),
+        ],
+    )
+    root = symbols[("main.py", "root")]
+    local_helper = symbols[("main.py", "helper")]
+    external_helper = symbols[("other.py", "helper")]
+    local_execute = symbols[("main.py", "execute")]
+
+    result = mygithub12.call_hierarchy(
+        object(), repository, commit_sha, root["symbol_id"], direction="callees"
+    )
+
+    targets = {edge["to"] for edge in result["edges"]}
+    assert targets == {local_helper["symbol_id"]}
+    assert external_helper["symbol_id"] not in targets
+    assert local_execute["symbol_id"] not in targets

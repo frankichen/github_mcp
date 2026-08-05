@@ -497,10 +497,17 @@ def find_references(service: Any, repository: str, commit_sha: str, symbol_id: s
     identity=_ready(service,repository,commit_sha); symbol=_get_symbol(repository,commit_sha,symbol_id); pattern=re.compile(r"\b"+re.escape(symbol["name"])+r"\b"); out=[]
     for row in _file_rows(repository,commit_sha):
         for n,line in enumerate(row["content"].splitlines(),1):
+            definition_start=None
+            if row["path"]==symbol["path"] and n==symbol["start_line"]:
+                declaration_match=pattern.search(line)
+                definition_start=declaration_match.start() if declaration_match else None
             for m in pattern.finditer(line):
-                is_def=row["path"]==symbol["path"] and symbol["start_line"]<=n<=symbol["end_line"]
+                is_def=definition_start is not None and m.start()==definition_start
                 if is_def and not include_definition: continue
-                tail=line[m.end():].lstrip(); kind="call" if tail.startswith("(") else "definition" if is_def else "unknown"
+                if is_def:
+                    kind="definition"
+                else:
+                    tail=line[m.end():].lstrip(); kind="call" if tail.startswith("(") else "unknown"
                 out.append({"path":row["path"],"blob_sha":row["blob_sha"],"line":n,"column":m.start()+1,"reference_kind":kind,"snippet":line[:1000],"reliability":"exact_lexical","authoritative":False})
     off=int(cursor or 0); limit=max(1,min(limit,MAX_RESULTS))
     return {"ok":True,**identity,"symbol":{"symbol_id":symbol_id,"name":symbol["name"]},"items":out[off:off+limit],"total":len(out),"next_cursor":str(off+limit) if off+limit<len(out) else None,"authoritative":False}
@@ -518,12 +525,27 @@ def call_hierarchy(service: Any, repository: str, commit_sha: str, symbol_id: st
             if candidates:
                 caller=min(candidates,key=lambda s:s["end_line"]-s["start_line"]); nodes[caller["symbol_id"]]={"symbol_id":caller["symbol_id"],"name":caller["name"],"path":caller["path"],"start_line":caller["start_line"]}; edges.append({"from":caller["symbol_id"],"to":symbol_id,"kind":"lexical_call","line":r["line"],"reliability":"heuristic"})
     if direction in {"callees","both"}:
-        with _db() as db: row=db.execute("SELECT content FROM files WHERE repository=? AND commit_sha=? AND path=?",(repository,commit_sha,root["path"])).fetchone(); syms=[dict(r) for r in db.execute("SELECT * FROM symbols WHERE repository=? AND commit_sha=?",(repository,commit_sha))]
+        with _db() as db:
+            row=db.execute("SELECT content FROM files WHERE repository=? AND commit_sha=? AND path=?",(repository,commit_sha,root["path"])).fetchone()
+            syms=[dict(r) for r in db.execute("SELECT * FROM symbols WHERE repository=? AND commit_sha=? AND path=?",(repository,commit_sha,root["path"]))]
         if row:
             segment="\n".join(row["content"].splitlines()[root["start_line"]-1:root["end_line"]])
-            for name in set(re.findall(r"\b([A-Za-z_]\w*)\s*\(",segment)):
-                target=next((s for s in syms if s["name"]==name and s["symbol_id"]!=symbol_id),None)
-                if target: nodes[target["symbol_id"]]={"symbol_id":target["symbol_id"],"name":target["name"],"path":target["path"],"start_line":target["start_line"]}; edges.append({"from":symbol_id,"to":target["symbol_id"],"kind":"lexical_call","reliability":"heuristic"})
+            call_pattern=re.compile(r"(?<![\w.])(?:(?P<qualifier>[A-Za-z_]\w*)\.)?(?P<name>[A-Za-z_]\w*)\s*\(")
+            seen_targets=set()
+            for match in call_pattern.finditer(segment):
+                qualifier=match.group("qualifier"); name=match.group("name")
+                candidates=[s for s in syms if s["name"]==name and s["symbol_id"]!=symbol_id]
+                if qualifier:
+                    if qualifier not in {"self","cls"} or not root.get("parent_name"):
+                        continue
+                    candidates=[s for s in candidates if s.get("parent_name")==root.get("parent_name")]
+                else:
+                    same_scope=[s for s in candidates if s.get("parent_name")==root.get("parent_name")]
+                    if same_scope: candidates=same_scope
+                if len(candidates)!=1: continue
+                target=candidates[0]
+                if target["symbol_id"] in seen_targets: continue
+                seen_targets.add(target["symbol_id"]); nodes[target["symbol_id"]]={"symbol_id":target["symbol_id"],"name":target["name"],"path":target["path"],"start_line":target["start_line"]}; edges.append({"from":symbol_id,"to":target["symbol_id"],"kind":"lexical_call","reliability":"heuristic"})
                 if len(edges)>=limit: break
     return {"ok":True,**identity,"root_symbol_id":symbol_id,"direction":direction,"depth_requested":depth,"nodes":list(nodes.values()),"edges":edges[:limit],"truncated":len(edges)>limit,"authoritative":False}
 
