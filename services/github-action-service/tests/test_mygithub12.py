@@ -146,13 +146,17 @@ def _seed_symbol_index(tmp_path, monkeypatch, files):
     return repository, commit_sha, symbols
 
 
-def test_find_references_labels_declaration_before_call(tmp_path, monkeypatch):
+def test_find_references_distinguishes_declarations_and_qualified_calls(tmp_path, monkeypatch):
     repository, commit_sha, symbols = _seed_symbol_index(
         tmp_path,
         monkeypatch,
-        [("main.py", "def target():\n    return True\n\n\ndef caller():\n    return target()\n")],
+        [(
+            "main.py",
+            "def target():\n    return True\n\n\nclass Client:\n    def target(self):\n        return True\n\n\ndef caller(client):\n    client.target()\n    return target()\n",
+        )],
     )
     target = symbols[("main.py", "target")]
+    caller = symbols[("main.py", "caller")]
 
     result = mygithub12.find_references(
         object(), repository, commit_sha, target["symbol_id"], include_definition=True
@@ -160,7 +164,14 @@ def test_find_references_labels_declaration_before_call(tmp_path, monkeypatch):
 
     assert [(item["line"], item["reference_kind"]) for item in result["items"]] == [
         (1, "definition"),
-        (6, "call"),
+        (11, "unknown"),
+        (12, "call"),
+    ]
+    hierarchy = mygithub12.call_hierarchy(
+        object(), repository, commit_sha, target["symbol_id"], direction="callers"
+    )
+    assert [(edge["from"], edge["line"]) for edge in hierarchy["edges"]] == [
+        (caller["symbol_id"], 12),
     ]
 
 
@@ -189,3 +200,44 @@ def test_call_hierarchy_resolves_only_unambiguous_local_callees(tmp_path, monkey
     assert targets == {local_helper["symbol_id"]}
     assert external_helper["symbol_id"] not in targets
     assert local_execute["symbol_id"] not in targets
+
+
+def test_call_hierarchy_skips_calls_inside_nested_declarations(tmp_path, monkeypatch):
+    repository, commit_sha, symbols = _seed_symbol_index(
+        tmp_path,
+        monkeypatch,
+        [(
+            "main.py",
+            "def helper():\n    return 1\n\n\ndef root():\n    def nested():\n        return helper()\n    return 0\n",
+        )],
+    )
+    root = symbols[("main.py", "root")]
+
+    result = mygithub12.call_hierarchy(
+        object(), repository, commit_sha, root["symbol_id"], direction="callees"
+    )
+
+    assert result["edges"] == []
+
+
+def test_call_hierarchy_resolves_python_self_and_module_calls(tmp_path, monkeypatch):
+    repository, commit_sha, symbols = _seed_symbol_index(
+        tmp_path,
+        monkeypatch,
+        [(
+            "main.py",
+            "def module_helper():\n    return 1\n\n\ndef execute():\n    return 0\n\n\nclass Worker:\n    def local(self):\n        return 2\n\n    def root(self):\n        self.local()\n        db.execute()\n        return module_helper()\n",
+        )],
+    )
+    root = symbols[("main.py", "Worker.root")]
+    local = symbols[("main.py", "Worker.local")]
+    module_helper = symbols[("main.py", "module_helper")]
+    execute = symbols[("main.py", "execute")]
+
+    result = mygithub12.call_hierarchy(
+        object(), repository, commit_sha, root["symbol_id"], direction="callees"
+    )
+
+    targets = {edge["to"] for edge in result["edges"]}
+    assert targets == {local["symbol_id"], module_helper["symbol_id"]}
+    assert execute["symbol_id"] not in targets

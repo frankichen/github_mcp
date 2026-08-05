@@ -495,22 +495,66 @@ def get_symbol_definition(service: Any, repository: str, commit_sha: str, symbol
 
 def find_references(service: Any, repository: str, commit_sha: str, symbol_id: str, include_definition: bool=False, limit: int=100, cursor: str="") -> dict[str,Any]:
     identity=_ready(service,repository,commit_sha); symbol=_get_symbol(repository,commit_sha,symbol_id); pattern=re.compile(r"\b"+re.escape(symbol["name"])+r"\b"); out=[]
+    with _db() as db:
+        definition_rows=db.execute("SELECT path,start_line,symbol_id FROM symbols WHERE repository=? AND commit_sha=? AND name=?",(repository,commit_sha,symbol["name"])).fetchall()
+    definitions: dict[tuple[str,int],set[str]]={}
+    for item in definition_rows:
+        definitions.setdefault((item["path"],item["start_line"]),set()).add(item["symbol_id"])
     for row in _file_rows(repository,commit_sha):
         for n,line in enumerate(row["content"].splitlines(),1):
-            definition_start=None
-            if row["path"]==symbol["path"] and n==symbol["start_line"]:
-                declaration_match=pattern.search(line)
-                definition_start=declaration_match.start() if declaration_match else None
+            line_definitions=definitions.get((row["path"],n),set())
+            declaration_match=pattern.search(line) if line_definitions else None
+            declaration_start=declaration_match.start() if declaration_match else None
             for m in pattern.finditer(line):
-                is_def=definition_start is not None and m.start()==definition_start
-                if is_def and not include_definition: continue
-                if is_def:
+                is_declaration=declaration_start is not None and m.start()==declaration_start
+                if is_declaration:
+                    if symbol_id not in line_definitions:
+                        continue
+                    if not include_definition:
+                        continue
                     kind="definition"
                 else:
-                    tail=line[m.end():].lstrip(); kind="call" if tail.startswith("(") else "unknown"
+                    prefix=line[:m.start()].rstrip(); tail=line[m.end():].lstrip()
+                    kind="call" if tail.startswith("(") and not prefix.endswith(".") else "unknown"
                 out.append({"path":row["path"],"blob_sha":row["blob_sha"],"line":n,"column":m.start()+1,"reference_kind":kind,"snippet":line[:1000],"reliability":"exact_lexical","authoritative":False})
     off=int(cursor or 0); limit=max(1,min(limit,MAX_RESULTS))
     return {"ok":True,**identity,"symbol":{"symbol_id":symbol_id,"name":symbol["name"]},"items":out[off:off+limit],"total":len(out),"next_cursor":str(off+limit) if off+limit<len(out) else None,"authoritative":False}
+
+
+def _python_call_tokens(content: str, root: dict[str,Any]) -> list[tuple[str | None,str]]:
+    try:
+        tree=ast.parse(content)
+    except SyntaxError:
+        return []
+    root_node=next((node for node in ast.walk(tree) if isinstance(node,(ast.ClassDef,ast.FunctionDef,ast.AsyncFunctionDef)) and getattr(node,"name","")==root["name"] and getattr(node,"lineno",0)==root["start_line"]),None)
+    if root_node is None:
+        return []
+    tokens: list[tuple[str | None,str]]=[]
+
+    class CallVisitor(ast.NodeVisitor):
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func,ast.Name):
+                tokens.append((None,node.func.id))
+            elif isinstance(node.func,ast.Attribute) and isinstance(node.func.value,ast.Name) and node.func.value.id in {"self","cls"}:
+                tokens.append((node.func.value.id,node.func.attr))
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return None
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return None
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return None
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return None
+
+    visitor=CallVisitor()
+    for statement in getattr(root_node,"body",[]):
+        visitor.visit(statement)
+    return tokens
 
 
 def call_hierarchy(service: Any, repository: str, commit_sha: str, symbol_id: str, direction: str="both", depth: int=2, limit: int=200) -> dict[str,Any]:
@@ -529,16 +573,21 @@ def call_hierarchy(service: Any, repository: str, commit_sha: str, symbol_id: st
             row=db.execute("SELECT content FROM files WHERE repository=? AND commit_sha=? AND path=?",(repository,commit_sha,root["path"])).fetchone()
             syms=[dict(r) for r in db.execute("SELECT * FROM symbols WHERE repository=? AND commit_sha=? AND path=?",(repository,commit_sha,root["path"]))]
         if row:
-            segment="\n".join(row["content"].splitlines()[root["start_line"]-1:root["end_line"]])
-            call_pattern=re.compile(r"(?<![\w.])(?:(?P<qualifier>[A-Za-z_]\w*)\.)?(?P<name>[A-Za-z_]\w*)\s*\(")
+            if root["language"]=="python":
+                call_tokens=_python_call_tokens(row["content"],root)
+            else:
+                segment="\n".join(row["content"].splitlines()[root["start_line"]-1:root["end_line"]])
+                call_pattern=re.compile(r"(?<![\w.])(?:(?P<qualifier>[A-Za-z_]\w*)\.)?(?P<name>[A-Za-z_]\w*)\s*\(")
+                call_tokens=[(match.group("qualifier"),match.group("name")) for match in call_pattern.finditer(segment)]
             seen_targets=set()
-            for match in call_pattern.finditer(segment):
-                qualifier=match.group("qualifier"); name=match.group("name")
+            for qualifier,name in call_tokens:
                 candidates=[s for s in syms if s["name"]==name and s["symbol_id"]!=symbol_id]
                 if qualifier:
                     if qualifier not in {"self","cls"} or not root.get("parent_name"):
                         continue
                     candidates=[s for s in candidates if s.get("parent_name")==root.get("parent_name")]
+                elif root["language"]=="python":
+                    candidates=[s for s in candidates if s.get("parent_name") is None]
                 else:
                     same_scope=[s for s in candidates if s.get("parent_name")==root.get("parent_name")]
                     if same_scope: candidates=same_scope
@@ -548,7 +597,6 @@ def call_hierarchy(service: Any, repository: str, commit_sha: str, symbol_id: st
                 seen_targets.add(target["symbol_id"]); nodes[target["symbol_id"]]={"symbol_id":target["symbol_id"],"name":target["name"],"path":target["path"],"start_line":target["start_line"]}; edges.append({"from":symbol_id,"to":target["symbol_id"],"kind":"lexical_call","reliability":"heuristic"})
                 if len(edges)>=limit: break
     return {"ok":True,**identity,"root_symbol_id":symbol_id,"direction":direction,"depth_requested":depth,"nodes":list(nodes.values()),"edges":edges[:limit],"truncated":len(edges)>limit,"authoritative":False}
-
 
 def symbol_implementations(service: Any, repository: str, commit_sha: str, symbol_id: str) -> dict[str,Any]:
     identity=_ready(service,repository,commit_sha); root=_get_symbol(repository,commit_sha,symbol_id)
