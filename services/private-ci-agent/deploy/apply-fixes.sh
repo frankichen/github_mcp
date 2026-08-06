@@ -157,7 +157,7 @@ chmod 700 /srv/private-ci/cache/go
 runuser -u ciworker -- env HOME=/home/ciworker XDG_RUNTIME_DIR=/run/user/1500 \
     DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1500/bus \
     PYTHONPATH="${AGENT_DIR}" \
-    /usr/bin/python3 "${AGENT_DIR}/deploy/prepare-go-cache" || die "go cache preheat failed"
+    "${AGENT_DIR}/deploy/prepare-go-cache" || die "go cache preheat failed"
 
 # ── 7. 预热共享 Playwright 浏览器缓存 ──────────────────────
 log "Preheating shared Playwright browser cache"
