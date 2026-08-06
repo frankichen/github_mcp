@@ -59,6 +59,27 @@ def test_go_uses_read_write_job_cache_and_controlled_environment(monkeypatch, tm
     assert all("UNCONTROLLED" not in item for item in command)
 
 
+def test_npm_cache_mounts_to_npm_default_directory(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_run(command, **_kwargs):
+        captured.append(command)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    cache = tmp_path / "npm-cache"
+    cache.mkdir()
+    result = PodmanRunner("podman").run_command(
+        "docker.io/library/node:22", "job-123", str(tmp_path / "source"),
+        {"npm": str(cache)}, "npm ci", 30, network=True,
+    )
+
+    assert result["exit_code"] == 0
+    command = captured[0]
+    mount = command[command.index("-v", command.index("--workdir")) + 1]
+    assert mount == f"{cache}:/root/.npm:Z"
+
+
 def test_service_environment_is_forwarded_without_host_env(monkeypatch, tmp_path):
     captured = []
 
