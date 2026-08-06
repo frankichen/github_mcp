@@ -94,9 +94,53 @@ def test_npm_cache_mounts_to_controlled_shared_directory(monkeypatch, tmp_path):
     assert result["exit_code"] == 0
     command = captured[0]
     mount = command[command.index("-v", command.index("--workdir")) + 1]
-    assert mount == f"{cache}:/ci-cache/npm:z"
+    assert mount == f"{cache}:/ci-cache/npm:rw,z"
     assert "NPM_CONFIG_CACHE=/ci-cache/npm" in command
     assert not any("node_modules" in item for item in command)
+
+
+def test_playwright_cache_mount_and_environment_are_explicit(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_run(command, **_kwargs):
+        captured.append(command)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    cache = tmp_path / "ms-playwright"
+    result = PodmanRunner("podman").run_command(
+        "docker.io/library/node:22", "job-123", str(tmp_path / "source"),
+        {"npm": str(tmp_path / "npm"), "playwright": str(cache)},
+        "node -e 'console.log(process.env.PLAYWRIGHT_BROWSERS_PATH)'", 30, network=True,
+    )
+
+    assert result["exit_code"] == 0
+    command = captured[0]
+    assert f"{cache}:/ci-cache/ms-playwright:rw,z" in command
+    assert "PLAYWRIGHT_BROWSERS_PATH=/ci-cache/ms-playwright" in command
+    assert not any("node_modules" in item for item in command)
+    assert "--http-proxy=false" in command
+
+
+def test_shared_browser_cache_uses_nonexclusive_relabel(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_run(command, **_kwargs):
+        captured.append(command)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    cache = tmp_path / "ms-playwright"
+    runner = PodmanRunner("podman")
+    runner.run_command("docker.io/library/node:22", "job-a", str(first), {"playwright": str(cache)}, "true", 30, network=False)
+    runner.run_command("docker.io/library/node:22", "job-b", str(second), {"playwright": str(cache)}, "true", 30, network=False)
+
+    assert all(f"{cache}:/ci-cache/ms-playwright:rw,z" in command for command in captured)
+    assert all(":Z" not in item for command in captured for item in command if "ms-playwright" in item)
 
 
 def test_proxy_is_explicitly_rewritten_and_redacted_from_logs(monkeypatch, tmp_path, caplog):
@@ -179,7 +223,7 @@ def test_parallel_node_workspaces_share_only_controlled_download_cache(monkeypat
     runner.run_command("docker.io/library/node:22", "job-a", str(first), {"npm": str(cache)}, "npm ci", 30, network=True)
     runner.run_command("docker.io/library/node:22", "job-b", str(second), {"npm": str(cache)}, "npm ci", 30, network=True)
 
-    assert all(f"{cache}:/ci-cache/npm:z" in command for command in captured)
+    assert all(f"{cache}:/ci-cache/npm:rw,z" in command for command in captured)
     assert any(f"{first}:/workspace:Z" in item for item in captured[0])
     assert any(f"{second}:/workspace:Z" in item for item in captured[1])
     assert all(not any("node_modules" in item for item in command) for command in captured)

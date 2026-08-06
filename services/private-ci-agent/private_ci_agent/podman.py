@@ -196,6 +196,7 @@ class PodmanRunner:
     def _cache_mounts(cache_dirs: dict) -> tuple[list[str], str | None]:
         mounts: list[str] = []
         go_cache = None
+        needs_cache_parent = False
         for cache_name, cache_path in cache_dirs.items():
             if cache_name == "go":
                 go_cache = os.path.realpath(cache_path)
@@ -205,15 +206,28 @@ class PodmanRunner:
                 if os.path.exists(cache_path):
                     mounts.extend(["-v", f"{cache_path}:/ci-venv:Z"])
             elif cache_name == "pip":
+                needs_cache_parent = True
                 if PodmanRunner._ensure_cache_dir(cache_path):
-                    mounts.extend(["-v", f"{cache_path}:/ci-cache/pip:Z"])
+                    mounts.extend(["-v", f"{cache_path}:/ci-cache/pip:rw,Z"])
             elif cache_name == "npm":
+                needs_cache_parent = True
                 if PodmanRunner._ensure_cache_dir(cache_path):
                     # :z allows concurrent rootless containers to share only the
                     # download cache; node_modules remains workspace-local.
-                    mounts.extend(["-v", f"{cache_path}:/ci-cache/npm:z"])
+                    mounts.extend(["-v", f"{cache_path}:/ci-cache/npm:rw,z"])
+            elif cache_name == "playwright":
+                needs_cache_parent = True
+                if PodmanRunner._ensure_cache_dir(cache_path):
+                    # Browser binaries are a shared, immutable maintenance cache.
+                    # Use shared SELinux relabeling (:z), never the exclusive :Z.
+                    mounts.extend(["-v", f"{cache_path}:/ci-cache/ms-playwright:rw,z"])
             elif os.path.exists(cache_path):
                 mounts.extend(["-v", f"{cache_path}:{cache_path}:Z"])
+        if needs_cache_parent:
+            # Minimal read-write parent for bind mounts in images that do not
+            # ship /ci-cache.  The actual persistent data remains in the
+            # explicitly mounted child directories above.
+            mounts.insert(0, "--tmpfs=/ci-cache:rw,nosuid,size=64m")
         return mounts, go_cache
 
     def run(
@@ -284,6 +298,8 @@ class PodmanRunner:
             safe_env.update(env_vars)
         if "npm" in cache_dirs:
             safe_env["NPM_CONFIG_CACHE"] = "/ci-cache/npm"
+        if "playwright" in cache_dirs:
+            safe_env["PLAYWRIGHT_BROWSERS_PATH"] = "/ci-cache/ms-playwright"
         safe_env = {k: v for k, v in safe_env.items()
                     if not any(f.lower() in k.lower()
                                for f in ["TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH"])}
@@ -393,6 +409,8 @@ class PodmanRunner:
             })
         if "npm" in cache_dirs:
             safe_env["NPM_CONFIG_CACHE"] = "/ci-cache/npm"
+        if "playwright" in cache_dirs:
+            safe_env["PLAYWRIGHT_BROWSERS_PATH"] = "/ci-cache/ms-playwright"
         if env:
             allowed = {
                 "DATABASE_URL", "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "RABBITMQ_URL",

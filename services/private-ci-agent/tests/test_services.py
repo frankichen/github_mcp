@@ -1,6 +1,9 @@
+import subprocess
 from types import SimpleNamespace
 
-from private_ci_agent.services import ServiceManager, safe_job_suffix
+import pytest
+
+from private_ci_agent.services import ServiceManager, ServiceSetupError, safe_job_suffix, sanitize_service_stderr
 
 
 def test_job_suffix_is_safe_and_bounded():
@@ -34,3 +37,102 @@ def test_cleanup_is_scoped_to_current_job(monkeypatch):
     ServiceManager("podman").cleanup("job-123")
     assert ["podman", "pod", "rm", "-f", "ci-svc-job_123"] in commands
     assert all("lenshub-postgres" not in item for command in commands for item in command)
+
+
+def test_default_service_images_match_preloaded_rootless_images():
+    manager = ServiceManager("podman")
+    assert manager.images == {
+        "postgres": "docker.io/library/postgres:16-alpine",
+        "redis": "docker.io/library/redis:7-alpine",
+        "rabbitmq": "docker.io/library/rabbitmq:3-management-alpine",
+    }
+
+
+def test_service_run_failure_contains_safe_diagnostic(monkeypatch):
+    def fake_run(_command, **_kwargs):
+        return SimpleNamespace(
+            returncode=125,
+            stdout="",
+            stderr=(
+                "Error: POSTGRES_PASSWORD=unit-password-value "
+                "pull https://user:unit-pass@example.invalid/image?token=unit-token-value "
+                "secret=unit-secret-value"
+            ),
+        )
+
+    monkeypatch.setattr("private_ci_agent.services.subprocess.run", fake_run)
+    with pytest.raises(ServiceSetupError) as raised:
+        ServiceManager("podman")._run(
+            ["run", "docker.io/library/postgres:16-alpine"],
+            "POSTGRES_UNAVAILABLE",
+            resource_type="postgres",
+            operation="start_container",
+            image="docker.io/library/postgres:16-alpine",
+        )
+
+    message = str(raised.value)
+    assert "code=POSTGRES_UNAVAILABLE" in message
+    assert "operation=start_container" in message
+    assert "exit_code=125" in message
+    assert "resource=postgres" in message
+    assert "image=docker.io/library/postgres:16-alpine" in message
+    assert "unit-password-value" not in message
+    assert "user:unit-pass" not in message
+    assert "token=unit-token-value" not in message
+    assert "secret=unit-secret-value" not in message
+    assert len(message.rsplit("reason=", 1)[-1]) <= 500
+
+
+def test_service_timeout_diagnostic_is_distinct(monkeypatch):
+    def fake_run(_command, **_kwargs):
+        raise subprocess.TimeoutExpired("podman", 20)
+
+    monkeypatch.setattr("private_ci_agent.services.subprocess.run", fake_run)
+    with pytest.raises(ServiceSetupError) as raised:
+        ServiceManager("podman")._run(
+            ["run", "docker.io/library/redis:7-alpine"],
+            "REDIS_UNAVAILABLE",
+            resource_type="redis",
+            operation="start_container",
+            image="docker.io/library/redis:7-alpine",
+        )
+
+    assert "code=REDIS_UNAVAILABLE" in str(raised.value)
+    assert "timed_out=true" in str(raised.value)
+    assert "exit_code=-1" in str(raised.value)
+
+
+def test_readiness_reports_exited_resource_and_tail(monkeypatch):
+    def fake_run(command, **_kwargs):
+        if command[1:2] == ["exec"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="not ready")
+        if command[1:3] == ["inspect", "--format"]:
+            return SimpleNamespace(returncode=0, stdout="exited|17|container failed", stderr="")
+        if command[1:3] == ["logs", "--tail"]:
+            return SimpleNamespace(returncode=0, stdout="password=unit-hidden", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.services.subprocess.run", fake_run)
+    manager = ServiceManager("podman")
+    manager.timeout = 1
+    with pytest.raises(ServiceSetupError) as raised:
+        manager._wait_ready({
+            "postgres": "ci-postgres",
+            "redis": "ci-redis",
+            "rabbitmq": "ci-rabbitmq",
+        })
+
+    message = str(raised.value)
+    assert raised.value.code == "POSTGRES_UNAVAILABLE"
+    assert "resource=postgres" in message
+    assert "exit_code=17" in message
+    assert "container failed" in message
+    assert "password=unit-hidden" not in message
+
+
+def test_stderr_sanitizer_bounds_and_removes_url_credentials():
+    value = "x " * 1000 + " https://user:unit-pass@example.invalid/path?token=unit-secret"
+    sanitized = sanitize_service_stderr(value)
+    assert len(sanitized) == 500
+    assert "unit-pass" not in sanitized
+    assert "token=unit-secret" not in sanitized

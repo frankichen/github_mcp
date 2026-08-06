@@ -377,13 +377,19 @@ def node_commands_for_workspace(workspace: dict, required_default: list[str] | N
     if not package_manager:
         return {"error": "configuration_error", "message": "Node workspace requires exactly one supported lock file", "selected_scripts": selected, "skipped_scripts": skipped}
     install = {"npm": "npm ci", "pnpm": "pnpm install --frozen-lockfile", "yarn": "yarn install --immutable", "bun": "bun install --frozen-lockfile"}[package_manager]
+    cache_dirs = {"npm": "/ci-cache/npm"} if package_manager == "npm" else {}
+    # The legacy Vue browser smoke searches this fixed path before attempting
+    # an install.  Keep it separate from npm downloads and node_modules so the
+    # immutable browser runtime can be shared safely by concurrent workspaces.
+    if workspace.get("framework") == "vue" or workspace.get("path") == "h5/lenshub-console":
+        cache_dirs["playwright"] = "/ci-cache/ms-playwright"
     return {
         "setup": [install],
         "check": [item for item in selected if item.get("command")],
         "skipped": skipped,
         "selected_scripts": [item["name"] for item in selected if item.get("command")],
         "image": "docker.io/library/node:22",
-        "cache_dirs": {"npm": "/ci-cache/npm"} if package_manager == "npm" else {},
+        "cache_dirs": cache_dirs,
     }
 
 

@@ -42,3 +42,13 @@ def test_auto_gupiao_is_agent_source_allowed():
     assert data["repositories"]["frankichen/auto_gupiao"]["enabled"] is True
     assert "repo-auto-check" in allowed
     assert "go-check" in allowed
+
+
+def test_playwright_cache_maintenance_is_pinned_and_not_a_job_step():
+    script = (DEPLOY_DIR / "prepare-playwright-cache").read_text(encoding="utf-8")
+
+    assert "/srv/private-ci/cache/ms-playwright" in script
+    assert "/ci-cache/ms-playwright" in script
+    assert "playwright@1.62.0 install chromium --no-shell" in script
+    assert "pass_proxy=True" in script
+    assert "run as ciworker" in script

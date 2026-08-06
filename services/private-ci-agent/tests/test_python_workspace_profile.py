@@ -195,7 +195,7 @@ def test_podman_mounts_python_venv_and_pip_cache_and_controls_proxy(tmp_path, mo
     )
     setup_command = captured[-1]
     assert f"{venv}:/ci-venv:Z" in setup_command
-    assert f"{pip_cache}:/ci-cache/pip:Z" in setup_command
+    assert f"{pip_cache}:/ci-cache/pip:rw,Z" in setup_command
     assert "HTTP_PROXY=http://host.containers.internal:10808" in setup_command
     assert "PIP_CACHE_DIR=/ci-cache/pip" in setup_command
     assert "--network=none" not in setup_command
