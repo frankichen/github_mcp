@@ -52,3 +52,11 @@ def test_playwright_cache_maintenance_is_pinned_and_not_a_job_step():
     assert "playwright@1.62.0 install chromium --no-shell" in script
     assert "pass_proxy=True" in script
     assert "run as ciworker" in script
+
+
+def test_apply_fixes_runs_go_cache_preheat_with_bash():
+    script = (DEPLOY_DIR / "apply-fixes.sh").read_text(encoding="utf-8")
+
+    expected = '/bin/bash "${AGENT_DIR}/deploy/prepare-go-cache"'
+    assert expected in script
+    assert '/usr/bin/python3 "${AGENT_DIR}/deploy/prepare-go-cache"' not in script
