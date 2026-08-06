@@ -62,7 +62,7 @@ chmod 700 /srv/private-ci/cache/go
 runuser -u ciworker -- env HOME=/home/ciworker XDG_RUNTIME_DIR=/run/user/1500 \
     DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1500/bus \
     PYTHONPATH="${AGENT_DIR}" \
-    /usr/bin/python3 "${AGENT_DIR}/deploy/prepare-go-cache" || die "go cache preheat failed"
+    /bin/bash "${AGENT_DIR}/deploy/prepare-go-cache" || die "go cache preheat failed"
 
 # ── 6. 重启 worker 加载新代码 ─────────────────────────────
 log "Restarting private-ci-agent.service"
