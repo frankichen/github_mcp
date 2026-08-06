@@ -58,7 +58,8 @@ done
 log "Rebuilding github-action-service controller"
 cd "${REPO_ROOT}/services/github-action-service"
 BUILD_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
-SERVICE_VERSION="$(python3 -c 'from app.version import SERVICE_VERSION; print(SERVICE_VERSION)')"
+SERVICE_VERSION="$(sed -n 's/^SERVICE_VERSION = "\([0-9][0-9.]*\)"/\1/p' app/version.py)"
+[ -n "${SERVICE_VERSION}" ] || die "SERVICE_VERSION is missing from app/version.py"
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 export SOURCE_REPOSITORY="https://github.com/frankichen/github_mcp"
 export VCS_REF="${BUILD_SHA}" SERVICE_VERSION BUILD_DATE
