@@ -67,13 +67,13 @@ class ServiceManager:
             self._run(["pod", "create", "--name", network, "--userns=keep-id", "--network", "slirp4netns:allow_host_loopback=true",
                        "--add-host", "postgres:127.0.0.1", "--add-host", "redis:127.0.0.1",
                        "--add-host", "rabbitmq:127.0.0.1"], "SERVICE_SETUP_FAILED")
-            self._run(["run", "-d", "--name", names["postgres"], "--pod", network, "--user", "0",
+            self._run(["run", "-d", "--http-proxy=false", "--name", names["postgres"], "--pod", network, "--user", "0",
                        "-e", "POSTGRES_USER=lenshub",
                        "-e", f"POSTGRES_PASSWORD={db_password}", "-e", "POSTGRES_DB=postgres",
                        self.images["postgres"]], "POSTGRES_UNAVAILABLE")
-            self._run(["run", "-d", "--name", names["redis"], "--pod", network, self.images["redis"], "redis-server",
+            self._run(["run", "-d", "--http-proxy=false", "--name", names["redis"], "--pod", network, self.images["redis"], "redis-server",
                        "--save", "", "--appendonly", "no"], "REDIS_UNAVAILABLE")
-            self._run(["run", "-d", "--name", names["rabbitmq"], "--pod", network,
+            self._run(["run", "-d", "--http-proxy=false", "--name", names["rabbitmq"], "--pod", network,
                        "-e", f"RABBITMQ_DEFAULT_USER={rabbit_user}",
                        "-e", f"RABBITMQ_DEFAULT_PASS={rabbit_password}",
                        "-e", f"RABBITMQ_DEFAULT_VHOST={rabbit_vhost}", self.images["rabbitmq"]], "RABBITMQ_UNAVAILABLE")
