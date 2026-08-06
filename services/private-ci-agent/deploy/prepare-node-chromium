@@ -13,10 +13,10 @@ fi
 # worktree. Podman must start from a directory the worker can enter.
 cd /tmp
 
-# Rootless Buildah may otherwise choose /var/tmp, which is protected by the
-# Worker service hardening. Keep transient build layers in the Worker-owned
-# writable area instead.
-BUILD_TMPDIR="/srv/private-ci/tmp"
+# Buildah's transient build directory must be writable inside its rootless
+# mount namespace. The image itself is persisted in the Worker-owned store;
+# only the temporary build layers belong in /tmp.
+BUILD_TMPDIR="${PRIVATE_CI_BUILD_TMPDIR:-/tmp}"
 mkdir -p "${BUILD_TMPDIR}"
 export TMPDIR="${BUILD_TMPDIR}" BUILDAH_TMPDIR="${BUILD_TMPDIR}"
 
@@ -30,6 +30,26 @@ if [ -r /srv/private-ci/run/proxy.runtime.conf ]; then
     . /srv/private-ci/run/proxy.runtime.conf
     set +a
 fi
+
+# The proxy listener is on the Worker host loopback.  A rootless build
+# network reaches that listener through the host gateway, so rewrite only the
+# loopback host in the inherited proxy URLs; credentials and ports remain
+# untouched.
+CONTAINER_PROXY_HOST="${PRIVATE_CI_CONTAINER_PROXY_HOST:-10.0.2.2}"
+rewrite_loopback_proxy_url() {
+    local value="$1"
+    value="${value//127.0.0.1/${CONTAINER_PROXY_HOST}}"
+    value="${value//localhost/${CONTAINER_PROXY_HOST}}"
+    value="${value//\[::1\]/${CONTAINER_PROXY_HOST}}"
+    value="${value//::1/${CONTAINER_PROXY_HOST}}"
+    printf '%s' "${value}"
+}
+for proxy_var in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
+    proxy_value="${!proxy_var:-}"
+    if [ -n "${proxy_value}" ]; then
+        export "${proxy_var}=$(rewrite_loopback_proxy_url "${proxy_value}")"
+    fi
+done
 
 if /usr/bin/podman image exists "${IMAGE}" 2>/dev/null; then
     echo "[node-image] ready image=${IMAGE} source=local-store"
@@ -46,7 +66,7 @@ trap 'rm -rf "${context}"' EXIT
 install -m 0644 "${AGENT_ROOT}/deploy/Dockerfile.node-chromium" "${context}/Dockerfile"
 
 echo "[node-image] building shared image=${IMAGE}"
-/usr/bin/podman build \
+/usr/bin/buildah bud \
     --pull=never \
     --network=slirp4netns:allow_host_loopback=true \
     --tag "${IMAGE}" \
