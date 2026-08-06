@@ -82,7 +82,7 @@ def register_with_backoff(client: ControllerClient, profiles: list[str], max_con
 
 
 def main():
-    global _current_job_id, _podman_binary
+    global _current_job_id, _current_lease_token, _podman_binary
 
     config = load_config()
     if "worker_token" not in config:
