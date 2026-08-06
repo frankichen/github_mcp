@@ -1,6 +1,12 @@
 services:
   github-action-service:
-    build: .
+    build:
+      context: .
+      args:
+        SOURCE_REPOSITORY: ${SOURCE_REPOSITORY:-https://github.com/frankichen/github_mcp}
+        VCS_REF: ${VCS_REF:?VCS_REF is required for a production Controller build}
+        SERVICE_VERSION: ${SERVICE_VERSION:-12.0.0}
+        BUILD_DATE: ${BUILD_DATE:?BUILD_DATE is required for a production Controller build}
     container_name: github-action-service
     restart: unless-stopped
     env_file:
@@ -9,11 +15,15 @@ services:
       DEPLOYMENT_DB_PATH: /data/private-ci/deployments.db
       DEPLOY_STATUS_FILE: /data/private-ci/gongshi-test-status.json
       DEPLOY_CALLBACK_API_KEY_FILE: /run/secrets/deploy_callback_api_key
+      MYGITHUB12_RUNTIME_MODE: production
+      MYGITHUB12_BUILD_SHA: ${MYGITHUB12_BUILD_SHA:?MYGITHUB12_BUILD_SHA is required for a production Controller}
+      MYGITHUB12_VERSION: ${MYGITHUB12_VERSION:-12.0.0}
       MYGITHUB10_RUNTIME_MODE: production
-      MYGITHUB10_BUILD_SHA: 8b19103bb12e12373fdfda2b9763f52b8dc6ff25
+      MYGITHUB10_BUILD_SHA: ${MYGITHUB10_BUILD_SHA:?MYGITHUB10_BUILD_SHA is required for a production Controller}
+      MYGITHUB10_VERSION: ${MYGITHUB10_VERSION:-12.0.0}
     ports:
       - "127.0.0.1:8765:8000"
-      - "100.118.124.97:8788:8000"
+      - "100.127.108.20:8765:8000"
     volumes:
       - github_action_data:/data
       # Mount the directory, not only the SQLite main file. SQLite WAL/SHM
