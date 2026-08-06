@@ -1,0 +1,49 @@
+#!/bin/bash
+set -euo pipefail
+
+# Build the browser-capable Node runtime once in the Worker's persistent
+# rootless Podman store. CI jobs use the same local tag from every branch and
+# worktree; a missing image is a deployment/preheat error, never a per-job pull.
+if [ "$(id -u)" != "1500" ]; then
+    echo "[node-image] run as ciworker (uid 1500)" >&2
+    exit 2
+fi
+
+AGENT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+IMAGE="${PRIVATE_CI_NODE_CHROMIUM_IMAGE:-localhost/node-chromium:22}"
+BASE_IMAGE="docker.io/library/node:22"
+
+if [ -r /srv/private-ci/run/proxy.runtime.conf ]; then
+    set -a
+    # shellcheck source=/dev/null
+    . /srv/private-ci/run/proxy.runtime.conf
+    set +a
+fi
+
+if /usr/bin/podman image exists "${IMAGE}" 2>/dev/null; then
+    echo "[node-image] ready image=${IMAGE} source=local-store"
+    exit 0
+fi
+
+if ! /usr/bin/podman image exists "${BASE_IMAGE}" 2>/dev/null; then
+    echo "[node-image] base image missing locally: ${BASE_IMAGE}" >&2
+    exit 1
+fi
+
+context="$(mktemp -d /tmp/private-ci-node-chromium.XXXXXX)"
+trap 'rm -rf "${context}"' EXIT
+install -m 0644 "${AGENT_ROOT}/deploy/Dockerfile.node-chromium" "${context}/Dockerfile"
+
+echo "[node-image] building shared image=${IMAGE}"
+/usr/bin/podman build \
+    --pull=never \
+    --network=slirp4netns:allow_host_loopback=true \
+    --tag "${IMAGE}" \
+    --file "${context}/Dockerfile" \
+    "${context}"
+
+/usr/bin/podman image exists "${IMAGE}" || {
+    echo "[node-image] image build did not produce ${IMAGE}" >&2
+    exit 1
+}
+echo "[node-image] ready image=${IMAGE} source=local-store"

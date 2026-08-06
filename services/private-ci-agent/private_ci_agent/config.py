@@ -6,7 +6,7 @@ from pathlib import Path
 
 DEFAULT_CONFIG = {
     "worker_id": "wsl-ci-01",
-    "controller_url": "http://100.118.124.97:8788",
+    "controller_url": "http://100.127.108.20:8765",
     "max_concurrent_jobs": 1,
     "poll_interval_seconds": 5,
     "heartbeat_interval_seconds": 15,

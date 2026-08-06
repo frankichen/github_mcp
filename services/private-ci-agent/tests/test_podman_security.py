@@ -44,6 +44,19 @@ def test_rootless_command_does_not_use_env_host_or_forward_tokens(monkeypatch, t
     assert "--network=none" in command
 
 
+def test_local_shared_node_image_never_falls_back_to_pull(monkeypatch):
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=1, stdout="", stderr="missing")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    assert not PodmanRunner("podman").image_available("localhost/node-chromium:22")
+    assert len(calls) == 1
+    assert calls[0][:3] == ["podman", "image", "exists"]
+
+
 def test_go_uses_read_write_job_cache_and_controlled_environment(monkeypatch, tmp_path):
     captured = []
 

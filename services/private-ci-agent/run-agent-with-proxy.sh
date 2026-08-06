@@ -13,6 +13,7 @@ RUNTIME_PROXY_CONF="/srv/private-ci/run/proxy.runtime.conf"
 LOG_DIR="/srv/private-ci/logs"
 LOCKFILE="/srv/private-ci/run/private-ci-agent.lock"
 PODMAN_TMPDIR="/srv/private-ci/run/tmp"
+CONTROLLER_HOST="${PRIVATE_CI_CONTROLLER_HOST:-100.127.108.20}"
 
 log() {
     local level="$1"; shift
@@ -127,13 +128,13 @@ build_proxy_env() {
     [ "${protocol}" = mixed ] && all_proxy_url="socks5h://${host}:${port}"
 
     # NO_PROXY: internal services that must bypass proxy
-    local no_proxy="localhost,127.0.0.1,::1,100.118.124.97,de,.de,.local,.internal,${host}"
+    local no_proxy="localhost,127.0.0.1,::1,${CONTROLLER_HOST},de,.de,.local,.internal,${host}"
     [ -n "${gateway}" ] && no_proxy="${no_proxy},${gateway}"
     [ -n "${resolver}" ] && no_proxy="${no_proxy},${resolver}"
 
     # Worker API address (from config)
     local controller_host
-    controller_host=$(echo "100.118.124.97" | tr -d '\n')
+    controller_host="${CONTROLLER_HOST}"
     if [ -n "${controller_host}" ] && [[ "${no_proxy}" != *"${controller_host}"* ]]; then
         no_proxy="${no_proxy},${controller_host}"
     fi
@@ -173,8 +174,8 @@ HTTPS_PROXY=
 all_proxy=
 http_proxy=
 https_proxy=
-NO_PROXY=localhost,127.0.0.1,::1,100.118.124.97,de,.de,.local,.internal,${PROXY_HOST}
-no_proxy=localhost,127.0.0.1,::1,100.118.124.97,de,.de,.local,.internal,${PROXY_HOST}
+NO_PROXY=localhost,127.0.0.1,::1,${CONTROLLER_HOST},de,.de,.local,.internal,${PROXY_HOST}
+no_proxy=localhost,127.0.0.1,::1,${CONTROLLER_HOST},de,.de,.local,.internal,${PROXY_HOST}
 PROXY_AVAILABLE=0
 PROXY_PROTOCOL=none
 PROXY_HOST=${PROXY_HOST}

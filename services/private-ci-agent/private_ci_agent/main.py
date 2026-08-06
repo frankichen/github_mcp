@@ -260,7 +260,7 @@ def _execute_job(job: Job, client, config: dict, workspace_mgr: WorkspaceManager
         upload_download_log(f"[download] proxy_port={proxy_env.get('PROXY_PORT', '')}\n")
         upload_download_log("[download] github route=proxy\n")
         upload_download_log("[download] controller route=direct\n")
-        upload_download_log("[download] private_registry route=direct\n")
+        upload_download_log("[download] local_image_store route=local\n")
     except Exception:
         upload_download_log("[download] proxy_available=false\n[download] error_code=PROXY_UNAVAILABLE\n")
         client.finish_job(job_id, -1, "failed",

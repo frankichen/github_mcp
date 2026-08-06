@@ -170,8 +170,12 @@ def test_node_chromium_image_is_restricted_to_approved_prefix(monkeypatch):
     with pytest.raises(ValueError):
         node_browser_image()
 
+    monkeypatch.setattr(profiles_module, "NODE_CHROMIUM_IMAGE", "localhost/node-chromium:22")
+    assert node_browser_image() == "localhost/node-chromium:22"
+
     monkeypatch.setattr(profiles_module, "NODE_CHROMIUM_IMAGE", "100.118.124.97:5555/library/node-chromium:22")
-    assert node_browser_image() == "100.118.124.97:5555/library/node-chromium:22"
+    with pytest.raises(ValueError):
+        node_browser_image()
 
 
 def test_vue_workspace_without_browser_smoke_does_not_mount_playwright_cache(tmp_path):
@@ -268,6 +272,9 @@ def test_go_mod_requirement_selects_compatible_version_and_build(tmp_path):
     assert any(item["name"] == "gobuild" and item["command"] == "go build ./... 2>&1" for item in commands["check"])
     assert commands["cache_dirs"] == {"go": "/ci-cache"}
     assert "GOMODCACHE" in commands["setup"][0]["command"]
+    migration = next(item for item in commands["setup"] if item["name"] == "migrate")
+    assert "/ci-cache/.tool-bin/goose" in migration["command"]
+    assert "CI_MIGRATION_TIMEOUT_SECONDS" in migration["command"]
 
 
 def test_go_toolchain_is_the_effective_minimum(tmp_path):

@@ -27,15 +27,15 @@ LOCK_FILES = {
 }
 NODE_IMAGE = "docker.io/library/node:22"
 # 浏览器 smoke 需要 Chromium 系统库（libnspr4/libnss3 等），node:22 基础镜像
-# 不包含它们。受控运行镜像由 deploy/Dockerfile.node-chromium 构建并预加载到
-# 私有 registry（100.118.124.97:5555），job 只读使用，不允许仓库输入注入。
+# 不包含它们。受控运行镜像由 Worker 维护脚本构建一次并留在同一个
+# rootless Podman image store 中；所有分支/worktree 使用同一个本地标签，job
+# 只读使用，不允许仓库输入注入，也不再依赖已清理的远端 Registry。
 NODE_CHROMIUM_IMAGE = os.environ.get(
     "PRIVATE_CI_NODE_CHROMIUM_IMAGE",
-    "100.118.124.97:5555/library/node-chromium:22",
+    "localhost/node-chromium:22",
 )
 APPROVED_NODE_CHROMIUM_PREFIXES = (
-    "docker.io/library/node-chromium:",
-    "100.118.124.97:5555/library/node-chromium:",
+    "localhost/node-chromium:",
 )
 SAFE_NODE_SCRIPTS = ("lint", "typecheck", "test:run", "test:ci", "test", "build")
 UNSAFE_SCRIPT_WORDS = ("dev", "serve", "start", "preview", "watch")
@@ -60,7 +60,24 @@ GO_COMMANDS = {
         {"name": "version", "command": "go version"},
         {"name": "env", "command": "go env"},
         {"name": "mod_download", "command": "go mod download 2>&1"},
-        {"name": "migrate", "command": "if [ -f Makefile ] && grep -Eq '^migrate-up:' Makefile; then make migrate-up; else echo 'SKIP: Make target migrate-up not present'; fi 2>&1"},
+        {
+            "name": "migrate",
+            "command": (
+                "if [ -f Makefile ] && grep -Eq '^migrate-up:' Makefile; then "
+                "echo '[go:.:migrate] shared Go cache active'; "
+                "if [ -x /ci-cache/.tool-bin/goose ]; then "
+                "timeout --foreground --signal=TERM --kill-after=15s "
+                "\"${CI_MIGRATION_TIMEOUT_SECONDS:-300}s\" "
+                "make --no-print-directory GOOSE=/ci-cache/.tool-bin/goose migrate-up; "
+                "else "
+                "echo '[go:.:migrate] shared goose binary missing; using workspace fallback'; "
+                "timeout --foreground --signal=TERM --kill-after=15s "
+                "\"${CI_MIGRATION_TIMEOUT_SECONDS:-300}s\" "
+                "make --no-print-directory migrate-up; "
+                "fi; "
+                "else echo 'SKIP: Make target migrate-up not present'; fi 2>&1"
+            ),
+        },
     ],
     "check": [
         {"name": "ai-integrity", "command": "if [ -f Makefile ] && grep -Eq '^ai-integrity-check:' Makefile; then make ai-integrity-check; else echo 'SKIP: Make target ai-integrity-check not present'; fi 2>&1"},
@@ -82,7 +99,6 @@ FAST_CHECK_COMMANDS = {
 
 APPROVED_GO_IMAGE_PREFIXES = (
     "docker.io/library/golang:",
-    "100.118.124.97:5555/library/golang:",
 )
 
 GO_DIRECTIVE_RE = re.compile(r"^\s*go\s+(?P<version>\d+\.\d+(?:\.\d+)?)\s*$", re.MULTILINE)

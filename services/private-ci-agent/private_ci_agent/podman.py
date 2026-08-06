@@ -19,6 +19,7 @@ REQUIRED_NO_PROXY = ("postgres", "redis", "rabbitmq", "localhost", "127.0.0.1", 
 LOOPBACK_PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 CONTAINER_PROXY_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
 ROOTLESS_OUTBOUND_NETWORK = "slirp4netns:allow_host_loopback=true"
+LOCAL_ONLY_IMAGE_PREFIXES = ("localhost/node-chromium:",)
 
 
 class PodmanRunner:
@@ -140,7 +141,7 @@ class PodmanRunner:
         return {"exit_code": -1, "stdout": "", "stderr": code, "timed_out": False}
 
     def image_available(self, image: str, allow_pull: bool = True) -> bool:
-        """Verify the selected image exists locally, pulling only when missing."""
+        """Verify an image exists, never pulling local-only shared runtimes."""
         try:
             exists = subprocess.run(
                 [self.podman, "image", "exists", image],
@@ -150,13 +151,12 @@ class PodmanRunner:
             )
             if exists.returncode == 0:
                 return True
-            if not allow_pull:
+            if not allow_pull or any(image.startswith(prefix) for prefix in LOCAL_ONLY_IMAGE_PREFIXES):
+                if any(image.startswith(prefix) for prefix in LOCAL_ONLY_IMAGE_PREFIXES):
+                    logger.error("Local shared image is not prewarmed: %s", image)
                 return False
 
-            pull = [self.podman, "pull", "--platform", "linux/amd64"]
-            if image.startswith("100.118.124.97:5555/"):
-                pull.extend(["--tls-verify=false"])
-            pull.append(image)
+            pull = [self.podman, "pull", "--platform", "linux/amd64", image]
             refreshed = subprocess.run(pull, capture_output=True, text=True, timeout=180)
             if refreshed.returncode != 0:
                 return False

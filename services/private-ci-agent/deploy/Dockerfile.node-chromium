@@ -4,9 +4,9 @@
 # 导致 Playwright 浏览器 smoke 在容器内 Chrome startup 失败。本镜像在
 # node:22 之上补齐 Chromium 系统依赖，供浏览器 smoke 工作区使用。
 #
-# 构建并推送到受控 registry（与 go 镜像同一私有 registry）：
-#   podman build -t 100.118.124.97:5555/library/node-chromium:22 -f Dockerfile.node-chromium .
-#   podman push 100.118.124.97:5555/library/node-chromium:22
+# Worker 只需构建一次并留在本机 rootless Podman image store：
+#   podman build --pull=never -t localhost/node-chromium:22 -f Dockerfile.node-chromium .
+# 不推送到远端；所有分支/worktree 复用这个本地标签。
 #
 # Worker 上由运维预加载（root + ciworker 存储路径），job 只读使用，不隐式 pull。
 

@@ -12,6 +12,9 @@ WORKSPACE_ROOT="/srv/private-ci/workspaces"
 CACHE_ROOT="/srv/private-ci/cache"
 LOG_ROOT="/srv/private-ci/logs"
 RUN_DIR="/srv/private-ci/run"
+CONTROLLER_HOST="${PRIVATE_CI_CONTROLLER_HOST:-100.127.108.20}"
+CONTROLLER_PORT="${PRIVATE_CI_CONTROLLER_PORT:-8765}"
+NODE_CHROMIUM_IMAGE="${PRIVATE_CI_NODE_CHROMIUM_IMAGE:-localhost/node-chromium:22}"
 
 CIWORKER_UID=1500
 CIWORKER_GID=1500
@@ -121,10 +124,16 @@ run_preflight() {
         fi
     fi
 
-    if timeout 5 bash -c "echo >/dev/tcp/100.118.124.97/8788" 2>/dev/null; then
-        log_pass "Controller 100.118.124.97:8788 reachable"
+    if timeout 5 bash -c "echo >/dev/tcp/${CONTROLLER_HOST}/${CONTROLLER_PORT}" 2>/dev/null; then
+        log_pass "Controller ${CONTROLLER_HOST}:${CONTROLLER_PORT} reachable"
     else
-        log_warn "Controller 100.118.124.97:8788 not reachable"
+        log_warn "Controller ${CONTROLLER_HOST}:${CONTROLLER_PORT} not reachable"
+    fi
+
+    if podman_run_as_ciworker image exists "${NODE_CHROMIUM_IMAGE}" >/dev/null 2>&1; then
+        log_pass "Shared Node Chromium image available: ${NODE_CHROMIUM_IMAGE}"
+    else
+        log_warn "Shared Node Chromium image is not prewarmed: ${NODE_CHROMIUM_IMAGE}"
     fi
 
     local proxy_host proxy_port=10808
@@ -135,7 +144,7 @@ run_preflight() {
 
     local no_proxy_val
     no_proxy_val=$(grep '^NO_PROXY=' /etc/private-ci/proxy.conf 2>/dev/null | cut -d= -f2- || echo "")
-    echo "${no_proxy_val}" | grep -q "100.118.124.97" && log_pass "NO_PROXY includes Controller IP" || log_warn "NO_PROXY may not include Controller IP"
+    echo "${no_proxy_val}" | grep -q "${CONTROLLER_HOST}" && log_pass "NO_PROXY includes Controller IP" || log_warn "NO_PROXY may not include Controller IP"
 
     local agent_count
     agent_count=$(pgrep -cf "private_ci_agent.main" 2>/dev/null || true)

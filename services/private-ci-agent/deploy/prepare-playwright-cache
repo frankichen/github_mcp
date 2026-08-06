@@ -12,6 +12,13 @@ AGENT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CACHE_ROOT="/srv/private-ci/cache/ms-playwright"
 NPM_CACHE="/srv/private-ci/cache/npm"
 WORKSPACE_ROOT="/srv/private-ci/workspaces"
+
+if [ -r /srv/private-ci/run/proxy.runtime.conf ]; then
+    set -a
+    # shellcheck source=/dev/null
+    . /srv/private-ci/run/proxy.runtime.conf
+    set +a
+fi
 # PodmanRunner maps CACHE_ROOT to the container target /ci-cache/ms-playwright.
 MAINTENANCE_WORKSPACE="$(mktemp -d "${WORKSPACE_ROOT}/.playwright-maintenance.XXXXXX")"
 trap 'rm -rf "${MAINTENANCE_WORKSPACE}"' EXIT
