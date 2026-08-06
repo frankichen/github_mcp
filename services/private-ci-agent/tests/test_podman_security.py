@@ -1,7 +1,7 @@
 import logging
 from types import SimpleNamespace
 
-from private_ci_agent.podman import PodmanRunner
+from private_ci_agent.podman import PodmanRunner, ROOTLESS_OUTBOUND_NETWORK
 
 
 def test_rootless_command_does_not_use_env_host_or_forward_tokens(monkeypatch, tmp_path):
@@ -71,6 +71,9 @@ def test_go_uses_read_write_job_cache_and_controlled_environment(monkeypatch, tm
     assert "--env-host" not in command
     assert all("GITHUB_TOKEN" not in item for item in command)
     assert all("UNCONTROLLED" not in item for item in command)
+    assert "--network" in command
+    assert command[command.index("--network") + 1] == ROOTLESS_OUTBOUND_NETWORK
+    assert "--network=none" not in command
 
 
 def test_npm_cache_mounts_to_controlled_shared_directory(monkeypatch, tmp_path):
@@ -120,7 +123,9 @@ def test_proxy_is_explicitly_rewritten_and_redacted_from_logs(monkeypatch, tmp_p
     validation, command = captured
     assert "--http-proxy=false" in validation
     assert any("https://github.com" in item for item in validation)
+    assert validation[validation.index("--network") + 1] == ROOTLESS_OUTBOUND_NETWORK
     assert "--http-proxy=false" in command
+    assert command[command.index("--network") + 1] == ROOTLESS_OUTBOUND_NETWORK
     assert "HTTP_PROXY=http://proxy-user:proxy-password@host.containers.internal:10808" in command
     assert "HTTPS_PROXY=http://host.containers.internal:10808" in command
     assert "ALL_PROXY=socks5h://host.containers.internal:10808" in command
@@ -218,3 +223,25 @@ def test_service_environment_is_forwarded_without_host_env(monkeypatch, tmp_path
     assert any(item.startswith("DATABASE_URL=") for item in command)
     assert "CI_WORKER_TOKEN" not in " ".join(command)
     assert "postgres" in next(item for item in command if item.startswith("NO_PROXY="))
+
+
+def test_proxy_probe_reuses_named_service_pod(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_run(command, **_kwargs):
+        captured.append(command)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:10808")
+    monkeypatch.setenv("PRIVATE_CI_CONTAINER_PROXY_HOST", "10.0.2.2")
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+
+    PodmanRunner("podman").run_command(
+        "docker.io/library/golang:1.26.4", "job-123", str(tmp_path), {}, "go env", 30,
+        network=True, network_name="ci-job_123", pass_proxy=True,
+    )
+
+    assert len(captured) == 2
+    for command in captured:
+        assert command[command.index("--pod") + 1] == "ci-job_123"
+        assert ROOTLESS_OUTBOUND_NETWORK not in command
