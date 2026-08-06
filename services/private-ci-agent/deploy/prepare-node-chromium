@@ -13,6 +13,13 @@ fi
 # worktree. Podman must start from a directory the worker can enter.
 cd /tmp
 
+# Rootless Buildah may otherwise choose /var/tmp, which is protected by the
+# Worker service hardening. Keep transient build layers in the Worker-owned
+# writable area instead.
+BUILD_TMPDIR="/srv/private-ci/tmp"
+mkdir -p "${BUILD_TMPDIR}"
+export TMPDIR="${BUILD_TMPDIR}" BUILDAH_TMPDIR="${BUILD_TMPDIR}"
+
 AGENT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE="${PRIVATE_CI_NODE_CHROMIUM_IMAGE:-localhost/node-chromium:22}"
 BASE_IMAGE="docker.io/library/node:22"

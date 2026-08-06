@@ -52,6 +52,9 @@ for f in prepare-node-chromium prepare-go-cache prepare-playwright-cache; do
     install -o nobody -g nogroup -m 755 "${src}" "${AGENT_DIR}/deploy/${f}"
     log "  updated deploy/${f}"
 done
+install -o nobody -g nogroup -m 644 \
+    "${REPO_ROOT}/services/private-ci-agent/deploy/Dockerfile.node-chromium" \
+    "${AGENT_DIR}/deploy/Dockerfile.node-chromium"
 
 # ── 4. 重建并重启 controller（github-action-service）────────
 # 容器内代码通过镜像打包（build: .），heartbeat lease_token 修复需重建。
