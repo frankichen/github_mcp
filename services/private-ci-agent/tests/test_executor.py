@@ -123,6 +123,69 @@ def test_node_setup_failure_blocks_all_node_checks(tmp_path, timed_out):
     assert not any(command.startswith("npm run ") for command, _, _ in podman.commands)
 
 
+def test_browser_preheat_failure_blocks_node_checks_without_running_them(tmp_path):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "cloud-storage-plan-browser-smoke.mjs").write_text(
+        "npx --yes playwright@1.62.0 install --with-deps chromium\n",
+        encoding="utf-8",
+    )
+
+    class BrowserPreheatFailurePodman(FakePodman):
+        def run_command(self, _image, _job_id, _source_dir, _caches, command, _timeout, network=False, **_kwargs):
+            self.caches.append(_caches)
+            self.commands.append((command, network, _timeout))
+            failed = "npx --yes playwright@1.62.0 install chromium --no-shell" in command
+            return {"exit_code": 1 if failed else 0, "stdout": "", "stderr": "", "timed_out": False}
+
+    podman = BrowserPreheatFailurePodman()
+    workspace = {
+        "path": ".", "stack": "node", "framework": "vue", "package_manager": "npm",
+        "scripts": {
+            "test:run": "npm run test:browser-smoke:storage-plan",
+            "test:browser-smoke:storage-plan": "node scripts/cloud-storage-plan-browser-smoke.mjs",
+            "typecheck": "vue-tsc --noEmit", "build": "vite build",
+        },
+    }
+    result = make_executor(podman)._execute_workspace(make_job(tmp_path), workspace)
+
+    assert result["passed"] is False
+    assert any(step["step_name"].endswith(":playwright_preheat") and step["status"] == "failed" for step in result["steps"])
+    blocked = [step for step in result["steps"] if step["status"] == "blocked_by_setup"]
+    assert {step["step_name"] for step in blocked} == {"node:.:test:run", "node:.:typecheck", "node:.:build"}
+    assert not any(command.startswith("npm run ") for command, _, _ in podman.commands)
+
+
+def test_failed_npm_install_blocks_browser_preheat_and_checks(tmp_path):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "cloud-storage-plan-browser-smoke.mjs").write_text(
+        "npx --yes playwright@1.62.0 install chromium\n",
+        encoding="utf-8",
+    )
+
+    class NpmFailurePodman(FakePodman):
+        def run_command(self, _image, _job_id, _source_dir, _caches, command, _timeout, network=False, **_kwargs):
+            self.caches.append(_caches)
+            self.commands.append((command, network, _timeout))
+            return {"exit_code": 1 if command == "npm ci" else 0, "stdout": "", "stderr": "", "timed_out": False}
+
+    podman = NpmFailurePodman()
+    workspace = {
+        "path": ".", "stack": "node", "framework": "vue", "package_manager": "npm",
+        "scripts": {
+            "test:run": "npm run test:browser-smoke:storage-plan",
+            "test:browser-smoke:storage-plan": "node scripts/cloud-storage-plan-browser-smoke.mjs",
+        },
+    }
+    result = make_executor(podman)._execute_workspace(make_job(tmp_path), workspace)
+
+    preheat = next(step for step in result["steps"] if step["step_name"].endswith(":playwright_preheat"))
+    assert preheat["status"] == "blocked_by_setup"
+    assert not any("playwright@1.62.0 install" in command for command, _, _ in podman.commands)
+    assert not any(command.startswith("npm run ") for command, _, _ in podman.commands)
+
+
 def test_node_workspace_uses_persistent_npm_cache_and_controlled_setup_proxy(tmp_path, monkeypatch):
     cache = tmp_path / "persistent-npm-cache"
     monkeypatch.setitem(executor_module.CACHE_MAP, "npm", str(cache))

@@ -1,4 +1,6 @@
 import json
+import os
+import subprocess
 
 import pytest
 
@@ -130,6 +132,81 @@ def test_node_profile_uses_controlled_cache_path(tmp_path):
         "npm": "/ci-cache/npm",
         "playwright": "/ci-cache/ms-playwright",
     }
+
+
+def test_browser_preheat_uses_pinned_workspace_playwright(tmp_path):
+    node_package(
+        tmp_path,
+        {"test:run": "npm run test:browser-smoke:storage-plan", "test:browser-smoke:storage-plan": "node scripts/cloud-storage-plan-browser-smoke.mjs"},
+    )
+    (tmp_path / "package-lock.json").write_text("{}")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "cloud-storage-plan-browser-smoke.mjs").write_text(
+        "npx --yes playwright@1.62.0 install --with-deps chromium\n",
+        encoding="utf-8",
+    )
+    workspace = discover_workspaces(str(tmp_path))["workspaces"][0]
+    commands = node_commands_for_workspace(workspace, source_dir=str(tmp_path))
+
+    preheat = commands["setup"][1]
+    assert preheat["name"] == "playwright_preheat"
+    assert "npx --yes playwright@1.62.0 install chromium --no-shell" in preheat["command"]
+    assert "PLAYWRIGHT_BROWSERS_PATH" in preheat["command"]
+    assert "/ci-cache/ms-playwright" in preheat["command"]
+    assert "--with-deps" not in preheat["command"]
+
+
+def test_browser_preheat_uses_workspace_local_playwright(tmp_path):
+    node_package(tmp_path, {"test:run": "node scripts/browser-smoke.mjs"}, deps={"playwright": "^1.62.0"})
+    (tmp_path / "package-lock.json").write_text("{}")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "browser-smoke.mjs").write_text("console.log('browser-smoke')\n", encoding="utf-8")
+    workspace = discover_workspaces(str(tmp_path))["workspaces"][0]
+    commands = node_commands_for_workspace(workspace, source_dir=str(tmp_path))
+
+    preheat = commands["setup"][1]
+    assert "node_modules/.bin/playwright install chromium --no-shell" in preheat["command"]
+    assert "npx --yes playwright@" not in preheat["command"]
+
+
+def test_browser_preheat_is_idempotent_on_cache_hit_and_installs_on_miss(tmp_path):
+    node_package(
+        tmp_path,
+        {"test:run": "node scripts/cloud-storage-plan-browser-smoke.mjs"},
+    )
+    (tmp_path / "package-lock.json").write_text("{}")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "cloud-storage-plan-browser-smoke.mjs").write_text(
+        "npx --yes playwright@1.62.0 install chromium\n", encoding="utf-8"
+    )
+    workspace = discover_workspaces(str(tmp_path))["workspaces"][0]
+    command = node_commands_for_workspace(workspace, source_dir=str(tmp_path))["setup"][1]["command"]
+    cache = tmp_path / "browser-cache"
+    cache.mkdir()
+    marker = tmp_path / "npx-called"
+    fake_npx = tmp_path / "npx"
+    fake_npx.write_text(
+        f"#!/bin/sh\ntouch '{marker}'\ntouch \"$PLAYWRIGHT_BROWSERS_PATH/chrome\"\nchmod 700 \"$PLAYWRIGHT_BROWSERS_PATH/chrome\"\n",
+        encoding="utf-8",
+    )
+    fake_npx.chmod(0o700)
+    (cache / "chrome").write_text("cached", encoding="utf-8")
+    (cache / "chrome").chmod(0o700)
+    env = {"PLAYWRIGHT_BROWSERS_PATH": str(cache), "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+
+    hit = subprocess.run(["/bin/sh", "-c", command], env=env, capture_output=True, text=True)
+    assert hit.returncode == 0
+    assert "cache_hit=true" in hit.stdout
+    assert not marker.exists()
+
+    (cache / "chrome").unlink()
+    miss = subprocess.run(["/bin/sh", "-c", command], env=env, capture_output=True, text=True)
+    assert miss.returncode == 0
+    assert "cache_hit=false" in miss.stdout
+    assert marker.exists()
 
 
 def test_go_mod_requirement_selects_compatible_version_and_build(tmp_path):

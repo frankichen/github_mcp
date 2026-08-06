@@ -227,7 +227,7 @@ class JobExecutor:
         stack = workspace["stack"]
         if stack == "node":
             required_default = workspace.get("required_scripts") or []
-            return node_commands_for_workspace(workspace, required_default)
+            return node_commands_for_workspace(workspace, required_default, source_dir=source_dir)
         if stack == "go":
             return go_commands_for_workspace(source_dir)
         if stack == "python":
@@ -294,6 +294,22 @@ class JobExecutor:
 
         setup_failed = False
         for setup in commands.get("setup", []):
+            if setup_failed and workspace["stack"] == "node":
+                # A browser preheat depends on the successful npm install.  Do
+                # not run it after npm ci failed; report the dependency failure
+                # explicitly and keep all Node checks blocked by setup.
+                name = setup.get("name", "setup") if isinstance(setup, dict) else "setup"
+                command = setup.get("command") if isinstance(setup, dict) else setup
+                blocked_step = {
+                    "step_name": f"{label}:{name}",
+                    "command": command,
+                    "status": "blocked_by_setup",
+                    "exit_code": None,
+                    "duration_seconds": 0,
+                }
+                steps.append(blocked_step)
+                self.log_manager.upload(job.job_id, f"[{blocked_step['step_name']}] BLOCKED_BY_SETUP\n")
+                continue
             name = setup.get("name", "setup") if isinstance(setup, dict) else "setup"
             command = setup.get("command") if isinstance(setup, dict) else setup
             # Dependency installation and migrations may need outbound access.
