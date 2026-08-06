@@ -181,8 +181,8 @@ def test_proxy_is_explicitly_rewritten_and_redacted_from_logs(monkeypatch, tmp_p
     assert len(captured) == 2
     validation, command = captured
     assert "--http-proxy=false" in validation
-    assert any("curl -4 --proxy \"$proxy\" --connect-timeout 5 --max-time 15 -fsS -o /dev/null https://github.com" in item for item in validation)
-    assert any("https://github.com" in item for item in validation)
+    assert any("curl -4 --proxy \"$proxy\" --connect-timeout 5 --max-time 15 -fsS -o /dev/null https://api.github.com" in item for item in validation)
+    assert any("https://api.github.com" in item for item in validation)
     assert validation[validation.index("--network") + 1] == ROOTLESS_OUTBOUND_NETWORK
     assert "--http-proxy=false" in command
     assert command[command.index("--network") + 1] == ROOTLESS_OUTBOUND_NETWORK
