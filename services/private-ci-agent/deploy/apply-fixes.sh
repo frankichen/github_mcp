@@ -69,7 +69,18 @@ export VCS_REF="${BUILD_SHA}" SERVICE_VERSION BUILD_DATE
 export MYGITHUB12_BUILD_SHA="${BUILD_SHA}" MYGITHUB10_BUILD_SHA="${BUILD_SHA}"
 export MYGITHUB12_VERSION="${SERVICE_VERSION}" MYGITHUB10_VERSION="${SERVICE_VERSION}"
 CONTROLLER_IMAGE="github-action-service:${BUILD_SHA}"
+# Docker BuildKit runs its build steps in a separate network namespace. Use
+# the host network so the build can reach the host-only proxy listener at
+# 127.0.0.1:10808, and pass the proxy explicitly to apt/pip/npm layers.
+DOCKER_BUILD_PROXY="${PRIVATE_CI_DOCKER_BUILD_PROXY:-http://127.0.0.1:10808}"
 docker build \
+    --network host \
+    --build-arg "HTTP_PROXY=${DOCKER_BUILD_PROXY}" \
+    --build-arg "HTTPS_PROXY=${DOCKER_BUILD_PROXY}" \
+    --build-arg "ALL_PROXY=${DOCKER_BUILD_PROXY}" \
+    --build-arg "http_proxy=${DOCKER_BUILD_PROXY}" \
+    --build-arg "https_proxy=${DOCKER_BUILD_PROXY}" \
+    --build-arg "all_proxy=${DOCKER_BUILD_PROXY}" \
     --build-arg "SOURCE_REPOSITORY=${SOURCE_REPOSITORY}" \
     --build-arg "VCS_REF=${VCS_REF}" \
     --build-arg "SERVICE_VERSION=${SERVICE_VERSION}" \
