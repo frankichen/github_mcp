@@ -49,8 +49,10 @@ class ControllerClient:
         except Exception:
             return False
 
-    def heartbeat(self, current_job_id: Optional[str] = None) -> dict:
+    def heartbeat(self, current_job_id: Optional[str] = None, lease_token: Optional[str] = None) -> dict:
         body = {"current_job_id": current_job_id} if current_job_id else {}
+        if lease_token:
+            body["lease_token"] = lease_token
         return self._request("POST", "/internal/ci/workers/heartbeat", body)
 
     def lease_job(self) -> Optional[dict]:

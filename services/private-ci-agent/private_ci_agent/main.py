@@ -34,6 +34,7 @@ logger = logging.getLogger("ci-agent")
 
 _running = True
 _current_job_id = None
+_current_lease_token = None
 _cancel_event = threading.Event()
 _podman_binary = "/usr/bin/podman"
 REGISTER_BACKOFF_SECONDS = (2, 5, 10, 30, 60, 60)
@@ -135,7 +136,8 @@ def main():
         while not heartbeat_stop.is_set():
             try:
                 job_at_send = _current_job_id
-                response = client.heartbeat(job_at_send)
+                token_at_send = _current_lease_token
+                response = client.heartbeat(job_at_send, token_at_send)
                 if job_at_send and response.get("cancel_requested"):
                     logger.info("Cancel requested for job %s", job_at_send)
                     _request_cancel(job_at_send)
@@ -151,7 +153,7 @@ def main():
             try:
                 if _current_job_id:
                     try:
-                        hb = client.heartbeat(_current_job_id)
+                        hb = client.heartbeat(_current_job_id, _current_lease_token)
                         if hb.get("cancel_requested"):
                             logger.info("Cancel requested for job %s", _current_job_id)
                             _request_cancel(_current_job_id)
@@ -182,6 +184,7 @@ def main():
                             changed_files=result.get("changed_files", []),
                         )
                         _current_job_id = job.job_id
+                        _current_lease_token = job.lease_token
                         _cancel_event.clear()
 
                         try:
@@ -197,6 +200,7 @@ def main():
                         finally:
                             _cleanup_job(job.job_id, workspace_mgr)
                             _current_job_id = None
+                            _current_lease_token = None
 
                 time.sleep(poll_interval)
             except Exception as e:

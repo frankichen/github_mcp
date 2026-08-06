@@ -99,9 +99,14 @@ async def worker_heartbeat(request: Request):
     except Exception:
         body = {}
     current_job_id = body.get("current_job_id")
+    lease_token = body.get("lease_token")
 
     if current_job_id:
-        renewed = renew_lease(current_job_id, request.headers.get("Authorization", "")[7:])
+        # renew_lease must receive the job's lease token, not the worker's
+        # registration token: the Authorization header only proves the worker
+        # identity, while the lease token is the per-job credential that must
+        # match lease_token_hash for the renewal to apply.
+        renewed = renew_lease(current_job_id, lease_token or request.headers.get("Authorization", "")[7:])
         cancel_requested = need_heartbeat(current_job_id)
 
         return {
