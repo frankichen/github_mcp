@@ -100,6 +100,9 @@ class PodmanRunner:
             elif cache_name == "pip":
                 if os.path.exists(cache_path):
                     mounts.extend(["-v", f"{cache_path}:/ci-cache/pip:Z"])
+            elif cache_name == "npm":
+                if os.path.exists(cache_path):
+                    mounts.extend(["-v", f"{cache_path}:/root/.npm:Z"])
             elif os.path.exists(cache_path):
                 mounts.extend(["-v", f"{cache_path}:{cache_path}:Z"])
         return mounts, go_cache

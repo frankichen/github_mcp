@@ -1,6 +1,8 @@
 import os
 from types import SimpleNamespace
 
+import pytest
+
 from private_ci_agent.executor import JobExecutor
 from private_ci_agent.models import Job
 from private_ci_agent.podman import PodmanRunner
@@ -46,7 +48,7 @@ class FakePodman:
 
     def run_command(self, _image, _job_id, _source_dir, _caches, command, _timeout, network=False, **_kwargs):
         self.caches.append(_caches)
-        self.commands.append((command, network))
+        self.commands.append((command, network, _timeout))
         exit_code = 1 if self.failing_command and self.failing_command in command else 0
         return {"exit_code": exit_code, "stdout": "", "stderr": "", "timed_out": False}
 
@@ -90,7 +92,43 @@ def test_setup_failure_blocks_go_checks_without_mislabeling_code_failure(tmp_pat
     assert any(step["status"] == "failed" and step["step_name"].endswith(":mod_download") for step in result["steps"])
     blocked = [step for step in result["steps"] if step["status"] == "blocked_by_setup"]
     assert {step["step_name"].rsplit(":", 1)[-1] for step in blocked} == {"govet", "gotest", "gobuild"}
-    assert not any("go vet" in command or "go test" in command or "go build" in command for command, _ in podman.commands)
+    assert not any("go vet" in command or "go test" in command or "go build" in command for command, _, _ in podman.commands)
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_node_setup_failure_blocks_all_node_checks(tmp_path, timed_out):
+    class NodeSetupFailurePodman(FakePodman):
+        def run_command(self, _image, _job_id, _source_dir, _caches, command, _timeout, network=False, **_kwargs):
+            self.caches.append(_caches)
+            self.commands.append((command, network, _timeout))
+            failed = command == "npm ci"
+            return {"exit_code": -1 if failed and timed_out else (1 if failed else 0), "stdout": "", "stderr": "", "timed_out": failed and timed_out}
+
+    podman = NodeSetupFailurePodman()
+    workspace = {
+        "path": ".", "stack": "node", "package_manager": "npm",
+        "scripts": {"test": "vitest run", "typecheck": "vue-tsc --noEmit", "build": "vite build"},
+    }
+    result = make_executor(podman)._execute_workspace(make_job(tmp_path), workspace)
+
+    assert result["passed"] is False
+    setup = next(step for step in result["steps"] if step["step_name"].endswith(":setup"))
+    assert setup["status"] == ("timed_out" if timed_out else "failed")
+    blocked = [step for step in result["steps"] if step["status"] == "blocked_by_setup"]
+    assert {step["step_name"].rsplit(":", 1)[-1] for step in blocked} == {"test", "typecheck", "build"}
+    assert not any(command.startswith("npm run ") for command, _, _ in podman.commands)
+
+
+@pytest.mark.parametrize(("job_timeout", "maximum", "expected"), [(900, 600, 600), (60, 600, 60)])
+def test_setup_timeout_is_bounded_by_job_and_agent_policy(tmp_path, job_timeout, maximum, expected):
+    executor = make_executor(FakePodman())
+    executor.config = {"max_job_seconds": maximum}
+    job = make_job(tmp_path)
+    job.timeout_seconds = job_timeout
+
+    executor._run_setup(job, "node:.", "node:22", str(tmp_path), {}, "setup", "npm ci")
+
+    assert executor.podman.commands == [("npm ci", True, expected)]
 
 
 def test_go_build_failure_fails_workspace(tmp_path):
@@ -117,7 +155,7 @@ def test_go_cache_is_job_scoped_and_outside_source(tmp_path):
     assert cache_path == str(source.parent / "go-cache")
     assert not cache_path.startswith(str(source) + "/")
     assert (source.parent / "go-cache").stat().st_mode & 0o777 == 0o700
-    assert [command for command, _ in podman.commands[:4]] == [
+    assert [command for command, _, _ in podman.commands[:4]] == [
         "echo '[go:.:setup] preparing writable cache'; mkdir -p \"$HOME\" \"$GOPATH\" \"$GOMODCACHE\" \"$GOCACHE\" \"$(dirname \"$GOENV\")\" \"$GOTMPDIR\" \"$XDG_CACHE_HOME\" \"$XDG_CONFIG_HOME\"; test -w /ci-cache; test -w \"$GOMODCACHE\"; test -w \"$GOCACHE\"; test -w \"$GOTMPDIR\"",
         "go version",
         "go env",
@@ -145,7 +183,7 @@ class OnceFailingPodman(FakePodman):
 
     def run_command(self, _image, _job_id, _source_dir, _caches, command, _timeout, network=False, **_kwargs):
         self.caches.append(_caches)
-        self.commands.append((command, network))
+        self.commands.append((command, network, _timeout))
         exit_code = 0
         if self._failing and self._failing in command and not self._already_failed:
             self._already_failed = True
@@ -162,7 +200,7 @@ class AlwaysFailPodman(FakePodman):
 
     def run_command(self, _image, _job_id, _source_dir, _caches, command, _timeout, network=False, **_kwargs):
         self.caches.append(_caches)
-        self.commands.append((command, network))
+        self.commands.append((command, network, _timeout))
         exit_code = 1 if self._failing and self._failing in command else 0
         return {"exit_code": exit_code, "stdout": "", "stderr": "", "timed_out": False}
 
@@ -174,7 +212,7 @@ def test_gofmt_autofix_formats_workspace_without_git_writeback(tmp_path):
 
     class GofmtAutofixPodman(FakePodman):
         def run_command(self, image, job_id, source_dir, caches, command, timeout, network=False, **kwargs):
-            self.commands.append((command, network))
+            self.commands.append((command, network, timeout))
             if "gofmt -w" in command:
                 return {
                     "exit_code": 0,
@@ -191,7 +229,7 @@ def test_gofmt_autofix_formats_workspace_without_git_writeback(tmp_path):
     assert result["passed"] is True
     gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
     assert gofmt_step["status"] == "passed"
-    commands = [command for command, _ in podman.commands]
+    commands = [command for command, _, _ in podman.commands]
     assert any("gofmt -w" in command for command in commands)
     assert not any("git commit" in command or "git push" in command for command in commands)
     assert any("GOFMT AUTOFIX FILES" in message for message in executor.log_manager.messages)

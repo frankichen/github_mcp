@@ -298,7 +298,10 @@ class JobExecutor:
             self.log_manager.upload(job.job_id, f"[{step['step_name']}] {skipped['status']}: {skipped.get('reason')}\n")
 
         for check in commands.get("check", []):
-            if setup_failed and workspace["stack"] == "go" and check["name"] in {"govet", "gotest", "gobuild"}:
+            if setup_failed and (
+                (workspace["stack"] == "go" and check["name"] in {"govet", "gotest", "gobuild"})
+                or workspace["stack"] in {"node", "python"}
+            ):
                 step = {
                     "step_name": f"{label}:{check['name']}",
                     "command": check["command"],
@@ -351,13 +354,18 @@ class JobExecutor:
         name = f"{label}:{step_name}"
         self.log_manager.upload(job.job_id, f"[{name}] Starting: {command}\n")
         start = time.time()
-        result = self.podman.run_command(image, job.job_id, source_dir, caches, command, 300, network=True,
+        result = self.podman.run_command(image, job.job_id, source_dir, caches, command, self._setup_timeout(job), network=True,
                                          env=self._service_env(service_env), network_name=service_env.network if service_env else None,
                                          pass_proxy=pass_proxy)
         self._upload_output(job.job_id, result)
         status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else "failed")
         self.log_manager.upload(job.job_id, f"[{name}] {status.upper()} (exit={result['exit_code']})\n")
         return {"step_name": name, "command": command, "status": status, "exit_code": result["exit_code"], "duration_seconds": time.time() - start}
+
+    def _setup_timeout(self, job: Job) -> int:
+        """Bound setup by both the leased job deadline and the agent policy."""
+        configured_maximum = int(getattr(self, "config", {}).get("max_job_seconds", job.timeout_seconds))
+        return max(1, min(job.timeout_seconds, configured_maximum))
 
     def _run_check(self, job, label, image, source_dir, caches, name, command, service_env=None, extra_env=None, pass_proxy=False):
         step_name = f"{label}:{name}"
