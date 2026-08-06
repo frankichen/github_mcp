@@ -119,14 +119,14 @@ def test_optional_missing_script_is_skipped(tmp_path):
     assert skipped[0]["status"] == "skipped"
 
 
-def test_node_profile_cache_and_commands_remain_unchanged(tmp_path):
+def test_node_profile_uses_controlled_cache_path(tmp_path):
     node_package(tmp_path, {"test:run": "vitest run"})
     (tmp_path / "package-lock.json").write_text("{}")
     workspace = discover_workspaces(str(tmp_path))["workspaces"][0]
     commands = node_commands_for_workspace(workspace, ["test:run"])
 
     assert commands["setup"] == ["npm ci"]
-    assert commands["cache_dirs"] == {"npm": "/root/.npm"}
+    assert commands["cache_dirs"] == {"npm": "/ci-cache/npm"}
 
 
 def test_go_mod_requirement_selects_compatible_version_and_build(tmp_path):

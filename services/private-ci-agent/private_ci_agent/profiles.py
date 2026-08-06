@@ -383,7 +383,7 @@ def node_commands_for_workspace(workspace: dict, required_default: list[str] | N
         "skipped": skipped,
         "selected_scripts": [item["name"] for item in selected if item.get("command")],
         "image": "docker.io/library/node:22",
-        "cache_dirs": {"npm": "/root/.npm"} if package_manager == "npm" else {},
+        "cache_dirs": {"npm": "/ci-cache/npm"} if package_manager == "npm" else {},
     }
 
 

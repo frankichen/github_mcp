@@ -22,6 +22,7 @@ def test_prepare_uses_isolated_network_and_aliases(monkeypatch, tmp_path):
     assert any("--pod" in command and any("postgres" in item for item in command) for command in commands)
     assert any("--pod" in command and any("redis" in item for item in command) for command in commands)
     assert any("--pod" in command and any("rabbitmq" in item for item in command) for command in commands)
+    assert all("--http-proxy=false" in command for command in commands if command[1] == "run")
     assert (tmp_path / "runtime" / "services.env").stat().st_mode & 0o777 == 0o600
     manager.cleanup("job-123", str(tmp_path))
     assert not (tmp_path / "runtime" / "services.env").exists()

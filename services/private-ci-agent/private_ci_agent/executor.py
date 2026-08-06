@@ -26,7 +26,7 @@ from private_ci_agent.services import ServiceManager, ServiceSetupError
 
 logger = logging.getLogger(__name__)
 
-CACHE_MAP = {"go": "/srv/private-ci/cache/go", "python": "/srv/private-ci/cache/pip", "node": "/srv/private-ci/cache/npm"}
+CACHE_MAP = {"go": "/srv/private-ci/cache/go", "pip": "/srv/private-ci/cache/pip", "npm": "/srv/private-ci/cache/npm"}
 PROFILE_BY_STACK = {"go": "go-check", "python": "python-check", "node": "node-check"}
 
 
@@ -281,8 +281,10 @@ class JobExecutor:
         for setup in commands.get("setup", []):
             name = setup.get("name", "setup") if isinstance(setup, dict) else "setup"
             command = setup.get("command") if isinstance(setup, dict) else setup
+            # Dependency installation and migrations may need outbound access.
+            # Podman receives proxies only through its controlled pass_proxy path.
             step = self._run_setup(job, label, image, source_dir, caches, name, command, service_env,
-                                   pass_proxy=(workspace["stack"] == "python"))
+                                   pass_proxy=True)
             steps.append(step)
             if step["exit_code"] != 0:
                 setup_failed = True

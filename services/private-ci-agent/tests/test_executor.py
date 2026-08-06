@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import private_ci_agent.executor as executor_module
 from private_ci_agent.executor import JobExecutor
 from private_ci_agent.models import Job
 from private_ci_agent.podman import PodmanRunner
@@ -42,6 +43,7 @@ class FakePodman:
         self.failing_command = failing_command
         self.commands = []
         self.caches = []
+        self.call_options = []
 
     def image_available(self, _image):
         return True
@@ -49,6 +51,7 @@ class FakePodman:
     def run_command(self, _image, _job_id, _source_dir, _caches, command, _timeout, network=False, **_kwargs):
         self.caches.append(_caches)
         self.commands.append((command, network, _timeout))
+        self.call_options.append(_kwargs)
         exit_code = 1 if self.failing_command and self.failing_command in command else 0
         return {"exit_code": exit_code, "stdout": "", "stderr": "", "timed_out": False}
 
@@ -117,6 +120,22 @@ def test_node_setup_failure_blocks_all_node_checks(tmp_path, timed_out):
     blocked = [step for step in result["steps"] if step["status"] == "blocked_by_setup"]
     assert {step["step_name"].rsplit(":", 1)[-1] for step in blocked} == {"test", "typecheck", "build"}
     assert not any(command.startswith("npm run ") for command, _, _ in podman.commands)
+
+
+def test_node_workspace_uses_persistent_npm_cache_and_controlled_setup_proxy(tmp_path, monkeypatch):
+    cache = tmp_path / "persistent-npm-cache"
+    monkeypatch.setitem(executor_module.CACHE_MAP, "npm", str(cache))
+    podman = FakePodman()
+    workspace = {
+        "path": ".", "stack": "node", "package_manager": "npm",
+        "scripts": {"test": "vitest run"},
+    }
+
+    result = make_executor(podman)._execute_workspace(make_job(tmp_path), workspace)
+
+    assert result["passed"] is True
+    assert all(caches == {"npm": str(cache)} for caches in podman.caches)
+    assert podman.call_options[0]["pass_proxy"] is True
 
 
 @pytest.mark.parametrize(("job_timeout", "maximum", "expected"), [(900, 600, 600), (60, 600, 60)])

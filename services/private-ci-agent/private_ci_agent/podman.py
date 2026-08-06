@@ -3,32 +3,129 @@
 import hashlib
 import logging
 import os
+import re
 import subprocess
+from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
+
+PROXY_ENV_NAMES = {
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "all_proxy",
+}
+REQUIRED_NO_PROXY = ("postgres", "redis", "rabbitmq", "localhost", "127.0.0.1", "::1")
+LOOPBACK_PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+CONTAINER_PROXY_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
 
 
 class PodmanRunner:
     def __init__(self, podman_binary: str = "/usr/bin/podman"):
         self.podman = podman_binary
+        self._validated_proxy_contexts: set[tuple[str, str, str]] = set()
 
     @staticmethod
     def _container_proxy_env() -> dict[str, str]:
-        """Pass host-loopback proxies through rootless Podman containers."""
-        proxy_keys = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"}
+        """Return the explicitly controlled proxy environment for a container."""
         result = {
             key: value for key, value in os.environ.items()
-            if key in proxy_keys and value
+            if key in PROXY_ENV_NAMES and value
         }
+        if not result:
+            return PodmanRunner._no_proxy_env()
         container_proxy_host = os.environ.get("PRIVATE_CI_CONTAINER_PROXY_HOST", "host.containers.internal")
+        if not CONTAINER_PROXY_HOST_RE.fullmatch(container_proxy_host) or container_proxy_host.lower() in LOOPBACK_PROXY_HOSTS:
+            raise ValueError("PRIVATE_CI_CONTAINER_PROXY_HOST must be a non-loopback hostname or IPv4 address")
         for key, value in list(result.items()):
-            if "127.0.0.1" in value or "localhost" in value:
-                result[key] = value.replace("127.0.0.1", container_proxy_host).replace("localhost", container_proxy_host)
-        no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy")
-        if no_proxy:
-            result["NO_PROXY"] = no_proxy
-            result["no_proxy"] = no_proxy
+            result[key] = PodmanRunner._rewrite_loopback_proxy_url(value, container_proxy_host)
+        result.update(PodmanRunner._no_proxy_env())
         return result
+
+    @staticmethod
+    def _rewrite_loopback_proxy_url(value: str, container_proxy_host: str) -> str:
+        """Replace only a loopback URL hostname, preserving scheme and credentials."""
+        try:
+            parsed = urlsplit(value)
+            if parsed.hostname not in LOOPBACK_PROXY_HOSTS:
+                return value
+            port = parsed.port
+        except ValueError:
+            return value
+        userinfo = f"{parsed.netloc.rsplit('@', 1)[0]}@" if "@" in parsed.netloc else ""
+        netloc = f"{userinfo}{container_proxy_host}"
+        if port is not None:
+            netloc = f"{netloc}:{port}"
+        return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+    @staticmethod
+    def _no_proxy_env() -> dict[str, str]:
+        """Keep internal service names and the existing bypass allowlist intact."""
+        values = []
+        for name in ("NO_PROXY", "no_proxy"):
+            values.extend(item.strip() for item in os.environ.get(name, "").split(",") if item.strip())
+        values.extend(REQUIRED_NO_PROXY)
+        merged = ",".join(dict.fromkeys(values))
+        return {"NO_PROXY": merged, "no_proxy": merged}
+
+    @staticmethod
+    def _ensure_cache_dir(cache_path: str) -> bool:
+        try:
+            os.makedirs(cache_path, mode=0o700, exist_ok=True)
+            return True
+        except OSError as exc:
+            logger.error("Unable to prepare controlled cache directory: %s", type(exc).__name__)
+            return False
+
+    def _validate_container_proxy(
+        self,
+        image: str,
+        container_name: str,
+        network: bool,
+        network_name: str | None,
+        proxy_env: dict[str, str],
+    ) -> bool:
+        """Verify the rewritten proxy from an equally isolated container once."""
+        active_proxy = {key: value for key, value in proxy_env.items() if key in PROXY_ENV_NAMES}
+        if not active_proxy:
+            return True
+        if not network and not network_name:
+            logger.warning("Refusing proxy injection into a network-isolated container")
+            return False
+        fingerprint = hashlib.sha256("\0".join(f"{key}={value}" for key, value in sorted(active_proxy.items())).encode()).hexdigest()
+        context = network_name or "default"
+        cache_key = (image, context, fingerprint)
+        if cache_key in self._validated_proxy_contexts:
+            return True
+
+        network_args = ["--pod", network_name] if network_name else []
+        userns_args = [] if network_name else ["--userns=keep-id"]
+        command = [
+            self.podman, "run", "--rm", "--pull=never", "--http-proxy=false",
+            "--name", f"{container_name}-proxycheck",
+        ] + userns_args + [
+            "--cap-drop=ALL", "--security-opt=no-new-privileges",
+            "--read-only", "--tmpfs=/tmp:rw,noexec,nosuid,size=64m",
+        ] + network_args
+        for key, value in proxy_env.items():
+            if key in PROXY_ENV_NAMES or key in {"NO_PROXY", "no_proxy"}:
+                command.extend(["--env", f"{key}={value}"])
+        command.extend([
+            "--entrypoint", "/bin/sh", image, "-c",
+            'proxy=${HTTPS_PROXY:-${HTTP_PROXY:-${ALL_PROXY:-}}}; test -n "$proxy" && if command -v curl >/dev/null; then curl --proxy "$proxy" --connect-timeout 5 --max-time 15 -fsS -o /dev/null https://github.com; elif command -v python >/dev/null; then python -c \'import urllib.request; urllib.request.urlopen("https://github.com", timeout=15).close()\'; else exit 127; fi',
+        ])
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("Container proxy validation failed: %s", type(exc).__name__)
+            return False
+        if result.returncode != 0:
+            logger.warning("Container proxy validation failed with exit=%s", result.returncode)
+            return False
+        self._validated_proxy_contexts.add(cache_key)
+        return True
+
+    @staticmethod
+    def _proxy_failure(code: str) -> dict:
+        return {"exit_code": -1, "stdout": "", "stderr": code, "timed_out": False}
 
     def image_available(self, image: str, allow_pull: bool = True) -> bool:
         """Verify the selected image exists locally, pulling only when missing."""
@@ -98,11 +195,13 @@ class PodmanRunner:
                 if os.path.exists(cache_path):
                     mounts.extend(["-v", f"{cache_path}:/ci-venv:Z"])
             elif cache_name == "pip":
-                if os.path.exists(cache_path):
+                if PodmanRunner._ensure_cache_dir(cache_path):
                     mounts.extend(["-v", f"{cache_path}:/ci-cache/pip:Z"])
             elif cache_name == "npm":
-                if os.path.exists(cache_path):
-                    mounts.extend(["-v", f"{cache_path}:/root/.npm:Z"])
+                if PodmanRunner._ensure_cache_dir(cache_path):
+                    # :z allows concurrent rootless containers to share only the
+                    # download cache; node_modules remains workspace-local.
+                    mounts.extend(["-v", f"{cache_path}:/ci-cache/npm:z"])
             elif os.path.exists(cache_path):
                 mounts.extend(["-v", f"{cache_path}:{cache_path}:Z"])
         return mounts, go_cache
@@ -116,6 +215,7 @@ class PodmanRunner:
         commands: list[str],
         timeout_seconds: int,
         env: dict = None,
+        pass_proxy: bool = False,
     ) -> dict:
         """Run commands in an isolated rootless Podman container."""
         container_name = self._container_name(job_id, source_dir)
@@ -126,6 +226,7 @@ class PodmanRunner:
             self.podman, "run",
             "--rm",
             "--pull=never",
+            "--http-proxy=false",
             "--name", container_name,
             "--userns=keep-id",
             "--cap-drop=ALL",
@@ -148,9 +249,17 @@ class PodmanRunner:
             "-c", " && ".join(commands),
         ]
 
-        env_vars = env or {}
-        inherited_proxy = self._container_proxy_env()
-        safe_env = {**inherited_proxy, **self._go_cache_env(go_cache)}
+        env_vars = {key: value for key, value in (env or {}).items() if key not in PROXY_ENV_NAMES}
+        try:
+            proxy_env = self._container_proxy_env() if pass_proxy else {}
+        except ValueError:
+            logger.error("Container proxy configuration is invalid")
+            return self._proxy_failure("PROXY_CONFIGURATION_INVALID")
+        if pass_proxy and not self._validate_container_proxy(image, container_name, False, None, proxy_env):
+            return self._proxy_failure("PROXY_VALIDATION_FAILED")
+        safe_env = self._no_proxy_env()
+        safe_env.update(proxy_env)
+        safe_env.update(self._go_cache_env(go_cache))
         if "pip" in cache_dirs:
             safe_env.update({
                 "PIP_CACHE_DIR": "/ci-cache/pip",
@@ -163,6 +272,8 @@ class PodmanRunner:
             })
         else:
             safe_env.update(env_vars)
+        if "npm" in cache_dirs:
+            safe_env["NPM_CONFIG_CACHE"] = "/ci-cache/npm"
         safe_env = {k: v for k, v in safe_env.items()
                     if not any(f.lower() in k.lower()
                                for f in ["TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH"])}
@@ -172,8 +283,7 @@ class PodmanRunner:
             env_args.extend(["--env", f"{key}={value}"])
         cmd[cmd.index("--entrypoint"):cmd.index("--entrypoint")] = env_args
 
-        logger.info("Running podman container: %s image=%s", container_name, image)
-        logger.debug("Podman command: %s", " ".join(cmd))
+        logger.info("Running podman container: %s image=%s proxy=%s", container_name, image, pass_proxy)
 
         try:
             process = subprocess.run(
@@ -198,11 +308,11 @@ class PodmanRunner:
                 "timed_out": True,
             }
         except Exception as exc:
-            logger.error("Container execution failed: %s", exc)
+            logger.error("Container execution failed: %s", type(exc).__name__)
             return {
                 "exit_code": -1,
                 "stdout": "",
-                "stderr": f"ERROR: {str(exc)}",
+                "stderr": f"ERROR: {type(exc).__name__}",
                 "timed_out": False,
             }
 
@@ -231,6 +341,7 @@ class PodmanRunner:
             self.podman, "run",
             "--rm",
             "--pull=never",
+            "--http-proxy=false",
             "--name", container_name,
         ] + userns_arg + [
             "--cap-drop=ALL",
@@ -255,26 +366,29 @@ class PodmanRunner:
             "-c", command,
         ]
 
-        safe_env = self._container_proxy_env() if pass_proxy else {}
+        try:
+            proxy_env = self._container_proxy_env() if pass_proxy else {}
+        except ValueError:
+            logger.error("Container proxy configuration is invalid")
+            return self._proxy_failure("PROXY_CONFIGURATION_INVALID")
+        if pass_proxy and not self._validate_container_proxy(image, container_name, network, network_name, proxy_env):
+            return self._proxy_failure("PROXY_VALIDATION_FAILED")
+        safe_env = self._no_proxy_env()
+        safe_env.update(proxy_env)
         safe_env.update(self._go_cache_env(go_cache))
         if "pip" in cache_dirs:
             safe_env.update({
                 "PIP_CACHE_DIR": "/ci-cache/pip",
                 "PIP_DISABLE_PIP_VERSION_CHECK": "1",
             })
+        if "npm" in cache_dirs:
+            safe_env["NPM_CONFIG_CACHE"] = "/ci-cache/npm"
         if env:
             allowed = {
                 "DATABASE_URL", "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "RABBITMQ_URL",
                 "AI_INTEGRITY_BASE_SHA", "AI_INTEGRITY_REPORT", "AI_INTEGRITY_CHANGED_FILES",
             }
             safe_env.update({key: value for key, value in env.items() if key in allowed})
-        if network_name:
-            existing = safe_env.get("NO_PROXY", "")
-            safe_env["NO_PROXY"] = ",".join(dict.fromkeys(
-                [item for item in existing.split(",") + ["postgres", "redis", "rabbitmq"] if item]
-            ))
-            safe_env["no_proxy"] = safe_env["NO_PROXY"]
-
         env_args = []
         for key, value in safe_env.items():
             env_args.extend(["--env", f"{key}={value}"])
