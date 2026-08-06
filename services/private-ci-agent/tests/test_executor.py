@@ -76,6 +76,18 @@ def make_executor(podman):
     return executor
 
 
+@pytest.fixture(autouse=True)
+def _isolate_go_shared_cache(tmp_path, monkeypatch):
+    """Route the shared Go module cache into a temp dir for every test.
+
+    The executor now uses CACHE_MAP["go"] for all Go workspaces; tests must
+    never touch the real /srv/private-ci/cache/go path.
+    """
+    shared_cache = tmp_path / "shared-go-cache"
+    monkeypatch.setitem(executor_module.CACHE_MAP, "go", str(shared_cache))
+    return shared_cache
+
+
 def make_job(source_dir):
     return Job(
         job_id="job-123",
@@ -268,21 +280,23 @@ def test_go_build_failure_fails_workspace(tmp_path):
     assert any(step["step_name"].endswith(":gobuild") and step["status"] == "failed" for step in result["steps"])
 
 
-def test_go_cache_is_job_scoped_and_outside_source(tmp_path):
+def test_go_cache_is_shared_across_jobs_and_outside_source(tmp_path, monkeypatch):
     source = tmp_path / "job-123" / "source"
     source.mkdir(parents=True)
     (source / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
     podman = FakePodman()
     job = make_job(source)
     job.workspace = str(source.parent)
+    shared_cache = tmp_path / "shared-go-cache"
+    monkeypatch.setitem(executor_module.CACHE_MAP, "go", str(shared_cache))
 
     result = make_executor(podman)._execute_workspace(job, {"path": ".", "stack": "go"})
 
     assert result["passed"] is True
     cache_path = podman.caches[0]["go"]
-    assert cache_path == str(source.parent / "go-cache")
+    assert cache_path == str(shared_cache)
     assert not cache_path.startswith(str(source) + "/")
-    assert (source.parent / "go-cache").stat().st_mode & 0o777 == 0o700
+    assert (shared_cache).stat().st_mode & 0o777 == 0o700
     assert [command for command, _, _ in podman.commands[:4]] == [
         "echo '[go:.:setup] preparing writable cache'; mkdir -p \"$HOME\" \"$GOPATH\" \"$GOMODCACHE\" \"$GOCACHE\" \"$(dirname \"$GOENV\")\" \"$GOTMPDIR\" \"$XDG_CACHE_HOME\" \"$XDG_CONFIG_HOME\"; test -w /ci-cache; test -w \"$GOMODCACHE\"; test -w \"$GOCACHE\"; test -w \"$GOTMPDIR\"",
         "go version",

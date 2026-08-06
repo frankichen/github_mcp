@@ -1,0 +1,63 @@
+#!/bin/bash
+set -euo pipefail
+
+# 预热共享 Go 模块缓存：预下载 goose 工具及其依赖到
+# /srv/private-ci/cache/go（agent 侧 CACHE_MAP["go"] 共享目录）。
+#
+# 背景：sxt 的 Makefile（#725）安装 goose 时使用隔离的临时 GOMODCACHE，
+# 下载结果不会落共享缓存，导致每个 CI job 都冷下载 goose 全部依赖。
+# 但该 Makefile 保留 GOPROXY=file://$shared_module_cache 优先代理——只要
+# 共享 cache/download 里已有 goose 模块，所有 job 都会本地命中，秒级完成。
+#
+# 用法（root，一次即可；可重复执行）：
+#   /srv/private-ci/agent/bin/prepare-go-cache
+
+if [ "$(id -u)" != "1500" ]; then
+    echo "[go-cache] run as ciworker (uid 1500)" >&2
+    exit 2
+fi
+
+AGENT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CACHE_ROOT="/srv/private-ci/cache/go"
+GOOSE_VERSION="${GOOSE_VERSION:-v3.22.1}"
+
+umask 077
+mkdir -p "${CACHE_ROOT}"
+chmod 700 "${CACHE_ROOT}"
+
+PYTHONPATH="${AGENT_ROOT}" /usr/bin/python3 - "${CACHE_ROOT}" "${GOOSE_VERSION}" <<'PY'
+import os
+import sys
+
+from private_ci_agent.podman import PodmanRunner
+
+cache_root, goose_version = sys.argv[1:]
+# 挂载共享 go 缓存为 /ci-cache；PodmanRunner 自动设置
+# GOMODCACHE=/ci-cache/gomod 等 go 环境。GOBIN 落在共享缓存内可写的
+# 隔离子目录，避免污染模块缓存布局。
+result = PodmanRunner("/usr/bin/podman").run_command(
+    "docker.io/library/golang:1.26.4",
+    f"go-cache-maintenance-{os.getpid()}",
+    "/srv/private-ci/workspaces",
+    {"go": cache_root},
+    f"GOBIN=/ci-cache/.tool-bin go install github.com/pressly/goose/v3/cmd/goose@{goose_version} 2>&1",
+    900,
+    network=True,
+    pass_proxy=True,
+)
+if result.get("exit_code") != 0:
+    print(
+        f"[go-cache] preheat failed exit={result.get('exit_code')} "
+        f"timed_out={bool(result.get('timed_out'))}",
+        file=sys.stderr,
+    )
+    if result.get("stderr"):
+        print(result["stderr"][-2000:], file=sys.stderr)
+    raise SystemExit(1)
+
+goose_dir = os.path.join(cache_root, "gomod", "cache", "download", "github.com", "pressly", "goose")
+if not os.path.isdir(goose_dir):
+    print(f"[go-cache] goose module cache missing at {goose_dir}", file=sys.stderr)
+    raise SystemExit(1)
+print(f"[go-cache] ready goose={goose_version} path={cache_root}")
+PY

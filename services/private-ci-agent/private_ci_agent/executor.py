@@ -291,10 +291,11 @@ class JobExecutor:
                 "steps": [{"step_name": label, "status": "configuration_error", "exit_code": 2, "message": message}],
             }
         if workspace["stack"] == "go":
-            # Go 缓存必须和源码目录分离，并按 job 隔离，避免第三方模块进入 gofmt 的源码扫描范围。
-            cache_root = os.path.join(job.workspace or os.path.dirname(job.source_dir), "go-cache")
-            os.makedirs(cache_root, mode=0o700, exist_ok=True)
-            os.chmod(cache_root, 0o700)
+            # Go 模块缓存跨 job 共享（CACHE_MAP["go"]），避免每个 job 冷下载
+            # 全部依赖；缓存目录在源码目录之外，不会进入 gofmt 的扫描范围。
+            cache_root = CACHE_MAP["go"]
+            if not os.path.isdir(cache_root):
+                os.makedirs(cache_root, mode=0o700)
             caches = {"go": cache_root}
         elif workspace["stack"] == "python":
             # Python venv must persist across container steps.
