@@ -16,6 +16,7 @@ PROXY_ENV_NAMES = {
 REQUIRED_NO_PROXY = ("postgres", "redis", "rabbitmq", "localhost", "127.0.0.1", "::1")
 LOOPBACK_PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 CONTAINER_PROXY_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
+ROOTLESS_OUTBOUND_NETWORK = "slirp4netns:allow_host_loopback=true"
 
 
 class PodmanRunner:
@@ -75,6 +76,15 @@ class PodmanRunner:
             logger.error("Unable to prepare controlled cache directory: %s", type(exc).__name__)
             return False
 
+    @staticmethod
+    def _network_args(network: bool, network_name: str | None) -> list[str]:
+        """Select the same explicit Rootless network for probes and CI commands."""
+        if network_name:
+            return ["--pod", network_name]
+        if network:
+            return ["--network", ROOTLESS_OUTBOUND_NETWORK]
+        return ["--network=none"]
+
     def _validate_container_proxy(
         self,
         image: str,
@@ -91,12 +101,12 @@ class PodmanRunner:
             logger.warning("Refusing proxy injection into a network-isolated container")
             return False
         fingerprint = hashlib.sha256("\0".join(f"{key}={value}" for key, value in sorted(active_proxy.items())).encode()).hexdigest()
-        context = network_name or "default"
+        context = network_name or ROOTLESS_OUTBOUND_NETWORK
         cache_key = (image, context, fingerprint)
         if cache_key in self._validated_proxy_contexts:
             return True
 
-        network_args = ["--pod", network_name] if network_name else []
+        network_args = self._network_args(network, network_name)
         userns_args = [] if network_name else ["--userns=keep-id"]
         command = [
             self.podman, "run", "--rm", "--pull=never", "--http-proxy=false",
@@ -334,7 +344,7 @@ class PodmanRunner:
         container_name = self._container_name(job_id, source_dir)
         cache_mounts, go_cache = self._cache_mounts(cache_dirs)
         project_root = os.path.abspath(os.path.join(source_dir, os.pardir, os.pardir))
-        net_arg = ["--pod", network_name] if network_name else ([] if network else ["--network=none"])
+        net_arg = self._network_args(network, network_name)
         userns_arg = [] if network_name else ["--userns=keep-id"]
 
         cmd = [
