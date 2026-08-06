@@ -20,6 +20,10 @@ LOOPBACK_PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 CONTAINER_PROXY_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
 ROOTLESS_OUTBOUND_NETWORK = "slirp4netns:allow_host_loopback=true"
 LOCAL_ONLY_IMAGE_PREFIXES = ("localhost/node-chromium:",)
+GO_CACHE_SUBDIRECTORIES = (
+    "home", "gopath", "gomod", "gobuild", "config/go",
+    "xdg-cache", "xdg-config", "tmp", ".tool-bin",
+)
 
 
 class PodmanRunner:
@@ -203,6 +207,11 @@ class PodmanRunner:
             if cache_name == "go":
                 go_cache = os.path.realpath(cache_path)
                 if os.path.exists(go_cache):
+                    try:
+                        for subdirectory in GO_CACHE_SUBDIRECTORIES:
+                            os.makedirs(os.path.join(go_cache, subdirectory), mode=0o700, exist_ok=True)
+                    except OSError as exc:
+                        logger.warning("Unable to prepare Go cache layout: %s", type(exc).__name__)
                     mounts.extend(["--mount", f"type=bind,src={go_cache},dst=/ci-cache,rw"])
             elif cache_name == "python_venv":
                 if os.path.exists(cache_path):

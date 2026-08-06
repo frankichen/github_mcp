@@ -23,6 +23,9 @@ if [ -r /srv/private-ci/run/proxy.runtime.conf ]; then
     . /srv/private-ci/run/proxy.runtime.conf
     set +a
 fi
+# Keep standalone maintenance runs aligned with the systemd worker: the
+# rootless network reaches the Worker host proxy through this gateway.
+export PRIVATE_CI_CONTAINER_PROXY_HOST="${PRIVATE_CI_CONTAINER_PROXY_HOST:-10.0.2.2}"
 # PodmanRunner maps CACHE_ROOT to the container target /ci-cache/ms-playwright.
 MAINTENANCE_WORKSPACE="$(mktemp -d "${WORKSPACE_ROOT}/.playwright-maintenance.XXXXXX")"
 trap 'rm -rf "${MAINTENANCE_WORKSPACE}"' EXIT

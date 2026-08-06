@@ -31,10 +31,34 @@ if [ -r /srv/private-ci/run/proxy.runtime.conf ]; then
     . /srv/private-ci/run/proxy.runtime.conf
     set +a
 fi
+# Standalone maintenance runs do not inherit the systemd launcher's container
+# gateway setting; slirp4netns exposes the Worker host through 10.0.2.2.
+export PRIVATE_CI_CONTAINER_PROXY_HOST="${PRIVATE_CI_CONTAINER_PROXY_HOST:-10.0.2.2}"
 
 umask 077
 mkdir -p "${CACHE_ROOT}"
 chmod 700 "${CACHE_ROOT}"
+mkdir -p \
+    "${CACHE_ROOT}/home" \
+    "${CACHE_ROOT}/gopath" \
+    "${CACHE_ROOT}/gomod" \
+    "${CACHE_ROOT}/gobuild" \
+    "${CACHE_ROOT}/config/go" \
+    "${CACHE_ROOT}/xdg-cache" \
+    "${CACHE_ROOT}/xdg-config" \
+    "${CACHE_ROOT}/tmp" \
+    "${CACHE_ROOT}/.tool-bin"
+chmod 700 \
+    "${CACHE_ROOT}/home" \
+    "${CACHE_ROOT}/gopath" \
+    "${CACHE_ROOT}/gomod" \
+    "${CACHE_ROOT}/gobuild" \
+    "${CACHE_ROOT}/config" \
+    "${CACHE_ROOT}/config/go" \
+    "${CACHE_ROOT}/xdg-cache" \
+    "${CACHE_ROOT}/xdg-config" \
+    "${CACHE_ROOT}/tmp" \
+    "${CACHE_ROOT}/.tool-bin"
 
 PYTHONPATH="${AGENT_ROOT}" /usr/bin/python3 - "${CACHE_ROOT}" "${GOOSE_VERSION}" <<'PY'
 import os
