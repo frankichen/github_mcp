@@ -128,10 +128,17 @@ def test_node_profile_uses_controlled_cache_path(tmp_path):
     commands = node_commands_for_workspace(workspace, ["test:run"])
 
     assert commands["setup"] == ["npm ci"]
-    assert commands["cache_dirs"] == {
-        "npm": "/ci-cache/npm",
-        "playwright": "/ci-cache/ms-playwright",
-    }
+    assert commands["cache_dirs"] == {"npm": "/ci-cache/npm"}
+
+
+def test_vue_workspace_without_browser_smoke_does_not_mount_playwright_cache(tmp_path):
+    node_package(tmp_path, {"test:run": "vitest run"})
+    (tmp_path / "package-lock.json").write_text("{}")
+    workspace = discover_workspaces(str(tmp_path))["workspaces"][0]
+
+    commands = node_commands_for_workspace(workspace, ["test:run"])
+
+    assert commands["cache_dirs"] == {"npm": "/ci-cache/npm"}
 
 
 def test_browser_preheat_uses_pinned_workspace_playwright(tmp_path):

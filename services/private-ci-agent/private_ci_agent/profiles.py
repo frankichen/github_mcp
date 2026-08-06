@@ -496,7 +496,7 @@ def node_commands_for_workspace(
     # The legacy Vue browser smoke searches this fixed path before attempting
     # an install.  Keep it separate from npm downloads and node_modules so the
     # immutable browser runtime can be shared safely by concurrent workspaces.
-    if workspace.get("framework") == "vue" or workspace.get("path") == "h5/lenshub-console":
+    if _script_uses_browser_smoke(workspace):
         cache_dirs["playwright"] = "/ci-cache/ms-playwright"
     setup = [install]
     browser_setup = _browser_preheat_command(workspace, source_dir)

@@ -210,7 +210,11 @@ def test_vue_workspace_maps_shared_playwright_cache_without_node_modules(tmp_pat
     podman = FakePodman()
     workspace = {
         "path": "h5/lenshub-console", "stack": "node", "framework": "vue",
-        "package_manager": "npm", "scripts": {"test": "vitest run"},
+        "package_manager": "npm",
+        "scripts": {
+            "test": "vitest run",
+            "test:browser-smoke": "node scripts/browser-smoke.mjs",
+        },
     }
 
     result = make_executor(podman)._execute_workspace(make_job(tmp_path), workspace)
