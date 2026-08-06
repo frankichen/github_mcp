@@ -5,6 +5,8 @@ import logging
 import os
 import re
 import subprocess
+import threading
+import time
 from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
@@ -240,6 +242,7 @@ class PodmanRunner:
         timeout_seconds: int,
         env: dict = None,
         pass_proxy: bool = False,
+        cancel_event: threading.Event | None = None,
     ) -> dict:
         """Run commands in an isolated rootless Podman container."""
         container_name = self._container_name(job_id, source_dir)
@@ -311,28 +314,120 @@ class PodmanRunner:
 
         logger.info("Running podman container: %s image=%s proxy=%s", container_name, image, pass_proxy)
 
+        return self._run_process(cmd, container_name, timeout_seconds, cancel_event)
+
+    def _run_process(self, cmd: list[str], container_name: str, timeout_seconds: int,
+                     cancel_event: threading.Event | None = None) -> dict:
+        """Run a container command, honoring both the deadline and an external cancel.
+
+        With no cancel_event this keeps the historical subprocess.run behavior.
+        With a cancel_event we use Popen so a cancel request can stop the
+        container and reap the process immediately instead of waiting for the
+        network request inside the container to finish.
+        """
+        if cancel_event is None:
+            try:
+                process = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds + 60,
+                )
+                return {
+                    "exit_code": process.returncode,
+                    "stdout": process.stdout,
+                    "stderr": process.stderr,
+                    "timed_out": False,
+                }
+            except subprocess.TimeoutExpired:
+                logger.warning("Container timed out: %s", container_name)
+                self._kill_container(container_name)
+                return {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": "TIMEOUT: Job exceeded maximum execution time",
+                    "timed_out": True,
+                }
+            except Exception as exc:
+                logger.error("Container execution failed: %s", type(exc).__name__)
+                return {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"ERROR: {type(exc).__name__}",
+                    "timed_out": False,
+                }
+
+        deadline = time.monotonic() + timeout_seconds + 60
         try:
-            process = subprocess.run(
+            process = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout_seconds + 60,
             )
-            return {
-                "exit_code": process.returncode,
-                "stdout": process.stdout,
-                "stderr": process.stderr,
-                "timed_out": False,
-            }
-        except subprocess.TimeoutExpired:
-            logger.warning("Container timed out: %s", container_name)
-            self._kill_container(container_name)
+        except Exception as exc:
+            logger.error("Container start failed: %s", type(exc).__name__)
             return {
                 "exit_code": -1,
                 "stdout": "",
-                "stderr": "TIMEOUT: Job exceeded maximum execution time",
-                "timed_out": True,
+                "stderr": f"ERROR: {type(exc).__name__}",
+                "timed_out": False,
             }
+        try:
+            while True:
+                if cancel_event.is_set():
+                    logger.warning("Cancel requested, stopping container: %s", container_name)
+                    self._kill_container(container_name)
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        stdout, stderr = process.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                        try:
+                            stdout, stderr = process.communicate(timeout=10)
+                        except Exception:
+                            stdout, stderr = "", "CANCELLED"
+                    except Exception:
+                        stdout, stderr = "", "CANCELLED"
+                    return {
+                        "exit_code": -1,
+                        "stdout": stdout or "",
+                        "stderr": stderr or "CANCELLED",
+                        "timed_out": False,
+                        "cancelled": True,
+                    }
+                try:
+                    stdout, stderr = process.communicate(timeout=0.5)
+                    return {
+                        "exit_code": process.returncode,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "timed_out": False,
+                    }
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        logger.warning("Container timed out: %s", container_name)
+                        self._kill_container(container_name)
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                        try:
+                            stdout, stderr = process.communicate(timeout=10)
+                        except Exception:
+                            stdout, stderr = "", ""
+                        return {
+                            "exit_code": -1,
+                            "stdout": stdout or "",
+                            "stderr": "TIMEOUT: Job exceeded maximum execution time",
+                            "timed_out": True,
+                        }
         except Exception as exc:
             logger.error("Container execution failed: %s", type(exc).__name__)
             return {
@@ -355,6 +450,7 @@ class PodmanRunner:
         network_name: str | None = None,
         pass_proxy: bool = False,
         extra_mounts: list[str] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict:
         """Run one command with explicit network and proxy boundaries."""
         container_name = self._container_name(job_id, source_dir)
@@ -422,40 +518,43 @@ class PodmanRunner:
             env_args.extend(["--env", f"{key}={value}"])
         cmd[cmd.index("--entrypoint"):cmd.index("--entrypoint")] = env_args
 
-        try:
-            process = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds + 60,
-            )
-            return {
-                "exit_code": process.returncode,
-                "stdout": process.stdout,
-                "stderr": process.stderr,
-                "timed_out": False,
-            }
-        except subprocess.TimeoutExpired:
-            self._kill_container(container_name)
-            return {
-                "exit_code": -1,
-                "stdout": "",
-                "stderr": "TIMEOUT",
-                "timed_out": True,
-            }
-        except Exception as exc:
-            logger.error("Container execution failed: %s", type(exc).__name__)
-            return {
-                "exit_code": -1,
-                "stdout": "",
-                "stderr": f"ERROR: {type(exc).__name__}",
-                "timed_out": False,
-            }
+        return self._run_process(cmd, container_name, timeout_seconds, cancel_event)
 
     @staticmethod
     def _container_name(job_id: str, source_dir: str = "") -> str:
         suffix = hashlib.sha1(str(source_dir).encode()).hexdigest()[:6] if source_dir else "main"
         return f"ci-{job_id[:12]}-{suffix}"
+
+    @staticmethod
+    def _job_container_prefix(job_id: str) -> str:
+        """Prefix shared by every container owned by a job (main + per-workspace)."""
+        return f"ci-{job_id[:12]}"
+
+    def kill_job(self, job_id: str) -> int:
+        """Force-stop and remove every container owned by the job."""
+        prefix = self._job_container_prefix(job_id)
+        names = self._container_names_matching(prefix)
+        for name in names:
+            self._kill_container(name)
+            try:
+                subprocess.run([self.podman, "rm", "-f", name],
+                               capture_output=True, timeout=10)
+            except Exception:
+                pass
+        if names:
+            logger.warning("Cancelled job %s: reclaimed %d container(s)", job_id[:12], len(names))
+        return len(names)
+
+    def _container_names_matching(self, prefix: str) -> list[str]:
+        try:
+            result = subprocess.run(
+                [self.podman, "ps", "-a", "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return [name for name in result.stdout.strip().split("\n") if name.startswith(prefix)]
+        except Exception as exc:
+            logger.warning("Listing containers failed: %s", exc)
+            return []
 
     @staticmethod
     def _go_cache_env(go_cache: str | None) -> dict:
@@ -474,7 +573,7 @@ class PodmanRunner:
         }
 
     def kill(self, job_id: str):
-        self._kill_container(f"ci-{job_id[:12]}")
+        self.kill_job(job_id)
 
     def _kill_container(self, container_name: str):
         try:

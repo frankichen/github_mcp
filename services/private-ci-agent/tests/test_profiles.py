@@ -5,10 +5,13 @@ import subprocess
 import pytest
 
 from private_ci_agent.profiles import (
+    NODE_CHROMIUM_IMAGE,
+    NODE_IMAGE,
     discover_workspaces,
     go_commands_for_workspace,
     go_image_for_version,
     go_version_requirements,
+    node_browser_image,
     node_commands_for_workspace,
     select_node_scripts,
 )
@@ -129,6 +132,46 @@ def test_node_profile_uses_controlled_cache_path(tmp_path):
 
     assert commands["setup"] == ["npm ci"]
     assert commands["cache_dirs"] == {"npm": "/ci-cache/npm"}
+
+
+def test_plain_node_workspace_uses_lightweight_node_image(tmp_path):
+    node_package(tmp_path, {"test:run": "vitest run"})
+    (tmp_path / "package-lock.json").write_text("{}")
+    workspace = discover_workspaces(str(tmp_path))["workspaces"][0]
+
+    commands = node_commands_for_workspace(workspace, ["test:run"])
+
+    assert commands["image"] == NODE_IMAGE
+
+
+def test_browser_smoke_workspace_uses_controlled_chromium_image(tmp_path):
+    node_package(
+        tmp_path,
+        {"test:run": "npm run test:browser-smoke:storage-plan", "test:browser-smoke:storage-plan": "node scripts/cloud-storage-plan-browser-smoke.mjs"},
+    )
+    (tmp_path / "package-lock.json").write_text("{}")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "cloud-storage-plan-browser-smoke.mjs").write_text(
+        "npx --yes playwright@1.62.0 install chromium\n", encoding="utf-8"
+    )
+    workspace = discover_workspaces(str(tmp_path))["workspaces"][0]
+
+    commands = node_commands_for_workspace(workspace, source_dir=str(tmp_path))
+
+    assert commands["image"] == NODE_CHROMIUM_IMAGE
+    assert NODE_CHROMIUM_IMAGE != NODE_IMAGE
+
+
+def test_node_chromium_image_is_restricted_to_approved_prefix(monkeypatch):
+    import private_ci_agent.profiles as profiles_module
+
+    monkeypatch.setattr(profiles_module, "NODE_CHROMIUM_IMAGE", "docker.io/attacker/node-chromium:22")
+    with pytest.raises(ValueError):
+        node_browser_image()
+
+    monkeypatch.setattr(profiles_module, "NODE_CHROMIUM_IMAGE", "100.118.124.97:5555/library/node-chromium:22")
+    assert node_browser_image() == "100.118.124.97:5555/library/node-chromium:22"
 
 
 def test_vue_workspace_without_browser_smoke_does_not_mount_playwright_cache(tmp_path):

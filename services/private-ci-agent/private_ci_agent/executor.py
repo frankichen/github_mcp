@@ -3,6 +3,7 @@
 import logging
 import json
 import os
+import threading
 import time
 import hashlib
 import subprocess
@@ -36,18 +37,36 @@ PROFILE_BY_STACK = {"go": "go-check", "python": "python-check", "node": "node-ch
 
 
 class JobExecutor:
-    def __init__(self, controller_client, config: dict):
+    def __init__(self, controller_client, config: dict, cancel_event: threading.Event | None = None):
         self.client = controller_client
         self.config = config
+        self.cancel_event = cancel_event
         self.podman = PodmanRunner(config.get("podman_binary", "/usr/bin/podman"))
         self.log_manager = LogManager(controller_client, config.get("max_log_bytes", 10485760))
         self.services = ServiceManager(config.get("podman_binary", "/usr/bin/podman"), config)
+
+    def _cancelled(self) -> bool:
+        cancel_event = getattr(self, "cancel_event", None)
+        return cancel_event is not None and cancel_event.is_set()
+
+    def _cancel_summary(self, job_id: str, metadata: dict | None = None) -> dict:
+        summary = {"status": "cancelled", "exit_code": -1, "steps": [], "cancelled": True}
+        if metadata:
+            summary = {**metadata, **summary}
+        self.log_manager.upload(job_id, "JOB_CANCELLED\n")
+        return summary
 
     def execute(self, job: Job) -> dict:
         job_id = job.job_id
         self.log_manager.reset(job_id)
         self.log_manager.upload(job_id, f"[CI] repo={job.repository} sha={job.commit_sha[:12]} profile={job.profile}\n")
         self.client.update_job_status(job_id, "preparing")
+
+        if self._cancelled():
+            self.log_manager.flush(job_id)
+            summary = self._cancel_summary(job_id)
+            self.client.finish_job(job_id, -1, "cancelled", summary=summary)
+            return summary
 
         repo_config = get_repository_overrides(job.repository, job.profile)
         if job.profile == "repo-fast-check":
@@ -123,6 +142,20 @@ class JobExecutor:
                 results = []
                 for future in as_completed(futures):
                     results.append(future.result())
+                    if self._cancelled():
+                        # A cancel arrived while a workspace step was running:
+                        # stop every container owned by the job and drain the
+                        # remaining futures (they observe the same cancel flag
+                        # and terminate their steps promptly).
+                        self.podman.kill_job(job_id)
+                        for pending in futures:
+                            if pending is future or pending.done():
+                                continue
+                            try:
+                                results.append(pending.result(timeout=30))
+                            except Exception:
+                                pass
+                        break
                 for result in results:
                     all_steps.extend(result["steps"])
                     if not result["passed"]:
@@ -131,6 +164,12 @@ class JobExecutor:
         finally:
             self.log_manager.flush(job_id)
             self.services.cleanup(job_id, job.workspace)
+
+        if self._cancelled():
+            summary = self._cancel_summary(job_id, metadata)
+            self.log_manager.flush(job_id)
+            self.client.finish_job(job_id, -1, "cancelled", summary=summary)
+            return summary
 
         summary = {
             "status": "passed" if all_passed else "failed",
@@ -294,10 +333,19 @@ class JobExecutor:
 
         setup_failed = False
         for setup in commands.get("setup", []):
-            if setup_failed and workspace["stack"] == "node":
-                # A browser preheat depends on the successful npm install.  Do
-                # not run it after npm ci failed; report the dependency failure
-                # explicitly and keep all Node checks blocked by setup.
+            if self._cancelled():
+                step = {"step_name": f"{label}:{setup.get('name', 'setup') if isinstance(setup, dict) else 'setup'}",
+                        "status": "cancelled", "exit_code": None, "duration_seconds": 0}
+                steps.append(step)
+                passed = False
+                self.log_manager.upload(job.job_id, f"[{step['step_name']}] CANCELLED\n")
+                continue
+            if setup_failed:
+                # A later setup step depends on the successful earlier one
+                # (npm ci before browser preheat, go mod download before
+                # migrate).  Do not run it after a previous setup failed;
+                # report the dependency failure explicitly and keep every
+                # dependent step blocked by setup.
                 name = setup.get("name", "setup") if isinstance(setup, dict) else "setup"
                 command = setup.get("command") if isinstance(setup, dict) else setup
                 blocked_step = {
@@ -331,6 +379,13 @@ class JobExecutor:
             self.log_manager.upload(job.job_id, f"[{step['step_name']}] {skipped['status']}: {skipped.get('reason')}\n")
 
         for check in commands.get("check", []):
+            if self._cancelled():
+                step = {"step_name": f"{label}:{check['name']}", "command": check["command"],
+                        "status": "cancelled", "exit_code": None, "duration_seconds": 0}
+                steps.append(step)
+                passed = False
+                self.log_manager.upload(job.job_id, f"[{step['step_name']}] CANCELLED\n")
+                continue
             if setup_failed and (
                 (workspace["stack"] == "go" and check["name"] in {"govet", "gotest", "gobuild"})
                 or workspace["stack"] in {"node", "python"}
@@ -389,9 +444,9 @@ class JobExecutor:
         start = time.time()
         result = self.podman.run_command(image, job.job_id, source_dir, caches, command, self._setup_timeout(job), network=True,
                                          env=self._service_env(service_env), network_name=service_env.network if service_env else None,
-                                         pass_proxy=pass_proxy)
+                                         pass_proxy=pass_proxy, cancel_event=getattr(self, "cancel_event", None))
         self._upload_output(job.job_id, result)
-        status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else "failed")
+        status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else ("cancelled" if result.get("cancelled") else "failed"))
         self.log_manager.upload(job.job_id, f"[{name}] {status.upper()} (exit={result['exit_code']})\n")
         return {"step_name": name, "command": command, "status": status, "exit_code": result["exit_code"], "duration_seconds": time.time() - start}
 
@@ -411,9 +466,9 @@ class JobExecutor:
         result = self.podman.run_command(image, job.job_id, source_dir, caches, command, job.timeout_seconds,
                                          network=True if service_env else False, env=env if env else None,
                                          network_name=service_env.network if service_env else None,
-                                         pass_proxy=pass_proxy)
+                                         pass_proxy=pass_proxy, cancel_event=getattr(self, "cancel_event", None))
         self._upload_output(job.job_id, result)
-        status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else "failed")
+        status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else ("cancelled" if result.get("cancelled") else "failed"))
         duration = time.time() - start
         self.log_manager.upload(job.job_id, f"[{step_name}] {status.upper()} (exit={result['exit_code']}, {duration:.1f}s)\n")
         if step_id:
@@ -500,11 +555,13 @@ class JobExecutor:
             network=False,
             extra_mounts=[f"{artifacts_dir}:/ci-artifacts:Z"],
             pass_proxy=False,
+            cancel_event=getattr(self, "cancel_event", None),
         )
         self._upload_output(job_id, result)
         timed_out = bool(result.get("timed_out"))
-        exit_code = -1 if timed_out else int(result.get("exit_code", -1))
-        status = "timed_out" if timed_out else ("passed" if exit_code == 0 else "failed")
+        cancelled = bool(result.get("cancelled"))
+        exit_code = -1 if (timed_out or cancelled) else int(result.get("exit_code", -1))
+        status = ("timed_out" if timed_out else ("cancelled" if cancelled else ("passed" if exit_code == 0 else "failed")))
         duration = time.time() - step_started
         if step_id:
             self.client.finish_step(
@@ -537,7 +594,7 @@ class JobExecutor:
                 pass
 
         summary = {
-            "status": "passed" if exit_code == 0 else "failed",
+            "status": "passed" if exit_code == 0 else ("cancelled" if cancelled else "failed"),
             "exit_code": exit_code,
             "profile": "repo-fast-check",
             "base_sha": job.base_sha,
@@ -551,8 +608,12 @@ class JobExecutor:
             "steps": steps,
             "log_truncated": self.log_manager.is_truncated(job_id),
         }
+        if cancelled:
+            summary["cancelled"] = True
         if timed_out:
             summary["error_code"] = self.FAST_CHECK_ERROR_CODES["timeout"]
+        elif cancelled:
+            summary["error_code"] = "FAST_CHECK_CANCELLED"
         elif exit_code != 0:
             summary["error_code"] = self.FAST_CHECK_ERROR_CODES["integrity_failed"]
         return summary

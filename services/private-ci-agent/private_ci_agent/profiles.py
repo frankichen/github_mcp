@@ -25,9 +25,28 @@ LOCK_FILES = {
     "bun.lock": "bun",
     "bun.lockb": "bun",
 }
+NODE_IMAGE = "docker.io/library/node:22"
+# 浏览器 smoke 需要 Chromium 系统库（libnspr4/libnss3 等），node:22 基础镜像
+# 不包含它们。受控运行镜像由 deploy/Dockerfile.node-chromium 构建并预加载到
+# 私有 registry（100.118.124.97:5555），job 只读使用，不允许仓库输入注入。
+NODE_CHROMIUM_IMAGE = os.environ.get(
+    "PRIVATE_CI_NODE_CHROMIUM_IMAGE",
+    "100.118.124.97:5555/library/node-chromium:22",
+)
+APPROVED_NODE_CHROMIUM_PREFIXES = (
+    "docker.io/library/node-chromium:",
+    "100.118.124.97:5555/library/node-chromium:",
+)
 SAFE_NODE_SCRIPTS = ("lint", "typecheck", "test:run", "test:ci", "test", "build")
 UNSAFE_SCRIPT_WORDS = ("dev", "serve", "start", "preview", "watch")
 PLAYWRIGHT_VERSION_RE = re.compile(r"\bplaywright@(?P<version>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b")
+
+
+def node_browser_image() -> str:
+    """Return the controlled Chromium-capable Node image, or raise on unapproved input."""
+    if not any(NODE_CHROMIUM_IMAGE.startswith(prefix) for prefix in APPROVED_NODE_CHROMIUM_PREFIXES):
+        raise ValueError(f"unapproved Node Chromium image: {NODE_CHROMIUM_IMAGE}")
+    return NODE_CHROMIUM_IMAGE
 PLAYWRIGHT_PACKAGE_NAMES = ("playwright", "@playwright/test")
 
 _PYTHON_PACKAGE_DIRS = ("app", "private_ci_agent", "private_deploy_agent", "src")
@@ -502,12 +521,15 @@ def node_commands_for_workspace(
     browser_setup = _browser_preheat_command(workspace, source_dir)
     if browser_setup:
         setup.append(browser_setup)
+    # 浏览器 smoke 需要 Chromium 系统库，使用受控 node-chromium 镜像；
+    # 其余 Node 工作区保持受控的轻量 node:22。
+    image = node_browser_image() if _script_uses_browser_smoke(workspace) else NODE_IMAGE
     return {
         "setup": setup,
         "check": [item for item in selected if item.get("command")],
         "skipped": skipped,
         "selected_scripts": [item["name"] for item in selected if item.get("command")],
-        "image": "docker.io/library/node:22",
+        "image": image,
         "cache_dirs": cache_dirs,
     }
 

@@ -1,4 +1,6 @@
 import logging
+import subprocess
+import threading
 from types import SimpleNamespace
 
 from private_ci_agent.podman import PodmanRunner, ROOTLESS_OUTBOUND_NETWORK
@@ -289,3 +291,98 @@ def test_proxy_probe_reuses_named_service_pod(monkeypatch, tmp_path):
     for command in captured:
         assert command[command.index("--pod") + 1] == "ci-job_123"
         assert ROOTLESS_OUTBOUND_NETWORK not in command
+
+
+# ---- cancellation / forced reclaim ----
+
+
+def test_run_command_with_cancel_event_stops_container_and_reports_cancelled(monkeypatch, tmp_path):
+    """A cancel request must terminate a running container instead of waiting
+    for the network request inside it to finish."""
+    import time
+    import private_ci_agent.podman as podman_module
+
+    killed = []
+
+    class FakePopen:
+        def __init__(self, cmd, **_kwargs):
+            self.returncode = None
+
+        def terminate(self):
+            self.returncode = -1
+
+        def kill(self):
+            self.returncode = -1
+
+        def communicate(self, timeout=None):
+            if self.returncode is None:
+                # The real communicate keeps blocking on a live process; only
+                # termination lets the reaping call return.
+                raise subprocess.TimeoutExpired("podman", timeout)
+            return "out", "CANCELLED"
+
+    def fake_stop(cmd, **_kwargs):
+        killed.append(cmd)
+
+    monkeypatch.setattr(podman_module.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(podman_module.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    cancel_event = threading.Event()
+    runner = PodmanRunner("podman")
+    monkeypatch.setattr(runner, "_kill_container", fake_stop)
+
+    def request_cancel():
+        time.sleep(0.05)
+        cancel_event.set()
+
+    cancel_thread = threading.Thread(target=request_cancel)
+    cancel_thread.start()
+    result = runner.run_command(
+        "docker.io/library/node:22", "job-123", str(tmp_path), {}, "npm ci", 900,
+        network=True, pass_proxy=False, cancel_event=cancel_event,
+    )
+    cancel_thread.join()
+
+    assert result["cancelled"] is True
+    assert result["exit_code"] == -1
+    assert any("ci-job-123" in str(cmd) for cmd in killed)
+
+
+def test_kill_job_stops_every_container_with_job_prefix(monkeypatch):
+    import private_ci_agent.podman as podman_module
+
+    ps_output = "ci-job-123-abc123\nci-job-123-def456\nci-job-999-other\nci-svc-job_123\n"
+    stopped = []
+
+    def fake_run(cmd, **_kwargs):
+        if cmd[:2] == ["podman", "ps"]:
+            return SimpleNamespace(returncode=0, stdout=ps_output, stderr="")
+        stopped.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(podman_module.subprocess, "run", fake_run)
+    runner = PodmanRunner("podman")
+    count = runner.kill_job("job-123")
+
+    assert count == 2
+    assert any("ci-job-123-abc123" in cmd and cmd[1] == "stop" for cmd in stopped)
+    assert any("ci-job-123-def456" in cmd and cmd[1] == "stop" for cmd in stopped)
+    assert not any("ci-job-999" in cmd or "ci-svc-job_123" in cmd for cmd in stopped)
+
+
+def test_cleanup_stale_keeps_active_job_containers(monkeypatch):
+    import private_ci_agent.podman as podman_module
+
+    ps_output = "ci-job-123-abc123\nci-job-456-stale\n"
+    removed = []
+
+    def fake_run(cmd, **_kwargs):
+        if cmd[:2] == ["podman", "ps"]:
+            return SimpleNamespace(returncode=0, stdout=ps_output, stderr="")
+        if cmd[1] == "rm":
+            removed.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(podman_module.subprocess, "run", fake_run)
+    PodmanRunner("podman").cleanup_stale(["job-123"])
+
+    assert removed == [["podman", "rm", "-f", "ci-job-456-stale"]]

@@ -26,10 +26,11 @@ import sys
 from pathlib import Path
 
 from private_ci_agent.podman import PodmanRunner
+from private_ci_agent.profiles import node_browser_image
 
 workspace, npm_cache, browser_cache = sys.argv[1:]
 result = PodmanRunner("/usr/bin/podman").run_command(
-    "docker.io/library/node:22",
+    node_browser_image(),
     f"playwright-maintenance-{os.getpid()}",
     workspace,
     {"npm": npm_cache, "playwright": browser_cache},

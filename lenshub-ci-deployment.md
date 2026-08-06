@@ -258,11 +258,17 @@ OCI permission denied
 | 镜像 | 用途 | 大小 |
 |------|------|------|
 | `docker.io/library/golang:1.26.4` | Go workspace | ~900 MB |
-| `docker.io/library/node:22` | Node workspace | ~1.16 GB |
+| `docker.io/library/node:22` | Node workspace（无浏览器 smoke） | ~1.16 GB |
+| `100.118.124.97:5555/library/node-chromium:22` | Node 浏览器 smoke 受控运行时（含 Chromium 系统库） | ~1.5 GB |
 | `docker.io/library/alpine:latest` | 基础回退镜像 | ~9 MB |
 | `docker.io/library/postgres:16-alpine` | CI 隔离 PG | ~297 MB |
 | `docker.io/library/redis:7-alpine` | CI 隔离 Redis | ~40 MB |
 | `docker.io/library/rabbitmq:3-management-alpine` | CI 隔离 RabbitMQ | ~180 MB |
+
+`node-chromium:22` 由 `services/private-ci-agent/deploy/Dockerfile.node-chromium` 构建
+（`FROM docker.io/library/node:22` + Chromium 系统依赖），构建后推送到受控 registry
+并以 root 预加载到 ciworker 存储。`prepare-playwright-cache` 与浏览器 smoke 工作区
+只读使用该镜像，仓库输入不能指定任意镜像。
 
 **拉取命令模板** (以 root 执行)：
 ```bash

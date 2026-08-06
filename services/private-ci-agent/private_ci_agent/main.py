@@ -34,6 +34,7 @@ logger = logging.getLogger("ci-agent")
 
 _running = True
 _current_job_id = None
+_cancel_event = threading.Event()
 _podman_binary = "/usr/bin/podman"
 REGISTER_BACKOFF_SECONDS = (2, 5, 10, 30, 60, 60)
 
@@ -42,6 +43,28 @@ def signal_handler(sig, frame):
     global _running
     logger.info("Received signal %s, shutting down...", sig)
     _running = False
+
+
+def _request_cancel(job_id: str | None = None) -> bool:
+    """Signal cancel for the current job and force-reclaim its containers.
+
+    Safe to call from the heartbeat thread while the job thread is blocked in
+    podman run: it only flips the event and stops containers by job prefix.
+    When job_id is given (the job the cancel response was for), the request is
+    ignored if the worker has already moved on to a newer lease.  Returns True
+    when a job was actually cancelled.
+    """
+    current = _current_job_id
+    if not current:
+        return False
+    if job_id is not None and job_id != current:
+        # A stale cancel response for a previous job must not kill a fresh
+        # lease that started after the heartbeat was sent.
+        logger.info("Ignoring stale cancel for %s (current job is %s)", job_id, current)
+        return False
+    _cancel_event.set()
+    _kill_current_job(current)
+    return True
 
 
 def register_with_backoff(client: ControllerClient, profiles: list[str], max_concurrent: int,
@@ -103,13 +126,19 @@ def main():
     executor = JobExecutor(client, config)
     podman_runner = PodmanRunner(_podman_binary)
 
-    # Start heartbeat thread
+    # Start heartbeat thread.  Cancellation is monitored here (and in the
+    # lease loop) because podman run blocks the job thread: a cancel must be
+    # able to stop containers without waiting for the current step to return.
     heartbeat_stop = threading.Event()
 
     def heartbeat_loop():
         while not heartbeat_stop.is_set():
             try:
-                client.heartbeat(_current_job_id)
+                job_at_send = _current_job_id
+                response = client.heartbeat(job_at_send)
+                if job_at_send and response.get("cancel_requested"):
+                    logger.info("Cancel requested for job %s", job_at_send)
+                    _request_cancel(job_at_send)
             except Exception as e:
                 logger.warning("Heartbeat failed: %s", e)
             heartbeat_stop.wait(heartbeat_interval)
@@ -125,7 +154,7 @@ def main():
                         hb = client.heartbeat(_current_job_id)
                         if hb.get("cancel_requested"):
                             logger.info("Cancel requested for job %s", _current_job_id)
-                            _kill_current_job()
+                            _request_cancel(_current_job_id)
                             client.finish_job(_current_job_id, -1, "cancelled",
                                               summary={"cancelled": True})
                             _cleanup_job(_current_job_id, workspace_mgr)
@@ -153,6 +182,7 @@ def main():
                             changed_files=result.get("changed_files", []),
                         )
                         _current_job_id = job.job_id
+                        _cancel_event.clear()
 
                         try:
                             _execute_job(job, client, config, workspace_mgr,
@@ -207,7 +237,7 @@ def _execute_job(job: Job, client, config: dict, workspace_mgr: WorkspaceManager
             client.finish_job(job_id, -1, "failed", summary={"status": "failed", "exit_code": -1, "error_code": mirror_result.get("error_code"), "steps": []}, error_code=mirror_result.get("error_code"), error_message="source mirror preparation failed")
             return
         client.upload_log(job_id, f"[source] mirror_hit=true head={job.commit_sha}\n")
-        executor = JobExecutor(client, config)
+        executor = JobExecutor(client, config, cancel_event=_cancel_event)
         summary = executor.execute(job)
         logger.info("Job %s completed: %s", job_id, summary.get("status", "unknown"))
         return
@@ -305,7 +335,7 @@ def _execute_job(job: Job, client, config: dict, workspace_mgr: WorkspaceManager
         f.write(job.commit_sha + "\n")
 
     # Execute the job
-    executor = JobExecutor(client, config)
+    executor = JobExecutor(client, config, cancel_event=_cancel_event)
     summary = executor.execute(job)
     logger.info("Job %s completed: %s", job_id, summary.get("status", "unknown"))
 
@@ -318,26 +348,23 @@ def _cleanup_download(job_id: str, workspace: str, archive_path: str):
             pass
 
 
-def _kill_current_job():
+def _kill_current_job(job_id: str | None = None):
     global _current_job_id, _podman_binary
-    if _current_job_id:
-        import subprocess
-        container_name = f"ci-{_current_job_id[:12]}"
-        try:
-            subprocess.run([_podman_binary, "stop", "--time=10", container_name],
-                           capture_output=True, timeout=15)
-        except Exception:
-            try:
-                subprocess.run([_podman_binary, "kill", container_name],
-                               capture_output=True, timeout=10)
-            except Exception:
-                pass
+    if job_id is None:
+        job_id = _current_job_id
+    if not job_id:
+        return
+    # Containers are named ci-<job_id>[:12]-<source-hash>; stop by job prefix
+    # so every container owned by the job (main + per-workspace) is reclaimed.
+    runner = PodmanRunner(_podman_binary)
+    try:
+        runner.kill_job(job_id)
+    except Exception as exc:
+        logger.error("Failed to force-stop job containers: %s", exc)
 
 
 def _cleanup_job(job_id: str, workspace_mgr: WorkspaceManager):
     global _podman_binary
-    import subprocess
-    container_name = f"ci-{job_id[:12]}"
     try:
         # Worktrees belong to the independent mirror.  Remove stale worktree
         # metadata on every cleanup; this is harmless for archive jobs and
@@ -353,8 +380,7 @@ def _cleanup_job(job_id: str, workspace_mgr: WorkspaceManager):
     except Exception:
         pass
     try:
-        subprocess.run([_podman_binary, "rm", "-f", container_name],
-                       capture_output=True, timeout=10)
+        PodmanRunner(_podman_binary).kill_job(job_id)
     except Exception:
         pass
 

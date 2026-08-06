@@ -27,6 +27,9 @@ class FakeLogManager:
     def is_truncated(self, _job_id):
         return False
 
+    def flush(self, _job_id):
+        pass
+
 
 class FakeClient:
     def __init__(self):
@@ -95,8 +98,9 @@ def test_setup_failure_blocks_go_checks_without_mislabeling_code_failure(tmp_pat
     assert result["passed"] is False
     assert any(step["status"] == "failed" and step["step_name"].endswith(":mod_download") for step in result["steps"])
     blocked = [step for step in result["steps"] if step["status"] == "blocked_by_setup"]
-    assert {step["step_name"].rsplit(":", 1)[-1] for step in blocked} == {"govet", "gotest", "gobuild"}
+    assert {step["step_name"].rsplit(":", 1)[-1] for step in blocked} == {"migrate", "govet", "gotest", "gobuild"}
     assert not any("go vet" in command or "go test" in command or "go build" in command for command, _, _ in podman.commands)
+    assert not any("make migrate-up" in command for command, _, _ in podman.commands)
 
 
 @pytest.mark.parametrize("timed_out", [False, True])
@@ -608,3 +612,60 @@ def test_repo_auto_check_has_ai_integrity_step(tmp_path):
     assert "ai-integrity" in check_names, f"ai-integrity missing from {check_names}"
     assert check_names.index("ai-integrity") < check_names.index("gofmt"), \
         "ai-integrity should run before gofmt"
+
+
+# ---- cancellation short-circuit ----
+
+
+def test_cancel_event_short_circuits_remaining_steps(tmp_path):
+    import threading
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    podman = FakePodman()
+    cancel_event = threading.Event()
+
+    class CancelledAfterFirst(FakePodman):
+        def run_command(self, _image, _job_id, _source_dir, _caches, command, _timeout, network=False, **_kwargs):
+            self.commands.append((command, network, _timeout))
+            if len(self.commands) == 1:
+                cancel_event.set()
+            return {"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False, "cancelled": False}
+
+    podman = CancelledAfterFirst()
+    executor = make_executor(podman)
+    executor.cancel_event = cancel_event
+    result = executor._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
+
+    assert result["passed"] is False
+    cancelled = [step for step in result["steps"] if step["status"] == "cancelled"]
+    assert cancelled
+    # prepare_cache runs; everything after the first cancelled step is skipped.
+    assert len([c for c, _, _ in podman.commands]) == 1
+
+
+def test_execute_finishes_cancelled_when_event_set_before_run(tmp_path):
+    import threading
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    cancel_event = threading.Event()
+    cancel_event.set()
+    podman = FakePodman()
+
+    class CancellingClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.finished = []
+
+        def finish_job(self, job_id, exit_code, status, summary=None, error_code=None, error_message=None):
+            self.finished.append({"job_id": job_id, "exit_code": exit_code, "status": status, "summary": summary})
+
+    client = CancellingClient()
+    executor = make_executor(podman)
+    executor.client = client
+    executor.cancel_event = cancel_event
+    job = make_job(tmp_path)
+    job.workspace = str(tmp_path)
+
+    summary = executor.execute(job)
+
+    assert summary["status"] == "cancelled"
+    assert client.finished[-1]["status"] == "cancelled"
+    assert client.finished[-1]["exit_code"] == -1
