@@ -7,6 +7,7 @@ import private_ci_agent.executor as executor_module
 from private_ci_agent.executor import JobExecutor
 from private_ci_agent.models import Job
 from private_ci_agent.podman import PodmanRunner
+from private_ci_agent.services import ServiceSetupError
 from private_ci_agent.workspace import WorkspaceManager
 
 
@@ -136,6 +137,43 @@ def test_node_workspace_uses_persistent_npm_cache_and_controlled_setup_proxy(tmp
     assert result["passed"] is True
     assert all(caches == {"npm": str(cache)} for caches in podman.caches)
     assert podman.call_options[0]["pass_proxy"] is True
+
+
+def test_vue_workspace_maps_shared_playwright_cache_without_node_modules(tmp_path, monkeypatch):
+    npm_cache = tmp_path / "npm-cache"
+    browser_cache = tmp_path / "ms-playwright"
+    monkeypatch.setitem(executor_module.CACHE_MAP, "npm", str(npm_cache))
+    monkeypatch.setitem(executor_module.CACHE_MAP, "playwright", str(browser_cache))
+    podman = FakePodman()
+    workspace = {
+        "path": "h5/lenshub-console", "stack": "node", "framework": "vue",
+        "package_manager": "npm", "scripts": {"test": "vitest run"},
+    }
+
+    result = make_executor(podman)._execute_workspace(make_job(tmp_path), workspace)
+
+    assert result["passed"] is True
+    assert all(caches == {"npm": str(npm_cache), "playwright": str(browser_cache)} for caches in podman.caches)
+    assert all("node_modules" not in str(caches) for caches in podman.caches)
+
+
+def test_service_failure_log_keeps_safe_diagnostic(monkeypatch, tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    executor = make_executor(FakePodman())
+    diagnostic = "code=POSTGRES_UNAVAILABLE operation=start_container exit_code=125 resource=postgres image=docker.io/library/postgres:16-alpine timed_out=false reason=image missing"
+    executor.services = SimpleNamespace(
+        prepare=lambda _job_id, _workspace: (_ for _ in ()).throw(
+            ServiceSetupError("POSTGRES_UNAVAILABLE", diagnostic)
+        ),
+        cleanup=lambda _job_id, _workspace: None,
+    )
+    result = executor._execute_workspace(
+        make_job(tmp_path), {"path": ".", "stack": "go"},
+    )
+
+    assert result["passed"] is False
+    assert result["steps"][0]["error_code"] == "POSTGRES_UNAVAILABLE"
+    assert any(diagnostic in message for message in executor.log_manager.messages)
 
 
 @pytest.mark.parametrize(("job_timeout", "maximum", "expected"), [(900, 600, 600), (60, 600, 60)])

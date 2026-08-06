@@ -26,7 +26,12 @@ from private_ci_agent.services import ServiceManager, ServiceSetupError
 
 logger = logging.getLogger(__name__)
 
-CACHE_MAP = {"go": "/srv/private-ci/cache/go", "pip": "/srv/private-ci/cache/pip", "npm": "/srv/private-ci/cache/npm"}
+CACHE_MAP = {
+    "go": "/srv/private-ci/cache/go",
+    "pip": "/srv/private-ci/cache/pip",
+    "npm": "/srv/private-ci/cache/npm",
+    "playwright": "/srv/private-ci/cache/ms-playwright",
+}
 PROFILE_BY_STACK = {"go": "go-check", "python": "python-check", "node": "node-check"}
 
 
@@ -272,8 +277,18 @@ class JobExecutor:
                 service_env = self.services.prepare(job.job_id, job.workspace)
                 self.log_manager.upload(job.job_id, f"[services:ready] {service_env.public_summary()}\n")
             except ServiceSetupError as exc:
-                self.log_manager.upload(job.job_id, f"[services:failed] {exc.code}\n")
-                return {"passed": False, "exit_code": 1, "steps": [{"step_name": "services:prepare", "status": "failed", "exit_code": 1, "error_code": exc.code}]}
+                self.log_manager.upload(job.job_id, f"[services:failed] {exc.diagnostic}\n")
+                return {
+                    "passed": False,
+                    "exit_code": 1,
+                    "steps": [{
+                        "step_name": "services:prepare",
+                        "status": "failed",
+                        "exit_code": 1,
+                        "error_code": exc.code,
+                        "message": exc.diagnostic,
+                    }],
+                }
         passed = True
         exit_code = 0
 

@@ -126,7 +126,10 @@ def test_node_profile_uses_controlled_cache_path(tmp_path):
     commands = node_commands_for_workspace(workspace, ["test:run"])
 
     assert commands["setup"] == ["npm ci"]
-    assert commands["cache_dirs"] == {"npm": "/ci-cache/npm"}
+    assert commands["cache_dirs"] == {
+        "npm": "/ci-cache/npm",
+        "playwright": "/ci-cache/ms-playwright",
+    }
 
 
 def test_go_mod_requirement_selects_compatible_version_and_build(tmp_path):
