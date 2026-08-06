@@ -127,7 +127,7 @@ class PodmanRunner:
                 command.extend(["--env", f"{key}={value}"])
         command.extend([
             "--entrypoint", "/bin/sh", image, "-c",
-            'proxy=${HTTPS_PROXY:-${HTTP_PROXY:-${ALL_PROXY:-}}}; test -n "$proxy" && if command -v curl >/dev/null; then curl --proxy "$proxy" --connect-timeout 5 --max-time 15 -fsS -o /dev/null https://github.com; elif command -v python >/dev/null; then python -c \'import urllib.request; urllib.request.urlopen("https://github.com", timeout=15).close()\'; else exit 127; fi',
+            'proxy=${HTTPS_PROXY:-${HTTP_PROXY:-${ALL_PROXY:-}}}; test -n "$proxy" && if command -v curl >/dev/null; then curl -4 --proxy "$proxy" --connect-timeout 5 --max-time 15 -fsS -o /dev/null https://github.com; elif command -v python >/dev/null; then python -c \'import urllib.request; urllib.request.urlopen("https://github.com", timeout=15).close()\'; else exit 127; fi',
         ])
         try:
             result = subprocess.run(command, capture_output=True, text=True, timeout=20)
