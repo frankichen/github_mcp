@@ -8,6 +8,10 @@ if [ "$(id -u)" != "1500" ]; then
     exit 2
 fi
 
+# The deployment script may invoke this as ciworker from a root-only source
+# worktree. Podman must start from a directory the worker can enter.
+cd /tmp
+
 AGENT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CACHE_ROOT="/srv/private-ci/cache/ms-playwright"
 NPM_CACHE="/srv/private-ci/cache/npm"

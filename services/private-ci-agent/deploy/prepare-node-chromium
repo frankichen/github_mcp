@@ -9,6 +9,10 @@ if [ "$(id -u)" != "1500" ]; then
     exit 2
 fi
 
+# The deployment script may invoke this as ciworker from a root-only source
+# worktree. Podman must start from a directory the worker can enter.
+cd /tmp
+
 AGENT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE="${PRIVATE_CI_NODE_CHROMIUM_IMAGE:-localhost/node-chromium:22}"
 BASE_IMAGE="docker.io/library/node:22"
