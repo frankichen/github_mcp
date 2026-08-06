@@ -18,6 +18,8 @@ ASSIGNMENT_RE = re.compile(
     r"(?i)\b([A-Za-z0-9_]*(?:password|passwd|token|secret|authorization|cookie))\b"
     r"\s*([=:])\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
+JOB_LABEL = "private-ci.job"
+RESOURCE_LABEL = "private-ci.resource"
 
 
 def safe_job_suffix(job_id: str) -> str:
@@ -101,28 +103,40 @@ class ServiceManager:
         rabbit_vhost = f"ci_{suffix[:40]}"
         env_file = os.path.join(workspace, "runtime", "services.env")
         try:
-            self._run(["pod", "create", "--name", network, "--userns=keep-id", "--network", "slirp4netns:allow_host_loopback=true",
+            # 普通 Job 只读确认受控镜像已预加载，不在运行时隐式 pull，避免
+            # 代理、存储和网络副作用；缺镜像交给受控维护步骤补齐。
+            self._run(["image", "exists", self.images["postgres"]], "POSTGRES_UNAVAILABLE", resource_type="postgres",
+                      operation="inspect", image=self.images["postgres"])
+            self._run(["image", "exists", self.images["redis"]], "REDIS_UNAVAILABLE", resource_type="redis",
+                      operation="inspect", image=self.images["redis"])
+            self._run(["image", "exists", self.images["rabbitmq"]], "RABBITMQ_UNAVAILABLE", resource_type="rabbitmq",
+                      operation="inspect", image=self.images["rabbitmq"])
+            self._run(["pod", "create", "--name", network, "--label", f"{JOB_LABEL}={suffix}",
+                       "--label", f"{RESOURCE_LABEL}=pod", "--userns=keep-id", "--network", "slirp4netns:allow_host_loopback=true",
                        "--add-host", "postgres:127.0.0.1", "--add-host", "redis:127.0.0.1",
                        "--add-host", "rabbitmq:127.0.0.1"], "SERVICE_SETUP_FAILED",
-                      resource_type="pod", operation="create")
-            self._run(["run", "-d", "--http-proxy=false", "--name", names["postgres"], "--pod", network, "--user", "0",
+                      resource_type="pod", operation="create", resource_name=network)
+            self._run(["run", "-d", "--http-proxy=false", "--name", names["postgres"], "--label", f"{JOB_LABEL}={suffix}",
+                       "--label", f"{RESOURCE_LABEL}=postgres", "--pod", network, "--user", "0",
                        "-e", "POSTGRES_USER=lenshub",
                        "-e", f"POSTGRES_PASSWORD={db_password}", "-e", "POSTGRES_DB=postgres",
                        self.images["postgres"]], "POSTGRES_UNAVAILABLE", resource_type="postgres",
-                      operation="start_container", image=self.images["postgres"])
-            self._run(["run", "-d", "--http-proxy=false", "--name", names["redis"], "--pod", network, self.images["redis"], "redis-server",
+                      operation="start_container", image=self.images["postgres"], resource_name=names["postgres"])
+            self._run(["run", "-d", "--http-proxy=false", "--name", names["redis"], "--label", f"{JOB_LABEL}={suffix}",
+                       "--label", f"{RESOURCE_LABEL}=redis", "--pod", network, self.images["redis"], "redis-server",
                        "--save", "", "--appendonly", "no"], "REDIS_UNAVAILABLE", resource_type="redis",
-                      operation="start_container", image=self.images["redis"])
-            self._run(["run", "-d", "--http-proxy=false", "--name", names["rabbitmq"], "--pod", network,
+                      operation="start_container", image=self.images["redis"], resource_name=names["redis"])
+            self._run(["run", "-d", "--http-proxy=false", "--name", names["rabbitmq"], "--label", f"{JOB_LABEL}={suffix}",
+                       "--label", f"{RESOURCE_LABEL}=rabbitmq", "--pod", network,
                        "-e", f"RABBITMQ_DEFAULT_USER={rabbit_user}",
                        "-e", f"RABBITMQ_DEFAULT_PASS={rabbit_password}",
                        "-e", f"RABBITMQ_DEFAULT_VHOST={rabbit_vhost}", self.images["rabbitmq"]], "RABBITMQ_UNAVAILABLE",
-                      resource_type="rabbitmq", operation="start_container", image=self.images["rabbitmq"])
+                      resource_type="rabbitmq", operation="start_container", image=self.images["rabbitmq"], resource_name=names["rabbitmq"])
             self._wait_ready(names)
             self._run(["exec", "-e", f"PGPASSWORD={db_password}", names["postgres"], "psql",
                        "-U", "lenshub", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c",
                        f"CREATE DATABASE {database}"], "POSTGRES_SETUP_FAILED", resource_type="postgres",
-                      operation="create_database", image=self.images["postgres"])
+                      operation="create_database", image=self.images["postgres"], resource_name=names["postgres"])
             env = ServiceEnvironment(
                 network,
                 f"postgres://lenshub:{quote(db_password, safe='')}@postgres:5432/{database}?sslmode=disable",
@@ -153,8 +167,17 @@ class ServiceManager:
             "redis": ["exec", names["redis"], "redis-cli", "ping"],
             "rabbitmq": ["exec", names["rabbitmq"], "rabbitmq-diagnostics", "-q", "ping"],
         }
+        attempts = 0
+        last_probe_reasons = {}
         while time.monotonic() < deadline:
-            ready = {kind: self._try(command) for kind, command in probes.items()}
+            attempts += 1
+            probe_results = {kind: self._try_result(command) for kind, command in probes.items()}
+            ready = {kind: result is not None and result.returncode == 0 for kind, result in probe_results.items()}
+            last_probe_reasons = {
+                kind: sanitize_service_stderr((result.stderr or result.stdout or "").strip())
+                for kind, result in probe_results.items()
+                if result is not None and result.returncode != 0
+            }
             if all(ready.values()):
                 return
             for kind, name in names.items():
@@ -174,8 +197,10 @@ class ServiceManager:
                             kind,
                             state["exit_code"],
                             False,
-                            reason or f"container_status={state['status']}",
+                            f"attempts={attempts} state={state['status']} health={state.get('health', 'unknown')} "
+                            f"observed=inspect,logs {reason or last_probe_reasons.get(kind, 'probe_failed')}",
                             self.images[kind],
+                            resource_name=name,
                         ),
                     )
             time.sleep(2)
@@ -183,7 +208,9 @@ class ServiceManager:
             "SERVICE_SETUP_TIMEOUT",
             self._diagnostic(
                 "SERVICE_SETUP_TIMEOUT", "readiness", "services", -1, True,
-                "postgres/redis/rabbitmq readiness timeout",
+                f"attempts={attempts} postgres/redis/rabbitmq readiness timeout "
+                + " ".join(f"{kind}={reason}" for kind, reason in sorted(last_probe_reasons.items())),
+                resource_name=",".join(names.values()),
             ),
         )
 
@@ -194,10 +221,13 @@ class ServiceManager:
         os.chmod(path, 0o600)
 
     def cleanup(self, job_id: str, workspace: str = "") -> None:
+        # 资源名和标签都绑定当前 Job；只处理精确前缀，绝不 prune 其他任务资源。
         suffix = safe_job_suffix(job_id)
-        self._try(["pod", "rm", "-f", f"ci-svc-{suffix}"])
+        pod_name = f"ci-svc-{suffix}"
+        self._cleanup_resource(["pod", "rm", "-f", pod_name], "pod", pod_name)
         for kind in self.images:
-            self._try(["rm", "-f", f"ci-{suffix}-{kind}"])
+            name = f"ci-{suffix}-{kind}"
+            self._cleanup_resource(["rm", "-f", name], kind, name)
         if workspace:
             try:
                 os.remove(os.path.join(workspace, "runtime", "services.env"))
@@ -206,16 +236,19 @@ class ServiceManager:
 
     @staticmethod
     def _diagnostic(code: str, operation: str, resource_type: str, exit_code: int | None,
-                    timed_out: bool, reason: str, image: str | None = None) -> str:
+                    timed_out: bool, reason: str, image: str | None = None,
+                    resource_name: str | None = None) -> str:
         safe_image = sanitize_service_stderr(image or "-")
+        safe_name = sanitize_service_stderr(resource_name or "-")
         return (
             f"code={code} operation={operation} exit_code={exit_code if exit_code is not None else '-'} "
-            f"resource={resource_type} image={safe_image} timed_out={'true' if timed_out else 'false'} "
+            f"resource={resource_type} name={safe_name} image={safe_image} timed_out={'true' if timed_out else 'false'} "
             f"reason={sanitize_service_stderr(reason)}"
         )
 
     def _run(self, args: list[str], error_code: str, *, resource_type: str | None = None,
-             operation: str | None = None, image: str | None = None) -> None:
+             operation: str | None = None, image: str | None = None,
+             resource_name: str | None = None) -> None:
         attempts = 3 if args[:2] == ["pod", "create"] else 1
         resource_type = resource_type or ("pod" if args[:2] == ["pod", "create"] else "service")
         operation = operation or ("create" if args[:2] == ["pod", "create"] else "run")
@@ -239,12 +272,20 @@ class ServiceManager:
                 reason = type(exc).__name__
                 result = None
             if result is not None and result.returncode == 0:
+                logger.info(
+                    "services operation=%s resource=%s name=%s exit_code=0 image=%s",
+                    operation, resource_type, resource_name or "-", image or "-",
+                )
                 return
             if attempt + 1 < attempts:
                 time.sleep(1)
+        context = self._container_failure_context(resource_name) if resource_name else ""
+        reason = " ".join(item for item in (reason, context) if item).strip()
         raise ServiceSetupError(
             error_code,
-            self._diagnostic(error_code, operation, resource_type, exit_code, timed_out, reason, image),
+            self._diagnostic(
+                error_code, operation, resource_type, exit_code, timed_out, reason, image, resource_name
+            ),
         )
 
     def _try(self, args: list[str]) -> bool:
@@ -257,21 +298,43 @@ class ServiceManager:
         except (OSError, subprocess.TimeoutExpired):
             return None
 
+    def _cleanup_resource(self, args: list[str], resource_type: str, name: str) -> None:
+        result = self._try_result(args)
+        logger.info(
+            "services operation=cleanup resource=%s name=%s exit_code=%s",
+            resource_type,
+            name,
+            result.returncode if result is not None else -1,
+        )
+
     def _container_state(self, name: str) -> dict | None:
         try:
             inspected = subprocess.run(
-                [self.podman, "inspect", "--format", "{{.State.Status}}|{{.State.ExitCode}}|{{.State.Error}}", name],
+                [
+                    self.podman,
+                    "inspect",
+                    "--format",
+                    "{{.State.Status}}|{{.State.ExitCode}}|{{.State.Error}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}unknown{{end}}",
+                    name,
+                ],
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
             if inspected.returncode != 0:
                 return None
-            status, exit_code, error = (inspected.stdout.strip().split("|", 2) + ["", "", ""])[:3]
+            status, exit_code, error, health = (inspected.stdout.strip().split("|", 3) + ["", "", "", ""])[:4]
             try:
                 parsed_exit_code = int(exit_code)
             except ValueError:
                 parsed_exit_code = -1
+            logger.info(
+                "services operation=inspect resource=container name=%s exit_code=%s state=%s health=%s",
+                name,
+                parsed_exit_code,
+                sanitize_service_stderr(status),
+                sanitize_service_stderr(health or "unknown"),
+            )
             logs = ""
             if status in {"exited", "dead"}:
                 log_result = subprocess.run(
@@ -281,9 +344,29 @@ class ServiceManager:
                     timeout=10,
                 )
                 logs = log_result.stderr.strip() or log_result.stdout.strip()
-            return {"status": status, "exit_code": parsed_exit_code, "error": error, "logs": logs}
+                logger.info(
+                    "services operation=logs resource=container name=%s exit_code=%s",
+                    name,
+                    log_result.returncode,
+                )
+            return {
+                "status": status,
+                "exit_code": parsed_exit_code,
+                "error": sanitize_service_stderr(error),
+                "health": sanitize_service_stderr(health or "unknown"),
+                "logs": sanitize_service_stderr(logs),
+            }
         except (OSError, subprocess.TimeoutExpired):
             return None
+
+    def _container_failure_context(self, name: str) -> str:
+        state = self._container_state(name)
+        if not state:
+            return ""
+        return sanitize_service_stderr(
+            f"state={state['status']} health={state.get('health', 'unknown')} "
+            f"exit={state['exit_code']} {state['error']} {state['logs']}"
+        )
 
 
 def cleanup_job_services(podman_binary: str, job_id: str, workspace: str = "") -> None:

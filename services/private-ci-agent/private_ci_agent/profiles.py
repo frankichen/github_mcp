@@ -27,6 +27,8 @@ LOCK_FILES = {
 }
 SAFE_NODE_SCRIPTS = ("lint", "typecheck", "test:run", "test:ci", "test", "build")
 UNSAFE_SCRIPT_WORDS = ("dev", "serve", "start", "preview", "watch")
+PLAYWRIGHT_VERSION_RE = re.compile(r"\bplaywright@(?P<version>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b")
+PLAYWRIGHT_PACKAGE_NAMES = ("playwright", "@playwright/test")
 
 _PYTHON_PACKAGE_DIRS = ("app", "private_ci_agent", "private_deploy_agent", "src")
 
@@ -265,6 +267,13 @@ def _node_workspace(source_dir: str, rel: str, files: set[str], explicit: dict |
         "scripts": scripts,
         "package_engines": package.get("engines") or {},
     }
+    # Keep the dependency identity private to the profile generator.  It lets
+    # setup invoke the workspace-local Playwright CLI when the repository owns
+    # the dependency, without exposing dependency values in CI metadata.
+    for package_name in PLAYWRIGHT_PACKAGE_NAMES:
+        if package_name in dependencies:
+            result["_playwright_package"] = package_name
+            break
     if package.get("_configuration_error"):
         result["configuration_error"] = package["_configuration_error"]
     if explicit:
@@ -366,7 +375,113 @@ def select_node_scripts(workspace: dict, required_default: list[str] | None = No
     return selected, skipped
 
 
-def node_commands_for_workspace(workspace: dict, required_default: list[str] | None = None) -> dict:
+def _script_uses_browser_smoke(workspace: dict) -> bool:
+    scripts = workspace.get("scripts") or {}
+    return any("browser-smoke" in f"{name} {command}".lower() for name, command in scripts.items())
+
+
+def _pinned_playwright_versions(source_dir: str | None, workspace: dict) -> set[str]:
+    """Find the exact Playwright version a browser smoke script pins.
+
+    LensHub's legacy smoke script does not declare Playwright in package.json;
+    it pins the CLI in its checked-in .mjs file.  Read only bounded script files
+    so setup can use that exact version instead of a global or guessed one.
+    """
+    versions = set()
+    scripts = workspace.get("scripts") or {}
+    for command in scripts.values():
+        versions.update(match.group("version") for match in PLAYWRIGHT_VERSION_RE.finditer(str(command)))
+    if not source_dir:
+        return versions
+    scripts_root = Path(source_dir) / "scripts"
+    try:
+        root = scripts_root.resolve(strict=True)
+    except OSError:
+        return versions
+    candidates = []
+    try:
+        candidates = sorted(root.rglob("*"))[:64]
+    except OSError:
+        return versions
+    for path in candidates:
+        if path.suffix not in {".js", ".mjs", ".cjs", ".ts"}:
+            continue
+        try:
+            if not path.is_file() or path.stat().st_size > 256 * 1024:
+                continue
+            if not path.resolve().is_relative_to(root):
+                continue
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        versions.update(match.group("version") for match in PLAYWRIGHT_VERSION_RE.finditer(content))
+    return versions
+
+
+def _browser_preheat_command(workspace: dict, source_dir: str | None) -> dict | None:
+    if not _script_uses_browser_smoke(workspace):
+        return None
+
+    # 浏览器 smoke 必须在 setup 的有网容器中预热；check 容器保持离线，
+    # 因而这里只接受本地依赖或源码明确 pin 的版本，不猜测全局 Playwright。
+    package_name = workspace.get("_playwright_package")
+    versions = _pinned_playwright_versions(source_dir, workspace)
+    if package_name and len(versions) <= 1:
+        expected = next(iter(versions), "")
+        package_literal = json.dumps(package_name)
+        expected_literal = json.dumps(expected)
+        version_line = (
+            f"node -e 'const p=require({package_literal}+\"/package.json\"); "
+            f"const expected={expected_literal}; "
+            "if (expected && p.version !== expected) { "
+            "console.error(\"[browser:preheat] Playwright version mismatch\"); "
+            "process.exit(1); }; "
+            "console.log(\"[browser:preheat] playwright_version=\"+p.version)'"
+        )
+        install = "node_modules/.bin/playwright install chromium --no-shell"
+    elif len(versions) == 1:
+        version = next(iter(versions))
+        version_line = f"echo '[browser:preheat] playwright_version={version}'"
+        # This is the same pinned CLI reference used by the checked-in smoke
+        # script.  npm's controlled cache prevents repeated package downloads.
+        install = f"npx --yes playwright@{version} install chromium --no-shell"
+    else:
+        return {
+            "name": "playwright_preheat",
+            "command": (
+                "echo '[browser:preheat] unable to determine one pinned Playwright version'; "
+                "exit 1"
+            ),
+        }
+
+    probe = (
+        'BROWSER="$(find "$PLAYWRIGHT_BROWSERS_PATH" -type f '
+        '\\( -name chrome -o -name chromium -o -name headless_shell '
+        '-o -name chrome-headless-shell \\) -perm /111 -print -quit 2>/dev/null)"'
+    )
+    command = (
+        "set -eu; "
+        "echo '[browser:preheat] cache=/ci-cache/ms-playwright'; "
+        f"{version_line}; "
+        f"{probe}; "
+        "if [ -n \"$BROWSER\" ]; then "
+        "echo '[browser:preheat] cache_hit=true'; "
+        "else "
+        "echo '[browser:preheat] cache_hit=false'; "
+        f"{install}; "
+        "fi; "
+        f"{probe}; "
+        "test -n \"$BROWSER\"; "
+        "echo '[browser:preheat] executable=present'"
+    )
+    return {"name": "playwright_preheat", "command": command}
+
+
+def node_commands_for_workspace(
+    workspace: dict,
+    required_default: list[str] | None = None,
+    source_dir: str | None = None,
+) -> dict:
     selected, skipped = select_node_scripts(workspace, required_default)
     invalid = [item for item in selected if not item.get("command")]
     selected = [item for item in selected if item.get("command")]
@@ -381,10 +496,14 @@ def node_commands_for_workspace(workspace: dict, required_default: list[str] | N
     # The legacy Vue browser smoke searches this fixed path before attempting
     # an install.  Keep it separate from npm downloads and node_modules so the
     # immutable browser runtime can be shared safely by concurrent workspaces.
-    if workspace.get("framework") == "vue" or workspace.get("path") == "h5/lenshub-console":
+    if _script_uses_browser_smoke(workspace):
         cache_dirs["playwright"] = "/ci-cache/ms-playwright"
+    setup = [install]
+    browser_setup = _browser_preheat_command(workspace, source_dir)
+    if browser_setup:
+        setup.append(browser_setup)
     return {
-        "setup": [install],
+        "setup": setup,
         "check": [item for item in selected if item.get("command")],
         "skipped": skipped,
         "selected_scripts": [item["name"] for item in selected if item.get("command")],
@@ -405,7 +524,7 @@ def get_commands_for_profile(profile: str, source_dir: str = "") -> dict:
     if profile == "node-check":
         detected = discover_workspaces(source_dir, {"workspaces": [{"path": ".", "type": "node"}]})
         node = next((item for item in detected["workspaces"] if item["stack"] == "node"), None)
-        return node_commands_for_workspace(node or {"path": ".", "stack": "node"})
+        return node_commands_for_workspace(node or {"path": ".", "stack": "node"}, source_dir=source_dir)
     if profile == "go-check" and source_dir:
         return go_commands_for_workspace(source_dir)
     if profile == "python-check" and source_dir:

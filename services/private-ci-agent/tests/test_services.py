@@ -26,6 +26,8 @@ def test_prepare_uses_isolated_network_and_aliases(monkeypatch, tmp_path):
     assert any("--pod" in command and any("redis" in item for item in command) for command in commands)
     assert any("--pod" in command and any("rabbitmq" in item for item in command) for command in commands)
     assert all("--http-proxy=false" in command for command in commands if command[1] == "run")
+    assert any("private-ci.job=job_123" in item for command in commands for item in command)
+    assert any("private-ci.resource=postgres" in item for command in commands for item in command)
     assert (tmp_path / "runtime" / "services.env").stat().st_mode & 0o777 == 0o600
     manager.cleanup("job-123", str(tmp_path))
     assert not (tmp_path / "runtime" / "services.env").exists()
@@ -68,6 +70,7 @@ def test_service_run_failure_contains_safe_diagnostic(monkeypatch):
             resource_type="postgres",
             operation="start_container",
             image="docker.io/library/postgres:16-alpine",
+            resource_name="ci-job-postgres",
         )
 
     message = str(raised.value)
@@ -75,6 +78,7 @@ def test_service_run_failure_contains_safe_diagnostic(monkeypatch):
     assert "operation=start_container" in message
     assert "exit_code=125" in message
     assert "resource=postgres" in message
+    assert "name=ci-job-postgres" in message
     assert "image=docker.io/library/postgres:16-alpine" in message
     assert "unit-password-value" not in message
     assert "user:unit-pass" not in message
@@ -100,6 +104,22 @@ def test_service_timeout_diagnostic_is_distinct(monkeypatch):
     assert "code=REDIS_UNAVAILABLE" in str(raised.value)
     assert "timed_out=true" in str(raised.value)
     assert "exit_code=-1" in str(raised.value)
+
+
+def test_missing_service_image_reports_inspect_operation(monkeypatch, tmp_path):
+    def fake_run(command, **_kwargs):
+        if command[1:3] == ["image", "exists"] and "postgres" in command[-1]:
+            return SimpleNamespace(returncode=125, stdout="", stderr="image not known")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.services.subprocess.run", fake_run)
+    with pytest.raises(ServiceSetupError) as raised:
+        ServiceManager("podman").prepare("job-image-missing", str(tmp_path))
+
+    assert raised.value.code == "POSTGRES_UNAVAILABLE"
+    assert "operation=inspect" in raised.value.diagnostic
+    assert "image=docker.io/library/postgres:16-alpine" in raised.value.diagnostic
+    assert "image not known" in raised.value.diagnostic
 
 
 def test_readiness_reports_exited_resource_and_tail(monkeypatch):
@@ -128,6 +148,25 @@ def test_readiness_reports_exited_resource_and_tail(monkeypatch):
     assert "exit_code=17" in message
     assert "container failed" in message
     assert "password=unit-hidden" not in message
+
+
+def test_readiness_diagnostic_includes_attempts_and_health(monkeypatch):
+    def fake_run(command, **_kwargs):
+        if command[1:2] == ["exec"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="not ready")
+        if command[1:3] == ["inspect", "--format"]:
+            return SimpleNamespace(returncode=0, stdout="running|0||starting", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.services.subprocess.run", fake_run)
+    manager = ServiceManager("podman")
+    manager.timeout = 0
+    with pytest.raises(ServiceSetupError) as raised:
+        manager._wait_ready({"postgres": "ci-postgres", "redis": "ci-redis", "rabbitmq": "ci-rabbitmq"})
+
+    assert raised.value.code == "SERVICE_SETUP_TIMEOUT"
+    assert "operation=readiness" in raised.value.diagnostic
+    assert "attempts=0" in raised.value.diagnostic or "attempts=" in raised.value.diagnostic
 
 
 def test_stderr_sanitizer_bounds_and_removes_url_credentials():
