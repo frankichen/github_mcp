@@ -789,6 +789,7 @@ def build_patch(path: str, expected_blob_sha: str, original_text: str, replaceme
 
 
 def capabilities(build_sha: str) -> dict[str, Any]:
+    from app.mcp_response import MAX_RESPONSE_RESOURCE_CHUNK_BYTES, MAX_SAFE_INLINE_BYTES
     if not re.fullmatch(r"[0-9a-f]{40}", build_sha or ""):
         raise RuntimeError("build_sha must be a full lowercase 40-character Git commit SHA")
     new_build_env = bool(os.environ.get("MYGITHUB12_BUILD_SHA"))
@@ -796,7 +797,7 @@ def capabilities(build_sha: str) -> dict[str, Any]:
     return {
         "name": "MyGithut12",
         "version": SERVICE_VERSION,
-        "tool_count": 154,
+        "tool_count": 155,
         "build_sha": build_sha,
         "build_sha_source": "environment" if new_build_env or legacy_build_env else "vcs_fallback",
         "runtime_mode": os.environ.get("MYGITHUB12_RUNTIME_MODE", os.environ.get("MYGITHUB10_RUNTIME_MODE", "development")),
@@ -804,13 +805,18 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "source_repository": "frankichen/github_mcp",
         "repository_index_version": "12.0.0-1",
         "supported_index_languages": ["python", "go", "typescript", "javascript", "vue", "java", "rust", "csharp", "sql"],
-        "max_inline_response_bytes": MAX_INLINE_RESPONSE_BYTES,
+        "max_inline_response_bytes": MAX_SAFE_INLINE_BYTES,
+        "transport_inline_hard_limit_bytes": MAX_INLINE_RESPONSE_BYTES,
+        "response_resource_chunk_bytes": MAX_RESPONSE_RESOURCE_CHUNK_BYTES,
         "max_file_chunk_bytes": MAX_FILE_CHUNK_BYTES,
         "max_patch_bytes": MAX_PATCH_BYTES,
         "max_upload_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES,
         "supports_file_manifest": True,
         "supports_byte_chunks": True,
         "supports_mcp_resources": True,
+        "supports_response_resource_fallback": True,
+        "supports_structured_content": True,
+        "supports_response_meta": True,
         "supports_incremental_patch": True,
         "supports_range_edit": True,
         "range_edit_semantics": {"start_line": "1-based inclusive", "end_line": "1-based inclusive", "encoding": "UTF-8 text lines; original LF/CRLF and final-newline state are preserved"},
