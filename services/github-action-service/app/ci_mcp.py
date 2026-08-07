@@ -56,6 +56,133 @@ def _error_response(code: str, message: str, retryable: bool = False, details: d
     }, ensure_ascii=False)
 
 
+_PRIVATE_CI_SUMMARY_FIELDS = (
+    "job_id", "repository", "branch", "commit_sha", "base_sha", "profile",
+    "status", "exit_code", "priority", "worker_id", "queue_position",
+    "created_at", "started_at", "finished_at", "duration_seconds",
+    "cancel_requested", "superseded_by_job_id",
+)
+_PRIVATE_CI_STEP_SUMMARY_FIELDS = ("step_name", "status", "exit_code", "duration_seconds")
+_PRIVATE_CI_WORKSPACE_FIELDS = ("path", "stack", "framework", "package_manager")
+_MAX_SUMMARY_STEPS = 100
+_MAX_SUMMARY_WORKSPACES = 100
+
+
+def _bounded_status_value(value, max_items: int = 20, max_chars: int = 2048):
+    if isinstance(value, str):
+        return value if len(value) <= max_chars else value[:max_chars] + "…"
+    if isinstance(value, list):
+        return [_bounded_status_value(item, max_items, max_chars) for item in value[:max_items]]
+    if isinstance(value, dict):
+        return {
+            str(key): _bounded_status_value(item, max_items, max_chars)
+            for key, item in list(value.items())[:max_items]
+        }
+    return value
+
+
+def _private_ci_logical_steps(job_summary: dict, persisted_steps: list[dict]) -> list[dict]:
+    worker_steps = job_summary.get("steps")
+    if isinstance(worker_steps, list) and worker_steps:
+        return [step for step in worker_steps if isinstance(step, dict)]
+    return [step for step in persisted_steps if isinstance(step, dict)]
+
+
+def _merge_private_ci_full_steps(job_summary: dict, persisted_steps: list[dict]) -> list[dict]:
+    logical_steps = _private_ci_logical_steps(job_summary, persisted_steps)
+    persisted_by_name: dict[str, list[dict]] = {}
+    for persisted in persisted_steps:
+        if not isinstance(persisted, dict):
+            continue
+        persisted_by_name.setdefault(str(persisted.get("step_name", "")), []).append(persisted)
+
+    merged: list[dict] = []
+    consumed: set[int] = set()
+    for logical in logical_steps:
+        item = dict(logical)
+        candidates = persisted_by_name.get(str(item.get("step_name", "")), [])
+        persisted = candidates.pop(0) if candidates else None
+        if persisted is not None:
+            consumed.add(id(persisted))
+            for key in ("started_at", "finished_at", "log_start_offset", "log_end_offset"):
+                if key in persisted:
+                    item[key] = persisted.get(key)
+            for key in ("status", "exit_code", "duration_seconds"):
+                if item.get(key) is None and key in persisted:
+                    item[key] = persisted.get(key)
+        merged.append(item)
+
+    for persisted in persisted_steps:
+        if isinstance(persisted, dict) and id(persisted) not in consumed:
+            merged.append(dict(persisted))
+    return merged
+
+
+def build_private_ci_job_response(job: dict, persisted_steps: list[dict], detail_level: str = "summary") -> dict:
+    if detail_level not in {"summary", "full"}:
+        raise ValueError("detail_level must be 'summary' or 'full'")
+
+    job_summary = job.get("summary") if isinstance(job.get("summary"), dict) else {}
+    logical_steps = _private_ci_logical_steps(job_summary, persisted_steps)
+    current_step = next(
+        (step.get("step_name") for step in logical_steps if step.get("status") == "running"),
+        None,
+    )
+
+    if detail_level == "full":
+        result = dict(job)
+        summary_without_steps = dict(job_summary)
+        summary_without_steps.pop("steps", None)
+        result["summary"] = summary_without_steps
+        result["current_step"] = current_step
+        result["steps"] = _merge_private_ci_full_steps(job_summary, persisted_steps)
+        result["steps_total"] = len(result["steps"])
+        result["steps_truncated"] = False
+        result["ok"] = True
+        result["_mcp_response_mode"] = "full"
+        return result
+
+    result = {key: job.get(key) for key in _PRIVATE_CI_SUMMARY_FIELDS}
+    result["current_step"] = current_step
+    result["git_tree_sha"] = job_summary.get("git_tree_sha")
+    result["detected_stacks"] = list(job.get("detected_stacks") or job_summary.get("detected_stacks") or [])
+    result["selected_profiles"] = list(job.get("selected_profiles") or job_summary.get("selected_profiles") or [])
+
+    raw_workspaces = job.get("workspaces") or job_summary.get("workspaces") or []
+    normalized_workspaces = [
+        {key: workspace.get(key) for key in _PRIVATE_CI_WORKSPACE_FIELDS if key in workspace}
+        for workspace in raw_workspaces
+        if isinstance(workspace, dict)
+    ]
+    result["workspaces"] = normalized_workspaces[:_MAX_SUMMARY_WORKSPACES]
+    result["workspaces_total"] = len(normalized_workspaces)
+    result["workspaces_truncated"] = len(normalized_workspaces) > _MAX_SUMMARY_WORKSPACES
+    result["workspaces_next_cursor"] = str(_MAX_SUMMARY_WORKSPACES) if result["workspaces_truncated"] else None
+
+    compact_steps = [
+        {key: step.get(key) for key in _PRIVATE_CI_STEP_SUMMARY_FIELDS}
+        for step in logical_steps
+    ]
+    result["steps"] = compact_steps[:_MAX_SUMMARY_STEPS]
+    result["steps_total"] = len(compact_steps)
+    result["steps_truncated"] = len(compact_steps) > _MAX_SUMMARY_STEPS
+    result["steps_next_cursor"] = str(_MAX_SUMMARY_STEPS) if result["steps_truncated"] else None
+
+    status_summary = {}
+    for key in ("error", "errors", "warnings", "failure_reason", "error_code", "error_message", "message"):
+        value = job_summary.get(key, job.get(key))
+        if value not in (None, "", [], {}):
+            status_summary[key] = _bounded_status_value(value)
+    if job.get("log_truncated") or job_summary.get("log_truncated"):
+        status_summary["log_truncated"] = True
+    if status_summary:
+        result["status_summary"] = status_summary
+
+    result["ok"] = True
+    result["_mcp_response_mode"] = "summary"
+    return result
+
+
 def register_private_ci_mcp_tools(mcp: FastMCP):
     """Register private CI MCP tools on the FastMCP server."""
 
@@ -206,27 +333,24 @@ This is for the private WSL CI system. NOT for GitHub Actions dispatch (use star
 
     @mcp.tool(
         name="get_private_ci_job",
-        description="""Get the current status and details of a specific private CI job by job_id.
+        description="""Get one private CI job. Defaults to a compact gate-safe summary.
 
-Returns complete job information including status, queue_position, current_step, exit_code, steps array, and timestamps.
+summary keeps exact repository/branch/commit/tree identity, gate status, worker/queue state,
+normalized workspaces, and bounded step status without commands, offsets, evidence, or changed files.
+Use detail_level='full' only for debugging; oversized full results are returned through a response resource.
 
 This is for the private CI system. NOT for GitHub Actions runs (use get_ci_job for that).""",
     )
-    async def get_private_ci_job(job_id: str) -> str:
+    async def get_private_ci_job(job_id: str, detail_level: str = "summary") -> str:
         try:
             job = await asyncio.to_thread(get_job, job_id)
             if not job:
                 return _error_response("PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found")
-            steps = await asyncio.to_thread(get_steps, job_id)
-            current_step = None
-            for s in steps:
-                if s.get("status") == "running":
-                    current_step = s.get("step_name")
-                    break
-            job["current_step"] = current_step
-            job["steps"] = steps
-            job["ok"] = True
-            return json.dumps(job, ensure_ascii=False)
+            if detail_level not in {"summary", "full"}:
+                return _error_response("INVALID_ARGUMENT", "detail_level must be 'summary' or 'full'")
+            persisted_steps = await asyncio.to_thread(get_steps, job_id)
+            result = build_private_ci_job_response(job, persisted_steps, detail_level)
+            return json.dumps(result, ensure_ascii=False)
         except Exception as e:
             return _error_response("INTERNAL_ERROR", str(e))
 
