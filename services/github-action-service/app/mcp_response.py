@@ -20,7 +20,8 @@ from typing import Any, Callable
 from mcp.server.fastmcp import FastMCP
 
 MAX_SAFE_INLINE_BYTES = 32 * 1024
-MAX_RESPONSE_RESOURCE_CHUNK_BYTES = 32 * 1024
+# Leave room for the chunk envelope and MCP transport framing.
+MAX_RESPONSE_RESOURCE_CHUNK_BYTES = 24 * 1024
 RESPONSE_RESOURCE_TTL_SECONDS = 60 * 60
 RESOURCE_URI_PREFIX = "mygithub12://response/"
 

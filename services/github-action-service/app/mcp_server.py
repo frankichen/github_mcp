@@ -13,7 +13,6 @@ from typing import Annotated, Optional
 import httpx
 from pydantic import Field
 
-from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import AuthSettings
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.transport_security import TransportSecuritySettings
@@ -32,6 +31,12 @@ from app import mygithub12
 from app import attestation_registry
 from app.version import runtime_build_sha
 from app.mygithub12_mcp import register_mygithub12_tools
+from app.mcp_response import (
+    MAX_RESPONSE_RESOURCE_CHUNK_BYTES,
+    StructuredFastMCP,
+    read_response_resource_chunk,
+    read_response_resource_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +75,7 @@ class ApiKeyVerifier:
         )
 
 
-mcp = FastMCP(
+mcp = StructuredFastMCP(
     "GitHub Action Service",
     instructions="""\
 Use this MCP server to read and write code on GitHub repositories, and manage CI/CD workflows.
@@ -133,6 +138,29 @@ Development History & Reports:
     ),
     stateless_http=True,
 )
+
+
+@mcp.resource("mygithub12://response/{resource_id}", mime_type="application/json")
+def get_mcp_response_resource(resource_id: str) -> str:
+    """Read one short-lived oversized tool response through MCP resources/read."""
+    return read_response_resource_text(f"mygithub12://response/{resource_id}")
+
+
+@mcp.tool(
+    name="read_mcp_response_resource",
+    description="Read one bounded UTF-8 chunk from an oversized MCP response resource with SHA and continuation metadata.",
+)
+async def read_mcp_response_resource(
+    resource_uri: str,
+    offset_bytes: int = 0,
+    limit_bytes: int = MAX_RESPONSE_RESOURCE_CHUNK_BYTES,
+) -> dict[str, object]:
+    try:
+        return read_response_resource_chunk(resource_uri, offset_bytes, limit_bytes)
+    except FileNotFoundError as exc:
+        return {"ok": False, "error": {"code": "MCP_RESPONSE_RESOURCE_NOT_FOUND", "message": str(exc)}}
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "INVALID_MCP_RESPONSE_RESOURCE", "message": str(exc)}}
 
 
 # ========================================================================
