@@ -120,7 +120,9 @@ def test_get_private_ci_job_full_keeps_detail_without_duplicate_steps():
     assert result["changed_files"] == job["changed_files"]
     assert result["summary"]["evidence"] == job["summary"]["evidence"]
     assert result["summary"]["performance"] == job["summary"]["performance"]
-    assert "steps" not in result["summary"]
+    assert result["git_tree_sha"] == "b" * 40
+    for duplicate_key in ("steps", "status", "exit_code", "detected_stacks", "selected_profiles", "workspaces", "git_tree_sha"):
+        assert duplicate_key not in result["summary"]
     assert result["steps_total"] == 36
     assert result["steps"][0]["command"].startswith("npm run test")
     assert result["steps"][0]["log_start_offset"] == 0

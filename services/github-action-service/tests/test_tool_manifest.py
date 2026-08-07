@@ -45,6 +45,8 @@ async def test_registered_tool_manifest_is_stable_and_unique():
     assert tools["search_repository_text"].annotations.readOnlyHint is True
     assert "result" not in (tools["get_private_ci_job"].outputSchema.get("properties") or {})
     assert tools["get_private_ci_job"].inputSchema["properties"]["detail_level"]["default"] == "summary"
+    templates = await mcp.list_resource_templates()
+    assert any(str(template.uriTemplate) == "mygithub12://response/{resource_id}" for template in templates)
     for name in ("commit_github_files", "apply_github_patch", "edit_github_file_ranges", "commit_github_uploaded_files"):
         properties = tools[name].inputSchema["properties"]
         assert properties["workspace_id"]["default"] == ""

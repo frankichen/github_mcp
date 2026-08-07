@@ -132,9 +132,14 @@ def build_private_ci_job_response(job: dict, persisted_steps: list[dict], detail
     if detail_level == "full":
         result = dict(job)
         summary_without_steps = dict(job_summary)
-        summary_without_steps.pop("steps", None)
+        for duplicate_key in (
+            "steps", "status", "exit_code", "detected_stacks",
+            "selected_profiles", "workspaces", "git_tree_sha",
+        ):
+            summary_without_steps.pop(duplicate_key, None)
         result["summary"] = summary_without_steps
         result["current_step"] = current_step
+        result["git_tree_sha"] = job_summary.get("git_tree_sha")
         result["steps"] = _merge_private_ci_full_steps(job_summary, persisted_steps)
         result["steps_total"] = len(result["steps"])
         result["steps_truncated"] = False
