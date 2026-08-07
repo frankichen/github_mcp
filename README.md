@@ -48,9 +48,11 @@ private-deploy-agent（服务器端）
 
 ## GitHub Action Service
 
-MyGithub10 当前版本为 `10.1.1`。文件写入使用非强制 CAS、expected HEAD/blob 校验和写后 blob/content SHA 回读证明；大于 64 KiB 的文件应使用 manifest、chunk read/upload 和 finalize/commit 流程，不应退化为普通全文提交。
+MyGithut12 当前版本为 `12.0.1`。文件写入继续使用非强制 CAS、expected HEAD/blob 校验和写后 blob/content SHA 回读证明；大文件仍使用 manifest、chunk read/upload 和 finalize/commit 流程，不退化为普通全文提交。
 
-Python 服务现有 118 个 MCP 工具，除文件、目录、分支、提交、Pull Request 和 CI 外，还覆盖 Issue、Review Thread、Actions Artifact/Job/Rerun、Release、Tag、Deployment、Environment、Ruleset/Branch Protection、Webhook、Events 和 Notifications。所有新增写操作要求显式 `confirm=true`，所有仓库级操作共用 `ALLOWED_REPOSITORIES` 授权边界。
+Python 服务现有 155 个 MCP 工具。除既有 GitHub、CI、Workspace、Index 和上下文工具外，`read_mcp_response_resource` 用于按 UTF-8 byte offset 分块读取容量降级后的完整工具响应。所有写操作继续受原有授权、CAS、confirm 和 CI 门禁约束。
+
+MCP tool result 默认以真正的 `structuredContent` 对象返回；安全 inline budget 为 32 KiB，超过预算的完整 payload 会保存为短期 `mygithub12://response/...` Resource，并在小型 inline summary 的 `response_meta` 中返回 `inline_bytes`、`total_bytes`、`truncated`、`resource_uri`、`has_more` 和 SHA-256。`get_private_ci_job` 默认 `detail_level=summary`，只返回门禁所需状态；`detail_level=full` 保留 command、changed files、evidence 和 step offsets，但仍受统一 resource fallback 保护。
 
 GitHub 认证支持 PAT Secret 文件和 GitHub App installation token。GitHub App 模式会在内存中缓存短期 token，并在到期前自动刷新；状态工具只返回认证类型、installation ID 和过期时间，不返回凭据。服务默认应只监听 `127.0.0.1`，通过 HTTPS 反向代理或安全隧道提供 MCP 访问。
 
@@ -76,9 +78,9 @@ docker compose up -d --build
 必须配置 PAT（优先 `GITHUB_TOKEN_FILE`）或 GitHub App 三项配置、`ACTION_API_KEY`，并按最小权限设置 `ALLOWED_REPOSITORIES` 和 `ALLOW_DEFAULT_BRANCH_WRITE`。
 `ALLOWED_REPOSITORIES` 默认拒绝全部仓库；只有显式设置为逗号分隔仓库列表或明确设置为 `*` 才会放行。`/health` 仅表示进程存活，`/ready` 检查 GitHub 配置和 Controller 数据库，受 API Key 保护的 `/metrics` 提供低基数请求计数与累计耗时。
 
-## MyGithut12 规划状态
+## MyGithut12 运行状态
 
-当前现网仍是 `MyGithut11 / 10.1.1`。MyGithut12 计划升级为 `12.0.0`，在保留现有 118 个工具兼容性的基础上新增 36 个工具，总数达到 154。新增范围覆盖精确 Commit 索引、增量索引、多聊天窗口开发工作区、分支租约和范围冲突、树和文本搜索、语义候选检索、符号定义与关系、依赖图、上下文包、变更影响、补丁分析、受影响测试和契约变化检测。此处仅表示需求和开发基线已经建立，不表示功能已经实现或部署。
+MyGithut12 已进入 `12.0.1` response-contract 版本：保留既有 154 个工具名称和业务门禁语义，并新增 1 个 response resource 分块读取工具。Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
 
 ## Private Deploy Agent
 
