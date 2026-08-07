@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from app.ci_mcp import build_private_ci_job_response
+from app.ci_mcp import build_private_ci_job_list_item, build_private_ci_job_response
 from app.mcp_response import (
     MAX_SAFE_INLINE_BYTES,
     StructuredFastMCP,
@@ -86,6 +86,59 @@ def _large_ci_job(step_count: int = 36, changed_count: int = 140) -> tuple[dict,
         "workspaces": workspaces,
     }
     return job, persisted_steps
+
+
+def test_list_private_ci_jobs_summary_stays_bounded_for_ten_large_jobs():
+    jobs = []
+    for index in range(10):
+        job, _ = _large_ci_job(step_count=36, changed_count=140)
+        job["job_id"] = f"job-large-{index:03d}"
+        job["commit_sha"] = f"{index + 1:040x}"[-40:]
+        job["summary"]["steps"][3]["status"] = "failed"
+        job["summary"]["steps"][3]["exit_code"] = 1
+        job["summary"]["steps"][5]["status"] = "skipped"
+        jobs.append(build_private_ci_job_list_item(job))
+
+    payload = {
+        "ok": True,
+        "jobs": jobs,
+        "total_count": 10,
+        "limit": 10,
+        "offset": 0,
+        "has_more": False,
+    }
+    serialized_bytes = response_size_bytes(payload)
+
+    assert serialized_bytes < 16 * 1024
+    assert serialized_bytes < 8 * 1024
+    assert len(jobs) == 10
+    for item in jobs:
+        assert item["job_id"]
+        assert len(item["commit_sha"]) == 40
+        assert item["profile"] == "repo-auto-check"
+        assert item["status"] == "passed"
+        assert item["exit_code"] == 0
+        assert item["changed_files_total"] == 140
+        assert item["steps_total"] == 36
+        assert item["failed_steps_count"] == 1
+        assert item["skipped_steps_count"] == 1
+        assert item["git_tree_sha"] == "b" * 40
+        for removed in ("summary", "changed_files", "workspaces", "steps", "evidence", "performance"):
+            assert removed not in item
+    assert "command" not in json.dumps(payload)
+    assert "report_summary" not in json.dumps(payload)
+
+
+def test_list_private_ci_jobs_summary_handles_jobs_without_worker_steps():
+    job, _ = _large_ci_job()
+    job["summary"].pop("steps")
+    item = build_private_ci_job_list_item(job)
+
+    assert item["steps_total"] is None
+    assert item["failed_steps_count"] is None
+    assert item["skipped_steps_count"] is None
+    assert "summary" not in item
+
 
 
 def test_get_private_ci_job_compact_summary_is_gate_complete_and_small():
