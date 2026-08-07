@@ -432,6 +432,57 @@ def compare_github_commits(repository: str, base: str, head: str, file_limit: in
         raise GitHubApiError(e.status, str(e))
 
 
+def _normalize_pull_request_head_filter(repository: str, head_branch: str) -> tuple[str, str, str]:
+    requested = head_branch.strip()
+    if not requested:
+        return "", "", ""
+    repository_owner = repository.split("/", 1)[0]
+    if ":" in requested:
+        requested_owner, requested_ref = requested.split(":", 1)
+    else:
+        requested_owner, requested_ref = repository_owner, requested
+    requested_owner = requested_owner.strip()
+    requested_ref = requested_ref.strip()
+    if not requested_owner or not requested_ref:
+        raise ValueError("head_branch must be a branch name or owner:branch")
+    return f"{requested_owner}:{requested_ref}", requested_owner, requested_ref
+
+
+def _pull_request_head_owner(pr) -> str:
+    head = getattr(pr, "head", None)
+    user = getattr(head, "user", None)
+    login = getattr(user, "login", None)
+    if login:
+        return str(login)
+    repo = getattr(head, "repo", None)
+    owner = getattr(repo, "owner", None)
+    login = getattr(owner, "login", None)
+    if login:
+        return str(login)
+    label = getattr(head, "label", "") or ""
+    if ":" in label:
+        return label.split(":", 1)[0]
+    return ""
+
+
+def _pull_request_matches_filters(
+    pr, *, state: str, expected_head_owner: str, expected_head_ref: str, base_branch: str,
+) -> tuple[bool, list[str]]:
+    warnings: list[str] = []
+    if expected_head_ref:
+        actual_ref = str(getattr(getattr(pr, "head", None), "ref", "") or "")
+        actual_owner = _pull_request_head_owner(pr)
+        if actual_ref != expected_head_ref or not actual_owner or actual_owner.casefold() != expected_head_owner.casefold():
+            warnings.append("UPSTREAM_HEAD_FILTER_MISMATCH")
+    if base_branch:
+        actual_base = str(getattr(getattr(pr, "base", None), "ref", "") or "")
+        if actual_base != base_branch:
+            warnings.append("UPSTREAM_BASE_FILTER_MISMATCH")
+    if state and state != "all" and str(getattr(pr, "state", "") or "") != state:
+        warnings.append("UPSTREAM_STATE_FILTER_MISMATCH")
+    return not warnings, warnings
+
+
 def list_github_pull_requests(
     repository: str,
     state: str = "open",
@@ -446,8 +497,9 @@ def list_github_pull_requests(
     try:
         repo = gh.get_repo(repository)
         kwargs = {"state": state, "sort": sort, "direction": direction}
-        if head_branch:
-            kwargs["head"] = head_branch
+        normalized_head, expected_head_owner, expected_head_ref = _normalize_pull_request_head_filter(repository, head_branch)
+        if normalized_head:
+            kwargs["head"] = normalized_head
         if base_branch:
             kwargs["base"] = base_branch
 
@@ -457,7 +509,21 @@ def list_github_pull_requests(
         start = (page - 1) * limit
         end = start + limit
 
-        return {
+        filtered_prs = []
+        filter_warnings: set[str] = set()
+        for pr in page_prs:
+            matches, warnings = _pull_request_matches_filters(
+                pr,
+                state=state,
+                expected_head_owner=expected_head_owner,
+                expected_head_ref=expected_head_ref,
+                base_branch=base_branch,
+            )
+            filter_warnings.update(warnings)
+            if matches:
+                filtered_prs.append(pr)
+
+        result = {
             "ok": True,
             "repository": repository,
             "total_count": total,
@@ -478,9 +544,12 @@ def list_github_pull_requests(
                     "updated_at": pr.updated_at.isoformat() if pr.updated_at else None,
                     "html_url": pr.html_url,
                 }
-                for pr in page_prs
+                for pr in filtered_prs
             ],
         }
+        if filter_warnings:
+            result["warnings"] = sorted(filter_warnings)
+        return result
     except GithubException as e:
         if e.status == 404:
             return {"ok": False, "error": {"code": "REPOSITORY_NOT_FOUND", "message": str(e), "retryable": False}}
