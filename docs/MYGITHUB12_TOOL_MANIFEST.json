@@ -1,11 +1,11 @@
 {
   "service_name": "MyGithut12",
-  "service_version": "12.0.0",
+  "service_version": "12.0.1",
   "manifest_format": "composed-v1",
   "legacy_manifest": "MYGITHUB10_TOOL_MANIFEST.json",
   "legacy_tool_count": 118,
-  "new_tool_count": 36,
-  "tool_count": 154,
+  "new_tool_count": 37,
+  "tool_count": 155,
   "new_tools": [
     "get_repository_index_status",
     "request_repository_index_build",
@@ -42,6 +42,7 @@
     "analyze_repository_change_impact",
     "analyze_repository_patch",
     "get_affected_tests",
-    "detect_repository_contract_changes"
+    "detect_repository_contract_changes",
+    "read_mcp_response_resource"
   ]
 }
