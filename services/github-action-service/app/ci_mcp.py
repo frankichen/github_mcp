@@ -62,6 +62,7 @@ _PRIVATE_CI_SUMMARY_FIELDS = (
     "created_at", "started_at", "finished_at", "duration_seconds",
     "cancel_requested", "superseded_by_job_id",
 )
+_PRIVATE_CI_LIST_FIELDS = _PRIVATE_CI_SUMMARY_FIELDS + ("attempts",)
 _PRIVATE_CI_STEP_SUMMARY_FIELDS = ("step_name", "status", "exit_code", "duration_seconds")
 _PRIVATE_CI_WORKSPACE_FIELDS = ("path", "stack", "framework", "package_manager")
 _MAX_SUMMARY_STEPS = 100
@@ -116,6 +117,41 @@ def _merge_private_ci_full_steps(job_summary: dict, persisted_steps: list[dict])
         if isinstance(persisted, dict) and id(persisted) not in consumed:
             merged.append(dict(persisted))
     return merged
+
+
+def build_private_ci_job_list_item(job: dict) -> dict:
+    """Return bounded discovery metadata for one private CI job."""
+    job_summary = job.get("summary") if isinstance(job.get("summary"), dict) else {}
+    summary_steps = job_summary.get("steps") if isinstance(job_summary.get("steps"), list) else None
+    logical_steps = [step for step in (summary_steps or []) if isinstance(step, dict)]
+
+    result = {key: job.get(key) for key in _PRIVATE_CI_LIST_FIELDS}
+    current_step = job.get("current_step") or next(
+        (step.get("step_name") for step in logical_steps if step.get("status") == "running"),
+        None,
+    )
+    for optional_key in ("worker_id", "queue_position", "superseded_by_job_id"):
+        if result.get(optional_key) is None:
+            result.pop(optional_key, None)
+    if current_step is not None:
+        result["current_step"] = current_step
+    result["changed_files_total"] = int(job.get("changed_files_total") or 0)
+    result["changed_files_truncated"] = bool(job.get("changed_files_truncated"))
+    result["detected_stacks"] = list(job.get("detected_stacks") or job_summary.get("detected_stacks") or [])
+    result["selected_profiles"] = list(job.get("selected_profiles") or job_summary.get("selected_profiles") or [])
+    git_tree_sha = job_summary.get("git_tree_sha")
+    if git_tree_sha:
+        result["git_tree_sha"] = git_tree_sha
+
+    if summary_steps is None:
+        result["steps_total"] = None
+        result["failed_steps_count"] = None
+        result["skipped_steps_count"] = None
+    else:
+        result["steps_total"] = len(logical_steps)
+        result["failed_steps_count"] = sum(step.get("status") == "failed" for step in logical_steps)
+        result["skipped_steps_count"] = sum(step.get("status") == "skipped" for step in logical_steps)
+    return result
 
 
 def build_private_ci_job_response(job: dict, persisted_steps: list[dict], detail_level: str = "summary") -> dict:
@@ -258,7 +294,7 @@ This is for the private CI system. NOT for GitHub Actions runs (use list_ci_jobs
                 limit=limit + offset + 10,
             )
             total = len(jobs)
-            page_jobs = jobs[offset:offset + limit]
+            page_jobs = [build_private_ci_job_list_item(job) for job in jobs[offset:offset + limit]]
             return json.dumps({
                 "ok": True,
                 "jobs": page_jobs,
@@ -266,6 +302,7 @@ This is for the private CI system. NOT for GitHub Actions runs (use list_ci_jobs
                 "limit": limit,
                 "offset": offset,
                 "has_more": (offset + limit) < total,
+                "_mcp_response_mode": "summary",
             }, ensure_ascii=False)
         except Exception as e:
             return _error_response("INTERNAL_ERROR", str(e))

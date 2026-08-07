@@ -48,7 +48,7 @@ private-deploy-agent（服务器端）
 
 ## GitHub Action Service
 
-MyGithut12 当前版本为 `12.0.1`。文件写入继续使用非强制 CAS、expected HEAD/blob 校验和写后 blob/content SHA 回读证明；大文件仍使用 manifest、chunk read/upload 和 finalize/commit 流程，不退化为普通全文提交。
+MyGithut12 当前版本为 `12.0.2`。文件写入继续使用非强制 CAS、expected HEAD/blob 校验和写后 blob/content SHA 回读证明；大文件仍使用 manifest、chunk read/upload 和 finalize/commit 流程，不退化为普通全文提交。
 
 Python 服务现有 155 个 MCP 工具。除既有 GitHub、CI、Workspace、Index 和上下文工具外，`read_mcp_response_resource` 用于按 UTF-8 byte offset 分块读取容量降级后的完整工具响应。所有写操作继续受原有授权、CAS、confirm 和 CI 门禁约束。
 
@@ -80,7 +80,7 @@ docker compose up -d --build
 
 ## MyGithut12 运行状态
 
-MyGithut12 已进入 `12.0.1` response-contract 版本：保留既有 154 个工具名称和业务门禁语义，并新增 1 个 response resource 分块读取工具。Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
+MyGithut12 已进入 `12.0.2` response-contract 版本：保留既有 154 个工具名称和业务门禁语义，并新增 1 个 response resource 分块读取工具。Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
 
 ## Private Deploy Agent
 
