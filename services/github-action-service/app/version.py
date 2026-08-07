@@ -8,7 +8,7 @@ from pathlib import Path
 
 BUILD_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SERVICE_NAME = "MyGithut12"
-SERVICE_VERSION = "12.0.1"
+SERVICE_VERSION = "12.0.2"
 SOURCE_REPOSITORY = "https://github.com/frankichen/github_mcp"
 
 
