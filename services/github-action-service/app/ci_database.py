@@ -724,9 +724,10 @@ def lease_job(worker_id: str, supported_profiles: list[str], max_concurrent: int
         job_id = rows["job_id"]
         repository = rows["repository"]
 
+        attempt_number = int(rows["attempts"]) + 1
         db.execute(
             """UPDATE ci_jobs SET status = 'leased', worker_id = ?, lease_token_hash = ?, lease_expires_at = ?,
-               attempts = attempts + 1, started_at = ?
+               attempts = attempts + 1, started_at = COALESCE(started_at, ?)
                WHERE job_id = ? AND status = 'queued'""",
             (worker_id, lease_token_hash, lease_expires, ts, job_id),
         )
@@ -737,7 +738,7 @@ def lease_job(worker_id: str, supported_profiles: list[str], max_concurrent: int
 
         _upsert_repo_queue_state(db, repository, queued_delta=-1, running_delta=1, last_dispatched_at=ts)
         set_worker_busy(worker_id, job_id)
-        _add_event(db, job_id, "leased", json.dumps({"worker_id": worker_id}))
+        _add_event(db, job_id, "leased", json.dumps({"worker_id": worker_id, "attempt_number": attempt_number}))
 
         db.commit()
 
@@ -752,6 +753,7 @@ def lease_job(worker_id: str, supported_profiles: list[str], max_concurrent: int
             "changed_files_truncated": bool(rows["changed_files_truncated"]),
             "profile": rows["profile"],
             "timeout_seconds": rows["timeout_seconds"],
+            "attempt_number": attempt_number,
             "lease_token": lease_token,
             "lease_expires_at": datetime.fromtimestamp(lease_expires, tz=timezone.utc).isoformat(),
         }
