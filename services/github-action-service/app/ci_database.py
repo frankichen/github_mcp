@@ -1055,21 +1055,29 @@ def append_log_batch(job_id: str, batch_id: str, content: str, attempt_number: i
     return new_offset, False
 
 
-def get_log_chunks(job_id: str, offset: int = 0, limit: int = 50) -> dict:
+def get_log_chunks(job_id: str, offset: int = 0, limit: int = 50, attempt_number: Optional[int] = None) -> dict:
     db = _get_db()
-    job = db.execute("SELECT log_total_bytes, log_truncated FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
+    job = db.execute("SELECT attempts, log_truncated FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
     if not job:
-        return {"job_id": job_id, "chunks": [], "next_offset": None, "total_bytes": 0, "truncated": False}
+        return {"job_id": job_id, "attempt_number": None, "chunks": [], "next_offset": None, "total_bytes": 0, "truncated": False}
+
+    selected_attempt = int(job["attempts"] if attempt_number is None else attempt_number)
+    has_selected = db.execute("SELECT 1 FROM ci_job_log_chunks WHERE job_id=? AND attempt_number=? LIMIT 1", (job_id, selected_attempt)).fetchone()
+    if not has_selected and selected_attempt != 0:
+        legacy = db.execute("SELECT 1 FROM ci_job_log_chunks WHERE job_id=? AND attempt_number=0 LIMIT 1", (job_id,)).fetchone()
+        if legacy:
+            selected_attempt = 0
 
     rows = db.execute(
-        "SELECT * FROM ci_job_log_chunks WHERE job_id = ? AND offset_from >= ? ORDER BY chunk_index LIMIT ?",
-        (job_id, offset, limit),
+        "SELECT * FROM ci_job_log_chunks WHERE job_id = ? AND attempt_number = ? AND offset_from >= ? ORDER BY chunk_index LIMIT ?",
+        (job_id, selected_attempt, offset, limit),
     ).fetchall()
 
     chunks = []
     next_offset = None
     for r in rows:
         chunks.append({
+            "attempt_number": r["attempt_number"],
             "chunk_index": r["chunk_index"],
             "offset_from": r["offset_from"],
             "offset_to": r["offset_to"],
@@ -1077,33 +1085,46 @@ def get_log_chunks(job_id: str, offset: int = 0, limit: int = 50) -> dict:
         })
         next_offset = r["offset_to"]
 
+    last_index = rows[-1]["chunk_index"] if rows else -1
     has_more = db.execute(
-        "SELECT COUNT(*) FROM ci_job_log_chunks WHERE job_id = ? AND chunk_index > ?",
-        (job_id, rows[-1]["chunk_index"] if rows else 0),
+        "SELECT COUNT(*) FROM ci_job_log_chunks WHERE job_id = ? AND attempt_number = ? AND chunk_index > ?",
+        (job_id, selected_attempt, last_index),
     ).fetchone()[0] > 0
+    total_bytes = db.execute(
+        "SELECT COALESCE(MAX(offset_to), 0) FROM ci_job_log_chunks WHERE job_id = ? AND attempt_number = ?",
+        (job_id, selected_attempt),
+    ).fetchone()[0]
 
     return {
         "job_id": job_id,
+        "attempt_number": selected_attempt,
         "chunks": chunks,
         "next_offset": next_offset if has_more else None,
-        "total_bytes": job["log_total_bytes"],
+        "total_bytes": total_bytes,
         "truncated": bool(job["log_truncated"]),
     }
 
 
-def get_log_tail(job_id: str, lines: int = 100, max_scan_bytes: int = 4 * 1024 * 1024) -> dict:
-    """Read backwards by chunk and stop only after enough complete newlines."""
+def get_log_tail(job_id: str, lines: int = 100, max_scan_bytes: int = 4 * 1024 * 1024, attempt_number: Optional[int] = None) -> dict:
+    """Read backwards from only the selected lease attempt."""
     db = _get_db()
-    row = db.execute("SELECT status, log_total_bytes, log_truncated FROM ci_jobs WHERE job_id=?", (job_id,)).fetchone()
+    row = db.execute("SELECT status, attempts, log_truncated FROM ci_jobs WHERE job_id=?", (job_id,)).fetchone()
     if not row:
-        return {"job_id": job_id, "status": None, "last_sequence": None, "requested_lines": lines, "returned_lines": 0, "total_bytes": 0, "bytes_scanned": 0, "first_line_partial": False, "max_bytes_reached": False, "truncated": False, "lines": []}
+        return {"job_id": job_id, "status": None, "attempt_number": None, "last_sequence": None, "requested_lines": lines, "returned_lines": 0, "total_bytes": 0, "bytes_scanned": 0, "first_line_partial": False, "max_bytes_reached": False, "truncated": False, "lines": []}
+    selected_attempt = int(row["attempts"] if attempt_number is None else attempt_number)
+    has_selected = db.execute("SELECT 1 FROM ci_job_log_chunks WHERE job_id=? AND attempt_number=? LIMIT 1", (job_id, selected_attempt)).fetchone()
+    if not has_selected and selected_attempt != 0:
+        legacy = db.execute("SELECT 1 FROM ci_job_log_chunks WHERE job_id=? AND attempt_number=0 LIMIT 1", (job_id,)).fetchone()
+        if legacy:
+            selected_attempt = 0
+    total_bytes = db.execute("SELECT COALESCE(MAX(offset_to), 0) FROM ci_job_log_chunks WHERE job_id=? AND attempt_number=?", (job_id, selected_attempt)).fetchone()[0]
     lines = min(max(int(lines), 1), 1000)
     max_scan_bytes = min(max(int(max_scan_bytes), 1), 64 * 1024 * 1024)
     collected, scanned, cursor, last_sequence = [], 0, None, None
     newline_count = 0
     while scanned < max_scan_bytes:
-        params = [job_id] if cursor is None else [job_id, cursor]
-        where = "job_id=?" if cursor is None else "job_id=? AND chunk_index<?"
+        params = [job_id, selected_attempt] if cursor is None else [job_id, selected_attempt, cursor]
+        where = "job_id=? AND attempt_number=?" if cursor is None else "job_id=? AND attempt_number=? AND chunk_index<?"
         batch = db.execute(f"SELECT chunk_index, content FROM ci_job_log_chunks WHERE {where} ORDER BY chunk_index DESC LIMIT 100", params).fetchall()
         if not batch: break
         if last_sequence is None: last_sequence = batch[0]["chunk_index"]
@@ -1120,7 +1141,7 @@ def get_log_tail(job_id: str, lines: int = 100, max_scan_bytes: int = 4 * 1024 *
     content = "".join(reversed(collected)); all_lines = content.splitlines()
     first_partial = bool(collected and cursor is not None and newline_count < lines + 1 and scanned >= max_scan_bytes)
     tail = all_lines[-lines:]
-    return {"job_id": job_id, "status": row["status"], "last_sequence": last_sequence, "requested_lines": lines, "returned_lines": len(tail), "total_bytes": row["log_total_bytes"], "bytes_scanned": scanned, "first_line_partial": first_partial, "max_bytes_reached": scanned >= max_scan_bytes, "truncated": bool(row["log_truncated"]), "lines": tail}
+    return {"job_id": job_id, "status": row["status"], "attempt_number": selected_attempt, "last_sequence": last_sequence, "requested_lines": lines, "returned_lines": len(tail), "total_bytes": total_bytes, "bytes_scanned": scanned, "first_line_partial": first_partial, "max_bytes_reached": scanned >= max_scan_bytes, "truncated": bool(row["log_truncated"]), "lines": tail}
 
 
 ### STEPS
