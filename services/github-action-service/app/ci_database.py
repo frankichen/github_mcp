@@ -1131,6 +1131,8 @@ def get_steps(job_id: str, attempt_number: Optional[int] = None) -> list[dict]:
         rows = db.execute("SELECT * FROM ci_job_steps WHERE job_id = ? ORDER BY id", (job_id,)).fetchall()
     else:
         rows = db.execute("SELECT * FROM ci_job_steps WHERE job_id = ? AND attempt_number = ? ORDER BY id", (job_id, int(attempt_number))).fetchall()
+        if not rows:
+            rows = db.execute("SELECT * FROM ci_job_steps WHERE job_id = ? AND attempt_number = 0 ORDER BY id", (job_id,)).fetchall()
     return [
         {
             "attempt_number": r["attempt_number"],
