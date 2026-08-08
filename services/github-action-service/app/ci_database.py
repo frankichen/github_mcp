@@ -126,6 +126,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS ci_job_log_chunks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_id TEXT NOT NULL,
+            attempt_number INTEGER NOT NULL DEFAULT 0,
             chunk_index INTEGER NOT NULL,
             offset_from INTEGER NOT NULL,
             offset_to INTEGER NOT NULL,
@@ -177,6 +178,10 @@ def init_db():
     step_columns = {row[1] for row in db.execute("PRAGMA table_info(ci_job_steps)").fetchall()}
     if "attempt_number" not in step_columns:
         db.execute("ALTER TABLE ci_job_steps ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 0")
+    log_columns = {row[1] for row in db.execute("PRAGMA table_info(ci_job_log_chunks)").fetchall()}
+    if "attempt_number" not in log_columns:
+        db.execute("ALTER TABLE ci_job_log_chunks ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 0")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_ci_job_log_chunks_attempt ON ci_job_log_chunks(job_id, attempt_number, chunk_index)")
     db.execute(
         "INSERT OR IGNORE INTO ci_controller_state (key, value, updated_at) VALUES ('draining', '0', ?)",
         (now_ts(),),
