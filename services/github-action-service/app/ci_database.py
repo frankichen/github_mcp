@@ -252,7 +252,7 @@ def get_worker(worker_id: str) -> Optional[dict]:
 
 
 def get_current_lease_attempt(job_id: str, worker_id: str, lease_token: str) -> Optional[int]:
-    """Return the current attempt only when the worker holds the live job lease."""
+    """Return the current attempt only when the worker holds an unexpired live lease."""
     if not lease_token:
         return None
     db = _get_db()
@@ -260,8 +260,9 @@ def get_current_lease_attempt(job_id: str, worker_id: str, lease_token: str) -> 
     row = db.execute(
         """SELECT attempts FROM ci_jobs
            WHERE job_id = ? AND worker_id = ? AND lease_token_hash = ?
-           AND status IN ('leased', 'downloading', 'preparing', 'running')""",
-        (job_id, worker_id, token_hash),
+           AND status IN ('leased', 'downloading', 'preparing', 'running')
+           AND lease_expires_at >= ?""",
+        (job_id, worker_id, token_hash, now_ts()),
     ).fetchone()
     return int(row["attempts"]) if row else None
 
@@ -529,6 +530,30 @@ def list_jobs(
     params.append(limit)
     rows = db.execute(query, params).fetchall()
     return [_job_row_to_dict(r, db) for r in rows]
+
+
+def get_controller_drain_status() -> dict:
+    """Return whether the controller can restart without orphaning a live CI lease."""
+    db = _get_db()
+    active_statuses = ("leased", "downloading", "preparing", "running")
+    placeholders = ",".join("?" for _ in active_statuses)
+    rows = db.execute(
+        f"SELECT job_id, repository, branch, commit_sha, profile, status, worker_id, attempts, started_at, lease_expires_at FROM ci_jobs WHERE status IN ({placeholders}) ORDER BY created_at",
+        active_statuses,
+    ).fetchall()
+    active_jobs = [{
+        "job_id": row["job_id"],
+        "repository": row["repository"],
+        "branch": row["branch"],
+        "commit_sha": row["commit_sha"],
+        "profile": row["profile"],
+        "status": row["status"],
+        "worker_id": row["worker_id"],
+        "attempt_number": row["attempts"],
+        "started_at": datetime.fromtimestamp(row["started_at"], tz=timezone.utc).isoformat() if row["started_at"] else None,
+        "lease_expires_at": datetime.fromtimestamp(row["lease_expires_at"], tz=timezone.utc).isoformat() if row["lease_expires_at"] else None,
+    } for row in rows]
+    return {"safe_to_restart": not active_jobs, "active_job_count": len(active_jobs), "active_jobs": active_jobs}
 
 
 def get_monitor_snapshot(active_limit: int = 50, recent_limit: int = 20) -> dict:
