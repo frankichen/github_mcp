@@ -300,6 +300,27 @@ def _parse_patch_details(patch: str) -> tuple[list[tuple[str, str, list[tuple[in
     if len(patch.encode()) > MAX_PATCH_BYTES:
         raise MyGithub10Error("PATCH_TOO_LARGE", "patch exceeds the patch limit")
     lines = patch.splitlines(keepends=True)
+    metadata_only_deletes: list[tuple[str, str, list[tuple[int, int, list[str], list[str]]]]] = []
+    block_index = 0
+    while block_index < len(lines):
+        if not lines[block_index].startswith("diff --git "):
+            block_index += 1
+            continue
+        block_end = block_index + 1
+        while block_end < len(lines) and not lines[block_end].startswith("diff --git "):
+            block_end += 1
+        block = lines[block_index:block_end]
+        has_delete_mode = any(line.startswith("deleted file mode ") for line in block)
+        has_text_headers = any(line.startswith("--- ") for line in block)
+        if has_delete_mode and not has_text_headers:
+            header = lines[block_index].rstrip("\r\n")
+            match = re.fullmatch(r"diff --git a/(.+) b/\1", header)
+            if not match:
+                raise MyGithub10Error("PATCH_INVALID_FORMAT", "metadata-only delete must use matching a/ and b/ paths")
+            path = match.group(1)
+            _safe_path(path)
+            metadata_only_deletes.append((path, "delete", []))
+        block_index = block_end
     result: list[tuple[str, str, list[tuple[int, int, list[str], list[str]]]]] = []
     normalized_hunks = []
     normalization_warnings = []
@@ -372,6 +393,7 @@ def _parse_patch_details(patch: str) -> tuple[list[tuple[str, str, list[tuple[in
         if not hunks:
             raise MyGithub10Error("PATCH_INVALID_FORMAT", f"file patch for {path} has no hunks")
         result.append((path, operation, hunks))
+    result.extend(metadata_only_deletes)
     if not result:
         raise MyGithub10Error("PATCH_EMPTY", "no file patch found")
     return result, {"patch_normalized": bool(normalization_warnings),
@@ -590,18 +612,35 @@ def apply_patch(client, repository: str, branch: str, expected_head_sha: str, ex
             except Exception as exc:
                 if getattr(exc, "status", None) != 404:
                     raise MyGithub10Error("GITHUB_READ_FAILED", f"GitHub failed while checking patch target {path}", {"path": path, "retryable": True}) from exc
-        elif operation != "delete":
+        else:
             old, old_sha, _ = _read_blob(repo, path, actual_head)
             if len(old) > MAX_TEXT_EDIT_FILE_BYTES:
                 raise MyGithub10Error("FILE_TOO_LARGE", f"text edit target exceeds the file limit: {path}", {"path": path, "limit_bytes": MAX_TEXT_EDIT_FILE_BYTES})
             if expected.get(path) and expected[path] != old_sha:
                 raise MyGithub10Error("BLOB_CHANGED", f"file blob changed before patch: {path}", {"expected": expected[path], "actual": old_sha, "repository": repository, "branch": branch, "path": path})
-        new = None if operation == "delete" else _apply_file_patch(
-            old,
-            hunks,
-            allow_empty_old=operation == "add",
-            path=path,
-        )
+        if operation == "delete":
+            if hunks:
+                deleted = _apply_file_patch(
+                    old,
+                    hunks,
+                    allow_empty_old=not old,
+                    path=path,
+                )
+                if deleted:
+                    raise MyGithub10Error("PATCH_INVALID_FORMAT", f"delete patch must remove all file content: {path}")
+            elif old:
+                raise MyGithub10Error(
+                    "PATCH_INVALID_FORMAT",
+                    f"metadata-only delete is valid only for an empty tracked file: {path}",
+                )
+            new = None
+        else:
+            new = _apply_file_patch(
+                old,
+                hunks,
+                allow_empty_old=operation == "add",
+                path=path,
+            )
         changed[path] = new
         previews.append({"path": path, "operation": operation, "old_blob_sha": old_sha,
                          "new_blob_sha": None if new is None else _git_blob_sha(new),
