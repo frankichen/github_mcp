@@ -173,6 +173,7 @@ async def job_get_source(job_id: str, request: Request):
 
     if job["worker_id"] != worker_id:
         raise HTTPException(status_code=403, detail={"error": "forbidden", "message": "Job not leased to you"})
+    _require_current_job_lease(job_id, worker_id, request)
 
     try:
         gh_token = credential_provider.token()
@@ -234,6 +235,7 @@ async def job_download_source(job_id: str, request: Request):
         raise HTTPException(status_code=404, detail={"error": "not_found"})
 
     body = await request.json()
+    _require_current_job_lease(job_id, worker_id, request, body)
     sha256 = body.get("sha256", "")
     size_bytes = body.get("size_bytes", 0)
 
@@ -248,6 +250,7 @@ async def job_upload_logs(job_id: str, request: Request):
     worker_id = await verify_ci_worker(request)
 
     body = await request.json()
+    _require_current_job_lease(job_id, worker_id, request, body)
     content = body.get("content", "")
     if not content:
         return {"status": "ok", "bytes_written": 0}
@@ -267,6 +270,7 @@ async def job_upload_logs(job_id: str, request: Request):
 async def job_upload_log_batch(job_id: str, request: Request):
     worker_id = await verify_ci_worker(request)
     body = await request.json()
+    _require_current_job_lease(job_id, worker_id, request, body)
     content = str(body.get("content") or "")
     batch_id = str(body.get("batch_id") or "")
     new_size, idempotent = append_log_batch(job_id, batch_id, content)
@@ -279,22 +283,24 @@ async def job_upload_step(job_id: str, request: Request):
     worker_id = await verify_ci_worker(request)
 
     body = await request.json()
+    attempt_number = _require_current_job_lease(job_id, worker_id, request, body)
     step_name = body.get("step_name", "")
     action = body.get("action", "start")  # start, finish, update_status
 
     if action == "start":
-        step_id = add_step(job_id, step_name, "running")
-        return {"status": "ok", "step_id": step_id}
+        step_id = add_step(job_id, step_name, "running", attempt_number=attempt_number)
+        return {"status": "ok", "step_id": step_id, "attempt_number": attempt_number}
     elif action == "finish":
         step_id = body.get("step_id")
         step_status = body.get("status", "completed")
         exit_code = body.get("exit_code")
         log_end_offset = body.get("log_end_offset")
-        finish_step(step_id, step_status, exit_code, log_end_offset)
-        return {"status": "ok", "step_id": step_id}
+        if not finish_step(step_id, step_status, exit_code, log_end_offset, job_id=job_id, attempt_number=attempt_number):
+            raise HTTPException(status_code=409, detail={"error": "stale_step", "message": "Step does not belong to the current job attempt"})
+        return {"status": "ok", "step_id": step_id, "attempt_number": attempt_number}
     elif action == "update_status":
         set_job_status(job_id, body.get("job_status", "running"))
-        return {"status": "ok"}
+        return {"status": "ok", "attempt_number": attempt_number}
 
     raise HTTPException(status_code=400, detail={"error": "bad_request", "message": f"Unknown action: {action}"})
 
@@ -304,6 +310,7 @@ async def job_finish(job_id: str, request: Request):
     worker_id = await verify_ci_worker(request)
 
     body = await request.json()
+    _require_current_job_lease(job_id, worker_id, request, body)
     exit_code = body.get("exit_code", -1)
     status = body.get("status", "failed")
     summary = body.get("summary")
@@ -322,6 +329,8 @@ async def job_finish(job_id: str, request: Request):
 @router.post("/jobs/{job_id}/release")
 async def job_release(job_id: str, request: Request):
     worker_id = await verify_ci_worker(request)
+    body = await request.json()
+    _require_current_job_lease(job_id, worker_id, request, body)
     release_job(job_id)
     logger.info("Job released: worker=%s job=%s", worker_id, job_id)
     return {"status": "ok", "job_id": job_id}
