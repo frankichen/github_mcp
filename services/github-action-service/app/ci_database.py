@@ -1076,32 +1076,37 @@ def get_log_tail(job_id: str, lines: int = 100, max_scan_bytes: int = 4 * 1024 *
 
 ### STEPS
 
-def add_step(job_id: str, step_name: str, status: str = "pending") -> int:
+def add_step(job_id: str, step_name: str, status: str = "pending", attempt_number: int = 0) -> int:
     db = _get_db()
     ts = now_ts()
     cursor = db.execute(
-        "INSERT INTO ci_job_steps (job_id, step_name, status, started_at) VALUES (?, ?, ?, ?)",
-        (job_id, step_name, status, ts if status == "running" else None),
+        "INSERT INTO ci_job_steps (job_id, attempt_number, step_name, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        (job_id, int(attempt_number), step_name, status, ts if status == "running" else None),
     )
     db.commit()
     _notify_job_change(job_id)
     return cursor.lastrowid
 
 
-def finish_step(step_id: int, status: str, exit_code: Optional[int] = None, log_end_offset: Optional[int] = None):
+def finish_step(step_id: int, status: str, exit_code: Optional[int] = None, log_end_offset: Optional[int] = None, *, job_id: Optional[str] = None, attempt_number: Optional[int] = None) -> bool:
     db = _get_db()
     ts = now_ts()
-    row = db.execute("SELECT job_id, step_name, started_at FROM ci_job_steps WHERE id = ?", (step_id,)).fetchone()
-    duration = ts - row["started_at"] if row and row["started_at"] else 0
+    row = db.execute("SELECT job_id, attempt_number, step_name, started_at FROM ci_job_steps WHERE id = ?", (step_id,)).fetchone()
+    if not row:
+        return False
+    if job_id is not None and row["job_id"] != job_id:
+        return False
+    if attempt_number is not None and int(row["attempt_number"]) != int(attempt_number):
+        return False
+    duration = ts - row["started_at"] if row["started_at"] else 0
     db.execute(
         "UPDATE ci_job_steps SET status = ?, exit_code = ?, finished_at = ?, duration_seconds = ?, log_end_offset = COALESCE(?, log_end_offset) WHERE id = ?",
         (status, exit_code, ts, duration, log_end_offset, step_id),
     )
-    if row:
-        _add_event(db, row["job_id"], "step_completed", json.dumps({"step_id": step_id, "step_name": row["step_name"], "status": status}))
+    _add_event(db, row["job_id"], "step_completed", json.dumps({"step_id": step_id, "step_name": row["step_name"], "status": status, "attempt_number": row["attempt_number"]}))
     db.commit()
-    if row:
-        _notify_job_change(row["job_id"])
+    _notify_job_change(row["job_id"])
+    return True
 
 
 def _newly_completed_steps(job_id: str, last_known_revision: int) -> list[dict]:
@@ -1120,11 +1125,15 @@ def _newly_completed_steps(job_id: str, last_known_revision: int) -> list[dict]:
     return result
 
 
-def get_steps(job_id: str) -> list[dict]:
+def get_steps(job_id: str, attempt_number: Optional[int] = None) -> list[dict]:
     db = _get_db()
-    rows = db.execute("SELECT * FROM ci_job_steps WHERE job_id = ? ORDER BY id", (job_id,)).fetchall()
+    if attempt_number is None:
+        rows = db.execute("SELECT * FROM ci_job_steps WHERE job_id = ? ORDER BY id", (job_id,)).fetchall()
+    else:
+        rows = db.execute("SELECT * FROM ci_job_steps WHERE job_id = ? AND attempt_number = ? ORDER BY id", (job_id, int(attempt_number))).fetchall()
     return [
         {
+            "attempt_number": r["attempt_number"],
             "step_name": r["step_name"],
             "status": r["status"],
             "exit_code": r["exit_code"],
