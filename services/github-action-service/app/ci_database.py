@@ -109,6 +109,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS ci_job_steps (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_id TEXT NOT NULL,
+            attempt_number INTEGER NOT NULL DEFAULT 0,
             step_name TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
             exit_code INTEGER,
@@ -167,6 +168,9 @@ def init_db():
         db.execute("ALTER TABLE ci_jobs ADD COLUMN changed_files_truncated INTEGER NOT NULL DEFAULT 0")
     if "performance_json" not in columns:
         db.execute("ALTER TABLE ci_jobs ADD COLUMN performance_json TEXT NOT NULL DEFAULT '{}'")
+    step_columns = {row[1] for row in db.execute("PRAGMA table_info(ci_job_steps)").fetchall()}
+    if "attempt_number" not in step_columns:
+        db.execute("ALTER TABLE ci_job_steps ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 0")
     db.commit()
 
 
@@ -191,7 +195,7 @@ def register_worker(worker_id: str, token: str, profiles: list[str], max_concurr
                max_concurrent=excluded.max_concurrent,
                last_heartbeat=excluded.last_heartbeat,
                registered_at=registered_at,
-               status='idle'""",
+               status=CASE WHEN ci_workers.current_job_id IS NULL THEN 'idle' ELSE ci_workers.status END""",
             (worker_id, token_hash, profiles_json, max_concurrent, ts, ts),
         )
         db.commit()
@@ -245,6 +249,21 @@ def get_worker(worker_id: str) -> Optional[dict]:
     if not row:
         return None
     return _worker_row_to_dict(row, now_ts())
+
+
+def get_current_lease_attempt(job_id: str, worker_id: str, lease_token: str) -> Optional[int]:
+    """Return the current attempt only when the worker holds the live job lease."""
+    if not lease_token:
+        return None
+    db = _get_db()
+    token_hash = hashlib.sha256(lease_token.encode()).hexdigest()
+    row = db.execute(
+        """SELECT attempts FROM ci_jobs
+           WHERE job_id = ? AND worker_id = ? AND lease_token_hash = ?
+           AND status IN ('leased', 'downloading', 'preparing', 'running')""",
+        (job_id, worker_id, token_hash),
+    ).fetchone()
+    return int(row["attempts"]) if row else None
 
 
 def _worker_row_to_dict(row, ts) -> dict:
