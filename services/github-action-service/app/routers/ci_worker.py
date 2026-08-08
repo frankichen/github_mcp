@@ -250,12 +250,12 @@ async def job_upload_logs(job_id: str, request: Request):
     worker_id = await verify_ci_worker(request)
 
     body = await request.json()
-    _require_current_job_lease(job_id, worker_id, request, body)
+    attempt_number = _require_current_job_lease(job_id, worker_id, request, body)
     content = body.get("content", "")
     if not content:
         return {"status": "ok", "bytes_written": 0}
 
-    new_size = append_log_chunk(job_id, content)
+    new_size = append_log_chunk(job_id, content, attempt_number=attempt_number)
     logger.info(
         "Log uploaded: worker=%s job=%s repo=%.12s bytes=%d total=%d",
         worker_id, job_id,
@@ -270,10 +270,10 @@ async def job_upload_logs(job_id: str, request: Request):
 async def job_upload_log_batch(job_id: str, request: Request):
     worker_id = await verify_ci_worker(request)
     body = await request.json()
-    _require_current_job_lease(job_id, worker_id, request, body)
+    attempt_number = _require_current_job_lease(job_id, worker_id, request, body)
     content = str(body.get("content") or "")
     batch_id = str(body.get("batch_id") or "")
-    new_size, idempotent = append_log_batch(job_id, batch_id, content)
+    new_size, idempotent = append_log_batch(job_id, batch_id, content, attempt_number=attempt_number)
     logger.info("Log batch uploaded: worker=%s job=%s batch=%s bytes=%d total=%d idempotent=%s", worker_id, job_id, batch_id[:12], len(content), new_size, idempotent)
     return {"status": "ok", "bytes_written": 0 if idempotent else len(content), "total_bytes": new_size, "idempotent": idempotent}
 
@@ -310,14 +310,16 @@ async def job_finish(job_id: str, request: Request):
     worker_id = await verify_ci_worker(request)
 
     body = await request.json()
-    _require_current_job_lease(job_id, worker_id, request, body)
+    attempt_number = _require_current_job_lease(job_id, worker_id, request, body)
+    lease_token = _lease_token(request, body)
     exit_code = body.get("exit_code", -1)
     status = body.get("status", "failed")
     summary = body.get("summary")
     error_code = body.get("error_code")
     error_message = body.get("error_message")
 
-    complete_job(job_id, exit_code, status, summary, error_code, error_message)
+    if not complete_job(job_id, exit_code, status, summary, error_code, error_message, expected_worker_id=worker_id, expected_lease_token=lease_token, expected_attempt_number=attempt_number):
+        raise HTTPException(status_code=409, detail={"error": "stale_lease", "message": "Job lease changed before completion"})
     logger.info(
         "Job finished: worker=%s job=%s status=%s exit=%d",
         worker_id, job_id, status, exit_code,
@@ -330,8 +332,10 @@ async def job_finish(job_id: str, request: Request):
 async def job_release(job_id: str, request: Request):
     worker_id = await verify_ci_worker(request)
     body = await request.json()
-    _require_current_job_lease(job_id, worker_id, request, body)
-    release_job(job_id)
+    attempt_number = _require_current_job_lease(job_id, worker_id, request, body)
+    lease_token = _lease_token(request, body)
+    if not release_job(job_id, expected_worker_id=worker_id, expected_lease_token=lease_token, expected_attempt_number=attempt_number):
+        raise HTTPException(status_code=409, detail={"error": "stale_lease", "message": "Job lease changed before release"})
     logger.info("Job released: worker=%s job=%s", worker_id, job_id)
     return {"status": "ok", "job_id": job_id}
 
