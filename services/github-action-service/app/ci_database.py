@@ -448,7 +448,7 @@ def _job_snapshot(job_id: str) -> dict:
     job = get_job(job_id)
     if not job:
         return {"status": "not_found", "current_step": None, "revision": 0}
-    steps = get_steps(job_id)
+    steps = get_steps(job_id, job.get("attempts") or None)
     current = next((s["step_name"] for s in steps if s["status"] == "running"), None)
     db = _get_db()
     revision = db.execute(
@@ -480,7 +480,7 @@ def wait_for_job_change(job_id: str, timeout_seconds: int = 55, last_known_statu
     job = get_job(job_id)
     if not job:
         return {"ok": False, "error": {"code": "PRIVATE_CI_JOB_NOT_FOUND", "message": "Job not found", "details": {}}}
-    steps = get_steps(job_id)
+    steps = get_steps(job_id, job.get("attempts") or None)
     current = next((s["step_name"] for s in steps if s["status"] == "running"), None)
     snapshot = _job_snapshot(job_id)
     elapsed = round(time.monotonic() - started, 3)
@@ -615,7 +615,7 @@ def get_monitor_snapshot(active_limit: int = 50, recent_limit: int = 20) -> dict
 
 def _monitor_job_row_to_dict(row, db, ts: float) -> dict:
     job = _job_row_to_dict(row, db)
-    steps = get_steps(row["job_id"])
+    steps = get_steps(row["job_id"], row["attempts"] or None)
     running_step_index = None
     current_step = None
     current_step_elapsed_seconds = None
