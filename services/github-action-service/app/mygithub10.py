@@ -391,7 +391,10 @@ def _parse_patch_details(patch: str) -> tuple[list[tuple[str, str, list[tuple[in
                                      "normalized": normalized_header})
             hunks.append((old_start, new_start, old_lines, new_lines))
         if not hunks:
-            raise MyGithub10Error("PATCH_INVALID_FORMAT", f"file patch for {path} has no hunks")
+            if operation != "delete":
+                raise MyGithub10Error("PATCH_INVALID_FORMAT", f"file patch for {path} has no hunks")
+            result.append((path, operation, []))
+            continue
         result.append((path, operation, hunks))
     result.extend(metadata_only_deletes)
     if not result:
