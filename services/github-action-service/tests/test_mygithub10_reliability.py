@@ -438,6 +438,99 @@ def test_range_edit_requires_exact_old_text_and_blob_sha():
     assert exc.value.code == "BLOB_CHANGED"
 
 
+def test_metadata_only_git_delete_supports_tracked_empty_file_and_blob_cas(monkeypatch):
+    patch = (
+        "diff --git a/empty.txt b/empty.txt\n"
+        "deleted file mode 100644\n"
+        "index e69de29..0000000\n"
+    )
+    assert mygithub10._parse_patch(patch) == [("empty.txt", "delete", [])]
+
+    empty_blob = mygithub10._git_blob_sha(b"")
+    service = ReadService(ReadRepo(b"", blob=empty_blob))
+    dry_run = mygithub10.apply_patch(
+        service,
+        "owner/repo",
+        "feature",
+        "head-1",
+        json.dumps({"empty.txt": empty_blob}),
+        patch,
+        "delete empty",
+        True,
+    )
+    assert dry_run["changed_files"] == [{
+        "path": "empty.txt",
+        "operation": "delete",
+        "old_blob_sha": empty_blob,
+        "new_blob_sha": None,
+        "new_content_sha256": None,
+        "added_lines": 0,
+        "deleted_lines": 0,
+    }]
+
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        mygithub10.apply_patch(
+            service,
+            "owner/repo",
+            "feature",
+            "head-1",
+            json.dumps({"empty.txt": "wrong-blob"}),
+            patch,
+            "delete empty",
+            True,
+        )
+    assert exc.value.code == "BLOB_CHANGED"
+
+    captured = {}
+
+    def commit_files(_client, _repository, _branch, _head, changed, expected_blobs, _message):
+        captured["changed"] = changed
+        captured["expected_blobs"] = expected_blobs
+        return {
+            "commit_sha": "commit-1",
+            "old_head_sha": "head-1",
+            "new_head_sha": "commit-1",
+            "tree_sha": "tree-1",
+            "changed_files": [],
+        }
+
+    monkeypatch.setattr(mygithub10, "_commit_files", commit_files)
+    committed = mygithub10.apply_patch(
+        service,
+        "owner/repo",
+        "feature",
+        "head-1",
+        json.dumps({"empty.txt": empty_blob}),
+        patch,
+        "delete empty",
+        False,
+    )
+    assert committed["commit_sha"] == "commit-1"
+    assert captured["changed"] == {"empty.txt": None}
+    assert captured["expected_blobs"] == {"empty.txt": empty_blob}
+
+
+def test_metadata_only_git_delete_rejects_non_empty_tracked_file():
+    patch = (
+        "diff --git a/not-empty.txt b/not-empty.txt\n"
+        "deleted file mode 100644\n"
+        "index 1234567..0000000\n"
+    )
+    service = ReadService(ReadRepo(b"content\n", blob="blob-1"))
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        mygithub10.apply_patch(
+            service,
+            "owner/repo",
+            "feature",
+            "head-1",
+            json.dumps({"not-empty.txt": "blob-1"}),
+            patch,
+            "delete non-empty",
+            True,
+        )
+    assert exc.value.code == "PATCH_INVALID_FORMAT"
+
+
 def test_new_file_patch_accepts_zero_old_range_and_preserves_bytes():
     patch = "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+中文🙂\n+\tline2"
     path, operation, hunks = mygithub10._parse_patch(patch)[0]
