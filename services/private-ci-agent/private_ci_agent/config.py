@@ -17,7 +17,10 @@ DEFAULT_CONFIG = {
     "max_log_bytes": 10485760,
     "max_source_bytes": 268435456,
     "podman_binary": "/usr/bin/podman",
-    "supported_profiles": ["repo-auto-check", "repo-fast-check", "python-check", "go-check", "node-check"],
+    "supported_profiles": [
+        "repo-auto-check", "repo-fast-check", "python-check", "go-check", "node-check",
+        "rust-check", "maven-check", "gradle-check", "dotnet-check",
+    ],
     # CI jobs must use the isolated bare mirror by default.  The archive
     # downloader remains an explicit compatibility fallback in config.
     "source_mirror_enabled": True,
@@ -40,6 +43,17 @@ def load_config() -> dict:
                 if line.startswith("CI_WORKER_TOKEN="):
                     config["worker_token"] = line.split("=", 1)[1].strip()
                     break
+
+    profile_path = "/etc/private-ci/profiles.yml"
+    if os.path.exists(profile_path):
+        try:
+            with open(profile_path, encoding="utf-8") as f:
+                profile_data = yaml.safe_load(f) or {}
+            configured_profiles = sorted((profile_data.get("profiles") or {}).keys())
+            if configured_profiles:
+                config["supported_profiles"] = configured_profiles
+        except (OSError, yaml.YAMLError):
+            pass
 
     return config
 
