@@ -794,14 +794,14 @@ def lease_job(worker_id: str, supported_profiles: list[str], max_concurrent: int
         repository = rows["repository"]
 
         attempt_number = int(rows["attempts"]) + 1
-        db.execute(
+        cursor = db.execute(
             """UPDATE ci_jobs SET status = 'leased', worker_id = ?, lease_token_hash = ?, lease_expires_at = ?,
                attempts = attempts + 1, started_at = COALESCE(started_at, ?)
                WHERE job_id = ? AND status = 'queued'""",
             (worker_id, lease_token_hash, lease_expires, ts, job_id),
         )
 
-        if db.total_changes == 0:
+        if cursor.rowcount != 1:
             db.execute("ROLLBACK")
             return None
 
