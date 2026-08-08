@@ -1,42 +1,44 @@
 profiles:
   repo-fast-check:
-    description: "Conservative changed-file fast feedback; never merge eligible"
+    description: "Conservative repository integrity fast feedback; never merge eligible"
     execution_mode: bounded_parallel
     merge_eligible: false
 
   repo-auto-check:
-    description: "Scan controlled Manifest workspaces and orchestrate approved checks"
-    execution_mode: sequential
+    description: "Scan controlled manifests and orchestrate approved language adapters"
+    execution_mode: parallel_workspaces
 
   go-check:
-    description: "Go version-aware format, vet, test, build"
+    description: "Go version-aware format verification, vet, test, build"
     language: go
     base_image: derived-from-go.mod
-    toolchain_policy: "select at least the go.mod go/toolchain directive"
-    checks:
-      - gofmt
-      - govet
-      - gotest
-      - gobuild
 
   python-check:
-    description: "Python lint, compile, test"
+    description: "Python install, lint, compile, test"
     language: python
     base_image: docker.io/library/python:3.12-slim
 
   node-check:
-    description: "Node.js workspace checks from package.json scripts"
+    description: "Node.js/Bun workspace checks from package.json scripts"
     language: node
     base_image: docker.io/library/node:22
-    package_managers:
-      package-lock.json: npm
-      pnpm-lock.yaml: pnpm
-      yarn.lock: yarn
-      bun.lock: bun
-    allowed_scripts:
-      - lint
-      - typecheck
-      - test:run
-      - test:ci
-      - test
-      - build
+
+  rust-check:
+    description: "Rust format, check and test"
+    language: rust
+    base_image: docker.io/library/rust:1
+
+  maven-check:
+    description: "Maven dependency resolution and tests"
+    language: java
+    base_image: docker.io/library/maven:3-eclipse-temurin-21
+
+  gradle-check:
+    description: "Gradle dependency resolution and tests"
+    language: java
+    base_image: docker.io/library/gradle:8-jdk21
+
+  dotnet-check:
+    description: ".NET restore, build and test"
+    language: dotnet
+    base_image: mcr.microsoft.com/dotnet/sdk:8.0

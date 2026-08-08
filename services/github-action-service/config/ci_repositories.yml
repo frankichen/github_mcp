@@ -1,6 +1,28 @@
+defaults:
+  auto_detect_profiles:
+    - go-check
+    - python-check
+    - node-check
+    - rust-check
+    - maven-check
+    - gradle-check
+    - dotnet-check
+
 repositories:
   frankichen/ai_war:
     enabled: true
+    private_ci: true
+    auto_detect: true
+    allowed_profiles:
+      - repo-auto-check
+      - repo-fast-check
+      - python-check
+    max_timeout_seconds: 900
+
+  frankichen/lenshub-diag-mcp:
+    enabled: true
+    private_ci: true
+    auto_detect: true
     allowed_profiles:
       - repo-auto-check
       - python-check
@@ -8,6 +30,7 @@ repositories:
 
   frankichen/sxt:
     enabled: true
+    private_ci: true
     auto_detect: true
     allowed_profiles:
       - repo-auto-check
@@ -34,6 +57,13 @@ repositories:
     workspaces:
       - path: .
         type: auto
+        services:
+          - postgres
+          - redis
+          - rabbitmq
+        hooks:
+          - go-migrate
+          - ai-integrity
       - path: h5/lenshub-console
         type: node
         package_manager: npm
@@ -44,12 +74,23 @@ repositories:
         optional_scripts:
           - lint
 
+  frankichen/github_mcp:
+    enabled: true
+    private_ci: true
+    auto_detect: true
+    allowed_profiles:
+      - repo-auto-check
+      - repo-fast-check
+      - python-check
+    max_timeout_seconds: 900
+
   frankichen/auto_gupiao:
     enabled: true
     private_ci: true
     auto_detect: true
     allowed_profiles:
       - repo-auto-check
+      - go-check
     max_timeout_seconds: 900
     merge_policy:
       private_ci_authoritative: true

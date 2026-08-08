@@ -1,6 +1,17 @@
+defaults:
+  auto_detect_profiles:
+    - go-check
+    - python-check
+    - node-check
+    - rust-check
+    - maven-check
+    - gradle-check
+    - dotnet-check
+
 repositories:
   frankichen/ai_war:
     enabled: true
+    private_ci: true
     auto_detect: true
     allowed_profiles:
       - repo-auto-check
@@ -10,6 +21,7 @@ repositories:
 
   frankichen/lenshub-diag-mcp:
     enabled: true
+    private_ci: true
     auto_detect: true
     allowed_profiles:
       - repo-auto-check
@@ -18,6 +30,7 @@ repositories:
 
   frankichen/sxt:
     enabled: true
+    private_ci: true
     auto_detect: true
     allowed_profiles:
       - repo-auto-check
@@ -25,9 +38,32 @@ repositories:
       - go-check
       - node-check
     max_timeout_seconds: 900
+    merge_policy:
+      private_ci_authoritative: true
+      required_private_ci_profile: repo-auto-check
+      github_checks_mode: required_only
+      allow_non_required_check_failures: true
+      allow_quota_or_infrastructure_failures: true
+      required_workflows: []
+    deployment:
+      enabled: true
+      self_deploy: false
+      environment: gongshi-test
+      scope: fullstack
+      private_ci: true
+      profile: repo-auto-check
+      script: scripts/deploy_gongshi_test.sh
+      status_file_env: DEPLOY_STATUS_FILE
     workspaces:
       - path: .
         type: auto
+        services:
+          - postgres
+          - redis
+          - rabbitmq
+        hooks:
+          - go-migrate
+          - ai-integrity
       - path: h5/lenshub-console
         type: node
         package_manager: npm
@@ -40,6 +76,7 @@ repositories:
 
   frankichen/github_mcp:
     enabled: true
+    private_ci: true
     auto_detect: true
     allowed_profiles:
       - repo-auto-check
@@ -55,8 +92,16 @@ repositories:
       - repo-auto-check
       - go-check
     max_timeout_seconds: 900
+    merge_policy:
+      private_ci_authoritative: true
+      required_private_ci_profile: repo-auto-check
+      github_checks_mode: required_only
+      allow_non_required_check_failures: true
+      allow_quota_or_infrastructure_failures: true
+      required_workflows: []
     deployment:
       enabled: true
+      self_deploy: true
       environment: auto-gupiao-test
       scope: reports
       private_ci: false
