@@ -1003,49 +1003,54 @@ def set_job_source_info(job_id: str, sha256: str, size_bytes: int):
 
 ### LOGS
 
-def append_log_chunk(job_id: str, content: str) -> int:
+def append_log_chunk(job_id: str, content: str, attempt_number: int = 0) -> int:
     db = _get_db()
+    attempt_number = int(attempt_number)
     current_offset = db.execute(
-        "SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id = ?", (job_id,)
+        "SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id = ? AND attempt_number = ?",
+        (job_id, attempt_number),
     ).fetchone()[0] or 0
 
     chunk_index = db.execute(
-        "SELECT COALESCE(MAX(chunk_index), -1) + 1 FROM ci_job_log_chunks WHERE job_id = ?", (job_id,)
+        "SELECT COALESCE(MAX(chunk_index), -1) + 1 FROM ci_job_log_chunks WHERE job_id = ? AND attempt_number = ?",
+        (job_id, attempt_number),
     ).fetchone()[0]
 
     content_len = len(content)
     new_offset = current_offset + content_len
 
     db.execute(
-        "INSERT INTO ci_job_log_chunks (job_id, chunk_index, offset_from, offset_to, content, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (job_id, chunk_index, current_offset, new_offset, content, now_ts()),
+        "INSERT INTO ci_job_log_chunks (job_id, attempt_number, chunk_index, offset_from, offset_to, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (job_id, attempt_number, chunk_index, current_offset, new_offset, content, now_ts()),
     )
     db.execute(
         "UPDATE ci_jobs SET log_total_bytes = log_total_bytes + ? WHERE job_id = ?",
         (content_len, job_id),
     )
-    _add_event(db, job_id, "log_revision", json.dumps({"bytes": content_len}))
+    _add_event(db, job_id, "log_revision", json.dumps({"bytes": content_len, "attempt_number": attempt_number}))
     db.commit()
     _notify_job_change(job_id)
     return new_offset
 
 
-def append_log_batch(job_id: str, batch_id: str, content: str) -> tuple[int, bool]:
+def append_log_batch(job_id: str, batch_id: str, content: str, attempt_number: int = 0) -> tuple[int, bool]:
     db = _get_db()
     if not batch_id or not content:
         return 0, True
-    row = db.execute("SELECT 1 FROM ci_job_log_batches WHERE job_id=? AND batch_id=?", (job_id, batch_id)).fetchone()
+    attempt_number = int(attempt_number)
+    scoped_batch_id = f"{attempt_number}:{batch_id}"
+    row = db.execute("SELECT 1 FROM ci_job_log_batches WHERE job_id=? AND batch_id=?", (job_id, scoped_batch_id)).fetchone()
     if row:
-        offset = db.execute("SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id=?", (job_id,)).fetchone()[0] or 0
+        offset = db.execute("SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id=? AND attempt_number=?", (job_id, attempt_number)).fetchone()[0] or 0
         return offset, True
-    current_offset = db.execute("SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id = ?", (job_id,)).fetchone()[0] or 0
-    chunk_index = db.execute("SELECT COALESCE(MAX(chunk_index), -1) + 1 FROM ci_job_log_chunks WHERE job_id = ?", (job_id,)).fetchone()[0]
+    current_offset = db.execute("SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id = ? AND attempt_number = ?", (job_id, attempt_number)).fetchone()[0] or 0
+    chunk_index = db.execute("SELECT COALESCE(MAX(chunk_index), -1) + 1 FROM ci_job_log_chunks WHERE job_id = ? AND attempt_number = ?", (job_id, attempt_number)).fetchone()[0]
     new_offset = current_offset + len(content)
     now = now_ts()
-    db.execute("INSERT INTO ci_job_log_batches(job_id,batch_id,created_at) VALUES(?,?,?)", (job_id, batch_id, now))
-    db.execute("INSERT INTO ci_job_log_chunks(job_id,chunk_index,offset_from,offset_to,content,created_at) VALUES(?,?,?,?,?,?)", (job_id, chunk_index, current_offset, new_offset, content, now))
+    db.execute("INSERT INTO ci_job_log_batches(job_id,batch_id,created_at) VALUES(?,?,?)", (job_id, scoped_batch_id, now))
+    db.execute("INSERT INTO ci_job_log_chunks(job_id,attempt_number,chunk_index,offset_from,offset_to,content,created_at) VALUES(?,?,?,?,?,?,?)", (job_id, attempt_number, chunk_index, current_offset, new_offset, content, now))
     db.execute("UPDATE ci_jobs SET log_total_bytes=log_total_bytes+? WHERE job_id=?", (len(content), job_id))
-    _add_event(db, job_id, "log_revision", json.dumps({"bytes": len(content), "batch_id": batch_id}))
+    _add_event(db, job_id, "log_revision", json.dumps({"bytes": len(content), "batch_id": batch_id, "attempt_number": attempt_number}))
     db.commit(); _notify_job_change(job_id)
     return new_offset, False
 
