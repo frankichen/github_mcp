@@ -148,6 +148,12 @@ def init_db():
             queued_jobs INTEGER NOT NULL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS ci_controller_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS ci_job_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_id TEXT NOT NULL,
@@ -171,6 +177,10 @@ def init_db():
     step_columns = {row[1] for row in db.execute("PRAGMA table_info(ci_job_steps)").fetchall()}
     if "attempt_number" not in step_columns:
         db.execute("ALTER TABLE ci_job_steps ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 0")
+    db.execute(
+        "INSERT OR IGNORE INTO ci_controller_state (key, value, updated_at) VALUES ('draining', '0', ?)",
+        (now_ts(),),
+    )
     db.commit()
 
 
@@ -532,6 +542,26 @@ def list_jobs(
     return [_job_row_to_dict(r, db) for r in rows]
 
 
+def set_controller_draining(draining: bool) -> dict:
+    """Atomically enable or disable the no-new-leases controller drain gate."""
+    db = _get_db()
+    with _db_write_lock:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            """INSERT INTO ci_controller_state (key, value, updated_at) VALUES ('draining', ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+            ("1" if draining else "0", now_ts()),
+        )
+        db.commit()
+    return get_controller_drain_status()
+
+
+def is_controller_draining(db=None) -> bool:
+    db = db or _get_db()
+    row = db.execute("SELECT value FROM ci_controller_state WHERE key = 'draining'").fetchone()
+    return bool(row and row["value"] == "1")
+
+
 def get_controller_drain_status() -> dict:
     """Return whether the controller can restart without orphaning a live CI lease."""
     db = _get_db()
@@ -553,7 +583,12 @@ def get_controller_drain_status() -> dict:
         "started_at": datetime.fromtimestamp(row["started_at"], tz=timezone.utc).isoformat() if row["started_at"] else None,
         "lease_expires_at": datetime.fromtimestamp(row["lease_expires_at"], tz=timezone.utc).isoformat() if row["lease_expires_at"] else None,
     } for row in rows]
-    return {"safe_to_restart": not active_jobs, "active_job_count": len(active_jobs), "active_jobs": active_jobs}
+    return {
+        "draining": is_controller_draining(db),
+        "safe_to_restart": not active_jobs,
+        "active_job_count": len(active_jobs),
+        "active_jobs": active_jobs,
+    }
 
 
 def get_monitor_snapshot(active_limit: int = 50, recent_limit: int = 20) -> dict:
@@ -707,6 +742,10 @@ def lease_job(worker_id: str, supported_profiles: list[str], max_concurrent: int
     db = _get_db()
     try:
         db.execute("BEGIN IMMEDIATE")
+
+        if is_controller_draining(db):
+            db.execute("ROLLBACK")
+            return None
 
         # Check worker concurrency
         running_count = db.execute(
