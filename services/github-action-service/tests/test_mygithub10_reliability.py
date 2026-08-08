@@ -510,25 +510,81 @@ def test_metadata_only_git_delete_supports_tracked_empty_file_and_blob_cas(monke
     assert captured["expected_blobs"] == {"empty.txt": empty_blob}
 
 
-def test_metadata_only_git_delete_rejects_non_empty_tracked_file():
+def test_headered_git_delete_supports_tracked_empty_file_without_hunks():
     patch = (
-        "diff --git a/not-empty.txt b/not-empty.txt\n"
+        "diff --git a/empty.txt b/empty.txt\n"
         "deleted file mode 100644\n"
-        "index 1234567..0000000\n"
+        "index e69de29..0000000\n"
+        "--- a/empty.txt\n"
+        "+++ /dev/null\n"
     )
-    service = ReadService(ReadRepo(b"content\n", blob="blob-1"))
+    assert mygithub10._parse_patch(patch) == [("empty.txt", "delete", [])]
+
+    empty_blob = mygithub10._git_blob_sha(b"")
+    service = ReadService(ReadRepo(b"", blob=empty_blob))
+    dry_run = mygithub10.apply_patch(
+        service,
+        "owner/repo",
+        "feature",
+        "head-1",
+        json.dumps({"empty.txt": empty_blob}),
+        patch,
+        "delete empty with headers",
+        True,
+    )
+    assert dry_run["changed_files"] == [{
+        "path": "empty.txt",
+        "operation": "delete",
+        "old_blob_sha": empty_blob,
+        "new_blob_sha": None,
+        "new_content_sha256": None,
+        "added_lines": 0,
+        "deleted_lines": 0,
+    }]
+
     with pytest.raises(mygithub10.MyGithub10Error) as exc:
         mygithub10.apply_patch(
             service,
             "owner/repo",
             "feature",
             "head-1",
-            json.dumps({"not-empty.txt": "blob-1"}),
+            json.dumps({"empty.txt": "wrong-blob"}),
             patch,
-            "delete non-empty",
+            "delete empty with headers",
             True,
         )
-    assert exc.value.code == "PATCH_INVALID_FORMAT"
+    assert exc.value.code == "BLOB_CHANGED"
+
+
+def test_no_hunk_git_delete_rejects_non_empty_tracked_file():
+    patches = (
+        (
+            "diff --git a/not-empty.txt b/not-empty.txt\n"
+            "deleted file mode 100644\n"
+            "index 1234567..0000000\n"
+        ),
+        (
+            "diff --git a/not-empty.txt b/not-empty.txt\n"
+            "deleted file mode 100644\n"
+            "index 1234567..0000000\n"
+            "--- a/not-empty.txt\n"
+            "+++ /dev/null\n"
+        ),
+    )
+    service = ReadService(ReadRepo(b"content\n", blob="blob-1"))
+    for patch in patches:
+        with pytest.raises(mygithub10.MyGithub10Error) as exc:
+            mygithub10.apply_patch(
+                service,
+                "owner/repo",
+                "feature",
+                "head-1",
+                json.dumps({"not-empty.txt": "blob-1"}),
+                patch,
+                "delete non-empty",
+                True,
+            )
+        assert exc.value.code == "PATCH_INVALID_FORMAT"
 
 
 def test_new_file_patch_accepts_zero_old_range_and_preserves_bytes():
