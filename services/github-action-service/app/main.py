@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
     validate_runtime_metadata()
     os.makedirs(os.path.dirname(settings.IDEMPOTENCY_DB_PATH), exist_ok=True)
     try:
-        from app.ci_database import init_db
+        from app.ci_database import init_db, set_controller_draining
         from app.deployment_service import init_deployment_db
         from app.attestation_registry import init_registry_db
         from app.mygithub12 import init_db as init_mygithub12_db
@@ -35,6 +35,7 @@ async def lifespan(app: FastAPI):
         init_deployment_db()
         init_registry_db()
         init_mygithub12_db()
+        set_controller_draining(False)
     except Exception:
         logger.exception("Controller database initialization failed")
         raise

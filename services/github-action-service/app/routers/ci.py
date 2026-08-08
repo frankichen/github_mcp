@@ -155,7 +155,7 @@ async def get_ci_job(job_id: str, request: Request):
     if not job:
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": f"Job '{job_id}' not found"})
 
-    steps = get_steps(job_id)
+    steps = get_steps(job_id, job.get("attempts") or None)
     current_step = None
     for s in steps:
         if s["status"] == "running":
