@@ -36,12 +36,28 @@ from app.ci_database import (
     finish_step,
     get_steps,
     recover_expired_leases,
-    recover_worker_jobs,
+    get_current_lease_attempt,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/internal/ci", tags=["CI Worker"])
+
+
+def _lease_token(request: Request, body: Optional[dict] = None) -> str:
+    if isinstance(body, dict) and body.get("lease_token"):
+        return str(body["lease_token"])
+    return str(request.headers.get("X-CI-Lease-Token") or "")
+
+
+def _require_current_job_lease(job_id: str, worker_id: str, request: Request, body: Optional[dict] = None) -> int:
+    attempt_number = get_current_lease_attempt(job_id, worker_id, _lease_token(request, body))
+    if attempt_number is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "stale_lease", "message": "Job lease is missing, expired, or no longer current"},
+        )
+    return attempt_number
 
 
 @router.get("/health")
@@ -76,7 +92,6 @@ async def worker_register(request: Request):
         raise HTTPException(status_code=400, detail={"error": "bad_request", "message": "max_concurrent must be 1-10"})
 
     try:
-        recover_worker_jobs(worker_id)
         ok = register_worker(worker_id.strip(), token, profiles, max_concurrent)
     except Exception:
         logger.exception("Worker registration failed before database result: worker_id=%s", worker_id)
@@ -102,18 +117,23 @@ async def worker_heartbeat(request: Request):
     lease_token = body.get("lease_token")
 
     if current_job_id:
-        # renew_lease must receive the job's lease token, not the worker's
-        # registration token: the Authorization header only proves the worker
-        # identity, while the lease token is the per-job credential that must
-        # match lease_token_hash for the renewal to apply.
-        renewed = renew_lease(current_job_id, lease_token or request.headers.get("Authorization", "")[7:])
-        cancel_requested = need_heartbeat(current_job_id)
+        if not lease_token:
+            return {
+                "status": "ok",
+                "worker_id": worker_id,
+                "lease_renewed": False,
+                "cancel_requested": True,
+                "stale_lease": True,
+            }
+        renewed = renew_lease(current_job_id, lease_token)
+        cancel_requested = (not renewed) or need_heartbeat(current_job_id)
 
         return {
             "status": "ok",
             "worker_id": worker_id,
             "lease_renewed": renewed,
             "cancel_requested": cancel_requested,
+            "stale_lease": not renewed,
         }
 
     return {"status": "ok", "worker_id": worker_id}
