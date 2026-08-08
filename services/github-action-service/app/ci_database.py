@@ -859,68 +859,107 @@ def _upsert_repo_queue_state(db, repository: str, queued_delta: int = 0, running
         )
 
 
-def complete_job(job_id: str, exit_code: int, status: str, summary: Optional[dict] = None, error_code: Optional[str] = None, error_message: Optional[str] = None):
+_ACTIVE_LEASE_STATUSES = ('leased', 'downloading', 'preparing', 'running')
+
+
+def _lease_matches(row, worker_id: Optional[str], lease_token: Optional[str], attempt_number: Optional[int], ts: float) -> bool:
+    if worker_id is None and lease_token is None and attempt_number is None:
+        return True
+    if not row or row["status"] not in _ACTIVE_LEASE_STATUSES:
+        return False
+    if not worker_id or row["worker_id"] != worker_id or not lease_token:
+        return False
+    if row["lease_token_hash"] != hashlib.sha256(lease_token.encode()).hexdigest():
+        return False
+    if attempt_number is None or int(row["attempts"]) != int(attempt_number):
+        return False
+    return bool(row["lease_expires_at"] and row["lease_expires_at"] >= ts)
+
+
+def complete_job(job_id: str, exit_code: int, status: str, summary: Optional[dict] = None, error_code: Optional[str] = None, error_message: Optional[str] = None, *, expected_worker_id: Optional[str] = None, expected_lease_token: Optional[str] = None, expected_attempt_number: Optional[int] = None) -> bool:
     db = _get_db()
     ts = now_ts()
-
-    row = db.execute("SELECT * FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
-    if not row:
-        return
-
-    started = row["started_at"]
-    duration = ts - started if started else 0
-
-    summary_json = json.dumps(summary) if summary else None
-
-    db.execute(
-        """UPDATE ci_jobs SET status = ?, exit_code = ?, summary_json = ?, finished_at = ?, duration_seconds = ?,
-           error_code = ?, error_message = ?, lease_token_hash = NULL, lease_expires_at = NULL, worker_id = NULL
-           WHERE job_id = ?""",
-        (status, exit_code, summary_json, ts, duration, error_code, error_message, job_id),
-    )
-
-    repo = row["repository"]
-    _upsert_repo_queue_state(db, repo, running_delta=-1)
-    _add_event(db, job_id, "completed", json.dumps({"status": status, "exit_code": exit_code}))
-    db.commit()
+    with _db_write_lock:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            row = db.execute("SELECT * FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if not row or not _lease_matches(row, expected_worker_id, expected_lease_token, expected_attempt_number, ts):
+                db.execute("ROLLBACK")
+                return False
+            started = row["started_at"]
+            duration = ts - started if started else 0
+            summary_json = json.dumps(summary) if summary else None
+            cursor = db.execute(
+                """UPDATE ci_jobs SET status = ?, exit_code = ?, summary_json = ?, finished_at = ?, duration_seconds = ?,
+                   error_code = ?, error_message = ?, lease_token_hash = NULL, lease_expires_at = NULL, worker_id = NULL
+                   WHERE job_id = ?""",
+                (status, exit_code, summary_json, ts, duration, error_code, error_message, job_id),
+            )
+            if cursor.rowcount != 1:
+                db.execute("ROLLBACK")
+                return False
+            _upsert_repo_queue_state(db, row["repository"], running_delta=-1)
+            _add_event(db, job_id, "completed", json.dumps({"status": status, "exit_code": exit_code, "attempt_number": row["attempts"]}))
+            db.commit()
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
     _notify_job_change(job_id)
+    return True
 
 
 def request_cancel_job(job_id: str) -> bool:
     db = _get_db()
-    db.execute("UPDATE ci_jobs SET cancel_requested = 1 WHERE job_id = ? AND status IN ('queued', 'leased', 'downloading', 'preparing', 'running')", (job_id,))
-    if db.total_changes > 0:
+    cursor = db.execute("UPDATE ci_jobs SET cancel_requested = 1 WHERE job_id = ? AND status IN ('queued', 'leased', 'downloading', 'preparing', 'running')", (job_id,))
+    if cursor.rowcount == 1:
         _add_event(db, job_id, "cancel_requested", "{}")
         db.commit()
         _notify_job_change(job_id)
         return True
+    db.commit()
     return False
 
 
 def cancel_queued_job(job_id: str) -> bool:
     db = _get_db()
-    db.execute(
+    cursor = db.execute(
         "UPDATE ci_jobs SET status = 'cancelled', finished_at = ? WHERE job_id = ? AND status = 'queued'",
         (now_ts(), job_id),
     )
-    if db.total_changes > 0:
+    if cursor.rowcount == 1:
         _add_event(db, job_id, "cancelled", "{}")
         db.commit()
         _notify_job_change(job_id)
         return True
+    db.commit()
     return False
 
 
-def release_job(job_id: str):
+def release_job(job_id: str, *, expected_worker_id: Optional[str] = None, expected_lease_token: Optional[str] = None, expected_attempt_number: Optional[int] = None) -> bool:
     db = _get_db()
-    row = db.execute("SELECT * FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
-    if not row:
-        return
-    db.execute("UPDATE ci_jobs SET status = 'queued', worker_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL WHERE job_id = ?", (job_id,))
-    _upsert_repo_queue_state(db, row["repository"], queued_delta=1, running_delta=-1)
-    _add_event(db, job_id, "released", "{}")
-    db.commit()
+    ts = now_ts()
+    with _db_write_lock:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            row = db.execute("SELECT * FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if not row or not _lease_matches(row, expected_worker_id, expected_lease_token, expected_attempt_number, ts):
+                db.execute("ROLLBACK")
+                return False
+            cursor = db.execute(
+                "UPDATE ci_jobs SET status = 'queued', worker_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL WHERE job_id = ?",
+                (job_id,),
+            )
+            if cursor.rowcount != 1:
+                db.execute("ROLLBACK")
+                return False
+            _upsert_repo_queue_state(db, row["repository"], queued_delta=1, running_delta=-1)
+            _add_event(db, job_id, "released", json.dumps({"attempt_number": row["attempts"]}))
+            db.commit()
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
     _notify_job_change(job_id)
+    return True
 
 
 def renew_lease(job_id: str, lease_token: str) -> bool:
@@ -928,14 +967,14 @@ def renew_lease(job_id: str, lease_token: str) -> bool:
     expected_hash = hashlib.sha256(lease_token.encode()).hexdigest()
     ts = now_ts()
     with _db_write_lock:
-        db.execute(
-            "UPDATE ci_jobs SET lease_expires_at = ? WHERE job_id = ? AND lease_token_hash = ?",
-            (ts + 120, job_id, expected_hash),
+        cursor = db.execute(
+            """UPDATE ci_jobs SET lease_expires_at = ?
+               WHERE job_id = ? AND lease_token_hash = ?
+               AND status IN ('leased', 'downloading', 'preparing', 'running')
+               AND lease_expires_at >= ?""",
+            (ts + 120, job_id, expected_hash, ts),
         )
-        changed = db.total_changes > 0
-        # This endpoint is called by every Worker heartbeat.  Leaving this
-        # UPDATE uncommitted keeps a write transaction open on the thread-local
-        # SQLite connection and blocks registration/job creation in others.
+        changed = cursor.rowcount == 1
         db.commit()
     return changed
 
