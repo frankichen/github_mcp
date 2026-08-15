@@ -126,14 +126,14 @@ class GitHubClient:
         except GithubException as e:
             self._handle_github_error(e)
 
-    def create_branch(self, repo_name: str, branch_name: str, base_branch: str):
+    def create_branch(self, repo_name: str, branch_name: str, base_ref: str):
         self._require_configured()
         try:
             repo = self._pygithub.get_repo(repo_name)
-            base = repo.get_branch(base_branch)
+            base = repo.get_commit(base_ref)
             ref = repo.create_git_ref(
                 f"refs/heads/{branch_name}",
-                base.commit.sha,
+                base.sha,
             )
             return ref
         except GithubException as e:

@@ -424,6 +424,32 @@ class TestGitHubErrorMapping:
             )
             assert response.status_code == 404
 
+    def test_create_branch_accepts_commit_sha_base_ref(self, client):
+        base_sha = "a" * 40
+        branch = "ai/sha-base"
+        with patch("app.routers.github._client._pygithub", create=True) as mock_gh:
+            mock_repo = MagicMock()
+            mock_repo.default_branch = "main"
+            mock_repo.get_branch.side_effect = lambda name: None if name == branch else (_ for _ in ()).throw(AssertionError("base ref must not be resolved as a branch"))
+            mock_repo.get_commit.return_value = MagicMock(sha=base_sha)
+            mock_repo.create_git_ref.return_value = MagicMock(object=MagicMock(sha=base_sha))
+            mock_gh.get_repo.return_value = mock_repo
+
+            response = client.post(
+                "/api/v1/github/branches",
+                json={
+                    "repository": "owner/allowed-repo",
+                    "branch": branch,
+                    "base_branch": base_sha,
+                },
+                headers=auth_headers(),
+            )
+
+            assert response.status_code == 200
+            assert response.json()["commit_sha"] == base_sha
+            mock_repo.get_commit.assert_called_once_with(base_sha)
+            mock_repo.create_git_ref.assert_called_once_with(f"refs/heads/{branch}", base_sha)
+
     def test_branch_exists_maps_to_409(self, client):
         with patch("app.routers.github._client._pygithub", create=True) as mock_gh:
             mock_repo = MagicMock()

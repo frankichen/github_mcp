@@ -3,6 +3,7 @@ from __future__ import annotations
 import json, os, re, sqlite3, uuid
 from typing import Any
 from app import mygithub12 as core
+from app.exceptions import AppError, BranchExistsError, GitHubApiError, NotConfiguredError, RateLimitError
 
 MyGithub12Error=core.MyGithub12Error
 DEFAULT_LEASE_SECONDS=core.DEFAULT_LEASE_SECONDS
@@ -23,12 +24,33 @@ def _workspace_public(row: sqlite3.Row | dict[str,Any]) -> dict[str,Any]:
     r=dict(row); r["scope"]=json.loads(r.pop("scope_json") or "{}"); r["lease_valid"]=r["lease_expires_at"]>_now() and r["status"]=="active"; return r
 
 
+def _branch_create_error(exc: Exception, branch: str, base_ref: str) -> MyGithub12Error:
+    details={"branch":branch,"base_ref":base_ref}
+    if isinstance(exc,BranchExistsError):
+        return MyGithub12Error("BRANCH_EXISTS",exc.message,details)
+    if isinstance(exc,RateLimitError):
+        return MyGithub12Error("RATE_LIMIT",exc.message,details)
+    if isinstance(exc,NotConfiguredError):
+        return MyGithub12Error("GITHUB_NOT_CONFIGURED",exc.message,details)
+    if isinstance(exc,GitHubApiError):
+        status=int(getattr(exc,"github_status",0) or 0); details["github_status"]=status
+        code={401:"GITHUB_AUTH_FAILED",403:"GITHUB_FORBIDDEN",404:"GITHUB_NOT_FOUND",409:"GITHUB_CONFLICT",422:"GITHUB_VALIDATION_ERROR",503:"GITHUB_TEMPORARY_FAILURE"}.get(status,"GITHUB_API_ERROR")
+        return MyGithub12Error(code,exc.message,details)
+    if isinstance(exc,AppError):
+        details["status_code"]=exc.status_code
+        if exc.details: details["cause_details"]=exc.details
+        return MyGithub12Error(str(exc.error).upper(),exc.message,details)
+    details["cause_type"]=type(exc).__name__
+    return MyGithub12Error("WORKSPACE_BRANCH_CREATE_FAILED","workspace branch could not be created",details)
+
+
 def create_workspace(service: Any, repository: str, task_name: str, base_ref: str="main", branch: str="", owner: str="chatgpt", create_branch: bool=True, lease_seconds: int=DEFAULT_LEASE_SECONDS) -> dict[str,Any]:
     identity=resolve_identity(service,repository,ref=base_ref); slug=re.sub(r"[^a-z0-9-]+","-",task_name.lower()).strip("-")[:40] or "task"; workspace_id="ws_"+uuid.uuid4().hex[:16]; branch=branch or f"ai/{slug}-{workspace_id[-8:]}"
     if not branch.startswith("ai/"): raise MyGithub12Error("WORKSPACE_SCOPE_CONFLICT","workspace branches must use ai/ prefix")
     if create_branch:
-        try: service.create_branch(repository,branch,base_ref)
-        except Exception as exc: raise MyGithub12Error("WORKSPACE_LEASE_CONFLICT","workspace branch could not be created",{"branch":branch}) from exc
+        try: service.create_branch(repository,branch,identity["commit_sha"])
+        except MyGithub12Error: raise
+        except Exception as exc: raise _branch_create_error(exc,branch,base_ref) from exc
     branch_state=service.client.get_branch(repository,branch)
     if not branch_state: raise MyGithub12Error("WORKSPACE_NOT_FOUND","workspace branch does not exist")
     head=str(branch_state.commit.sha); tree=_tree_sha(_service_repo(service,repository).get_commit(head)); lease_seconds=max(60,min(lease_seconds,MAX_LEASE_SECONDS)); init_db(); now=_now()
