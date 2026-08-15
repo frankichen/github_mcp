@@ -107,12 +107,19 @@ def test_workspace_completion_uses_revision_cas(tmp_path, monkeypatch):
                 "a" * 40, "{}", None, None, timestamp, timestamp,
             ),
         )
-    result = mygithub12.workspace_write_complete("ws_test", 1, "c" * 40, "d" * 40)
+    verification = {
+        "write_verified": True, "repository": "o/r", "branch": "ai/task",
+        "verified_branch_head_sha": "c" * 40, "verified_commit_sha": "c" * 40,
+        "verified_tree_sha": "d" * 40,
+    }
+    result = mygithub12.workspace_write_complete("ws_test", 1, "c" * 40, "d" * 40, verification)
     assert result["revision"] == 2
     assert result["head_sha"] == "c" * 40
     with pytest.raises(mygithub12.MyGithub12Error) as exc:
-        mygithub12.workspace_write_complete("ws_test", 1, "e" * 40, "f" * 40)
+        stale_verification = {**verification, "verified_branch_head_sha": "e" * 40, "verified_commit_sha": "e" * 40, "verified_tree_sha": "f" * 40}
+        mygithub12.workspace_write_complete("ws_test", 1, "e" * 40, "f" * 40, stale_verification)
     assert exc.value.code == "WORKSPACE_REVISION_MISMATCH"
+    assert exc.value.details["github_write_verified"] is True
 
 
 def _seed_symbol_index(tmp_path, monkeypatch, files):

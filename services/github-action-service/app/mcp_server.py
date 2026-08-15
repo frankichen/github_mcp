@@ -1,4 +1,5 @@
 import hmac
+import hashlib
 import json
 import logging
 import base64
@@ -20,6 +21,7 @@ from mcp.types import ToolAnnotations
 
 from app.config import settings as app_settings
 from app.github_client import GitHubClient
+from app.exceptions import AppError
 from app.services.github_service import GitHubService
 from app.services.ci_service import get_ci_service
 from app.ci_mcp import register_private_ci_mcp_tools
@@ -30,6 +32,7 @@ from app import mygithub10
 from app import mygithub12
 from app import attestation_registry
 from app.version import runtime_build_sha
+from app.observability import current_request_id
 from app.mygithub12_mcp import register_mygithub12_tools
 from app.mcp_response import (
     MAX_RESPONSE_RESOURCE_CHUNK_BYTES,
@@ -59,6 +62,132 @@ async def _github_call(function, *args, **kwargs):
             for item in repositories:
                 ensure_repository_allowed(item)
     return await asyncio.to_thread(function, *args, **kwargs)
+
+
+def _write_audit_context(workspace_id: str, workspace_revision: int) -> dict:
+    return {
+        "request_trace_id": current_request_id(),
+        "workspace_id": workspace_id or "",
+        "workspace_revision": int(workspace_revision or 0),
+    }
+
+
+def _safe_write_failure(exc: Exception, *, failed_stage: str = "") -> dict:
+    if isinstance(exc, mygithub12.MyGithub12Error):
+        details = dict(exc.details or {})
+        code = exc.code
+        message = exc.message
+    elif isinstance(exc, mygithub10.MyGithub10Error):
+        details = dict(exc.details or {})
+        code = exc.code
+        message = exc.message
+    elif isinstance(exc, AppError):
+        details = dict(exc.details or {})
+        code = "WRITE_VERIFY_FAILED" if exc.error == "write_verify_failed" else str(exc.error).upper()
+        message = exc.message
+    else:
+        details = {"cause_type": type(exc).__name__}
+        code = "INTERNAL_ERROR"
+        message = "write operation failed"
+    if failed_stage and not details.get("failed_stage"):
+        details["failed_stage"] = failed_stage
+    return {"code": code, "message": message, "details": details}
+
+
+async def _finalize_durable_write(
+    result: dict,
+    workspace_id: str,
+    expected_workspace_revision: int,
+) -> dict:
+    """Finalize a write only after GitHub durable verification and Workspace CAS."""
+    if result.get("replayed"):
+        # A replay is allowed only for an already success_verified operation.
+        return result
+    operation_id = str(result.pop("_operation_id", "") or "")
+    cleanup_upload_id = str(result.pop("_cleanup_upload_id", "") or "")
+    if result.get("write_verified") is not True:
+        exc = mygithub10.MyGithub10Error(
+            "WRITE_VERIFY_FAILED",
+            "write result is missing durable GitHub verification evidence",
+            {
+                "repository": result.get("repository", ""),
+                "branch": result.get("branch", ""),
+                "new_commit_sha": result.get("commit_sha", ""),
+                "failed_stage": "durable_verify_required",
+            },
+        )
+        if operation_id:
+            await _github_call(
+                mygithub10._idempotent_finish,
+                operation_id, "failed", result.get("commit_sha"), exc.code,
+                {**result, "failed_stage": "durable_verify_required", "error": {"code": exc.code, "details": exc.details}},
+            )
+        raise exc
+
+    if workspace_id:
+        result["workspace_id"] = workspace_id
+        result["workspace_revision_before"] = expected_workspace_revision
+        try:
+            workspace = await _github_call(
+                mygithub12.workspace_write_complete,
+                workspace_id, expected_workspace_revision,
+                result["commit_sha"], result["tree_sha"], result,
+            )
+            result["workspace"] = workspace
+            result["workspace_revision_after"] = workspace["revision"]
+            result["workspace_head_sha"] = workspace["head_sha"]
+        except Exception as exc:
+            failure = _safe_write_failure(exc, failed_stage="workspace_finalize")
+            failure["details"].update({
+                "github_write_verified": True,
+                "github_branch_head": result.get("verified_branch_head_sha", ""),
+                "new_commit_sha": result.get("commit_sha", ""),
+                "recovery_required": True,
+                "recommended_action": "refresh_workspace",
+            })
+            if operation_id:
+                await _github_call(
+                    mygithub10._idempotent_finish,
+                    operation_id, "indeterminate", result.get("commit_sha"), failure["code"],
+                    {**result, "failed_stage": "workspace_finalize", "error": failure},
+                )
+            if isinstance(exc, mygithub12.MyGithub12Error):
+                exc.details.update(failure["details"])
+                raise
+            raise mygithub10.MyGithub10Error(failure["code"], failure["message"], failure["details"]) from exc
+
+    if operation_id:
+        result["operation_id"] = operation_id
+        try:
+            await _github_call(
+                mygithub10._idempotent_finish,
+                operation_id, "success_verified", result.get("commit_sha"), None, result,
+            )
+        except Exception as exc:
+            raise mygithub10.MyGithub10Error(
+                "IDEMPOTENCY_FINALIZE_FAILED",
+                "GitHub write is verified but durable idempotency finalization failed",
+                {
+                    "operation_id": operation_id,
+                    "repository": result.get("repository", ""),
+                    "branch": result.get("branch", ""),
+                    "new_commit_sha": result.get("commit_sha", ""),
+                    "observed_branch_head": result.get("verified_branch_head_sha", ""),
+                    "expected_tree_sha": result.get("tree_sha", ""),
+                    "observed_tree_sha": result.get("verified_tree_sha", ""),
+                    "failed_stage": "idempotency_finalize",
+                    "github_write_verified": True,
+                    "workspace_finalized": bool(result.get("workspace_revision_after")),
+                    "recovery_required": True,
+                    "cause_type": type(exc).__name__,
+                },
+            ) from exc
+    if cleanup_upload_id:
+        try:
+            await _github_call(mygithub10.abort_upload, cleanup_upload_id)
+        except Exception:
+            logger.warning("verified upload cleanup failed upload_id=%s", cleanup_upload_id)
+    return result
 
 
 class ApiKeyVerifier:
@@ -146,10 +275,6 @@ def get_mcp_response_resource(resource_id: str) -> str:
     return read_response_resource_text(f"mygithub12://response/{resource_id}")
 
 
-@mcp.tool(
-    name="read_mcp_response_resource",
-    description="Read one bounded UTF-8 chunk from an oversized MCP response resource with SHA and continuation metadata.",
-)
 async def read_mcp_response_resource(
     resource_uri: str,
     offset_bytes: int = 0,
@@ -257,33 +382,97 @@ async def commit_github_files(
     workspace_id: str = "", expected_workspace_revision: int = 0,
 ) -> str:
     from app.models import CommitRequest, FileOperation, PullRequestConfig
+    operation_id = ""
     try:
-        await _github_call(mygithub12.workspace_write_preflight, _service, repository, branch, expected_head_sha, workspace_id, expected_workspace_revision)
         logger.info("MCP commit_github_files: repo=%s branch=%s files_json_len=%d", repository, branch, len(files_json))
         files_data = json.loads(files_json)
         pr_data = json.loads(pull_request_json) if pull_request_json else {}
         file_ops = [FileOperation(**f) for f in files_data]
         pr_config = PullRequestConfig(**pr_data) if pr_data.get("create") else None
+        audit_request = {
+            "tool_name": "commit_github_files",
+            "repository": repository,
+            "branch": branch,
+            "base_branch": base_branch,
+            "create_branch_if_missing": create_branch_if_missing,
+            "expected_head_sha": expected_head_sha,
+            "commit_message": commit_message,
+            "files": [
+                {
+                    "path": f.path,
+                    "operation": f.operation,
+                    "expected_sha": f.expected_sha or "",
+                    "content_sha256": hashlib.sha256((f.content or "").encode("utf-8")).hexdigest() if f.operation == "upsert" else None,
+                    "size_bytes": len((f.content or "").encode("utf-8")) if f.operation == "upsert" else 0,
+                }
+                for f in file_ops
+            ],
+        }
+        operation_id, _ = await _github_call(
+            mygithub10._idempotent_start,
+            "commit_github_files", "", audit_request,
+            _write_audit_context(workspace_id, expected_workspace_revision),
+        )
+        await _github_call(
+            mygithub12.workspace_write_preflight,
+            _service, repository, branch, expected_head_sha, workspace_id, expected_workspace_revision,
+        )
         request = CommitRequest(
             repository=repository, branch=branch, base_branch=base_branch,
             create_branch_if_missing=create_branch_if_missing,
             commit_message=commit_message, expected_head_sha=expected_head_sha if expected_head_sha else None,
             files=file_ops, pull_request=pr_config,
         )
-        result = await _github_call(_service.commit_files, request)
-        if workspace_id:
-            result["workspace"] = await _github_call(mygithub12.workspace_write_complete, workspace_id, expected_workspace_revision, result["new_head_sha"], result["tree_sha"])
+        try:
+            result = await _github_call(_service.commit_files, request)
+        except Exception as exc:
+            failure = _safe_write_failure(exc)
+            if operation_id:
+                await _github_call(
+                    mygithub10._idempotent_finish,
+                    operation_id, "failed", None, failure["code"],
+                    {"failed_stage": failure["details"].get("failed_stage", "github_write"), "error": failure},
+                )
+            if isinstance(exc, mygithub12.MyGithub12Error):
+                return _mygithub10_error(exc)
+            if isinstance(exc, AppError):
+                code = "HEAD_CHANGED" if exc.error == "head_sha_conflict" else ("WRITE_VERIFY_FAILED" if exc.error == "write_verify_failed" else str(exc.error).upper())
+                return _mygithub10_error(mygithub10.MyGithub10Error(code, exc.message, dict(exc.details or {})))
+            return _mygithub10_error(exc)
+
+        if result.get("write_verified") is not True:
+            raise mygithub10.MyGithub10Error(
+                "WRITE_VERIFY_FAILED",
+                "commit_github_files writer returned without durable GitHub verification",
+                {"repository": repository, "branch": branch, "new_commit_sha": result.get("commit_sha", ""), "failed_stage": "durable_verify_required"},
+            )
+        await _github_call(mygithub10._idempotent_mark_git_verified, operation_id, result)
+        result["_operation_id"] = operation_id
+        result = await _finalize_durable_write(result, workspace_id, expected_workspace_revision)
         return json.dumps(result, ensure_ascii=False)
     except json.JSONDecodeError as e:
         return json.dumps({"error": "json_parse_error", "message": f"files_json is not valid JSON (pos {e.pos}: {e.msg})", "received_len": len(files_json), "preview": files_json[:200]})
-    except Exception as e:
-        if isinstance(e, mygithub12.MyGithub12Error):
-            return _mygithub10_error(e)
-        if hasattr(e, "error") and getattr(e, "error", "") == "head_sha_conflict":
-            details = dict(getattr(e, "details", None) or {})
-            details.update({"repository": repository, "branch": branch, "phase": "before_write", "error_code": "HEAD_CHANGED"})
-            return json.dumps({"ok": False, "error": {"code": "HEAD_CHANGED", "message": getattr(e, "message", "Branch HEAD has changed") or "Branch HEAD has changed", "details": details}}, ensure_ascii=False)
-        return json.dumps({"error": type(e).__name__, "message": str(e)})
+    except Exception as exc:
+        # _finalize_durable_write owns git_verified -> indeterminate transitions;
+        # only pre-Git failures are marked failed here.
+        if operation_id:
+            try:
+                row = await _github_call(mygithub10._idempotent_existing_by_operation, operation_id)
+                if row and row.get("status") == "in_progress":
+                    failure = _safe_write_failure(exc)
+                    await _github_call(
+                        mygithub10._idempotent_finish,
+                        operation_id, "failed", None, failure["code"],
+                        {"failed_stage": failure["details"].get("failed_stage", "before_write"), "error": failure},
+                    )
+            except Exception:
+                logger.exception("commit_github_files audit finalization failed operation_id=%s", operation_id)
+        if isinstance(exc, mygithub12.MyGithub12Error) or isinstance(exc, mygithub10.MyGithub10Error):
+            return _mygithub10_error(exc)
+        if isinstance(exc, AppError):
+            code = "HEAD_CHANGED" if exc.error == "head_sha_conflict" else ("WRITE_VERIFY_FAILED" if exc.error == "write_verify_failed" else str(exc.error).upper())
+            return _mygithub10_error(mygithub10.MyGithub10Error(code, exc.message, dict(exc.details or {})))
+        return _mygithub10_error(exc)
 
 
 @mcp.tool(
@@ -904,9 +1093,13 @@ async def read_github_file_resource(resource_uri: str, offset_bytes: int = 0, li
 async def apply_github_patch(repository: str, branch: str, expected_head_sha: str, expected_blob_shas_json: str, patch: str, commit_message: str, dry_run: bool = True, idempotency_key: str = "", create_pull_request: bool = False, pull_request_json: str = "{}", workspace_id: str = "", expected_workspace_revision: int = 0) -> str:
     try:
         await _github_call(mygithub12.workspace_write_preflight, _service, repository, branch, expected_head_sha, workspace_id, expected_workspace_revision)
-        result = await _github_call(mygithub10.apply_patch, _service, repository, branch, expected_head_sha, expected_blob_shas_json, patch, commit_message, dry_run, idempotency_key)
-        if workspace_id and not dry_run:
-            result["workspace"] = await _github_call(mygithub12.workspace_write_complete, workspace_id, expected_workspace_revision, result["new_head_sha"], result["tree_sha"])
+        result = await _github_call(
+            mygithub10.apply_patch, _service, repository, branch, expected_head_sha,
+            expected_blob_shas_json, patch, commit_message, dry_run, idempotency_key,
+            _write_audit_context(workspace_id, expected_workspace_revision),
+        )
+        if not dry_run:
+            result = await _finalize_durable_write(result, workspace_id, expected_workspace_revision)
         return json.dumps(result, ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
@@ -936,9 +1129,13 @@ async def edit_github_file_ranges(
 ) -> str:
     try:
         await _github_call(mygithub12.workspace_write_preflight, _service, repository, branch, expected_head_sha, workspace_id, expected_workspace_revision)
-        result = await _github_call(mygithub10.edit_ranges, _service, repository, branch, expected_head_sha, operations_json, commit_message, dry_run, idempotency_key)
-        if workspace_id and not dry_run:
-            result["workspace"] = await _github_call(mygithub12.workspace_write_complete, workspace_id, expected_workspace_revision, result["new_head_sha"], result["tree_sha"])
+        result = await _github_call(
+            mygithub10.edit_ranges, _service, repository, branch, expected_head_sha,
+            operations_json, commit_message, dry_run, idempotency_key,
+            _write_audit_context(workspace_id, expected_workspace_revision),
+        )
+        if not dry_run:
+            result = await _finalize_durable_write(result, workspace_id, expected_workspace_revision)
         return json.dumps(result, ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
@@ -985,9 +1182,12 @@ async def finalize_github_file_upload(upload_id: str, expected_size_bytes: int, 
 async def commit_github_uploaded_files(repository: str, branch: str, expected_head_sha: str, path: str, expected_blob_sha: str, upload_id: str, commit_message: str, idempotency_key: str = "", workspace_id: str = "", expected_workspace_revision: int = 0) -> str:
     try:
         await _github_call(mygithub12.workspace_write_preflight, _service, repository, branch, expected_head_sha, workspace_id, expected_workspace_revision)
-        result = await _github_call(mygithub10.commit_upload, _service, repository, branch, expected_head_sha, path, expected_blob_sha, upload_id, commit_message, idempotency_key)
-        if workspace_id:
-            result["workspace"] = await _github_call(mygithub12.workspace_write_complete, workspace_id, expected_workspace_revision, result["new_head_sha"], result["tree_sha"])
+        result = await _github_call(
+            mygithub10.commit_upload, _service, repository, branch, expected_head_sha, path,
+            expected_blob_sha, upload_id, commit_message, idempotency_key,
+            _write_audit_context(workspace_id, expected_workspace_revision),
+        )
+        result = await _finalize_durable_write(result, workspace_id, expected_workspace_revision)
         return json.dumps(result, ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
@@ -1141,6 +1341,10 @@ async def get_repository_operation_policy(repository: str) -> str:
 register_github_extended_tools(mcp, _github_call)
 register_private_ci_mcp_tools(mcp)
 register_mygithub12_tools(mcp, _github_call, _service)
+mcp.tool(
+    name="read_mcp_response_resource",
+    description="Read one bounded UTF-8 chunk from an oversized MCP response resource with SHA and continuation metadata.",
+)(read_mcp_response_resource)
 
 
 # ========================================================================

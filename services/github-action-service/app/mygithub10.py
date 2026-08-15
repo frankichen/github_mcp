@@ -25,6 +25,8 @@ from typing import Any
 from app.config import settings
 from app.exceptions import ValidationError
 from app.version import SERVICE_VERSION
+from app.github_write_verify import WriteVerificationError, post_write_verify
+from app.observability import current_request_id
 
 MAX_INLINE_RESPONSE_BYTES = 65536
 MAX_FILE_CHUNK_BYTES = 65536
@@ -142,42 +144,106 @@ def _db() -> sqlite3.Connection:
             request_sha256 TEXT NOT NULL, tool_name TEXT NOT NULL, repository TEXT NOT NULL,
             branch TEXT NOT NULL, expected_head_sha TEXT NOT NULL, status TEXT NOT NULL,
             result_commit_sha TEXT, created_at REAL NOT NULL, finished_at REAL,
-            error_code TEXT, result_json TEXT, request_json TEXT
+            error_code TEXT, result_json TEXT, request_json TEXT,
+            caller_idempotency_key TEXT, request_trace_id TEXT, workspace_id TEXT,
+            workspace_revision INTEGER, previous_head_sha TEXT, computed_commit_sha TEXT,
+            expected_tree_sha TEXT, observed_branch_head TEXT, observed_commit_sha TEXT,
+            observed_tree_sha TEXT, failed_stage TEXT
         )"""
     )
     columns = {item[1] for item in db.execute("PRAGMA table_info(mygithub10_operations)")}
-    for name, definition in (("result_json", "TEXT"), ("request_json", "TEXT")):
+    additions = (
+        ("result_json", "TEXT"), ("request_json", "TEXT"),
+        ("caller_idempotency_key", "TEXT"), ("request_trace_id", "TEXT"),
+        ("workspace_id", "TEXT"), ("workspace_revision", "INTEGER"),
+        ("previous_head_sha", "TEXT"), ("computed_commit_sha", "TEXT"),
+        ("expected_tree_sha", "TEXT"), ("observed_branch_head", "TEXT"),
+        ("observed_commit_sha", "TEXT"), ("observed_tree_sha", "TEXT"),
+        ("failed_stage", "TEXT"),
+    )
+    for name, definition in additions:
         if name not in columns:
             db.execute(f"ALTER TABLE mygithub10_operations ADD COLUMN {name} {definition}")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_mygithub10_operations_trace ON mygithub10_operations(request_trace_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_mygithub10_operations_workspace ON mygithub10_operations(workspace_id)")
     db.commit()
     return db
 
 
-def _idempotent_start(tool_name: str, key: str, request: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
-    if not key:
-        return "", None
+def _operation_columns(db: sqlite3.Connection) -> list[str]:
+    return [item[1] for item in db.execute("PRAGMA table_info(mygithub10_operations)")]
+
+
+def _idempotent_start(
+    tool_name: str,
+    key: str,
+    request: dict[str, Any],
+    audit_context: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any] | None]:
     request_hash = _sha256(_json(request).encode())
     db = _db()
-    row = db.execute("SELECT * FROM mygithub10_operations WHERE idempotency_key = ?", (key,)).fetchone()
-    if row:
-        columns = [item[1] for item in db.execute("PRAGMA table_info(mygithub10_operations)")]
-        old = dict(zip(columns, row))
-        if old["request_sha256"] != request_hash:
-            raise MyGithub10Error("IDEMPOTENCY_CONFLICT", "idempotency key was used for a different request")
-        if old["status"] == "running":
-            raise MyGithub10Error("IDEMPOTENCY_IN_PROGRESS", "operation with this key is still running")
-        if old["status"] == "succeeded":
-            if old.get("result_json"):
-                result = json.loads(old["result_json"])
-                result["replayed"] = True
-                return "replay", result
-            raise MyGithub10Error("IDEMPOTENCY_RESULT_UNAVAILABLE", "the original idempotent result is unavailable")
-        raise MyGithub10Error(old["error_code"] or "IDEMPOTENCY_FAILED", "previous operation failed")
+    audit_context = audit_context or {}
+    if key:
+        row = db.execute(
+            "SELECT * FROM mygithub10_operations WHERE caller_idempotency_key=? OR (caller_idempotency_key IS NULL AND idempotency_key=?) ORDER BY created_at DESC LIMIT 1",
+            (key, key),
+        ).fetchone()
+        if row:
+            old = dict(zip(_operation_columns(db), row))
+            if old["request_sha256"] != request_hash:
+                raise MyGithub10Error("IDEMPOTENCY_CONFLICT", "idempotency key was used for a different request")
+            status = old["status"]
+            if status == "success_verified":
+                if old.get("result_json"):
+                    result = json.loads(old["result_json"])
+                    result["replayed"] = True
+                    result["operation_id"] = old["operation_id"]
+                    return "replay", result
+                raise MyGithub10Error("IDEMPOTENCY_RESULT_UNAVAILABLE", "the verified idempotent result is unavailable")
+            if status == "succeeded":
+                raise MyGithub10Error(
+                    "IDEMPOTENCY_RESULT_UNVERIFIED",
+                    "legacy idempotent success was not durably verified against GitHub",
+                    {"operation_id": old["operation_id"], "recovery_required": True},
+                )
+            if status in {"running", "in_progress"}:
+                if time.time() - float(old.get("created_at") or 0) > 300:
+                    db.execute(
+                        "UPDATE mygithub10_operations SET status='indeterminate',finished_at=?,error_code=? WHERE operation_id=?",
+                        (time.time(), "IDEMPOTENCY_INDETERMINATE", old["operation_id"]),
+                    )
+                    db.commit()
+                    status = "indeterminate"
+                else:
+                    raise MyGithub10Error(
+                        "IDEMPOTENCY_IN_PROGRESS",
+                        "operation with this key is still running",
+                        {"operation_id": old["operation_id"]},
+                    )
+            if status in {"git_verified", "indeterminate"}:
+                raise MyGithub10Error(
+                    "IDEMPOTENCY_INDETERMINATE",
+                    "previous operation did not reach durable application success; inspect GitHub and Workspace state before retry",
+                    {"operation_id": old["operation_id"], "recovery_required": True},
+                )
+            raise MyGithub10Error(old.get("error_code") or "IDEMPOTENCY_FAILED", "previous operation failed")
+
     operation_id = str(uuid.uuid4())
+    storage_key = key or f"__audit__:{operation_id}"
+    trace_id = str(audit_context.get("request_trace_id") or current_request_id() or operation_id)
+    workspace_id = str(audit_context.get("workspace_id") or "")
+    workspace_revision = int(audit_context.get("workspace_revision") or 0)
     try:
         db.execute(
-            "INSERT INTO mygithub10_operations(operation_id,idempotency_key,request_sha256,tool_name,repository,branch,expected_head_sha,status,created_at,request_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (operation_id, key, request_hash, tool_name, request.get("repository", ""), request.get("branch", ""), request.get("expected_head_sha", ""), "running", time.time(), _json(request)),
+            """INSERT INTO mygithub10_operations(
+                operation_id,idempotency_key,caller_idempotency_key,request_sha256,tool_name,repository,branch,
+                expected_head_sha,status,created_at,request_json,request_trace_id,workspace_id,workspace_revision
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                operation_id, storage_key, key or None, request_hash, tool_name, request.get("repository", ""),
+                request.get("branch", ""), request.get("expected_head_sha", ""), "in_progress", time.time(),
+                _json(request), trace_id, workspace_id, workspace_revision,
+            ),
         )
         db.commit()
     except sqlite3.IntegrityError:
@@ -186,24 +252,77 @@ def _idempotent_start(tool_name: str, key: str, request: dict[str, Any]) -> tupl
     return operation_id, None
 
 
-def _idempotent_finish(operation_id: str, status: str, commit_sha: str | None = None, error_code: str | None = None, result: dict[str, Any] | None = None) -> None:
+def _result_audit_fields(result: dict[str, Any] | None) -> tuple[Any, ...]:
+    result = result or {}
+    error = result.get("error") if isinstance(result.get("error"), dict) else {}
+    details = error.get("details") if isinstance(error.get("details"), dict) else {}
+    return (
+        result.get("old_head_sha") or result.get("previous_head_sha") or details.get("expected_previous_head"),
+        result.get("commit_sha") or result.get("new_head_sha") or details.get("new_commit_sha"),
+        result.get("tree_sha") or details.get("expected_tree_sha"),
+        result.get("verified_branch_head_sha") or details.get("observed_branch_head"),
+        result.get("verified_commit_sha") or details.get("observed_commit_sha"),
+        result.get("verified_tree_sha") or details.get("observed_tree_sha"),
+        result.get("failed_stage") or details.get("failed_stage"),
+    )
+
+
+def _idempotent_finish(
+    operation_id: str,
+    status: str,
+    commit_sha: str | None = None,
+    error_code: str | None = None,
+    result: dict[str, Any] | None = None,
+) -> None:
     if not operation_id or operation_id == "replay":
         return
+    if status == "succeeded":
+        status = "success_verified"
     db = _db()
-    db.execute("UPDATE mygithub10_operations SET status=?,result_commit_sha=?,finished_at=?,error_code=?,result_json=? WHERE operation_id=?", (status, commit_sha, time.time(), error_code, _json(result) if result is not None else None, operation_id))
+    previous_head, computed_commit, expected_tree, observed_branch, observed_commit, observed_tree, failed_stage = _result_audit_fields(result)
+    db.execute(
+        """UPDATE mygithub10_operations SET
+            status=?,result_commit_sha=?,finished_at=?,error_code=?,result_json=?,
+            previous_head_sha=COALESCE(?,previous_head_sha),computed_commit_sha=COALESCE(?,computed_commit_sha),
+            expected_tree_sha=COALESCE(?,expected_tree_sha),observed_branch_head=COALESCE(?,observed_branch_head),
+            observed_commit_sha=COALESCE(?,observed_commit_sha),observed_tree_sha=COALESCE(?,observed_tree_sha),
+            failed_stage=COALESCE(?,failed_stage)
+        WHERE operation_id=?""",
+        (
+            status, commit_sha or computed_commit, time.time() if status in {"success_verified", "failed", "indeterminate"} else None,
+            error_code, _json(result) if result is not None else None, previous_head, computed_commit, expected_tree,
+            observed_branch, observed_commit, observed_tree, failed_stage, operation_id,
+        ),
+    )
     db.commit()
 
 
+def _idempotent_mark_git_verified(operation_id: str, result: dict[str, Any]) -> None:
+    _idempotent_finish(operation_id, "git_verified", result.get("commit_sha"), result=result)
+
+
 def _idempotent_existing(key: str) -> dict[str, Any] | None:
-    """Read an existing operation without requiring any remote/file state."""
+    """Read an existing caller idempotency operation without remote state."""
     if not key:
         return None
     db = _db()
-    row = db.execute("SELECT * FROM mygithub10_operations WHERE idempotency_key = ?", (key,)).fetchone()
+    row = db.execute(
+        "SELECT * FROM mygithub10_operations WHERE caller_idempotency_key=? OR (caller_idempotency_key IS NULL AND idempotency_key=?) ORDER BY created_at DESC LIMIT 1",
+        (key, key),
+    ).fetchone()
     if not row:
         return None
-    columns = [item[1] for item in db.execute("PRAGMA table_info(mygithub10_operations)")]
-    return dict(zip(columns, row))
+    return dict(zip(_operation_columns(db), row))
+
+def _idempotent_existing_by_operation(operation_id: str) -> dict[str, Any] | None:
+    if not operation_id:
+        return None
+    db = _db()
+    row = db.execute("SELECT * FROM mygithub10_operations WHERE operation_id=?", (operation_id,)).fetchone()
+    if not row:
+        return None
+    return dict(zip(_operation_columns(db), row))
+
 
 
 def _repo(client, repository: str):
@@ -538,44 +657,59 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
     base_tree = getattr(getattr(git_commit, "tree", None), "sha", None) or git_commit.commit.tree.sha
     tree = gh.create_git_tree(repository, elements, base_tree)
     commit = gh.create_commit(repository, message, tree.sha, [actual_head])
+
     try:
         ref.edit(sha=commit.sha, force=False)
     except Exception as exc:
         latest = None
         try:
-            latest = repo.get_git_ref(f"heads/{branch}").object.sha
+            latest = gh.get_branch_head_fresh(repository, branch)
         except Exception:
             pass
-        raise MyGithub10Error("PATCH_HEAD_CHANGED", f"branch HEAD changed while updating {repository}:{branch}", {"expected": actual_head, "actual": latest, "repository": repository, "branch": branch, "phase": "ref_update", "error_code": "HEAD_CHANGED"}) from exc
+        if latest != commit.sha:
+            code = "PATCH_HEAD_CHANGED" if latest and latest != actual_head else "WRITE_VERIFY_FAILED"
+            details = {
+                "repository": repository, "branch": branch,
+                "expected_previous_head": actual_head, "new_commit_sha": commit.sha,
+                "observed_branch_head": latest or "", "expected_tree_sha": tree.sha,
+                "observed_tree_sha": "", "failed_stage": "branch_ref_update",
+            }
+            raise MyGithub10Error(
+                code,
+                f"GitHub branch ref update was not durably confirmed for {repository}:{branch}",
+                details,
+            ) from exc
+        # The update response may have been lost after GitHub applied it.  A
+        # fresh branch read already sees the intended commit, so continue into
+        # the full durable verification sequence instead of guessing failure.
+
+    expected_paths = {path: (None if content is None else new_shas[path]) for path, content in changed.items()}
+    try:
+        evidence = post_write_verify(
+            gh, repository, branch, actual_head, commit.sha, tree.sha, expected_paths
+        )
+    except WriteVerificationError as exc:
+        raise MyGithub10Error("WRITE_VERIFY_FAILED", exc.message, exc.details) from exc
+
     file_results = []
     for path, content in changed.items():
         if content is None:
-            try:
-                remaining = repo.get_contents(path, ref=commit.sha)
-            except Exception as exc:
-                if getattr(exc, "status", None) != 404:
-                    raise MyGithub10Error("WRITE_VERIFY_FAILED", f"could not verify deletion of {path}", {"repository": repository, "branch": branch, "commit_sha": commit.sha, "path": path}) from exc
-                remaining = None
-            if remaining is not None:
-                raise MyGithub10Error("WRITE_VERIFY_FAILED", f"deleted file still exists after commit: {path}", {"repository": repository, "branch": branch, "commit_sha": commit.sha, "path": path})
             file_results.append({"path": path, "operation": "delete", "old_blob_sha": old_shas[path], "new_blob_sha": None, "content_sha256": None, "size_bytes": 0})
             continue
         try:
-            entry = repo.get_contents(path, ref=commit.sha)
-            actual_blob = None if isinstance(entry, list) else entry.sha
-            blob = repo.get_git_blob(actual_blob) if actual_blob else None
-            actual_bytes = base64.b64decode(blob.content or "") if blob and getattr(blob, "encoding", "base64") == "base64" else (blob.content.encode("utf-8") if blob else b"")
+            actual_text, actual_blob, actual_size = gh.get_file(repository, path, commit.sha)
+            actual_bytes = actual_text.encode("utf-8") if actual_text is not None else b""
         except Exception as exc:
-            raise MyGithub10Error("WRITE_VERIFY_FAILED", f"could not read back {path} after commit", {"repository": repository, "branch": branch, "commit_sha": commit.sha, "path": path}) from exc
+            raise MyGithub10Error("WRITE_VERIFY_FAILED", f"could not read back {path} after commit", {**evidence, "path": path, "failed_stage": "path_content_readback"}) from exc
         expected_content_sha = _sha256(content)
         if actual_blob != new_shas[path] or actual_bytes != content:
-            raise MyGithub10Error("WRITE_VERIFY_FAILED", f"read-back bytes differ for {path}", {"repository": repository, "branch": branch, "commit_sha": commit.sha, "path": path, "expected_content_sha256": expected_content_sha, "actual_content_sha256": _sha256(actual_bytes), "expected_blob_sha": new_shas[path], "actual_blob_sha": actual_blob})
-        file_results.append({"path": path, "operation": "modify" if old_shas[path] else "add", "old_blob_sha": old_shas[path], "new_blob_sha": actual_blob, "content_sha256": expected_content_sha, "size_bytes": len(content)})
-    logger.info("mygithub10 write repository=%s branch=%s expected_head_sha=%s actual_head_sha=%s old_head_sha=%s new_head_sha=%s files=%s", repository, branch, expected_head_sha, actual_head, actual_head, commit.sha, [item["path"] for item in file_results])
-    return {"commit_sha": commit.sha, "new_head_sha": commit.sha, "old_head_sha": actual_head, "tree_sha": tree.sha, "branch": branch, "repository": repository, "changed_files": file_results}
+            raise MyGithub10Error("WRITE_VERIFY_FAILED", f"read-back bytes differ for {path}", {**evidence, "path": path, "failed_stage": "path_content_readback", "expected_content_sha256": expected_content_sha, "actual_content_sha256": _sha256(actual_bytes), "expected_blob_sha": new_shas[path], "actual_blob_sha": actual_blob})
+        file_results.append({"path": path, "operation": "modify" if old_shas[path] else "add", "old_blob_sha": old_shas[path], "new_blob_sha": actual_blob, "content_sha256": expected_content_sha, "size_bytes": actual_size})
+    logger.info("mygithub10 verified_write repository=%s branch=%s expected_head_sha=%s old_head_sha=%s new_head_sha=%s tree_sha=%s files=%s", repository, branch, expected_head_sha, actual_head, commit.sha, tree.sha, [item["path"] for item in file_results])
+    return {"commit_sha": commit.sha, "new_head_sha": commit.sha, "old_head_sha": actual_head, "tree_sha": tree.sha, "branch": branch, "repository": repository, "changed_files": file_results, **evidence}
 
 
-def apply_patch(client, repository: str, branch: str, expected_head_sha: str, expected_blob_shas_json: str, patch: str, commit_message: str, dry_run: bool, idempotency_key: str = "") -> dict[str, Any]:
+def apply_patch(client, repository: str, branch: str, expected_head_sha: str, expected_blob_shas_json: str, patch: str, commit_message: str, dry_run: bool, idempotency_key: str = "", audit_context: dict[str, Any] | None = None) -> dict[str, Any]:
     parsed, patch_metadata = _parse_patch_details(patch)
     try:
         expected = json.loads(expected_blob_shas_json or "{}")
@@ -591,7 +725,7 @@ def apply_patch(client, repository: str, branch: str, expected_head_sha: str, ex
         parsed,
         commit_message,
     )
-    operation_id, replay = ("", None) if dry_run else _idempotent_start("apply_github_patch", idempotency_key, request)
+    operation_id, replay = ("", None) if dry_run else _idempotent_start("apply_github_patch", idempotency_key, request, audit_context)
     if replay:
         return replay
     repo = _repo(client, repository)
@@ -660,14 +794,15 @@ def apply_patch(client, repository: str, branch: str, expected_head_sha: str, ex
         return result
     try:
         result.update(_commit_files(client, repository, branch, expected_head_sha, changed, expected, commit_message))
-        _idempotent_finish(operation_id, "succeeded", result["commit_sha"], result=result)
+        _idempotent_mark_git_verified(operation_id, result)
+        result["_operation_id"] = operation_id
         return result
     except MyGithub10Error as exc:
-        _idempotent_finish(operation_id, "failed", error_code=exc.code)
+        _idempotent_finish(operation_id, "failed", error_code=exc.code, result={"failed_stage": exc.details.get("failed_stage"), "error": {"code": exc.code, "details": exc.details}})
         raise
 
 
-def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, operations_json: str, commit_message: str, dry_run: bool, idempotency_key: str = "") -> dict[str, Any]:
+def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, operations_json: str, commit_message: str, dry_run: bool, idempotency_key: str = "", audit_context: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
         operations = json.loads(operations_json or "[]")
     except (TypeError, json.JSONDecodeError) as exc:
@@ -677,7 +812,7 @@ def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, op
     if len(operations) > MAX_FILE_EDIT_OPERATIONS:
         raise MyGithub10Error("PATCH_SCOPE_EXCEEDED", "too many range edit operations")
     request = {"tool_name": "edit_github_file_ranges", "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "operations": operations, "commit_message": commit_message}
-    operation_id, replay = ("", None) if dry_run else _idempotent_start("edit_github_file_ranges", idempotency_key, request)
+    operation_id, replay = ("", None) if dry_run else _idempotent_start("edit_github_file_ranges", idempotency_key, request, audit_context)
     if replay:
         return replay
     repo = _repo(client, repository)
@@ -804,10 +939,11 @@ def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, op
     if dry_run: return result
     try:
         result.update(_commit_files(client, repository, branch, expected_head_sha, changed, expected, commit_message))
-        _idempotent_finish(operation_id, "succeeded", result["commit_sha"], result=result)
+        _idempotent_mark_git_verified(operation_id, result)
+        result["_operation_id"] = operation_id
         return result
     except MyGithub10Error as exc:
-        _idempotent_finish(operation_id, "failed", error_code=exc.code)
+        _idempotent_finish(operation_id, "failed", error_code=exc.code, result={"failed_stage": exc.details.get("failed_stage"), "error": {"code": exc.code, "details": exc.details}})
         raise
 
 
@@ -1012,10 +1148,10 @@ def finalize_upload(upload_id: str, expected_size_bytes: int, expected_sha256: s
     return {"upload_id": upload_id, "size_bytes": len(data), "sha256": actual, "finalized": True}
 
 
-def commit_upload(client, repository: str, branch: str, expected_head_sha: str, path: str, expected_blob_sha: str, upload_id: str, commit_message: str, idempotency_key: str = "") -> dict[str, Any]:
+def commit_upload(client, repository: str, branch: str, expected_head_sha: str, path: str, expected_blob_sha: str, upload_id: str, commit_message: str, idempotency_key: str = "", audit_context: dict[str, Any] | None = None) -> dict[str, Any]:
     _safe_path(path)
     existing = _idempotent_existing(idempotency_key)
-    if existing and existing.get("status") == "succeeded":
+    if existing and existing.get("status") == "success_verified":
         stored_request = json.loads(existing.get("request_json") or "{}")
         scope = {"repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "path": path, "expected_blob_sha": expected_blob_sha, "upload_id": upload_id, "commit_message": commit_message}
         stored_scope = {key: stored_request.get(key) for key in scope}
@@ -1024,24 +1160,32 @@ def commit_upload(client, repository: str, branch: str, expected_head_sha: str, 
         if existing.get("result_json"):
             replay = json.loads(existing["result_json"])
             replay["replayed"] = True
+            replay["operation_id"] = existing["operation_id"]
             return replay
-        raise MyGithub10Error("IDEMPOTENCY_RESULT_UNAVAILABLE", "the original idempotent upload result is unavailable")
+        raise MyGithub10Error("IDEMPOTENCY_RESULT_UNAVAILABLE", "the verified idempotent upload result is unavailable")
+    if existing and existing.get("status") == "succeeded":
+        raise MyGithub10Error(
+            "IDEMPOTENCY_RESULT_UNVERIFIED",
+            "legacy upload success was not durably verified against GitHub",
+            {"operation_id": existing["operation_id"], "recovery_required": True},
+        )
     data_path, _, meta = _load_upload(upload_id)
     if not meta.get("finalized"):
         raise MyGithub10Error("UPLOAD_NOT_FINALIZED", "finalize the upload before committing")
     data = data_path.read_bytes()
     request = {"tool_name": "commit_github_uploaded_files", "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "path": path, "expected_blob_sha": expected_blob_sha, "upload_id": upload_id, "upload_sha256": meta["sha256"], "upload_size": meta["size"], "commit_message": commit_message}
-    operation_id, replay = _idempotent_start("commit_github_uploaded_files", idempotency_key, request)
+    operation_id, replay = _idempotent_start("commit_github_uploaded_files", idempotency_key, request, audit_context)
     if replay:
         return replay
     try:
         result = _commit_files(client, repository, branch, expected_head_sha, {path: data}, {path: expected_blob_sha}, commit_message)
         result = {"ok": True, **result, "upload_id": upload_id}
-        _idempotent_finish(operation_id, "succeeded", result["commit_sha"], result=result)
-        abort_upload(upload_id)
+        _idempotent_mark_git_verified(operation_id, result)
+        result["_operation_id"] = operation_id
+        result["_cleanup_upload_id"] = upload_id
         return result
     except MyGithub10Error as exc:
-        _idempotent_finish(operation_id, "failed", error_code=exc.code)
+        _idempotent_finish(operation_id, "failed", error_code=exc.code, result={"failed_stage": exc.details.get("failed_stage"), "error": {"code": exc.code, "details": exc.details}})
         raise
 
 

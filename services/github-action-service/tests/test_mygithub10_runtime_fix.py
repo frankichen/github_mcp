@@ -67,6 +67,23 @@ class FakeGitHubClient:
     def create_commit(self, _repository, message, tree_sha, parents):
         self.created_commits.append((message, tree_sha, parents))
         return SimpleNamespace(sha="new-commit")
+    def get_branch_head_fresh(self, _repository, _branch):
+        return self.repo.ref.object.sha
+
+    def get_commit_state_fresh(self, _repository, sha):
+        return {"commit_sha": sha, "tree_sha": "new-tree"}
+
+    def get_tree_sha_fresh(self, _repository, sha):
+        return sha
+
+    def get_file_sha_fresh(self, _repository, path, ref):
+        return self.repo.get_contents(path, ref=ref).sha
+
+    def get_file(self, _repository, path, ref=""):
+        entry = self.repo.get_contents(path, ref=ref)
+        data = self.repo.written_content if ref == "new-commit" and self.repo.written_content is not None else self.repo.data
+        return data.decode("utf-8"), entry.sha, len(data)
+
 
 
 class FakeService:

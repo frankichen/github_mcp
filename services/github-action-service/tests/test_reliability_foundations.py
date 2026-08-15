@@ -44,6 +44,18 @@ class CommitClient:
     def update_ref(self, *_args, **_kwargs):
         return None
 
+    def get_branch_head_fresh(self, _repository, _branch):
+        return "b" * 40
+
+    def get_commit_state_fresh(self, _repository, sha):
+        return {"commit_sha": sha, "tree_sha": "new-tree"}
+
+    def get_tree_sha_fresh(self, _repository, sha):
+        return sha
+
+    def get_file_sha_fresh(self, _repository, _path, _ref):
+        return "blob"
+
     def get_file(self, _repository, _path, _ref):
         return "", "blob", 0
 

@@ -153,10 +153,81 @@ def workspace_write_preflight(service: Any, repository: str, branch: str, expect
     return ws
 
 
-def workspace_write_complete(workspace_id: str, expected_workspace_revision: int, new_head_sha: str, tree_sha: str) -> dict[str,Any]:
-    _workspace_cas(workspace_id,expected_workspace_revision)
+def workspace_write_complete(
+    workspace_id: str,
+    expected_workspace_revision: int,
+    new_head_sha: str,
+    tree_sha: str,
+    verification: dict[str,Any] | None = None,
+) -> dict[str,Any]:
+    """Persist only a GitHub write that already passed durable read-back."""
+    verification=verification or {}
+    if verification.get("write_verified") is not True:
+        raise MyGithub12Error(
+            "WRITE_VERIFY_FAILED",
+            "workspace finalization requires durable GitHub write verification",
+            {"workspace_id":workspace_id,"failed_stage":"workspace_finalize","recovery_required":True},
+        )
+    try:
+        row=_workspace_cas(workspace_id,expected_workspace_revision)
+    except MyGithub12Error as exc:
+        if exc.code == "WORKSPACE_REVISION_MISMATCH":
+            exc.details.update({
+                "workspace_id":workspace_id,
+                "failed_stage":"workspace_finalize",
+                "github_write_verified":True,
+                "github_branch_head":verification.get("verified_branch_head_sha", ""),
+                "new_commit_sha":new_head_sha,
+                "recovery_required":True,
+                "recommended_action":"refresh_workspace",
+            })
+        raise
+    expected={
+        "repository":row["repository"],
+        "branch":row["branch"],
+        "commit_sha":new_head_sha,
+        "tree_sha":tree_sha,
+    }
+    observed={
+        "repository":verification.get("repository"),
+        "branch":verification.get("branch"),
+        "commit_sha":verification.get("verified_commit_sha"),
+        "tree_sha":verification.get("verified_tree_sha"),
+        "branch_head":verification.get("verified_branch_head_sha"),
+    }
+    if (
+        observed["repository"]!=expected["repository"]
+        or observed["branch"]!=expected["branch"]
+        or observed["commit_sha"]!=new_head_sha
+        or observed["branch_head"]!=new_head_sha
+        or observed["tree_sha"]!=tree_sha
+    ):
+        raise MyGithub12Error(
+            "WRITE_VERIFY_FAILED",
+            "workspace verification evidence does not match the requested GitHub head",
+            {
+                "workspace_id":workspace_id,
+                "failed_stage":"workspace_finalize",
+                "expected":expected,
+                "observed":observed,
+                "recovery_required":True,
+            },
+        )
     with _LOCK,_db() as db:
         cur=db.execute("UPDATE workspaces SET head_sha=?,tree_sha=?,index_commit_sha=?,revision=revision+1,updated_at=? WHERE workspace_id=? AND revision=?",(new_head_sha,tree_sha,new_head_sha,_now(),workspace_id,expected_workspace_revision))
-        if cur.rowcount!=1: raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH","workspace changed while completing write")
-        row=db.execute("SELECT * FROM workspaces WHERE workspace_id=?",(workspace_id,)).fetchone()
-    return _workspace_public(row)
+        if cur.rowcount!=1:
+            raise MyGithub12Error(
+                "WORKSPACE_REVISION_MISMATCH",
+                "workspace changed while completing a verified GitHub write",
+                {
+                    "workspace_id":workspace_id,
+                    "failed_stage":"workspace_finalize",
+                    "github_write_verified":True,
+                    "github_branch_head":new_head_sha,
+                    "new_commit_sha":new_head_sha,
+                    "recovery_required":True,
+                    "recommended_action":"refresh_workspace",
+                },
+            )
+        final_row=db.execute("SELECT * FROM workspaces WHERE workspace_id=?",(workspace_id,)).fetchone()
+    return _workspace_public(final_row)

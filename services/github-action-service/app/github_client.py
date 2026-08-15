@@ -219,6 +219,56 @@ class GitHubClient:
                 return None
             self._handle_github_error(e)
 
+    def get_branch_head_fresh(self, repo_name: str, branch_name: str):
+        """Read a branch ref with a new GitHub API request."""
+        self._require_configured()
+        try:
+            repo = self._pygithub.get_repo(repo_name)
+            ref = repo.get_git_ref(f"heads/{branch_name}")
+            return str(ref.object.sha)
+        except GithubException as e:
+            if e.status == 404:
+                return None
+            self._handle_github_error(e)
+
+    def get_commit_state_fresh(self, repo_name: str, commit_sha: str):
+        """Read a commit and its tree with a new GitHub API request."""
+        self._require_configured()
+        try:
+            repo = self._pygithub.get_repo(repo_name)
+            commit = repo.get_git_commit(commit_sha)
+            return {"commit_sha": str(commit.sha), "tree_sha": str(commit.tree.sha)}
+        except GithubException as e:
+            if e.status == 404:
+                return None
+            self._handle_github_error(e)
+
+    def get_tree_sha_fresh(self, repo_name: str, tree_sha: str):
+        """Read a Git tree with a new GitHub API request."""
+        self._require_configured()
+        try:
+            repo = self._pygithub.get_repo(repo_name)
+            tree = repo.get_git_tree(tree_sha, recursive=False)
+            return str(tree.sha)
+        except GithubException as e:
+            if e.status == 404:
+                return None
+            self._handle_github_error(e)
+
+    def get_file_sha_fresh(self, repo_name: str, path: str, ref: str):
+        """Read one path SHA at an exact ref with a new GitHub API request."""
+        self._require_configured()
+        try:
+            repo = self._pygithub.get_repo(repo_name)
+            contents = repo.get_contents(path, ref=ref)
+            if isinstance(contents, list):
+                return None
+            return contents.sha
+        except GithubException as e:
+            if e.status == 404:
+                return None
+            self._handle_github_error(e)
+
     def create_pull_request(
         self,
         repo_name: str,

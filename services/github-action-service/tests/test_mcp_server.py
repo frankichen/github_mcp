@@ -76,7 +76,7 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.0.2"
+        assert capabilities["version"] == "12.0.3"
         assert capabilities["tool_count"] == 155
         assert capabilities["max_inline_response_bytes"] == 32768
         assert capabilities["transport_inline_hard_limit_bytes"] == 65536
@@ -190,9 +190,17 @@ class TestMCPTools:
                 "repository": "owner/repo",
                 "branch": "feature-x",
                 "commit_sha": "abc123",
+                "new_head_sha": "abc123",
+                "old_head_sha": "old123",
+                "tree_sha": "tree123",
                 "commit_url": "https://github.com/owner/repo/commit/abc123",
                 "changed_files": [{"path": "test.py", "operation": "upsert"}],
                 "pull_request": None,
+                "write_verified": True,
+                "previous_head_sha": "old123",
+                "verified_branch_head_sha": "abc123",
+                "verified_commit_sha": "abc123",
+                "verified_tree_sha": "tree123",
             }
 
             result = await commit_github_files(

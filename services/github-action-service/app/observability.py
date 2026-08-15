@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextvars import ContextVar
 import logging
 import re
 import threading
@@ -18,6 +19,11 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _lock = threading.Lock()
 _requests = Counter()
 _duration_seconds = Counter()
+_current_request_id: ContextVar[str] = ContextVar("mygithub_request_id", default="")
+
+
+def current_request_id() -> str:
+    return _current_request_id.get()
 
 
 class RequestObservabilityMiddleware(BaseHTTPMiddleware):
@@ -26,6 +32,7 @@ class RequestObservabilityMiddleware(BaseHTTPMiddleware):
         request_id = supplied if _REQUEST_ID_RE.fullmatch(supplied) else uuid.uuid4().hex
         started = time.monotonic()
         status_code = 500
+        request_token = _current_request_id.set(request_id)
         try:
             response = await call_next(request)
             status_code = response.status_code
@@ -47,6 +54,7 @@ class RequestObservabilityMiddleware(BaseHTTPMiddleware):
                 status_code,
                 elapsed * 1000,
             )
+            _current_request_id.reset(request_token)
 
 
 def prometheus_metrics() -> str:

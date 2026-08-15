@@ -27,4 +27,4 @@ def test_runtime_version_must_match_authoritative_version(monkeypatch):
 
 def test_authoritative_version_is_1202():
     assert version.SERVICE_NAME == "MyGithut12"
-    assert version.SERVICE_VERSION == "12.0.2"
+    assert version.SERVICE_VERSION == "12.0.3"
