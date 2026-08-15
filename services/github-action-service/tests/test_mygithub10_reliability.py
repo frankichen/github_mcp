@@ -654,11 +654,22 @@ def test_upload_replay_survives_body_cleanup(tmp_path, monkeypatch):
     data = b"upload content\n"
     mygithub10.append_upload(upload["upload_id"], 0, data, digest(data.decode()))
     mygithub10.finalize_upload(upload["upload_id"], len(data), digest(data.decode()))
-    result = {"ok": True, "commit_sha": "upload-commit", "old_head_sha": "h1", "new_head_sha": "upload-commit", "tree_sha": "t1", "changed_files": [{"path": "upload.txt", "content_sha256": digest(data.decode()), "size_bytes": len(data)}], "upload_id": upload["upload_id"]}
+    result = {
+        "ok": True, "commit_sha": "upload-commit", "old_head_sha": "h1", "new_head_sha": "upload-commit",
+        "tree_sha": "t1", "changed_files": [{"path": "upload.txt", "content_sha256": digest(data.decode()), "size_bytes": len(data)}],
+        "upload_id": upload["upload_id"], "write_verified": True, "repository": "owner/repo", "branch": "feature",
+        "previous_head_sha": "h1", "verified_branch_head_sha": "upload-commit",
+        "verified_commit_sha": "upload-commit", "verified_tree_sha": "t1",
+    }
     monkeypatch.setattr(mygithub10, "_commit_files", lambda *args: {key: value for key, value in result.items() if key != "ok" and key != "upload_id"})
     service = ReadService(ReadRepo(b""))
     first = mygithub10.commit_upload(service, "owner/repo", "feature", "head-1", "upload.txt", "", upload["upload_id"], "upload", "upload-key")
     assert first["commit_sha"] == "upload-commit"
+    assert mygithub10._upload_paths(upload["upload_id"])[0].exists()
+    operation_id = first.pop("_operation_id")
+    first.pop("_cleanup_upload_id")
+    mygithub10._idempotent_finish(operation_id, "success_verified", "upload-commit", result=first)
+    mygithub10.abort_upload(upload["upload_id"] )
     assert not mygithub10._upload_paths(upload["upload_id"])[0].exists()
     replay = mygithub10.commit_upload(service, "owner/repo", "feature", "head-1", "upload.txt", "", upload["upload_id"], "upload", "upload-key")
     assert replay["commit_sha"] == "upload-commit"

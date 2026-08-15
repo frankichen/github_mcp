@@ -128,19 +128,19 @@ def _ensure_non_overlapping(splices: list[tuple[int, int, int, dict[str, Any]]])
 
 def edit_ranges(client, repository: str, branch: str, expected_head_sha: str,
                 operations_json: str, commit_message: str, dry_run: bool,
-                idempotency_key: str = "") -> dict[str, Any]:
+                idempotency_key: str = "", audit_context: dict[str, Any] | None = None) -> dict[str, Any]:
     return _ORIGINAL_EDIT_RANGES(
         client, repository, branch, expected_head_sha, operations_json,
-        commit_message, dry_run, idempotency_key,
+        commit_message, dry_run, idempotency_key, audit_context,
     )
 
 
 def apply_patch(client, repository: str, branch: str, expected_head_sha: str,
                 expected_blob_shas_json: str, patch: str, commit_message: str,
-                dry_run: bool, idempotency_key: str = "") -> dict[str, Any]:
+                dry_run: bool, idempotency_key: str = "", audit_context: dict[str, Any] | None = None) -> dict[str, Any]:
     return _ORIGINAL_APPLY_PATCH(
         client, repository, branch, expected_head_sha, expected_blob_shas_json,
-        patch, commit_message, dry_run, idempotency_key,
+        patch, commit_message, dry_run, idempotency_key, audit_context,
     )
 
 

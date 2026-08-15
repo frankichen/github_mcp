@@ -93,6 +93,16 @@ class ValidationError(AppError):
         )
 
 
+class WriteVerifyError(AppError):
+    def __init__(self, message: str, details: Optional[dict] = None):
+        super().__init__(
+            error="write_verify_failed",
+            message=message,
+            status_code=409,
+            details=details or {},
+        )
+
+
 class GitHubApiError(AppError):
     def __init__(self, status_code: int, message: str):
         self.github_status = status_code

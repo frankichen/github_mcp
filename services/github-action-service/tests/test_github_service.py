@@ -349,12 +349,23 @@ class TestMultiFileCommit:
             mock_repo.create_git_commit.return_value = mock_commit
 
             mock_ref = MagicMock()
+            mock_ref.object.sha = "commit_sha_123"
             mock_repo.get_git_ref.return_value = mock_ref
 
-            readback_a = MagicMock(sha="blob1_sha", decoded_content=b"content a")
-            readback_b = MagicMock(sha="blob2_sha", decoded_content=b"content b")
+            parent_git_commit = MagicMock()
+            parent_git_commit.sha = "parent_sha"
+            verified_git_commit = MagicMock()
+            verified_git_commit.sha = "commit_sha_123"
+            verified_git_commit.tree.sha = "tree_sha"
+            mock_repo.get_git_commit.side_effect = lambda sha: verified_git_commit if sha == "commit_sha_123" else parent_git_commit
+
+            fresh_a = MagicMock(sha="blob1_sha", decoded_content=b"content a", size=9)
+            fresh_b = MagicMock(sha="blob2_sha", decoded_content=b"content b", size=9)
+            readback_a = MagicMock(sha="blob1_sha", decoded_content=b"content a", size=9)
+            readback_b = MagicMock(sha="blob2_sha", decoded_content=b"content b", size=9)
             mock_repo.get_contents.side_effect = [
-                MagicMock(sha="old_a"), MagicMock(sha="old_b"), readback_a, readback_b,
+                MagicMock(sha="old_a"), MagicMock(sha="old_b"),
+                fresh_a, fresh_b, readback_a, readback_b,
             ]
 
             mock_gh.get_repo.return_value = mock_repo

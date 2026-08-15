@@ -6,6 +6,7 @@ from github.GithubException import GithubException, UnknownObjectException
 
 from app.config import settings
 from app.github_client import GitHubClient
+from app.github_write_verify import WriteVerificationError, post_write_verify
 from app.github_policy import ensure_repository_allowed
 from app.exceptions import (
     RepositoryNotAllowedError,
@@ -17,6 +18,7 @@ from app.exceptions import (
     NotFoundError,
     ContentTooLargeError,
     ValidationError,
+    WriteVerifyError,
     GitHubApiError,
     RateLimitError,
     NotConfiguredError,
@@ -231,19 +233,58 @@ class GitHubService:
         )
 
         ref_name = f"refs/heads/{branch}"
-        self.client.update_ref(repository, ref_name, commit.sha, force=False)
+        try:
+            self.client.update_ref(repository, ref_name, commit.sha, force=False)
+        except Exception as exc:
+            observed_head = ""
+            try:
+                observed_head = self.client.get_branch_head_fresh(repository, branch) or ""
+            except Exception:
+                pass
+            if observed_head != commit.sha:
+                details = {
+                    "repository": repository,
+                    "branch": branch,
+                    "expected_previous_head": parent_sha,
+                    "new_commit_sha": commit.sha,
+                    "observed_branch_head": observed_head,
+                    "expected_tree_sha": tree.sha,
+                    "observed_tree_sha": "",
+                    "failed_stage": "branch_ref_update",
+                }
+                if observed_head and observed_head != parent_sha:
+                    raise HeadShaConflictError(expected=parent_sha, actual=observed_head) from exc
+                raise WriteVerifyError("GitHub branch ref update was not durably confirmed", details) from exc
+
+        expected_paths = {}
+        for f, element in zip(request.files, tree_elements):
+            expected_paths[f.path] = None if f.operation == "delete" else element["sha"]
+        try:
+            write_evidence = post_write_verify(
+                self.client, repository, branch, parent_sha, commit.sha, tree.sha, expected_paths
+            )
+        except WriteVerificationError as exc:
+            raise WriteVerifyError(exc.message, exc.details) from exc
 
         verified_files = []
         for f in request.files:
             if f.operation == "delete":
-                if self.client.get_file_sha(repository, f.path, commit.sha) is not None:
-                    raise ValidationError(f"Write verification failed: deleted file '{f.path}' is still present")
                 verified_files.append({"path": f.path, "operation": "delete", "old_blob_sha": old_shas[f.path], "new_blob_sha": None, "content_sha256": None, "size_bytes": 0})
                 continue
             actual_content, actual_sha, actual_size = self.client.get_file(repository, f.path, commit.sha)
-            if actual_content is None or actual_content.encode("utf-8") != f.content.encode("utf-8"):
-                raise ValidationError(f"Write verification failed: read-back bytes differ for '{f.path}'")
-            verified_files.append({"path": f.path, "operation": "modify" if old_shas[f.path] else "add", "old_blob_sha": old_shas[f.path], "new_blob_sha": actual_sha, "content_sha256": hashlib.sha256(f.content.encode("utf-8")).hexdigest(), "size_bytes": actual_size})
+            expected_content = f.content.encode("utf-8")
+            if actual_content is None or actual_sha != expected_paths[f.path] or actual_content.encode("utf-8") != expected_content:
+                raise WriteVerifyError(
+                    f"GitHub content read-back differs for '{f.path}'",
+                    {
+                        **write_evidence,
+                        "failed_stage": "path_content_readback",
+                        "path": f.path,
+                        "expected_blob_sha": expected_paths[f.path],
+                        "observed_blob_sha": actual_sha,
+                    },
+                )
+            verified_files.append({"path": f.path, "operation": "modify" if old_shas[f.path] else "add", "old_blob_sha": old_shas[f.path], "new_blob_sha": actual_sha, "content_sha256": hashlib.sha256(expected_content).hexdigest(), "size_bytes": actual_size})
 
         commit_url = f"https://github.com/{repository}/commit/{commit.sha}"
 
@@ -264,6 +305,7 @@ class GitHubService:
             "tree_sha": tree.sha,
             "operation_count": len(request.files),
             "pull_request": None,
+            **write_evidence,
         }
 
         pr_config = request.pull_request
