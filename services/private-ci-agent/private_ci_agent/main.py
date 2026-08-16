@@ -279,6 +279,7 @@ def _execute_job(job: Job, client, config: dict, workspace_mgr: WorkspaceManager
         sha256, size_bytes = download_source_archive(
             config["controller_url"], config["worker_id"], config["worker_token"],
             job_id, archive_path, max_source_bytes,
+            lease_token=job.lease_token,
             log_callback=upload_download_log,
         )
         download_elapsed = time.time() - download_start

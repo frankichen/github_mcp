@@ -36,7 +36,6 @@ def registration_body(**overrides):
 def patch_successful_registration():
     return patch.multiple(
         ci_worker,
-        recover_worker_jobs=lambda _worker_id: None,
         register_worker=lambda *_args: True,
     )
 
@@ -124,7 +123,7 @@ def test_register_worker_upsert_does_not_duplicate(tmp_path, monkeypatch):
 
 
 def test_register_storage_failure_is_503(client):
-    with patch.object(ci_worker, "recover_worker_jobs"), patch.object(ci_worker, "register_worker", return_value=False):
+    with patch.object(ci_worker, "register_worker", return_value=False):
         response = client.post("/internal/ci/workers/register", json=registration_body())
     assert response.status_code == 503
     assert response.json()["detail"]["error"] == "worker_registration_unavailable"
@@ -229,23 +228,15 @@ def test_heartbeat_renews_lease_with_body_lease_token_not_worker_auth(client, mo
     assert renewed_with == [("job-lease-1", "job-lease-secret")]
 
 
-def test_heartbeat_falls_back_to_auth_when_lease_token_missing(client, monkeypatch):
-    """Legacy workers that do not send lease_token keep the old fallback."""
-    from app.routers import ci_worker
-
-    renewed_with = []
-
+def test_heartbeat_without_job_lease_token_marks_attempt_stale(client, monkeypatch):
+    """Worker auth cannot substitute for the per-job lease credential."""
     async def accept(_request):
         return "wsl-ci-test"
 
-    def fake_renew_lease(job_id, lease_token):
-        renewed_with.append((job_id, lease_token))
-        return True
-
+    renewed_with = []
     monkeypatch.setattr(ci_worker, "verify_ci_worker", accept)
     monkeypatch.setattr(ci_worker, "update_worker_heartbeat", lambda _worker_id: None)
-    monkeypatch.setattr(ci_worker, "renew_lease", fake_renew_lease)
-    monkeypatch.setattr(ci_worker, "need_heartbeat", lambda _job_id: False)
+    monkeypatch.setattr(ci_worker, "renew_lease", lambda *args: renewed_with.append(args))
 
     response = client.post(
         "/internal/ci/workers/heartbeat",
@@ -254,4 +245,7 @@ def test_heartbeat_falls_back_to_auth_when_lease_token_missing(client, monkeypat
     )
 
     assert response.status_code == 200
-    assert renewed_with == [("job-lease-2", "worker-token")]
+    assert renewed_with == []
+    assert response.json()["lease_renewed"] is False
+    assert response.json()["cancel_requested"] is True
+    assert response.json()["stale_lease"] is True

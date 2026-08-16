@@ -109,6 +109,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS ci_job_steps (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_id TEXT NOT NULL,
+            attempt_number INTEGER NOT NULL DEFAULT 0,
             step_name TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
             exit_code INTEGER,
@@ -125,6 +126,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS ci_job_log_chunks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_id TEXT NOT NULL,
+            attempt_number INTEGER NOT NULL DEFAULT 0,
             chunk_index INTEGER NOT NULL,
             offset_from INTEGER NOT NULL,
             offset_to INTEGER NOT NULL,
@@ -147,6 +149,12 @@ def init_db():
             queued_jobs INTEGER NOT NULL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS ci_controller_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS ci_job_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_id TEXT NOT NULL,
@@ -167,6 +175,17 @@ def init_db():
         db.execute("ALTER TABLE ci_jobs ADD COLUMN changed_files_truncated INTEGER NOT NULL DEFAULT 0")
     if "performance_json" not in columns:
         db.execute("ALTER TABLE ci_jobs ADD COLUMN performance_json TEXT NOT NULL DEFAULT '{}'")
+    step_columns = {row[1] for row in db.execute("PRAGMA table_info(ci_job_steps)").fetchall()}
+    if "attempt_number" not in step_columns:
+        db.execute("ALTER TABLE ci_job_steps ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 0")
+    log_columns = {row[1] for row in db.execute("PRAGMA table_info(ci_job_log_chunks)").fetchall()}
+    if "attempt_number" not in log_columns:
+        db.execute("ALTER TABLE ci_job_log_chunks ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 0")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_ci_job_log_chunks_attempt ON ci_job_log_chunks(job_id, attempt_number, chunk_index)")
+    db.execute(
+        "INSERT OR IGNORE INTO ci_controller_state (key, value, updated_at) VALUES ('draining', '0', ?)",
+        (now_ts(),),
+    )
     db.commit()
 
 
@@ -191,7 +210,7 @@ def register_worker(worker_id: str, token: str, profiles: list[str], max_concurr
                max_concurrent=excluded.max_concurrent,
                last_heartbeat=excluded.last_heartbeat,
                registered_at=registered_at,
-               status='idle'""",
+               status=CASE WHEN ci_workers.current_job_id IS NULL THEN 'idle' ELSE ci_workers.status END""",
             (worker_id, token_hash, profiles_json, max_concurrent, ts, ts),
         )
         db.commit()
@@ -245,6 +264,22 @@ def get_worker(worker_id: str) -> Optional[dict]:
     if not row:
         return None
     return _worker_row_to_dict(row, now_ts())
+
+
+def get_current_lease_attempt(job_id: str, worker_id: str, lease_token: str) -> Optional[int]:
+    """Return the current attempt only when the worker holds an unexpired live lease."""
+    if not lease_token:
+        return None
+    db = _get_db()
+    token_hash = hashlib.sha256(lease_token.encode()).hexdigest()
+    row = db.execute(
+        """SELECT attempts FROM ci_jobs
+           WHERE job_id = ? AND worker_id = ? AND lease_token_hash = ?
+           AND status IN ('leased', 'downloading', 'preparing', 'running')
+           AND lease_expires_at >= ?""",
+        (job_id, worker_id, token_hash, now_ts()),
+    ).fetchone()
+    return int(row["attempts"]) if row else None
 
 
 def _worker_row_to_dict(row, ts) -> dict:
@@ -428,7 +463,7 @@ def _job_snapshot(job_id: str) -> dict:
     job = get_job(job_id)
     if not job:
         return {"status": "not_found", "current_step": None, "revision": 0}
-    steps = get_steps(job_id)
+    steps = get_steps(job_id, job.get("attempts") or None)
     current = next((s["step_name"] for s in steps if s["status"] == "running"), None)
     db = _get_db()
     revision = db.execute(
@@ -460,7 +495,7 @@ def wait_for_job_change(job_id: str, timeout_seconds: int = 55, last_known_statu
     job = get_job(job_id)
     if not job:
         return {"ok": False, "error": {"code": "PRIVATE_CI_JOB_NOT_FOUND", "message": "Job not found", "details": {}}}
-    steps = get_steps(job_id)
+    steps = get_steps(job_id, job.get("attempts") or None)
     current = next((s["step_name"] for s in steps if s["status"] == "running"), None)
     snapshot = _job_snapshot(job_id)
     elapsed = round(time.monotonic() - started, 3)
@@ -510,6 +545,55 @@ def list_jobs(
     params.append(limit)
     rows = db.execute(query, params).fetchall()
     return [_job_row_to_dict(r, db) for r in rows]
+
+
+def set_controller_draining(draining: bool) -> dict:
+    """Atomically enable or disable the no-new-leases controller drain gate."""
+    db = _get_db()
+    with _db_write_lock:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            """INSERT INTO ci_controller_state (key, value, updated_at) VALUES ('draining', ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+            ("1" if draining else "0", now_ts()),
+        )
+        db.commit()
+    return get_controller_drain_status()
+
+
+def is_controller_draining(db=None) -> bool:
+    db = db or _get_db()
+    row = db.execute("SELECT value FROM ci_controller_state WHERE key = 'draining'").fetchone()
+    return bool(row and row["value"] == "1")
+
+
+def get_controller_drain_status() -> dict:
+    """Return whether the controller can restart without orphaning a live CI lease."""
+    db = _get_db()
+    active_statuses = ("leased", "downloading", "preparing", "running")
+    placeholders = ",".join("?" for _ in active_statuses)
+    rows = db.execute(
+        f"SELECT job_id, repository, branch, commit_sha, profile, status, worker_id, attempts, started_at, lease_expires_at FROM ci_jobs WHERE status IN ({placeholders}) ORDER BY created_at",
+        active_statuses,
+    ).fetchall()
+    active_jobs = [{
+        "job_id": row["job_id"],
+        "repository": row["repository"],
+        "branch": row["branch"],
+        "commit_sha": row["commit_sha"],
+        "profile": row["profile"],
+        "status": row["status"],
+        "worker_id": row["worker_id"],
+        "attempt_number": row["attempts"],
+        "started_at": datetime.fromtimestamp(row["started_at"], tz=timezone.utc).isoformat() if row["started_at"] else None,
+        "lease_expires_at": datetime.fromtimestamp(row["lease_expires_at"], tz=timezone.utc).isoformat() if row["lease_expires_at"] else None,
+    } for row in rows]
+    return {
+        "draining": is_controller_draining(db),
+        "safe_to_restart": not active_jobs,
+        "active_job_count": len(active_jobs),
+        "active_jobs": active_jobs,
+    }
 
 
 def get_monitor_snapshot(active_limit: int = 50, recent_limit: int = 20) -> dict:
@@ -571,7 +655,7 @@ def get_monitor_snapshot(active_limit: int = 50, recent_limit: int = 20) -> dict
 
 def _monitor_job_row_to_dict(row, db, ts: float) -> dict:
     job = _job_row_to_dict(row, db)
-    steps = get_steps(row["job_id"])
+    steps = get_steps(row["job_id"], row["attempts"] or None)
     running_step_index = None
     current_step = None
     current_step_elapsed_seconds = None
@@ -664,6 +748,10 @@ def lease_job(worker_id: str, supported_profiles: list[str], max_concurrent: int
     try:
         db.execute("BEGIN IMMEDIATE")
 
+        if is_controller_draining(db):
+            db.execute("ROLLBACK")
+            return None
+
         # Check worker concurrency
         running_count = db.execute(
             "SELECT COUNT(*) FROM ci_jobs WHERE worker_id = ? AND status IN ('leased', 'downloading', 'preparing', 'running')",
@@ -705,20 +793,21 @@ def lease_job(worker_id: str, supported_profiles: list[str], max_concurrent: int
         job_id = rows["job_id"]
         repository = rows["repository"]
 
-        db.execute(
+        attempt_number = int(rows["attempts"]) + 1
+        cursor = db.execute(
             """UPDATE ci_jobs SET status = 'leased', worker_id = ?, lease_token_hash = ?, lease_expires_at = ?,
-               attempts = attempts + 1, started_at = ?
+               attempts = attempts + 1, started_at = COALESCE(started_at, ?)
                WHERE job_id = ? AND status = 'queued'""",
             (worker_id, lease_token_hash, lease_expires, ts, job_id),
         )
 
-        if db.total_changes == 0:
+        if cursor.rowcount != 1:
             db.execute("ROLLBACK")
             return None
 
         _upsert_repo_queue_state(db, repository, queued_delta=-1, running_delta=1, last_dispatched_at=ts)
         set_worker_busy(worker_id, job_id)
-        _add_event(db, job_id, "leased", json.dumps({"worker_id": worker_id}))
+        _add_event(db, job_id, "leased", json.dumps({"worker_id": worker_id, "attempt_number": attempt_number}))
 
         db.commit()
 
@@ -733,6 +822,7 @@ def lease_job(worker_id: str, supported_profiles: list[str], max_concurrent: int
             "changed_files_truncated": bool(rows["changed_files_truncated"]),
             "profile": rows["profile"],
             "timeout_seconds": rows["timeout_seconds"],
+            "attempt_number": attempt_number,
             "lease_token": lease_token,
             "lease_expires_at": datetime.fromtimestamp(lease_expires, tz=timezone.utc).isoformat(),
         }
@@ -769,68 +859,107 @@ def _upsert_repo_queue_state(db, repository: str, queued_delta: int = 0, running
         )
 
 
-def complete_job(job_id: str, exit_code: int, status: str, summary: Optional[dict] = None, error_code: Optional[str] = None, error_message: Optional[str] = None):
+_ACTIVE_LEASE_STATUSES = ('leased', 'downloading', 'preparing', 'running')
+
+
+def _lease_matches(row, worker_id: Optional[str], lease_token: Optional[str], attempt_number: Optional[int], ts: float) -> bool:
+    if worker_id is None and lease_token is None and attempt_number is None:
+        return True
+    if not row or row["status"] not in _ACTIVE_LEASE_STATUSES:
+        return False
+    if not worker_id or row["worker_id"] != worker_id or not lease_token:
+        return False
+    if row["lease_token_hash"] != hashlib.sha256(lease_token.encode()).hexdigest():
+        return False
+    if attempt_number is None or int(row["attempts"]) != int(attempt_number):
+        return False
+    return bool(row["lease_expires_at"] and row["lease_expires_at"] >= ts)
+
+
+def complete_job(job_id: str, exit_code: int, status: str, summary: Optional[dict] = None, error_code: Optional[str] = None, error_message: Optional[str] = None, *, expected_worker_id: Optional[str] = None, expected_lease_token: Optional[str] = None, expected_attempt_number: Optional[int] = None) -> bool:
     db = _get_db()
     ts = now_ts()
-
-    row = db.execute("SELECT * FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
-    if not row:
-        return
-
-    started = row["started_at"]
-    duration = ts - started if started else 0
-
-    summary_json = json.dumps(summary) if summary else None
-
-    db.execute(
-        """UPDATE ci_jobs SET status = ?, exit_code = ?, summary_json = ?, finished_at = ?, duration_seconds = ?,
-           error_code = ?, error_message = ?, lease_token_hash = NULL, lease_expires_at = NULL, worker_id = NULL
-           WHERE job_id = ?""",
-        (status, exit_code, summary_json, ts, duration, error_code, error_message, job_id),
-    )
-
-    repo = row["repository"]
-    _upsert_repo_queue_state(db, repo, running_delta=-1)
-    _add_event(db, job_id, "completed", json.dumps({"status": status, "exit_code": exit_code}))
-    db.commit()
+    with _db_write_lock:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            row = db.execute("SELECT * FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if not row or not _lease_matches(row, expected_worker_id, expected_lease_token, expected_attempt_number, ts):
+                db.execute("ROLLBACK")
+                return False
+            started = row["started_at"]
+            duration = ts - started if started else 0
+            summary_json = json.dumps(summary) if summary else None
+            cursor = db.execute(
+                """UPDATE ci_jobs SET status = ?, exit_code = ?, summary_json = ?, finished_at = ?, duration_seconds = ?,
+                   error_code = ?, error_message = ?, lease_token_hash = NULL, lease_expires_at = NULL, worker_id = NULL
+                   WHERE job_id = ?""",
+                (status, exit_code, summary_json, ts, duration, error_code, error_message, job_id),
+            )
+            if cursor.rowcount != 1:
+                db.execute("ROLLBACK")
+                return False
+            _upsert_repo_queue_state(db, row["repository"], running_delta=-1)
+            _add_event(db, job_id, "completed", json.dumps({"status": status, "exit_code": exit_code, "attempt_number": row["attempts"]}))
+            db.commit()
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
     _notify_job_change(job_id)
+    return True
 
 
 def request_cancel_job(job_id: str) -> bool:
     db = _get_db()
-    db.execute("UPDATE ci_jobs SET cancel_requested = 1 WHERE job_id = ? AND status IN ('queued', 'leased', 'downloading', 'preparing', 'running')", (job_id,))
-    if db.total_changes > 0:
+    cursor = db.execute("UPDATE ci_jobs SET cancel_requested = 1 WHERE job_id = ? AND status IN ('queued', 'leased', 'downloading', 'preparing', 'running')", (job_id,))
+    if cursor.rowcount == 1:
         _add_event(db, job_id, "cancel_requested", "{}")
         db.commit()
         _notify_job_change(job_id)
         return True
+    db.commit()
     return False
 
 
 def cancel_queued_job(job_id: str) -> bool:
     db = _get_db()
-    db.execute(
+    cursor = db.execute(
         "UPDATE ci_jobs SET status = 'cancelled', finished_at = ? WHERE job_id = ? AND status = 'queued'",
         (now_ts(), job_id),
     )
-    if db.total_changes > 0:
+    if cursor.rowcount == 1:
         _add_event(db, job_id, "cancelled", "{}")
         db.commit()
         _notify_job_change(job_id)
         return True
+    db.commit()
     return False
 
 
-def release_job(job_id: str):
+def release_job(job_id: str, *, expected_worker_id: Optional[str] = None, expected_lease_token: Optional[str] = None, expected_attempt_number: Optional[int] = None) -> bool:
     db = _get_db()
-    row = db.execute("SELECT * FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
-    if not row:
-        return
-    db.execute("UPDATE ci_jobs SET status = 'queued', worker_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL WHERE job_id = ?", (job_id,))
-    _upsert_repo_queue_state(db, row["repository"], queued_delta=1, running_delta=-1)
-    _add_event(db, job_id, "released", "{}")
-    db.commit()
+    ts = now_ts()
+    with _db_write_lock:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            row = db.execute("SELECT * FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if not row or not _lease_matches(row, expected_worker_id, expected_lease_token, expected_attempt_number, ts):
+                db.execute("ROLLBACK")
+                return False
+            cursor = db.execute(
+                "UPDATE ci_jobs SET status = 'queued', worker_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL WHERE job_id = ?",
+                (job_id,),
+            )
+            if cursor.rowcount != 1:
+                db.execute("ROLLBACK")
+                return False
+            _upsert_repo_queue_state(db, row["repository"], queued_delta=1, running_delta=-1)
+            _add_event(db, job_id, "released", json.dumps({"attempt_number": row["attempts"]}))
+            db.commit()
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
     _notify_job_change(job_id)
+    return True
 
 
 def renew_lease(job_id: str, lease_token: str) -> bool:
@@ -838,14 +967,14 @@ def renew_lease(job_id: str, lease_token: str) -> bool:
     expected_hash = hashlib.sha256(lease_token.encode()).hexdigest()
     ts = now_ts()
     with _db_write_lock:
-        db.execute(
-            "UPDATE ci_jobs SET lease_expires_at = ? WHERE job_id = ? AND lease_token_hash = ?",
-            (ts + 120, job_id, expected_hash),
+        cursor = db.execute(
+            """UPDATE ci_jobs SET lease_expires_at = ?
+               WHERE job_id = ? AND lease_token_hash = ?
+               AND status IN ('leased', 'downloading', 'preparing', 'running')
+               AND lease_expires_at >= ?""",
+            (ts + 120, job_id, expected_hash, ts),
         )
-        changed = db.total_changes > 0
-        # This endpoint is called by every Worker heartbeat.  Leaving this
-        # UPDATE uncommitted keeps a write transaction open on the thread-local
-        # SQLite connection and blocks registration/job creation in others.
+        changed = cursor.rowcount == 1
         db.commit()
     return changed
 
@@ -913,68 +1042,81 @@ def set_job_source_info(job_id: str, sha256: str, size_bytes: int):
 
 ### LOGS
 
-def append_log_chunk(job_id: str, content: str) -> int:
+def append_log_chunk(job_id: str, content: str, attempt_number: int = 0) -> int:
     db = _get_db()
+    attempt_number = int(attempt_number)
     current_offset = db.execute(
-        "SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id = ?", (job_id,)
+        "SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id = ? AND attempt_number = ?",
+        (job_id, attempt_number),
     ).fetchone()[0] or 0
 
     chunk_index = db.execute(
-        "SELECT COALESCE(MAX(chunk_index), -1) + 1 FROM ci_job_log_chunks WHERE job_id = ?", (job_id,)
+        "SELECT COALESCE(MAX(chunk_index), -1) + 1 FROM ci_job_log_chunks WHERE job_id = ? AND attempt_number = ?",
+        (job_id, attempt_number),
     ).fetchone()[0]
 
     content_len = len(content)
     new_offset = current_offset + content_len
 
     db.execute(
-        "INSERT INTO ci_job_log_chunks (job_id, chunk_index, offset_from, offset_to, content, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (job_id, chunk_index, current_offset, new_offset, content, now_ts()),
+        "INSERT INTO ci_job_log_chunks (job_id, attempt_number, chunk_index, offset_from, offset_to, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (job_id, attempt_number, chunk_index, current_offset, new_offset, content, now_ts()),
     )
     db.execute(
         "UPDATE ci_jobs SET log_total_bytes = log_total_bytes + ? WHERE job_id = ?",
         (content_len, job_id),
     )
-    _add_event(db, job_id, "log_revision", json.dumps({"bytes": content_len}))
+    _add_event(db, job_id, "log_revision", json.dumps({"bytes": content_len, "attempt_number": attempt_number}))
     db.commit()
     _notify_job_change(job_id)
     return new_offset
 
 
-def append_log_batch(job_id: str, batch_id: str, content: str) -> tuple[int, bool]:
+def append_log_batch(job_id: str, batch_id: str, content: str, attempt_number: int = 0) -> tuple[int, bool]:
     db = _get_db()
     if not batch_id or not content:
         return 0, True
-    row = db.execute("SELECT 1 FROM ci_job_log_batches WHERE job_id=? AND batch_id=?", (job_id, batch_id)).fetchone()
+    attempt_number = int(attempt_number)
+    scoped_batch_id = f"{attempt_number}:{batch_id}"
+    row = db.execute("SELECT 1 FROM ci_job_log_batches WHERE job_id=? AND batch_id=?", (job_id, scoped_batch_id)).fetchone()
     if row:
-        offset = db.execute("SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id=?", (job_id,)).fetchone()[0] or 0
+        offset = db.execute("SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id=? AND attempt_number=?", (job_id, attempt_number)).fetchone()[0] or 0
         return offset, True
-    current_offset = db.execute("SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id = ?", (job_id,)).fetchone()[0] or 0
-    chunk_index = db.execute("SELECT COALESCE(MAX(chunk_index), -1) + 1 FROM ci_job_log_chunks WHERE job_id = ?", (job_id,)).fetchone()[0]
+    current_offset = db.execute("SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id = ? AND attempt_number = ?", (job_id, attempt_number)).fetchone()[0] or 0
+    chunk_index = db.execute("SELECT COALESCE(MAX(chunk_index), -1) + 1 FROM ci_job_log_chunks WHERE job_id = ? AND attempt_number = ?", (job_id, attempt_number)).fetchone()[0]
     new_offset = current_offset + len(content)
     now = now_ts()
-    db.execute("INSERT INTO ci_job_log_batches(job_id,batch_id,created_at) VALUES(?,?,?)", (job_id, batch_id, now))
-    db.execute("INSERT INTO ci_job_log_chunks(job_id,chunk_index,offset_from,offset_to,content,created_at) VALUES(?,?,?,?,?,?)", (job_id, chunk_index, current_offset, new_offset, content, now))
+    db.execute("INSERT INTO ci_job_log_batches(job_id,batch_id,created_at) VALUES(?,?,?)", (job_id, scoped_batch_id, now))
+    db.execute("INSERT INTO ci_job_log_chunks(job_id,attempt_number,chunk_index,offset_from,offset_to,content,created_at) VALUES(?,?,?,?,?,?,?)", (job_id, attempt_number, chunk_index, current_offset, new_offset, content, now))
     db.execute("UPDATE ci_jobs SET log_total_bytes=log_total_bytes+? WHERE job_id=?", (len(content), job_id))
-    _add_event(db, job_id, "log_revision", json.dumps({"bytes": len(content), "batch_id": batch_id}))
+    _add_event(db, job_id, "log_revision", json.dumps({"bytes": len(content), "batch_id": batch_id, "attempt_number": attempt_number}))
     db.commit(); _notify_job_change(job_id)
     return new_offset, False
 
 
-def get_log_chunks(job_id: str, offset: int = 0, limit: int = 50) -> dict:
+def get_log_chunks(job_id: str, offset: int = 0, limit: int = 50, attempt_number: Optional[int] = None) -> dict:
     db = _get_db()
-    job = db.execute("SELECT log_total_bytes, log_truncated FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
+    job = db.execute("SELECT attempts, log_truncated FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
     if not job:
-        return {"job_id": job_id, "chunks": [], "next_offset": None, "total_bytes": 0, "truncated": False}
+        return {"job_id": job_id, "attempt_number": None, "chunks": [], "next_offset": None, "total_bytes": 0, "truncated": False}
+
+    selected_attempt = int(job["attempts"] if attempt_number is None else attempt_number)
+    has_selected = db.execute("SELECT 1 FROM ci_job_log_chunks WHERE job_id=? AND attempt_number=? LIMIT 1", (job_id, selected_attempt)).fetchone()
+    if not has_selected and selected_attempt != 0:
+        legacy = db.execute("SELECT 1 FROM ci_job_log_chunks WHERE job_id=? AND attempt_number=0 LIMIT 1", (job_id,)).fetchone()
+        if legacy:
+            selected_attempt = 0
 
     rows = db.execute(
-        "SELECT * FROM ci_job_log_chunks WHERE job_id = ? AND offset_from >= ? ORDER BY chunk_index LIMIT ?",
-        (job_id, offset, limit),
+        "SELECT * FROM ci_job_log_chunks WHERE job_id = ? AND attempt_number = ? AND offset_from >= ? ORDER BY chunk_index LIMIT ?",
+        (job_id, selected_attempt, offset, limit),
     ).fetchall()
 
     chunks = []
     next_offset = None
     for r in rows:
         chunks.append({
+            "attempt_number": r["attempt_number"],
             "chunk_index": r["chunk_index"],
             "offset_from": r["offset_from"],
             "offset_to": r["offset_to"],
@@ -982,33 +1124,46 @@ def get_log_chunks(job_id: str, offset: int = 0, limit: int = 50) -> dict:
         })
         next_offset = r["offset_to"]
 
+    last_index = rows[-1]["chunk_index"] if rows else -1
     has_more = db.execute(
-        "SELECT COUNT(*) FROM ci_job_log_chunks WHERE job_id = ? AND chunk_index > ?",
-        (job_id, rows[-1]["chunk_index"] if rows else 0),
+        "SELECT COUNT(*) FROM ci_job_log_chunks WHERE job_id = ? AND attempt_number = ? AND chunk_index > ?",
+        (job_id, selected_attempt, last_index),
     ).fetchone()[0] > 0
+    total_bytes = db.execute(
+        "SELECT COALESCE(MAX(offset_to), 0) FROM ci_job_log_chunks WHERE job_id = ? AND attempt_number = ?",
+        (job_id, selected_attempt),
+    ).fetchone()[0]
 
     return {
         "job_id": job_id,
+        "attempt_number": selected_attempt,
         "chunks": chunks,
         "next_offset": next_offset if has_more else None,
-        "total_bytes": job["log_total_bytes"],
+        "total_bytes": total_bytes,
         "truncated": bool(job["log_truncated"]),
     }
 
 
-def get_log_tail(job_id: str, lines: int = 100, max_scan_bytes: int = 4 * 1024 * 1024) -> dict:
-    """Read backwards by chunk and stop only after enough complete newlines."""
+def get_log_tail(job_id: str, lines: int = 100, max_scan_bytes: int = 4 * 1024 * 1024, attempt_number: Optional[int] = None) -> dict:
+    """Read backwards from only the selected lease attempt."""
     db = _get_db()
-    row = db.execute("SELECT status, log_total_bytes, log_truncated FROM ci_jobs WHERE job_id=?", (job_id,)).fetchone()
+    row = db.execute("SELECT status, attempts, log_truncated FROM ci_jobs WHERE job_id=?", (job_id,)).fetchone()
     if not row:
-        return {"job_id": job_id, "status": None, "last_sequence": None, "requested_lines": lines, "returned_lines": 0, "total_bytes": 0, "bytes_scanned": 0, "first_line_partial": False, "max_bytes_reached": False, "truncated": False, "lines": []}
+        return {"job_id": job_id, "status": None, "attempt_number": None, "last_sequence": None, "requested_lines": lines, "returned_lines": 0, "total_bytes": 0, "bytes_scanned": 0, "first_line_partial": False, "max_bytes_reached": False, "truncated": False, "lines": []}
+    selected_attempt = int(row["attempts"] if attempt_number is None else attempt_number)
+    has_selected = db.execute("SELECT 1 FROM ci_job_log_chunks WHERE job_id=? AND attempt_number=? LIMIT 1", (job_id, selected_attempt)).fetchone()
+    if not has_selected and selected_attempt != 0:
+        legacy = db.execute("SELECT 1 FROM ci_job_log_chunks WHERE job_id=? AND attempt_number=0 LIMIT 1", (job_id,)).fetchone()
+        if legacy:
+            selected_attempt = 0
+    total_bytes = db.execute("SELECT COALESCE(MAX(offset_to), 0) FROM ci_job_log_chunks WHERE job_id=? AND attempt_number=?", (job_id, selected_attempt)).fetchone()[0]
     lines = min(max(int(lines), 1), 1000)
     max_scan_bytes = min(max(int(max_scan_bytes), 1), 64 * 1024 * 1024)
     collected, scanned, cursor, last_sequence = [], 0, None, None
     newline_count = 0
     while scanned < max_scan_bytes:
-        params = [job_id] if cursor is None else [job_id, cursor]
-        where = "job_id=?" if cursor is None else "job_id=? AND chunk_index<?"
+        params = [job_id, selected_attempt] if cursor is None else [job_id, selected_attempt, cursor]
+        where = "job_id=? AND attempt_number=?" if cursor is None else "job_id=? AND attempt_number=? AND chunk_index<?"
         batch = db.execute(f"SELECT chunk_index, content FROM ci_job_log_chunks WHERE {where} ORDER BY chunk_index DESC LIMIT 100", params).fetchall()
         if not batch: break
         if last_sequence is None: last_sequence = batch[0]["chunk_index"]
@@ -1025,37 +1180,42 @@ def get_log_tail(job_id: str, lines: int = 100, max_scan_bytes: int = 4 * 1024 *
     content = "".join(reversed(collected)); all_lines = content.splitlines()
     first_partial = bool(collected and cursor is not None and newline_count < lines + 1 and scanned >= max_scan_bytes)
     tail = all_lines[-lines:]
-    return {"job_id": job_id, "status": row["status"], "last_sequence": last_sequence, "requested_lines": lines, "returned_lines": len(tail), "total_bytes": row["log_total_bytes"], "bytes_scanned": scanned, "first_line_partial": first_partial, "max_bytes_reached": scanned >= max_scan_bytes, "truncated": bool(row["log_truncated"]), "lines": tail}
+    return {"job_id": job_id, "status": row["status"], "attempt_number": selected_attempt, "last_sequence": last_sequence, "requested_lines": lines, "returned_lines": len(tail), "total_bytes": total_bytes, "bytes_scanned": scanned, "first_line_partial": first_partial, "max_bytes_reached": scanned >= max_scan_bytes, "truncated": bool(row["log_truncated"]), "lines": tail}
 
 
 ### STEPS
 
-def add_step(job_id: str, step_name: str, status: str = "pending") -> int:
+def add_step(job_id: str, step_name: str, status: str = "pending", attempt_number: int = 0) -> int:
     db = _get_db()
     ts = now_ts()
     cursor = db.execute(
-        "INSERT INTO ci_job_steps (job_id, step_name, status, started_at) VALUES (?, ?, ?, ?)",
-        (job_id, step_name, status, ts if status == "running" else None),
+        "INSERT INTO ci_job_steps (job_id, attempt_number, step_name, status, started_at) VALUES (?, ?, ?, ?, ?)",
+        (job_id, int(attempt_number), step_name, status, ts if status == "running" else None),
     )
     db.commit()
     _notify_job_change(job_id)
     return cursor.lastrowid
 
 
-def finish_step(step_id: int, status: str, exit_code: Optional[int] = None, log_end_offset: Optional[int] = None):
+def finish_step(step_id: int, status: str, exit_code: Optional[int] = None, log_end_offset: Optional[int] = None, *, job_id: Optional[str] = None, attempt_number: Optional[int] = None) -> bool:
     db = _get_db()
     ts = now_ts()
-    row = db.execute("SELECT job_id, step_name, started_at FROM ci_job_steps WHERE id = ?", (step_id,)).fetchone()
-    duration = ts - row["started_at"] if row and row["started_at"] else 0
+    row = db.execute("SELECT job_id, attempt_number, step_name, started_at FROM ci_job_steps WHERE id = ?", (step_id,)).fetchone()
+    if not row:
+        return False
+    if job_id is not None and row["job_id"] != job_id:
+        return False
+    if attempt_number is not None and int(row["attempt_number"]) != int(attempt_number):
+        return False
+    duration = ts - row["started_at"] if row["started_at"] else 0
     db.execute(
         "UPDATE ci_job_steps SET status = ?, exit_code = ?, finished_at = ?, duration_seconds = ?, log_end_offset = COALESCE(?, log_end_offset) WHERE id = ?",
         (status, exit_code, ts, duration, log_end_offset, step_id),
     )
-    if row:
-        _add_event(db, row["job_id"], "step_completed", json.dumps({"step_id": step_id, "step_name": row["step_name"], "status": status}))
+    _add_event(db, row["job_id"], "step_completed", json.dumps({"step_id": step_id, "step_name": row["step_name"], "status": status, "attempt_number": row["attempt_number"]}))
     db.commit()
-    if row:
-        _notify_job_change(row["job_id"])
+    _notify_job_change(row["job_id"])
+    return True
 
 
 def _newly_completed_steps(job_id: str, last_known_revision: int) -> list[dict]:
@@ -1074,11 +1234,17 @@ def _newly_completed_steps(job_id: str, last_known_revision: int) -> list[dict]:
     return result
 
 
-def get_steps(job_id: str) -> list[dict]:
+def get_steps(job_id: str, attempt_number: Optional[int] = None) -> list[dict]:
     db = _get_db()
-    rows = db.execute("SELECT * FROM ci_job_steps WHERE job_id = ? ORDER BY id", (job_id,)).fetchall()
+    if attempt_number is None:
+        rows = db.execute("SELECT * FROM ci_job_steps WHERE job_id = ? ORDER BY id", (job_id,)).fetchall()
+    else:
+        rows = db.execute("SELECT * FROM ci_job_steps WHERE job_id = ? AND attempt_number = ? ORDER BY id", (job_id, int(attempt_number))).fetchall()
+        if not rows:
+            rows = db.execute("SELECT * FROM ci_job_steps WHERE job_id = ? AND attempt_number = 0 ORDER BY id", (job_id,)).fetchall()
     return [
         {
+            "attempt_number": r["attempt_number"],
             "step_name": r["step_name"],
             "status": r["status"],
             "exit_code": r["exit_code"],
