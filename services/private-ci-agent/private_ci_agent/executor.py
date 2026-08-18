@@ -430,7 +430,7 @@ class JobExecutor:
                 check["command"],
                 service_env,
                 extra_env=extra_env,
-                pass_proxy=(workspace["stack"] == "python"),
+                pass_proxy=False,
             )
             steps.append(step)
             if step["exit_code"] != 0:
