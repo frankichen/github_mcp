@@ -317,7 +317,10 @@ class PodmanRunner:
             "-c", " && ".join(commands),
         ]
 
-        env_vars = {key: value for key, value in (env or {}).items() if key not in PROXY_ENV_NAMES}
+        env_vars = {
+            key: value for key, value in (env or {}).items()
+            if key not in PROXY_ENV_NAMES and key not in PIP_CONTROL_ENV_NAMES
+        }
         try:
             proxy_env = self._container_proxy_env() if pass_proxy else {}
         except ValueError:
