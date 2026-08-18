@@ -77,6 +77,36 @@ class PodmanRunner:
         return {"NO_PROXY": merged, "no_proxy": merged}
 
     @staticmethod
+    def _controlled_pip_env() -> dict[str, str]:
+        """Forward only operator-controlled, non-credentialed pip mirror settings."""
+        result = {}
+        index_url = os.environ.get("PIP_INDEX_URL", "").strip()
+        if index_url:
+            try:
+                parsed = urlsplit(index_url)
+            except ValueError:
+                parsed = None
+            if (
+                parsed is not None
+                and parsed.scheme in {"http", "https"}
+                and parsed.hostname
+                and parsed.username is None
+                and parsed.password is None
+            ):
+                result["PIP_INDEX_URL"] = index_url
+            else:
+                logger.warning("Ignoring invalid or credentialed PIP_INDEX_URL")
+
+        trusted_host = os.environ.get("PIP_TRUSTED_HOST", "").strip()
+        if trusted_host:
+            hosts = trusted_host.split()
+            if hosts and all(PIP_TRUSTED_HOST_RE.fullmatch(host) for host in hosts):
+                result["PIP_TRUSTED_HOST"] = trusted_host
+            else:
+                logger.warning("Ignoring invalid PIP_TRUSTED_HOST")
+        return result
+
+    @staticmethod
     def _ensure_cache_dir(cache_path: str) -> bool:
         try:
             os.makedirs(cache_path, mode=0o700, exist_ok=True)
