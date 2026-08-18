@@ -80,7 +80,7 @@ def test_pip_cache_uses_operator_controlled_index(monkeypatch, tmp_path):
 
 def test_credentialed_pip_index_is_not_forwarded(monkeypatch):
     monkeypatch.setenv("PIP_INDEX_URL", "https://user:secret@example.com/simple")
-    monkeypatch.setenv("PIP_TRUSTED_HOST", "bad host")
+    monkeypatch.setenv("PIP_TRUSTED_HOST", "bad/host")
 
     assert PodmanRunner._controlled_pip_env() == {}
 
