@@ -178,6 +178,8 @@ def test_python_checks_stay_network_isolated_without_proxy(tmp_path):
     for _, _, options in podman.calls[1:]:
         assert options["network"] is False
         assert options["pass_proxy"] is False
+        assert options["env"]["CI_COMMIT_SHA"] == "a" * 40
+        assert options["env"]["CI_REPOSITORY_ROOT"] == "/repo"
 
 
 def test_python_venv_is_scoped_by_workspace_identity(tmp_path):

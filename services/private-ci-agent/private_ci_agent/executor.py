@@ -464,6 +464,8 @@ class JobExecutor:
         env = self._service_env(service_env) or {}
         if extra_env:
             env.update(extra_env)
+        env["CI_COMMIT_SHA"] = job.commit_sha
+        env["CI_REPOSITORY_ROOT"] = "/repo"
         result = self.podman.run_command(image, job.job_id, source_dir, caches, command, job.timeout_seconds,
                                          network=True if service_env else False, env=env if env else None,
                                          network_name=service_env.network if service_env else None,
