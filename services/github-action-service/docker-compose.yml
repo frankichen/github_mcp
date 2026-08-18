@@ -5,7 +5,7 @@ services:
       args:
         SOURCE_REPOSITORY: ${SOURCE_REPOSITORY:-https://github.com/frankichen/github_mcp}
         VCS_REF: ${VCS_REF:?VCS_REF is required for a production Controller build}
-        SERVICE_VERSION: ${SERVICE_VERSION:-12.0.4}
+        SERVICE_VERSION: ${SERVICE_VERSION:-12.0.5}
         BUILD_DATE: ${BUILD_DATE:?BUILD_DATE is required for a production Controller build}
     container_name: github-action-service
     restart: unless-stopped
@@ -17,10 +17,10 @@ services:
       DEPLOY_CALLBACK_API_KEY_FILE: /run/secrets/deploy_callback_api_key
       MYGITHUB12_RUNTIME_MODE: production
       MYGITHUB12_BUILD_SHA: ${MYGITHUB12_BUILD_SHA:?MYGITHUB12_BUILD_SHA is required for a production Controller}
-      MYGITHUB12_VERSION: ${MYGITHUB12_VERSION:-12.0.4}
+      MYGITHUB12_VERSION: ${MYGITHUB12_VERSION:-12.0.5}
       MYGITHUB10_RUNTIME_MODE: production
       MYGITHUB10_BUILD_SHA: ${MYGITHUB10_BUILD_SHA:?MYGITHUB10_BUILD_SHA is required for a production Controller}
-      MYGITHUB10_VERSION: ${MYGITHUB10_VERSION:-12.0.4}
+      MYGITHUB10_VERSION: ${MYGITHUB10_VERSION:-12.0.5}
     ports:
       - "127.0.0.1:8765:8000"
       - "100.127.108.20:8765:8000"
