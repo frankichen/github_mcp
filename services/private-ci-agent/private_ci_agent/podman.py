@@ -15,9 +15,11 @@ PROXY_ENV_NAMES = {
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
     "http_proxy", "https_proxy", "all_proxy",
 }
+PIP_CONTROL_ENV_NAMES = {"PIP_INDEX_URL", "PIP_TRUSTED_HOST"}
 REQUIRED_NO_PROXY = ("postgres", "redis", "rabbitmq", "localhost", "127.0.0.1", "::1")
 LOOPBACK_PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 CONTAINER_PROXY_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
+PIP_TRUSTED_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]{1,5})?$")
 ROOTLESS_OUTBOUND_NETWORK = "slirp4netns:allow_host_loopback=true"
 LOCAL_ONLY_IMAGE_PREFIXES = ("localhost/node-chromium:",)
 GO_CACHE_SUBDIRECTORIES = (
