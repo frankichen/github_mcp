@@ -108,6 +108,18 @@ class SetupFailPodman:
         return {"exit_code": 1, "stdout": "", "stderr": "setup failed", "timed_out": False}
 
 
+class SuccessPodman:
+    def __init__(self):
+        self.calls = []
+
+    def image_available(self, _image):
+        return True
+
+    def run_command(self, _image, _job_id, _source_dir, caches, command, _timeout, **kwargs):
+        self.calls.append((command, caches, kwargs))
+        return {"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}
+
+
 def _executor(podman):
     executor = object.__new__(JobExecutor)
     executor.podman = podman
@@ -144,6 +156,30 @@ def test_python_setup_failure_blocks_all_checks(tmp_path):
     assert podman.calls[0][2]["pass_proxy"] is True
     blocked = [step for step in result["steps"] if step["status"] == "blocked_by_setup"]
     assert {step["step_name"].rsplit(":", 1)[-1] for step in blocked} == {"ruff", "compileall", "pytest"}
+
+
+def test_python_checks_stay_network_isolated_without_proxy(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "requirements.txt").write_text("requests\n", encoding="utf-8")
+    _mkdir_package(source, "app")
+    (source / "tests").mkdir()
+    podman = SuccessPodman()
+
+    result = _executor(podman)._execute_workspace(
+        _job(source, tmp_path),
+        {"path": ".", "stack": "python"},
+    )
+
+    assert result["passed"] is True
+    assert len(podman.calls) == 4
+    assert podman.calls[0][2]["network"] is True
+    assert podman.calls[0][2]["pass_proxy"] is True
+    for _, _, options in podman.calls[1:]:
+        assert options["network"] is False
+        assert options["pass_proxy"] is False
+        assert options["env"]["CI_COMMIT_SHA"] == "a" * 40
+        assert options["env"]["CI_REPOSITORY_ROOT"] == "/repo"
 
 
 def test_python_venv_is_scoped_by_workspace_identity(tmp_path):

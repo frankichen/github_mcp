@@ -6,6 +6,7 @@ from app import version
 def test_runtime_build_sha_requires_full_commit_in_deployed_modes(monkeypatch):
     monkeypatch.setenv("MYGITHUB12_RUNTIME_MODE", "production")
     monkeypatch.setenv("MYGITHUB12_BUILD_SHA", "not-a-commit")
+    monkeypatch.setenv("CI_COMMIT_SHA", "b" * 40)
     with pytest.raises(RuntimeError, match="40-character Git commit SHA"):
         version.runtime_build_sha()
 
@@ -14,6 +15,15 @@ def test_runtime_build_sha_accepts_full_lowercase_commit(monkeypatch):
     expected = "a" * 40
     monkeypatch.setenv("MYGITHUB12_RUNTIME_MODE", "production")
     monkeypatch.setenv("MYGITHUB12_BUILD_SHA", expected)
+    assert version.runtime_build_sha() == expected
+
+
+def test_runtime_build_sha_accepts_ci_commit_in_development(monkeypatch):
+    expected = "b" * 40
+    monkeypatch.delenv("MYGITHUB12_BUILD_SHA", raising=False)
+    monkeypatch.delenv("MYGITHUB10_BUILD_SHA", raising=False)
+    monkeypatch.setenv("MYGITHUB12_RUNTIME_MODE", "development")
+    monkeypatch.setenv("CI_COMMIT_SHA", expected)
     assert version.runtime_build_sha() == expected
 
 

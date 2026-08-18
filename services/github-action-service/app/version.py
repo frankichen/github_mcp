@@ -19,7 +19,19 @@ def runtime_build_sha() -> str:
     runtime_mode = os.environ.get("MYGITHUB12_RUNTIME_MODE", os.environ.get("MYGITHUB10_RUNTIME_MODE", "development"))
     if runtime_mode != "development":
         raise RuntimeError("MYGITHUB12_BUILD_SHA must be a full lowercase 40-character Git commit SHA")
-    repository_root = Path(__file__).resolve().parents[3]
+
+    ci_commit = os.environ.get("CI_COMMIT_SHA", "").strip()
+    if BUILD_SHA_RE.fullmatch(ci_commit):
+        return ci_commit
+
+    configured_root = os.environ.get("CI_REPOSITORY_ROOT", "").strip()
+    if configured_root:
+        repository_root = Path(configured_root)
+    else:
+        resolved = Path(__file__).resolve()
+        if len(resolved.parents) <= 3:
+            raise RuntimeError("development repository root is unavailable; set CI_REPOSITORY_ROOT or CI_COMMIT_SHA")
+        repository_root = resolved.parents[3]
     try:
         candidate = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],

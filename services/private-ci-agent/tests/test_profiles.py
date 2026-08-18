@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import subprocess
 
 import pytest
@@ -241,15 +242,19 @@ def test_browser_preheat_is_idempotent_on_cache_hit_and_installs_on_miss(tmp_pat
     cache = tmp_path / "browser-cache"
     cache.mkdir()
     marker = tmp_path / "npx-called"
-    fake_npx = tmp_path / "npx"
-    fake_npx.write_text(
-        f"#!/bin/sh\ntouch '{marker}'\ntouch \"$PLAYWRIGHT_BROWSERS_PATH/chrome\"\nchmod 700 \"$PLAYWRIGHT_BROWSERS_PATH/chrome\"\n",
-        encoding="utf-8",
+    fake_install = (
+        f"touch {shlex.quote(str(marker))}; "
+        'touch "$PLAYWRIGHT_BROWSERS_PATH/chrome"; '
+        'chmod 700 "$PLAYWRIGHT_BROWSERS_PATH/chrome"'
     )
-    fake_npx.chmod(0o700)
+    command = command.replace(
+        "npx --yes playwright@1.62.0 install chromium --no-shell",
+        fake_install,
+    )
+    assert "npx --yes playwright@1.62.0" not in command
     (cache / "chrome").write_text("cached", encoding="utf-8")
     (cache / "chrome").chmod(0o700)
-    env = {"PLAYWRIGHT_BROWSERS_PATH": str(cache), "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+    env = dict(os.environ, PLAYWRIGHT_BROWSERS_PATH=str(cache))
 
     hit = subprocess.run(["/bin/sh", "-c", command], env=env, capture_output=True, text=True)
     assert hit.returncode == 0
