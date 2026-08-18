@@ -50,6 +50,41 @@ def test_rootless_command_does_not_use_env_host_or_forward_tokens(monkeypatch, t
     assert "--network=none" in command
 
 
+
+def test_pip_cache_uses_operator_controlled_index(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_run(command, **_kwargs):
+        captured.append(command)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setenv("PIP_INDEX_URL", "https://pypi.tuna.tsinghua.edu.cn/simple")
+    monkeypatch.setenv("PIP_TRUSTED_HOST", "pypi.tuna.tsinghua.edu.cn")
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    cache = tmp_path / "pip-cache"
+    cache.mkdir()
+
+    result = PodmanRunner("podman").run_command(
+        "docker.io/library/python:3.12-slim", "job-123", str(tmp_path),
+        {"pip": str(cache)}, "python -m pip --version", 30,
+        env={"PIP_INDEX_URL": "https://untrusted.example/simple"}, network=True,
+    )
+
+    assert result["exit_code"] == 0
+    command = captured[0]
+    assert "PIP_CACHE_DIR=/ci-cache/pip" in command
+    assert "PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple" in command
+    assert "PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn" in command
+    assert not any("untrusted.example" in item for item in command)
+
+
+def test_credentialed_pip_index_is_not_forwarded(monkeypatch):
+    monkeypatch.setenv("PIP_INDEX_URL", "https://user:secret@example.com/simple")
+    monkeypatch.setenv("PIP_TRUSTED_HOST", "bad host")
+
+    assert PodmanRunner._controlled_pip_env() == {}
+
+
 def test_local_shared_node_image_never_falls_back_to_pull(monkeypatch):
     calls = []
 
