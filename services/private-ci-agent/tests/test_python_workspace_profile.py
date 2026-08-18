@@ -49,6 +49,20 @@ def test_pyproject_without_dev_extra_uses_plain_editable_install(tmp_path):
     assert not any("[dev" in command or "--extra" in command for command in setup)
 
 
+def test_pyproject_dev_extra_installs_test_dependencies(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname='example'\nversion='1.0.0'\n[project.optional-dependencies]\ndev=['pytest-cov>=6']\n",
+        encoding="utf-8",
+    )
+    _mkdir_package(tmp_path, "src")
+    (tmp_path / "tests").mkdir()
+
+    plan = python_commands_for_workspace(str(tmp_path))
+    setup = _commands(plan, "setup")
+
+    assert any("-e '.[dev]'" in command for command in setup)
+
+
 def test_workspace_without_tests_has_structured_skip_and_safe_targets(tmp_path):
     (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
     _mkdir_package(tmp_path, "app")
