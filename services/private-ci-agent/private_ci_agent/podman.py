@@ -68,11 +68,22 @@ class PodmanRunner:
 
     @staticmethod
     def _no_proxy_env() -> dict[str, str]:
-        """Keep internal service names and the existing bypass allowlist intact."""
+        """Keep internal services and an explicitly trusted package mirror off the proxy."""
         values = []
         for name in ("NO_PROXY", "no_proxy"):
             values.extend(item.strip() for item in os.environ.get(name, "").split(",") if item.strip())
         values.extend(REQUIRED_NO_PROXY)
+
+        bypass_mirror = os.environ.get("PRIVATE_CI_PIP_INDEX_BYPASS_PROXY", "1").strip().lower()
+        if bypass_mirror not in {"0", "false", "no", "off"}:
+            pip_env = PodmanRunner._controlled_pip_env()
+            index_url = pip_env.get("PIP_INDEX_URL")
+            trusted_hosts = {item.rsplit(":", 1)[0] for item in pip_env.get("PIP_TRUSTED_HOST", "").split()}
+            if index_url:
+                index_host = urlsplit(index_url).hostname
+                if index_host and index_host in trusted_hosts:
+                    values.append(index_host)
+
         merged = ",".join(dict.fromkeys(values))
         return {"NO_PROXY": merged, "no_proxy": merged}
 
