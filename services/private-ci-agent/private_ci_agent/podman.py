@@ -548,6 +548,7 @@ class PodmanRunner:
                 "PIP_CACHE_DIR": "/ci-cache/pip",
                 "PIP_DISABLE_PIP_VERSION_CHECK": "1",
             })
+            safe_env.update(self._controlled_pip_env())
         if "npm" in cache_dirs:
             safe_env["NPM_CONFIG_CACHE"] = "/ci-cache/npm"
         if "playwright" in cache_dirs:
