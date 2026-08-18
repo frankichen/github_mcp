@@ -238,7 +238,7 @@ class JobExecutor:
 
     def _auto_plan(self, source_dir: str, repo_config: dict) -> dict:
         detected = discover_workspaces(source_dir, repo_config)
-        allowed = set(repo_config.get("allowed_profiles") or ("repo-auto-check",))
+        allowed = set(self.config.get("supported_profiles") or PROFILE_BY_STACK.values())
         selected = []
         for workspace in detected["workspaces"]:
             profile = PROFILE_BY_STACK.get(workspace["stack"])

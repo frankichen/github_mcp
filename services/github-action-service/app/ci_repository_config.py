@@ -1,18 +1,46 @@
-"""CI repository configuration module.
+"""Private CI repository policy.
 
-Loads and validates repository allowlists from config/ci_repositories.yml.
+Explicit repository entries remain authoritative for exceptions and deployment.
+Repositories matching the configured auto-enrollment patterns receive a synthetic,
+CI-only policy so new projects do not need per-repository registration.
 """
 
+from fnmatch import fnmatchcase
 import logging
 import os
-import yaml
 from typing import Optional
+
+import yaml
+
+from app.github_policy import repository_is_allowed as github_repository_is_allowed
 
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = os.environ.get("CI_REPOS_CONFIG_PATH", "/app/config/ci_repositories.yml")
+_DEFAULT_AUTO_PROFILES = ["repo-auto-check", "python-check", "go-check", "node-check"]
+_DEFAULT_AUTO_MERGE_POLICY = {
+    "private_ci_authoritative": True,
+    "required_private_ci_profile": "repo-auto-check",
+    "github_checks_mode": "required_only",
+    "allow_non_required_check_failures": True,
+    "allow_quota_or_infrastructure_failures": True,
+    "required_workflows": [],
+}
+_DEFAULT_AUTO_ENROLLMENT = {
+    "enabled": True,
+    "repository_patterns": ["frankichen/*"],
+    "defaults": {
+        "enabled": True,
+        "private_ci": True,
+        "auto_detect": True,
+        "allowed_profiles": list(_DEFAULT_AUTO_PROFILES),
+        "max_timeout_seconds": 900,
+        "merge_policy": dict(_DEFAULT_AUTO_MERGE_POLICY),
+    },
+}
 
 _DEFAULT_CONFIG = {
+    "auto_enroll": _DEFAULT_AUTO_ENROLLMENT,
     "repositories": {
         "frankichen/ai_war": {
             "enabled": True,
@@ -68,12 +96,15 @@ def _load_config() -> dict:
 
     if os.path.exists(CONFIG_PATH):
         try:
-            with open(CONFIG_PATH) as f:
-                _config_cache = yaml.safe_load(f) or {}
-            logger.info(f"Loaded CI repository config from {CONFIG_PATH}")
+            with open(CONFIG_PATH, encoding="utf-8") as handle:
+                loaded = yaml.safe_load(handle) or {}
+            if not isinstance(loaded, dict):
+                raise ValueError("CI repository config must be a mapping")
+            _config_cache = loaded
+            logger.info("Loaded CI repository config from %s", CONFIG_PATH)
             return _config_cache
-        except Exception as e:
-            logger.warning(f"Failed to load {CONFIG_PATH}: {e}")
+        except Exception as exc:
+            logger.warning("Failed to load %s: %s", CONFIG_PATH, exc)
 
     _config_cache = _DEFAULT_CONFIG
     logger.info("Using default CI repository config")
@@ -86,55 +117,106 @@ def reload_config():
     return _load_config()
 
 
-def is_repository_allowed(repository: str) -> bool:
-    config = _load_config()
-    repos = config.get("repositories", {})
-    if repository not in repos:
-        return False
-    return repos[repository].get("enabled", False)
+def _auto_enrollment_policy() -> dict:
+    policy = _load_config().get("auto_enroll") or {}
+    return policy if isinstance(policy, dict) else {}
 
 
-def is_profile_allowed(repository: str, profile: str) -> bool:
-    config = _load_config()
-    repos = config.get("repositories", {})
-    if repository not in repos:
-        return False
-    repo_config = repos[repository]
-    if not repo_config.get("enabled", False):
-        return False
-    allowed = repo_config.get("allowed_profiles", [])
-    return profile in allowed
+def _auto_enrolled_config(repository: str) -> dict:
+    """Build a CI-only policy for one repository without persisting registration."""
+    policy = _auto_enrollment_policy()
+    if policy.get("enabled") is not True:
+        return {}
+    if not github_repository_is_allowed(repository):
+        return {}
+
+    patterns = policy.get("repository_patterns") or []
+    if not isinstance(patterns, list):
+        logger.warning("auto_enroll.repository_patterns must be a list")
+        return {}
+    if not any(isinstance(pattern, str) and fnmatchcase(repository, pattern) for pattern in patterns):
+        return {}
+
+    defaults = policy.get("defaults") or {}
+    if not isinstance(defaults, dict):
+        logger.warning("auto_enroll.defaults must be a mapping")
+        return {}
+
+    entry = {
+        "enabled": True,
+        "private_ci": True,
+        "auto_detect": True,
+        "allowed_profiles": list(_DEFAULT_AUTO_PROFILES),
+        "max_timeout_seconds": 900,
+        "merge_policy": dict(_DEFAULT_AUTO_MERGE_POLICY),
+    }
+    for key in (
+        "enabled",
+        "private_ci",
+        "auto_detect",
+        "allowed_profiles",
+        "max_timeout_seconds",
+        "merge_policy",
+        "workspaces",
+    ):
+        if key in defaults:
+            entry[key] = defaults[key]
+
+    entry.pop("deployment", None)
+    return entry
 
 
-def get_max_timeout(repository: str) -> int:
-    config = _load_config()
-    repos = config.get("repositories", {})
-    if repository not in repos:
-        return 900
-    return repos[repository].get("max_timeout_seconds", 900)
-
-
-def get_allowed_repositories() -> list[str]:
-    config = _load_config()
-    return list(config.get("repositories", {}).keys())
-
-
-def get_allowed_profiles(repository: Optional[str] = None) -> list[str]:
-    """Return profiles allowed for one repository, or the global union."""
-    config = _load_config()
-    if repository:
-        return list(config.get("repositories", {}).get(repository, {}).get("allowed_profiles", []))
-    profiles = set()
-    for repo_cfg in config.get("repositories", {}).values():
-        for p in repo_cfg.get("allowed_profiles", []):
-            profiles.add(p)
-    return sorted(profiles)
+def get_repository_policy_source(repository: str) -> str:
+    repositories = _load_config().get("repositories", {}) or {}
+    if repository in repositories:
+        return "explicit"
+    if _auto_enrolled_config(repository):
+        return "auto"
+    return "none"
 
 
 def get_repository_config(repository: str) -> dict:
-    """Return the configured repository entry without exposing secrets."""
-    config = _load_config()
-    return dict(config.get("repositories", {}).get(repository, {}) or {})
+    """Resolve explicit policy first, then safe CI-only auto-enrollment."""
+    repositories = _load_config().get("repositories", {}) or {}
+    if repository in repositories:
+        return dict(repositories.get(repository) or {})
+    return _auto_enrolled_config(repository)
+
+
+def is_repository_allowed(repository: str) -> bool:
+    return get_repository_config(repository).get("enabled") is True
+
+
+def is_profile_allowed(repository: str, profile: str) -> bool:
+    entry = get_repository_config(repository)
+    return bool(entry.get("enabled") is True and profile in (entry.get("allowed_profiles") or []))
+
+
+def get_max_timeout(repository: str) -> int:
+    return int(get_repository_config(repository).get("max_timeout_seconds", 900))
+
+
+def get_allowed_repositories() -> list[str]:
+    """Return explicit repository entries; auto-enrollment is pattern based."""
+    return list((_load_config().get("repositories", {}) or {}).keys())
+
+
+def get_allowed_profiles(repository: Optional[str] = None) -> list[str]:
+    """Return profiles allowed for one repository, or the global effective union."""
+    if repository:
+        return list(get_repository_config(repository).get("allowed_profiles", []) or [])
+
+    profiles = set()
+    for repo_cfg in (_load_config().get("repositories", {}) or {}).values():
+        for profile in (repo_cfg or {}).get("allowed_profiles", []):
+            profiles.add(profile)
+    auto_policy = _auto_enrollment_policy()
+    if auto_policy.get("enabled") is True:
+        defaults = auto_policy.get("defaults") or {}
+        auto_profiles = defaults.get("allowed_profiles", _DEFAULT_AUTO_PROFILES)
+        if isinstance(auto_profiles, list):
+            profiles.update(profile for profile in auto_profiles if isinstance(profile, str))
+    return sorted(profiles)
 
 
 def is_private_ci_enabled(repository: str) -> bool:
@@ -146,20 +228,26 @@ def is_private_ci_enabled(repository: str) -> bool:
 
 
 def get_deployment_config(repository: str) -> dict:
-    """Return the fixed, repository-scoped deployment contract."""
+    """Return only explicit, fixed repository deployment contracts."""
+    if get_repository_policy_source(repository) != "explicit":
+        return {}
     entry = get_repository_config(repository)
     return dict(entry.get("deployment") or {})
 
 
 def is_test_deploy_enabled(repository: str) -> bool:
-    """Return whether repository has an enabled fixed deployment contract."""
+    """Return whether repository has an explicit enabled deployment contract."""
+    if get_repository_policy_source(repository) != "explicit":
+        return False
     entry = get_repository_config(repository)
     deployment = entry.get("deployment") or {}
     return bool(entry.get("enabled", False) and deployment.get("enabled", False))
 
 
 def is_self_deploy_enabled(repository: str) -> bool:
-    """Return whether a fixed deployment contract explicitly allows self deployment."""
+    """Return whether an explicit fixed deployment contract allows self deployment."""
+    if get_repository_policy_source(repository) != "explicit":
+        return False
     entry = get_repository_config(repository)
     deployment = entry.get("deployment") or {}
     return bool(

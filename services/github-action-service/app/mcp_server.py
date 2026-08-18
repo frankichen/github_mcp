@@ -26,7 +26,7 @@ from app.services.github_service import GitHubService
 from app.services.ci_service import get_ci_service
 from app.ci_mcp import register_private_ci_mcp_tools
 from app.github_extended_mcp import register_github_extended_tools
-from app.github_policy import ensure_repository_allowed
+from app.github_policy import ensure_repository_allowed, repository_is_allowed
 from app import github_utils
 from app import mygithub10
 from app import mygithub12
@@ -1304,18 +1304,10 @@ async def get_repository_operation_policy(repository: str) -> str:
         is_test_deploy_enabled,
     )
 
-    github_allowed = False
+    github_allowed = repository_is_allowed(repository)
     private_ci_allowed = False
     test_deploy_allowed = False
     self_deploy_allowed = False
-
-    # GitHub operations: same allowlist as commit_github_files et al.
-    allowed_repos_env = os.environ.get("ALLOWED_REPOSITORIES", "*").strip()
-    if allowed_repos_env == "*":
-        github_allowed = True
-    else:
-        allowed = {r.strip() for r in allowed_repos_env.split(",") if r.strip()}
-        github_allowed = repository in allowed
 
     # Private CI: same policy as start_private_ci_job
     private_ci_allowed = is_private_ci_enabled(repository)
