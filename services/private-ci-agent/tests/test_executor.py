@@ -683,3 +683,15 @@ def test_execute_finishes_cancelled_when_event_set_before_run(tmp_path):
     assert summary["status"] == "cancelled"
     assert client.finished[-1]["status"] == "cancelled"
     assert client.finished[-1]["exit_code"] == -1
+
+
+def test_auto_plan_uses_worker_capabilities_without_repository_registration(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='example'\n", encoding="utf-8")
+    executor = JobExecutor.__new__(JobExecutor)
+    executor.config = {"supported_profiles": ["repo-auto-check", "python-check"]}
+
+    plan = executor._auto_plan(str(tmp_path), {})
+
+    assert "error" not in plan
+    assert plan["selected_profiles"] == ["python-check"]
+    assert plan["detected_stacks"] == ["python"]

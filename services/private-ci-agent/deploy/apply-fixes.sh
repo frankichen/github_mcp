@@ -31,7 +31,7 @@ fi
 
 # ── 2. 同步 worker 代码（private-ci-agent）────────────────
 log "Syncing private-ci-agent source -> ${AGENT_DIR}"
-for f in config.py executor.py main.py podman.py profiles.py controller_client.py; do
+for f in config.py executor.py main.py podman.py profiles.py source.py controller_client.py; do
     src="${REPO_ROOT}/services/private-ci-agent/private_ci_agent/${f}"
     [ -f "${src}" ] || die "missing source ${src}"
     install -o nobody -g nogroup -m 664 "${src}" "${AGENT_DIR}/private_ci_agent/${f}"

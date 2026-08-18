@@ -571,13 +571,20 @@ def get_commands_for_profile(profile: str, source_dir: str = "") -> dict:
 
 
 def get_repository_overrides(repository: str, profile: str) -> dict:
-    path = "/etc/private-ci/repositories.yml"
+    """Return worker-local workspace hints only; Controller owns repository authorization."""
+    path = os.environ.get("PRIVATE_CI_REPOSITORY_OVERRIDES_PATH", "/etc/private-ci/repositories.yml")
     if not os.path.exists(path):
         return {}
     try:
         with open(path, encoding="utf-8") as handle:
             repos = yaml.safe_load(handle) or {}
-        return (repos.get("repositories", {}).get(repository) or {}).copy()
+        entry = (repos.get("repositories", {}).get(repository) or {})
+        workspaces = entry.get("workspaces") or []
+        if not isinstance(workspaces, list):
+            logger.warning("Repository workspace override must be a list: %s", repository)
+            return {}
+        sanitized = [dict(item) for item in workspaces if isinstance(item, dict)]
+        return {"workspaces": sanitized} if sanitized else {}
     except Exception as exc:
         logger.warning("Failed to load repository overrides: %s", exc)
         return {}

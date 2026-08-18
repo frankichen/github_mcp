@@ -48,7 +48,7 @@ private-deploy-agent（服务器端）
 
 ## GitHub Action Service
 
-MyGithut12 当前版本为 `12.0.3`。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。大文件仍使用 manifest、chunk read/upload 和 finalize/commit 流程，不退化为普通全文提交。
+MyGithut12 当前版本为 `12.0.4`。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。大文件仍使用 manifest、chunk read/upload 和 finalize/commit 流程，不退化为普通全文提交。
 
 Python 服务现有 155 个 MCP 工具。除既有 GitHub、CI、Workspace、Index 和上下文工具外，`read_mcp_response_resource` 用于按 UTF-8 byte offset 分块读取容量降级后的完整工具响应。所有写操作继续受原有授权、CAS、confirm 和 CI 门禁约束。
 
@@ -80,7 +80,7 @@ docker compose up -d --build
 
 ## MyGithut12 运行状态
 
-MyGithut12 已进入 `12.0.3` response-contract 版本：保留既有 154 个工具名称和业务门禁语义，并新增 1 个 response resource 分块读取工具。Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
+MyGithut12 已进入 `12.0.4` response-contract 版本：保留既有 154 个工具名称和业务门禁语义，并新增 1 个 response resource 分块读取工具。Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
 
 ## Private Deploy Agent
 

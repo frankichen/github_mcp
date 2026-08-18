@@ -14,7 +14,6 @@ import subprocess
 import fcntl
 import shutil
 import re
-import yaml
 
 from private_ci_agent.security import safe_extract_tar
 
@@ -25,20 +24,14 @@ DOWNLOAD_TOTAL_TIMEOUT = 300
 DOWNLOAD_MAX_RETRIES = 2
 DOWNLOAD_RETRY_BACKOFF = [5, 15]
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-REPOSITORY_CONFIG_PATH = "/etc/private-ci/repositories.yml"
 
 
 def _authoritative_repository_url(repository: str) -> str | None:
-    """Return the GitHub mirror URL only for an enabled worker allowlist entry."""
+    """Return the fixed GitHub URL for a repository already authorized by Controller."""
     if not REPOSITORY_RE.fullmatch(repository):
         return None
-    try:
-        with open(REPOSITORY_CONFIG_PATH, encoding="utf-8") as handle:
-            config = yaml.safe_load(handle) or {}
-        entry = (config.get("repositories") or {}).get(repository) or {}
-        if not entry.get("enabled", False):
-            return None
-    except (OSError, TypeError, yaml.YAMLError):
+    owner, name = repository.split("/", 1)
+    if owner in {".", ".."} or name in {".", ".."}:
         return None
     return f"https://github.com/{repository}.git"
 
