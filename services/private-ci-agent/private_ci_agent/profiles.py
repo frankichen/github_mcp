@@ -218,18 +218,24 @@ def python_commands_for_workspace(source_dir: str, workspace_dir: str | None = N
     workspace_key = __import__("hashlib").sha256(workspace_identity.encode("utf-8")).hexdigest()[:16]
     venv_root = f"/ci-venv/{workspace_key}"
     python = f"{venv_root}/bin/python"
-    pip_cache = f"{venv_root}/pip-cache"
+    pip_install = (
+        f"{python} -m pip --disable-pip-version-check --retries 6 --timeout 60 "
+        "install --no-input --quiet"
+    )
 
+    # The Podman layer owns PIP_CACHE_DIR=/ci-cache/pip. Do not override it
+    # inside the command with a job-local venv path, otherwise every job does
+    # a cold download and the persistent worker cache is never used.
     install_commands = [
         f"python -m venv {venv_root}",
-        f"PIP_CACHE_DIR={pip_cache} {python} -m pip install --no-input --quiet ruff pytest",
+        f"{pip_install} ruff pytest",
     ]
     if has_requirements_dev:
-        install_commands.append(f"PIP_CACHE_DIR={pip_cache} {python} -m pip install --no-input --quiet -r requirements-dev.txt")
+        install_commands.append(f"{pip_install} -r requirements-dev.txt")
     elif has_requirements:
-        install_commands.append(f"PIP_CACHE_DIR={pip_cache} {python} -m pip install --no-input --quiet -r requirements.txt")
+        install_commands.append(f"{pip_install} -r requirements.txt")
     if has_pyproject or has_setup:
-        install_commands.append(f"PIP_CACHE_DIR={pip_cache} {python} -m pip install --no-input --quiet -e .")
+        install_commands.append(f"{pip_install} -e .")
 
     has_tests = "tests" in dirs
     targets = [package_dir] + (["tests"] if has_tests else [])
