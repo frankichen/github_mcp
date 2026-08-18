@@ -13,9 +13,20 @@
 FROM docker.io/library/node:22
 
 # Chromium 运行依赖（Debian bookworm，对齐 Playwright 官方清单）。
-# 全部来自 Debian 官方源；保持最小集合，不加构建工具链。
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+# 全部来自 Debian 官方源；保持最小集合，不加构建工具链。代理来自
+# prepare-node-chromium 清洗后的宿主代理环境；未配置代理时保持直连。
+RUN set -eu; \
+    http_apt_proxy="${http_proxy:-${HTTP_PROXY:-}}"; \
+    https_apt_proxy="${https_proxy:-${HTTPS_PROXY:-${http_apt_proxy}}}"; \
+    set --; \
+    if [ -n "${http_apt_proxy}" ]; then \
+        set -- "$@" -o "Acquire::http::Proxy=${http_apt_proxy}"; \
+    fi; \
+    if [ -n "${https_apt_proxy}" ]; then \
+        set -- "$@" -o "Acquire::https::Proxy=${https_apt_proxy}"; \
+    fi; \
+    apt-get "$@" update; \
+    apt-get "$@" install -y --no-install-recommends \
         libnspr4 \
         libnss3 \
         libatk1.0-0 \
@@ -39,8 +50,8 @@ RUN apt-get update \
         libxi6 \
         libxtst6 \
         libxss1 \
-        fonts-liberation \
-    && rm -rf /var/lib/apt/lists/*
+        fonts-liberation; \
+    rm -rf /var/lib/apt/lists/*
 
 # 与 node:22 保持一致的工作目录与入口（CI 容器通过 --entrypoint /bin/sh 覆盖）
 WORKDIR /workspace

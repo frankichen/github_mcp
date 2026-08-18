@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from app import version
@@ -38,3 +40,20 @@ def test_runtime_version_must_match_authoritative_version(monkeypatch):
 def test_authoritative_version_is_1204():
     assert version.SERVICE_NAME == "MyGithut12"
     assert version.SERVICE_VERSION == "12.0.4"
+
+
+def test_controller_dockerfile_routes_apt_through_inherited_proxy():
+    dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "Acquire::http::Proxy=${http_apt_proxy}" in dockerfile
+    assert "Acquire::https::Proxy=${https_apt_proxy}" in dockerfile
+    assert "127.0.0.1:10808" not in dockerfile
+
+
+def test_controller_dockerfile_keeps_dependency_layers_before_commit_metadata():
+    dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text(encoding="utf-8")
+
+    validation = dockerfile.index("RUN python -c")
+    assert dockerfile.index("apt-get") < validation
+    assert dockerfile.index("pip install") < validation
+    assert dockerfile.index("LABEL org.opencontainers.image") > validation
