@@ -336,6 +336,7 @@ class PodmanRunner:
                 "PIP_CACHE_DIR": "/ci-cache/pip",
                 "PIP_DISABLE_PIP_VERSION_CHECK": "1",
             })
+            safe_env.update(self._controlled_pip_env())
         if go_cache:
             safe_env.update({
                 key: value for key, value in env_vars.items()
