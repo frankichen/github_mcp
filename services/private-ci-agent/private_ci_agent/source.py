@@ -30,6 +30,9 @@ def _authoritative_repository_url(repository: str) -> str | None:
     """Return the fixed GitHub URL for a repository already authorized by Controller."""
     if not REPOSITORY_RE.fullmatch(repository):
         return None
+    owner, name = repository.split("/", 1)
+    if owner in {".", ".."} or name in {".", ".."}:
+        return None
     return f"https://github.com/{repository}.git"
 
 
