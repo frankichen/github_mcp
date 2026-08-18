@@ -75,6 +75,8 @@ def test_pip_cache_uses_operator_controlled_index(monkeypatch, tmp_path):
     assert "PIP_CACHE_DIR=/ci-cache/pip" in command
     assert "PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple" in command
     assert "PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn" in command
+    no_proxy = next(item for item in command if item.startswith("NO_PROXY="))
+    assert "pypi.tuna.tsinghua.edu.cn" in no_proxy
     assert not any("untrusted.example" in item for item in command)
 
 
