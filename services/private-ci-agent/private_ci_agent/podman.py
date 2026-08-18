@@ -15,9 +15,11 @@ PROXY_ENV_NAMES = {
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
     "http_proxy", "https_proxy", "all_proxy",
 }
+PIP_CONTROL_ENV_NAMES = {"PIP_INDEX_URL", "PIP_TRUSTED_HOST"}
 REQUIRED_NO_PROXY = ("postgres", "redis", "rabbitmq", "localhost", "127.0.0.1", "::1")
 LOOPBACK_PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 CONTAINER_PROXY_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
+PIP_TRUSTED_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]{1,5})?$")
 ROOTLESS_OUTBOUND_NETWORK = "slirp4netns:allow_host_loopback=true"
 LOCAL_ONLY_IMAGE_PREFIXES = ("localhost/node-chromium:",)
 GO_CACHE_SUBDIRECTORIES = (
@@ -66,13 +68,54 @@ class PodmanRunner:
 
     @staticmethod
     def _no_proxy_env() -> dict[str, str]:
-        """Keep internal service names and the existing bypass allowlist intact."""
+        """Keep internal services and an explicitly trusted package mirror off the proxy."""
         values = []
         for name in ("NO_PROXY", "no_proxy"):
             values.extend(item.strip() for item in os.environ.get(name, "").split(",") if item.strip())
         values.extend(REQUIRED_NO_PROXY)
+
+        bypass_mirror = os.environ.get("PRIVATE_CI_PIP_INDEX_BYPASS_PROXY", "1").strip().lower()
+        if bypass_mirror not in {"0", "false", "no", "off"}:
+            pip_env = PodmanRunner._controlled_pip_env()
+            index_url = pip_env.get("PIP_INDEX_URL")
+            trusted_hosts = {item.rsplit(":", 1)[0] for item in pip_env.get("PIP_TRUSTED_HOST", "").split()}
+            if index_url:
+                index_host = urlsplit(index_url).hostname
+                if index_host and index_host in trusted_hosts:
+                    values.append(index_host)
+
         merged = ",".join(dict.fromkeys(values))
         return {"NO_PROXY": merged, "no_proxy": merged}
+
+    @staticmethod
+    def _controlled_pip_env() -> dict[str, str]:
+        """Forward only operator-controlled, non-credentialed pip mirror settings."""
+        result = {}
+        index_url = os.environ.get("PIP_INDEX_URL", "").strip()
+        if index_url:
+            try:
+                parsed = urlsplit(index_url)
+            except ValueError:
+                parsed = None
+            if (
+                parsed is not None
+                and parsed.scheme in {"http", "https"}
+                and parsed.hostname
+                and parsed.username is None
+                and parsed.password is None
+            ):
+                result["PIP_INDEX_URL"] = index_url
+            else:
+                logger.warning("Ignoring invalid or credentialed PIP_INDEX_URL")
+
+        trusted_host = os.environ.get("PIP_TRUSTED_HOST", "").strip()
+        if trusted_host:
+            hosts = trusted_host.split()
+            if hosts and all(PIP_TRUSTED_HOST_RE.fullmatch(host) for host in hosts):
+                result["PIP_TRUSTED_HOST"] = trusted_host
+            else:
+                logger.warning("Ignoring invalid PIP_TRUSTED_HOST")
+        return result
 
     @staticmethod
     def _ensure_cache_dir(cache_path: str) -> bool:
@@ -285,7 +328,10 @@ class PodmanRunner:
             "-c", " && ".join(commands),
         ]
 
-        env_vars = {key: value for key, value in (env or {}).items() if key not in PROXY_ENV_NAMES}
+        env_vars = {
+            key: value for key, value in (env or {}).items()
+            if key not in PROXY_ENV_NAMES and key not in PIP_CONTROL_ENV_NAMES
+        }
         try:
             proxy_env = self._container_proxy_env() if pass_proxy else {}
         except ValueError:
@@ -301,6 +347,7 @@ class PodmanRunner:
                 "PIP_CACHE_DIR": "/ci-cache/pip",
                 "PIP_DISABLE_PIP_VERSION_CHECK": "1",
             })
+            safe_env.update(self._controlled_pip_env())
         if go_cache:
             safe_env.update({
                 key: value for key, value in env_vars.items()
@@ -512,6 +559,7 @@ class PodmanRunner:
                 "PIP_CACHE_DIR": "/ci-cache/pip",
                 "PIP_DISABLE_PIP_VERSION_CHECK": "1",
             })
+            safe_env.update(self._controlled_pip_env())
         if "npm" in cache_dirs:
             safe_env["NPM_CONFIG_CACHE"] = "/ci-cache/npm"
         if "playwright" in cache_dirs:

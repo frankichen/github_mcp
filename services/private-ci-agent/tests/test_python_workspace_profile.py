@@ -45,8 +45,22 @@ def test_pyproject_without_dev_extra_uses_plain_editable_install(tmp_path):
     plan = python_commands_for_workspace(str(tmp_path))
     setup = _commands(plan, "setup")
 
-    assert any("/bin/python -m pip install --no-input --quiet -e . 2>&1" in command for command in setup)
+    assert any("install --no-input --quiet -e ." in command for command in setup)
     assert not any("[dev" in command or "--extra" in command for command in setup)
+
+
+def test_pyproject_dev_extra_installs_test_dependencies(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname='example'\nversion='1.0.0'\n[project.optional-dependencies]\ndev=['pytest-cov>=6']\n",
+        encoding="utf-8",
+    )
+    _mkdir_package(tmp_path, "src")
+    (tmp_path / "tests").mkdir()
+
+    plan = python_commands_for_workspace(str(tmp_path))
+    setup = _commands(plan, "setup")
+
+    assert any("-e '.[dev]'" in command for command in setup)
 
 
 def test_workspace_without_tests_has_structured_skip_and_safe_targets(tmp_path):
@@ -92,8 +106,16 @@ class FakeLogManager:
 
 
 class FakeClient:
-    def start_step(self, *_args):
-        return None
+    def __init__(self):
+        self.started = []
+        self.finished = []
+
+    def start_step(self, _job_id, step_name):
+        self.started.append(step_name)
+        return len(self.started)
+
+    def finish_step(self, _job_id, step_id, status, exit_code=None, log_end_offset=None):
+        self.finished.append((step_id, status, exit_code, log_end_offset))
 
 
 class SetupFailPodman:
@@ -146,7 +168,8 @@ def test_python_setup_failure_blocks_all_checks(tmp_path):
     (source / "tests").mkdir()
     podman = SetupFailPodman()
 
-    result = _executor(podman)._execute_workspace(
+    executor = _executor(podman)
+    result = executor._execute_workspace(
         _job(source, tmp_path),
         {"path": ".", "stack": "python"},
     )
@@ -154,6 +177,8 @@ def test_python_setup_failure_blocks_all_checks(tmp_path):
     assert result["passed"] is False
     assert len(podman.calls) == 1
     assert podman.calls[0][2]["pass_proxy"] is True
+    assert executor.client.started == ["python:.:bootstrap"]
+    assert executor.client.finished[0][1:3] == ("failed", 1)
     blocked = [step for step in result["steps"] if step["status"] == "blocked_by_setup"]
     assert {step["step_name"].rsplit(":", 1)[-1] for step in blocked} == {"ruff", "compileall", "pytest"}
 
@@ -198,7 +223,8 @@ def test_python_venv_is_scoped_by_workspace_identity(tmp_path):
     assert first["workspace_key"] != second["workspace_key"]
     assert f"/ci-venv/{first['workspace_key']}/bin/python" in first["check"][0]["command"]
     assert f"/ci-venv/{second['workspace_key']}/bin/python" in second["check"][0]["command"]
-    assert "PIP_CACHE_DIR=/ci-venv/" in first["setup"][0]["command"]
+    assert "PIP_CACHE_DIR=/ci-venv/" not in first["setup"][0]["command"]
+    assert "--retries 6 --timeout 60 install --no-input --quiet" in first["setup"][0]["command"]
 
 
 class Completed:

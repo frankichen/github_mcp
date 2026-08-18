@@ -442,14 +442,18 @@ class JobExecutor:
     def _run_setup(self, job, label, image, source_dir, caches, step_name, command, service_env=None, pass_proxy=False):
         name = f"{label}:{step_name}"
         self.log_manager.upload(job.job_id, f"[{name}] Starting: {command}\n")
+        step_id = self.client.start_step(job.job_id, name)
         start = time.time()
         result = self.podman.run_command(image, job.job_id, source_dir, caches, command, self._setup_timeout(job), network=True,
                                          env=self._service_env(service_env), network_name=service_env.network if service_env else None,
                                          pass_proxy=pass_proxy, cancel_event=getattr(self, "cancel_event", None))
         self._upload_output(job.job_id, result)
         status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else ("cancelled" if result.get("cancelled") else "failed"))
-        self.log_manager.upload(job.job_id, f"[{name}] {status.upper()} (exit={result['exit_code']})\n")
-        return {"step_name": name, "command": command, "status": status, "exit_code": result["exit_code"], "duration_seconds": time.time() - start}
+        duration = time.time() - start
+        self.log_manager.upload(job.job_id, f"[{name}] {status.upper()} (exit={result['exit_code']}, {duration:.1f}s)\n")
+        if step_id:
+            self.client.finish_step(job.job_id, step_id, status, result["exit_code"], self.log_manager.get_total(job.job_id))
+        return {"step_name": name, "command": command, "status": status, "exit_code": result["exit_code"], "duration_seconds": duration, "step_id": step_id}
 
     def _setup_timeout(self, job: Job) -> int:
         """Bound setup by both the leased job deadline and the agent policy."""
