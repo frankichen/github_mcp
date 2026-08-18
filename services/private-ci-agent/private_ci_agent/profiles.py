@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import tomllib
 from pathlib import Path
 
 import yaml
@@ -50,6 +51,19 @@ def node_browser_image() -> str:
 PLAYWRIGHT_PACKAGE_NAMES = ("playwright", "@playwright/test")
 
 _PYTHON_PACKAGE_DIRS = ("app", "private_ci_agent", "private_deploy_agent", "src")
+_PYTHON_TEST_EXTRAS = ("dev", "test", "tests", "ci")
+
+
+def _python_test_extra(root: Path) -> str | None:
+    pyproject = root / "pyproject.toml"
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    optional = data.get("project", {}).get("optional-dependencies", {})
+    if not isinstance(optional, dict):
+        return None
+    return next((name for name in _PYTHON_TEST_EXTRAS if isinstance(optional.get(name), list)), None)
 
 GO_COMMANDS = {
     "setup": [
@@ -235,7 +249,9 @@ def python_commands_for_workspace(source_dir: str, workspace_dir: str | None = N
     elif has_requirements:
         install_commands.append(f"{pip_install} -r requirements.txt")
     if has_pyproject or has_setup:
-        install_commands.append(f"{pip_install} -e .")
+        test_extra = _python_test_extra(root) if has_pyproject and not has_requirements_dev else None
+        editable_target = f"'.[{test_extra}]'" if test_extra else "."
+        install_commands.append(f"{pip_install} -e {editable_target}")
 
     has_tests = "tests" in dirs
     targets = [package_dir] + (["tests"] if has_tests else [])
