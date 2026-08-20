@@ -1,3 +1,5 @@
+import os
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -122,3 +124,241 @@ def test_node_chromium_dockerfile_uses_inherited_proxy():
     assert "Acquire::https::Proxy=${https_apt_proxy}" in dockerfile
     assert "proxy.runtime.conf" in preheat
     assert "PRIVATE_CI_CONTAINER_PROXY_HOST:-10.0.2.2" in preheat
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+APPLY_FIXES_SCRIPT = DEPLOY_DIR / "apply-fixes.sh"
+ROLLBACK_CONTAINER = "github-action-service-rollback-aaaaaaaaaaaa"
+
+FAKE_TOOL_SOURCE = r'''#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+name = Path(sys.argv[0]).name
+args = sys.argv[1:]
+call_log = Path(os.environ["FAKE_CALL_LOG"])
+state_path = Path(os.environ["FAKE_STATE"])
+
+def log_call():
+    with call_log.open("a", encoding="utf-8") as handle:
+        handle.write(name + (" " + " ".join(args) if args else "") + "\n")
+
+def load_state():
+    if not state_path.exists():
+        return set()
+    return {line for line in state_path.read_text(encoding="utf-8").splitlines() if line}
+
+def save_state(state):
+    state_path.write_text("".join(f"{item}\n" for item in sorted(state)), encoding="utf-8")
+
+log_call()
+
+if name == "docker":
+    state = load_state()
+    command = args[0] if args else ""
+    if command == "build":
+        sys.exit(0)
+    if command == "inspect":
+        target = args[1]
+        if target not in state:
+            sys.exit(1)
+        if "--format" in args:
+            print("EXISTING_ENV=1")
+        else:
+            print("[]")
+        sys.exit(0)
+    if command == "stop":
+        sys.exit(0 if args[-1] in state else 1)
+    if command == "rename":
+        old_name, new_name = args[1], args[2]
+        if old_name not in state:
+            sys.exit(1)
+        state.remove(old_name)
+        state.add(new_name)
+        save_state(state)
+        sys.exit(0)
+    if command == "update":
+        sys.exit(0)
+    if command == "run":
+        target = args[args.index("--name") + 1]
+        if os.environ.get("FAKE_DOCKER_RUN_FAIL") == "1":
+            if os.environ.get("FAKE_DOCKER_RUN_CREATES_CONTAINER") == "1":
+                state.add(target)
+                save_state(state)
+            sys.exit(125)
+        state.add(target)
+        save_state(state)
+        print("fake-controller-id")
+        sys.exit(0)
+    if command == "rm":
+        state.discard(args[-1])
+        save_state(state)
+        sys.exit(0)
+    if command == "start":
+        sys.exit(0 if args[-1] in state else 1)
+    if command == "logs":
+        sys.exit(0)
+    sys.exit(0)
+
+if name == "jq":
+    sys.stdin.read()
+    sys.exit(0)
+
+if name == "curl":
+    sys.exit(0 if os.environ.get("FAKE_HEALTH_MODE", "success") == "success" else 22)
+
+if name == "git":
+    if "rev-parse" in args:
+        print("a" * 40)
+        sys.exit(0)
+    sys.exit(1)
+
+if name == "systemctl":
+    sys.exit(0)
+
+if name in {"touch", "mount", "rm", "install", "sleep", "runuser", "mkdir", "chown", "chmod"}:
+    sys.exit(0)
+
+sys.exit(0)
+'''
+
+def _run_apply_fixes(
+    tmp_path,
+    *,
+    failure_mode=None,
+    docker_run_fail=False,
+    docker_run_creates_container=False,
+    health_mode="success",
+):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_tool = bin_dir / "fake-tool"
+    fake_tool.write_text(FAKE_TOOL_SOURCE, encoding="utf-8")
+    fake_tool.chmod(0o755)
+    for command in (
+        "docker", "jq", "curl", "git", "systemctl", "touch", "mount", "rm",
+        "install", "sleep", "runuser", "mkdir", "chown", "chmod",
+    ):
+        os.symlink(fake_tool, bin_dir / command)
+
+    call_log = tmp_path / "calls.log"
+    state_path = tmp_path / "containers.state"
+    state_path.write_text("github-action-service\n", encoding="utf-8")
+    env = os.environ.copy()
+    env.update({
+        "PATH": f"{bin_dir}:{env['PATH']}",
+        "FAKE_CALL_LOG": str(call_log),
+        "FAKE_STATE": str(state_path),
+        "FAKE_DOCKER_RUN_FAIL": "1" if docker_run_fail else "0",
+        "FAKE_DOCKER_RUN_CREATES_CONTAINER": "1" if docker_run_creates_container else "0",
+        "FAKE_HEALTH_MODE": health_mode,
+    })
+    if failure_mode is None:
+        env.pop("MYGITHUB12_DEPLOY_FAILURE_MODE", None)
+    else:
+        env["MYGITHUB12_DEPLOY_FAILURE_MODE"] = failure_mode
+
+    result = subprocess.run(
+        ["/bin/bash", str(APPLY_FIXES_SCRIPT)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    calls = call_log.read_text(encoding="utf-8").splitlines() if call_log.exists() else []
+    state = {line for line in state_path.read_text(encoding="utf-8").splitlines() if line}
+    return result, calls, state
+
+def _output(result):
+    return result.stdout + result.stderr
+
+def test_apply_fixes_default_mode_auto_rolls_back_start_failure(tmp_path):
+    result, calls, state = _run_apply_fixes(
+        tmp_path, docker_run_fail=True, docker_run_creates_container=True
+    )
+    assert result.returncode != 0
+    assert "Controller failure mode: auto-rollback" in _output(result)
+    assert "docker rm -f github-action-service" in calls
+    assert f"docker rename {ROLLBACK_CONTAINER} github-action-service" in calls
+    assert "docker start github-action-service" in calls
+    assert state == {"github-action-service"}
+
+def test_apply_fixes_explicit_auto_rollback_restores_start_failure(tmp_path):
+    result, calls, state = _run_apply_fixes(
+        tmp_path, failure_mode="auto-rollback", docker_run_fail=True, docker_run_creates_container=True
+    )
+    assert result.returncode != 0
+    assert "controller start failed; rollback started" in _output(result)
+    assert f"docker rename {ROLLBACK_CONTAINER} github-action-service" in calls
+    assert "docker start github-action-service" in calls
+    assert state == {"github-action-service"}
+
+def test_apply_fixes_explicit_auto_rollback_restores_health_failure(tmp_path):
+    result, calls, state = _run_apply_fixes(
+        tmp_path, failure_mode="auto-rollback", health_mode="failure"
+    )
+    assert result.returncode != 0
+    assert "controller health failed; rollback started" in _output(result)
+    assert "docker rm -f github-action-service" in calls
+    assert f"docker rename {ROLLBACK_CONTAINER} github-action-service" in calls
+    assert "docker start github-action-service" in calls
+    assert state == {"github-action-service"}
+
+def test_apply_fixes_fail_stop_start_failure_preserves_candidates(tmp_path):
+    result, calls, state = _run_apply_fixes(
+        tmp_path, failure_mode="fail-stop", docker_run_fail=True, docker_run_creates_container=True
+    )
+    output = _output(result)
+    assert result.returncode != 0
+    assert "AUTO_ROLLBACK_DISABLED" in output
+    assert "FAILURE_STAGE=controller_start" in output
+    assert f"ROLLBACK_CONTAINER={ROLLBACK_CONTAINER}" in output
+    assert "FAILED_CONTROLLER_CONTAINER=github-action-service (preserved for diagnostics)" in output
+    assert "MANUAL_RECOVERY_REQUIRES_AUTHORIZATION: 人工恢复需要另行授权" in output
+    assert "docker rm -f github-action-service" not in calls
+    assert f"docker rename {ROLLBACK_CONTAINER} github-action-service" not in calls
+    assert "docker start github-action-service" not in calls
+    assert state == {ROLLBACK_CONTAINER, "github-action-service"}
+
+def test_apply_fixes_fail_stop_reports_start_failure_without_new_container(tmp_path):
+    result, calls, state = _run_apply_fixes(
+        tmp_path, failure_mode="fail-stop", docker_run_fail=True, docker_run_creates_container=False
+    )
+    assert result.returncode != 0
+    assert "FAILED_CONTROLLER_CONTAINER=not-created" in _output(result)
+    assert f"docker rename {ROLLBACK_CONTAINER} github-action-service" not in calls
+    assert "docker start github-action-service" not in calls
+    assert state == {ROLLBACK_CONTAINER}
+
+def test_apply_fixes_fail_stop_health_failure_preserves_candidates(tmp_path):
+    result, calls, state = _run_apply_fixes(
+        tmp_path, failure_mode="fail-stop", health_mode="failure"
+    )
+    output = _output(result)
+    assert result.returncode != 0
+    assert "AUTO_ROLLBACK_DISABLED" in output
+    assert "FAILURE_STAGE=controller_health" in output
+    assert "docker rm -f github-action-service" not in calls
+    assert f"docker rename {ROLLBACK_CONTAINER} github-action-service" not in calls
+    assert "docker start github-action-service" not in calls
+    assert state == {ROLLBACK_CONTAINER, "github-action-service"}
+
+def test_apply_fixes_rejects_invalid_mode_before_controller_switch(tmp_path):
+    result, calls, state = _run_apply_fixes(tmp_path, failure_mode="unsafe-value")
+    assert result.returncode != 0
+    assert "allowed values: auto-rollback, fail-stop" in _output(result)
+    assert not any(call.startswith("docker ") for call in calls)
+    assert state == {"github-action-service"}
+
+def test_apply_fixes_success_path_continues_in_fail_stop_mode(tmp_path):
+    result, calls, state = _run_apply_fixes(tmp_path, failure_mode="fail-stop")
+    assert result.returncode == 0, _output(result)
+    assert "DONE. Worker restarted with local shared image and caches preheated." in _output(result)
+    assert len([call for call in calls if call.startswith("runuser ")]) == 3
+    assert "systemctl restart private-ci-agent.service" in calls
+    assert "systemctl is-active --quiet private-ci-agent.service" in calls
+    assert f"docker rename {ROLLBACK_CONTAINER} github-action-service" not in calls
+    assert state == {ROLLBACK_CONTAINER, "github-action-service"}

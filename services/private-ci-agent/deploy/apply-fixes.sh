@@ -21,6 +21,40 @@ CIWORKER_UID=1500
 log() { echo "[deploy] $*"; }
 die()  { echo "[deploy] FAIL: $*" >&2; exit 1; }
 
+DEPLOY_FAILURE_MODE="${MYGITHUB12_DEPLOY_FAILURE_MODE:-auto-rollback}"
+case "${DEPLOY_FAILURE_MODE}" in
+    auto-rollback|fail-stop) ;;
+    *) die "invalid MYGITHUB12_DEPLOY_FAILURE_MODE; allowed values: auto-rollback, fail-stop" ;;
+esac
+log "Controller failure mode: ${DEPLOY_FAILURE_MODE}"
+
+handle_controller_failure() {
+    local stage="$1"
+    local message="$2"
+
+    if [ "${DEPLOY_FAILURE_MODE}" = "auto-rollback" ]; then
+        docker rm -f github-action-service >/dev/null 2>&1 || true
+        docker rename "${ROLLBACK_CONTAINER}" github-action-service || true
+        docker start github-action-service || true
+        die "${message}; rollback started"
+    fi
+
+    local failed_container="not-created"
+    if docker inspect github-action-service >/dev/null 2>&1; then
+        failed_container="github-action-service"
+    fi
+    log "AUTO_ROLLBACK_DISABLED"
+    log "FAILURE_STAGE=${stage}"
+    log "ROLLBACK_CONTAINER=${ROLLBACK_CONTAINER}"
+    if [ "${failed_container}" = "not-created" ]; then
+        log "FAILED_CONTROLLER_CONTAINER=not-created"
+    else
+        log "FAILED_CONTROLLER_CONTAINER=${failed_container} (preserved for diagnostics)"
+    fi
+    log "MANUAL_RECOVERY_REQUIRES_AUTHORIZATION: 人工恢复需要另行授权"
+    die "${message}; automatic rollback disabled"
+}
+
 # ── 1. 根文件系统需要可写（当前 ro）────────────────────────
 if ! touch "${AGENT_DIR}/.wtest" 2>/dev/null; then
     log "Remounting / read-write (was read-only)"
@@ -119,10 +153,7 @@ if ! docker run -d \
     --publish 100.127.108.20:8765:8000 \
     "${CONTROLLER_MOUNT_ARGS[@]}" \
     "${CONTROLLER_IMAGE}"; then
-    docker rm -f github-action-service >/dev/null 2>&1 || true
-    docker rename "${ROLLBACK_CONTAINER}" github-action-service || true
-    docker start github-action-service || true
-    die "controller start failed; rollback started"
+    handle_controller_failure "controller_start" "controller start failed"
 fi
 
 controller_ready=0
@@ -135,10 +166,7 @@ for _ in $(seq 1 30); do
 done
 if [ "${controller_ready}" -ne 1 ]; then
     docker logs --tail 80 github-action-service >&2 || true
-    docker rm -f github-action-service || true
-    docker rename "${ROLLBACK_CONTAINER}" github-action-service || true
-    docker start github-action-service || true
-    die "controller health failed; rollback started"
+    handle_controller_failure "controller_health" "controller health failed"
 fi
 sleep 5
 
