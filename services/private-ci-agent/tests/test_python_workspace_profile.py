@@ -87,10 +87,28 @@ def test_xianyu_repo_auto_full_gate_selects_exact_eight_stages(tmp_path):
         "bootstrap", "ruff", "mypy", "compileall", "pytest",
         "migration-smoke", "secret-scan", "container-build",
     ]
-    assert plan["check"][-1] == {"name": "container-build", "kind": "container-build"}
+    assert plan["check"][-1] == {
+        "name": "container-build",
+        "kind": "container-build",
+        "build_policy": "xianyu-radar-python-v1",
+    }
     assert "-m mypy src" in plan["check"][1]["command"]
     assert "-m alembic downgrade base" in plan["check"][4]["command"]
     assert "scripts/scan_secrets.py" in plan["check"][5]["command"]
+
+
+def test_generic_python_profile_does_not_gain_xianyu_container_build(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname='generic-python'\nversion='1.0.0'\n",
+        encoding="utf-8",
+    )
+    _mkdir_package(tmp_path, "src")
+    (tmp_path / "tests").mkdir()
+
+    plan = python_commands_for_workspace(str(tmp_path))
+
+    assert [item["name"] for item in plan["check"]] == ["ruff", "compileall", "pytest"]
+    assert all(item.get("kind") != "container-build" for item in plan["check"])
 
 
 def test_xianyu_full_gate_fails_closed_when_contract_files_are_missing(tmp_path):

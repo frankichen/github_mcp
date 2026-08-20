@@ -26,6 +26,16 @@ GO_CACHE_SUBDIRECTORIES = (
     "home", "gopath", "gomod", "gobuild", "config/go",
     "xdg-cache", "xdg-config", "tmp", ".tool-bin",
 )
+CONTROLLED_BUILD_BASE_ALIASES = {
+    "xianyu-radar-python-v1": {
+        "python:3.12-slim": "docker.io/library/python:3.12-slim",
+        "docker.io/library/python:3.12-slim": "docker.io/library/python:3.12-slim",
+    },
+}
+DOCKERFILE_FROM_RE = re.compile(
+    r"^FROM\s+(?P<base>\S+)(?:\s+AS\s+(?P<alias>[A-Za-z0-9][A-Za-z0-9_.-]*))?\s*$",
+    re.IGNORECASE,
+)
 
 
 class PodmanRunner:
@@ -241,12 +251,61 @@ class PodmanRunner:
         except (OSError, subprocess.TimeoutExpired):
             return None
 
+    @staticmethod
+    def _controlled_build_base(dockerfile: str, build_policy: str | None) -> str:
+        """Validate Dockerfile FROM instructions and return the infra-owned base."""
+        aliases = CONTROLLED_BUILD_BASE_ALIASES.get(build_policy)
+        if aliases is None:
+            raise ValueError(f"unknown controlled build policy: {build_policy}")
+        try:
+            with open(dockerfile, encoding="utf-8") as handle:
+                content = handle.read()
+        except (OSError, UnicodeError) as exc:
+            raise ValueError("cannot read Dockerfile for controlled build") from exc
+
+        stage_aliases: set[str] = set()
+        canonical_base = None
+        for line_number, raw_line in enumerate(content.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not re.match(r"^FROM\b", line, re.IGNORECASE):
+                continue
+            match = DOCKERFILE_FROM_RE.fullmatch(line)
+            if match is None:
+                raise ValueError(f"unsupported Dockerfile FROM syntax at line {line_number}")
+            base = match.group("base")
+            alias = match.group("alias")
+            if "$" in base:
+                raise ValueError(f"dynamic Dockerfile base is not allowed at line {line_number}")
+            if base.casefold() in stage_aliases:
+                if alias:
+                    stage_aliases.add(alias.casefold())
+                continue
+            if canonical_base is not None:
+                raise ValueError(
+                    f"additional external Dockerfile FROM is not allowed at line {line_number}"
+                )
+            approved_base = aliases.get(base)
+            if approved_base is None:
+                raise ValueError(
+                    f"unapproved external Dockerfile base at line {line_number}: {base}"
+                )
+            canonical_base = approved_base
+            if alias:
+                stage_aliases.add(alias.casefold())
+
+        if canonical_base is None:
+            raise ValueError("Dockerfile has no approved external FROM")
+        return canonical_base
+
     def build_candidate(
         self,
         job_id: str,
         source_dir: str,
         timeout_seconds: int,
         probe_image: str,
+        build_policy: str | None,
         cancel_event: threading.Event | None = None,
     ) -> dict:
         """Build the checked-out Dockerfile with fixed rootless Podman arguments."""
@@ -257,6 +316,16 @@ class PodmanRunner:
                 return {"exit_code": 2, "stdout": "", "stderr": "CONFIGURATION_ERROR: Dockerfile missing", "timed_out": False}
         except ValueError:
             return {"exit_code": 2, "stdout": "", "stderr": "CONFIGURATION_ERROR: invalid build context", "timed_out": False}
+
+        try:
+            canonical_base = self._controlled_build_base(dockerfile, build_policy)
+        except ValueError as exc:
+            return {
+                "exit_code": 2,
+                "stdout": "",
+                "stderr": f"CONFIGURATION_ERROR: {exc}",
+                "timed_out": False,
+            }
 
         safe_job = re.sub(r"[^A-Za-z0-9_.-]", "-", job_id)[:48] or "job"
         image = f"localhost/private-ci-{safe_job}:candidate"
@@ -269,6 +338,7 @@ class PodmanRunner:
 
         cmd = [
             self.podman, "build", "--pull=never",
+            "--from", canonical_base,
             "--network", ROOTLESS_OUTBOUND_NETWORK,
             "--tag", image, "--file", dockerfile,
         ]

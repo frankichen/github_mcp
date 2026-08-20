@@ -430,7 +430,9 @@ class JobExecutor:
                 if job.changed_files and not getattr(job, "changed_files_truncated", False):
                     extra_env["AI_INTEGRITY_CHANGED_FILES"] = "\n".join(job.changed_files)
             if check.get("kind") == "container-build":
-                step = self._run_container_build(job, label, image, source_dir)
+                step = self._run_container_build(
+                    job, label, image, source_dir, build_policy=check.get("build_policy")
+                )
             else:
                 step = self._run_check(
                     job,
@@ -451,13 +453,14 @@ class JobExecutor:
 
         return {"passed": passed, "exit_code": exit_code, "steps": steps}
 
-    def _run_container_build(self, job, label, probe_image, source_dir):
+    def _run_container_build(self, job, label, probe_image, source_dir, build_policy):
         name = f"{label}:container-build"
         self.log_manager.upload(job.job_id, f"[{name}] Starting controlled Rootless Podman build\n")
         step_id = self.client.start_step(job.job_id, name)
         start = time.time()
         result = self.podman.build_candidate(
             job.job_id, source_dir, job.timeout_seconds, probe_image=probe_image,
+            build_policy=build_policy,
             cancel_event=getattr(self, "cancel_event", None),
         )
         self._upload_output(job.job_id, result)

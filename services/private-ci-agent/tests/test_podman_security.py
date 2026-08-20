@@ -3,6 +3,8 @@ import subprocess
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from private_ci_agent.podman import PodmanRunner, ROOTLESS_OUTBOUND_NETWORK
 
 
@@ -446,7 +448,7 @@ def test_cleanup_stale_keeps_active_job_containers(monkeypatch):
 
 
 def test_candidate_build_uses_fixed_rootless_context_and_controlled_proxy(monkeypatch, tmp_path):
-    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n", encoding="utf-8")
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim AS runtime\n", encoding="utf-8")
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:10808")
     captured = []
     runner = PodmanRunner("podman")
@@ -458,11 +460,14 @@ def test_candidate_build_uses_fixed_rootless_context_and_controlled_proxy(monkey
 
     monkeypatch.setattr(runner, "_run_process", fake_process)
     result = runner.build_candidate(
-        "job/unsafe", str(tmp_path), 60, probe_image="docker.io/library/python:3.12-slim"
+        "job/unsafe", str(tmp_path), 60,
+        probe_image="docker.io/library/python:3.12-slim",
+        build_policy="xianyu-radar-python-v1",
     )
 
     command = captured[0]
     assert command[:3] == ["podman", "build", "--pull=never"]
+    assert command[command.index("--from") + 1] == "docker.io/library/python:3.12-slim"
     assert "--network" in command
     assert "slirp4netns:allow_host_loopback=true" in command
     assert "localhost/private-ci-job-unsafe:candidate" in command
@@ -471,3 +476,78 @@ def test_candidate_build_uses_fixed_rootless_context_and_controlled_proxy(monkey
     assert "-c" not in command
     assert result["exit_code"] == 0
     assert result["image"] == "localhost/private-ci-job-unsafe:candidate"
+
+
+def test_candidate_build_accepts_canonical_base_and_stage_to_stage_from(monkeypatch, tmp_path):
+    (tmp_path / "Dockerfile").write_text(
+        "FROM docker.io/library/python:3.12-slim AS runtime\nFROM runtime AS final\n",
+        encoding="utf-8",
+    )
+    captured = []
+    runner = PodmanRunner("podman")
+    monkeypatch.setattr(runner, "_validate_container_proxy", lambda *args, **kwargs: True)
+
+    def fake_process(cmd, _name, _timeout, _cancel):
+        captured.append(cmd)
+        return {"exit_code": 0, "stdout": "ok", "stderr": "", "timed_out": False}
+
+    monkeypatch.setattr(runner, "_run_process", fake_process)
+    result = runner.build_candidate(
+        "job-123", str(tmp_path), 60,
+        probe_image="docker.io/library/python:3.12-slim",
+        build_policy="xianyu-radar-python-v1",
+    )
+
+    assert result["exit_code"] == 0
+    assert captured[0][captured[0].index("--from") + 1] == "docker.io/library/python:3.12-slim"
+
+
+@pytest.mark.parametrize(
+    ("dockerfile", "message"),
+    [
+        ("FROM evil.example/image:latest\n", "unapproved external Dockerfile base"),
+        ("FROM ${BASE_IMAGE}\n", "dynamic Dockerfile base is not allowed"),
+        (
+            "FROM python:3.12-slim AS runtime\nFROM evil.example/image:latest AS helper\n",
+            "additional external Dockerfile FROM is not allowed",
+        ),
+    ],
+    ids=["unapproved-base", "dynamic-base", "second-external-base"],
+)
+def test_candidate_build_fails_closed_before_subprocess(monkeypatch, tmp_path, dockerfile, message):
+    (tmp_path / "Dockerfile").write_text(dockerfile, encoding="utf-8")
+    runner = PodmanRunner("podman")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("controlled build must fail before proxy probe or build subprocess")
+
+    monkeypatch.setattr(runner, "_validate_container_proxy", forbidden)
+    monkeypatch.setattr(runner, "_run_process", forbidden)
+    result = runner.build_candidate(
+        "job-123", str(tmp_path), 60,
+        probe_image="docker.io/library/python:3.12-slim",
+        build_policy="xianyu-radar-python-v1",
+    )
+
+    assert result["exit_code"] == 2
+    assert result["stderr"].startswith("CONFIGURATION_ERROR:")
+    assert message in result["stderr"]
+
+
+def test_candidate_build_rejects_arbitrary_image_as_policy_before_subprocess(monkeypatch, tmp_path):
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n", encoding="utf-8")
+    runner = PodmanRunner("podman")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("arbitrary caller image must not reach a build subprocess")
+
+    monkeypatch.setattr(runner, "_validate_container_proxy", forbidden)
+    monkeypatch.setattr(runner, "_run_process", forbidden)
+    result = runner.build_candidate(
+        "job-123", str(tmp_path), 60,
+        probe_image="docker.io/library/python:3.12-slim",
+        build_policy="evil.example/image:latest",
+    )
+
+    assert result["exit_code"] == 2
+    assert "unknown controlled build policy" in result["stderr"]

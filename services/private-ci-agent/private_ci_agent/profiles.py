@@ -53,6 +53,7 @@ PLAYWRIGHT_PACKAGE_NAMES = ("playwright", "@playwright/test")
 _PYTHON_PACKAGE_DIRS = ("app", "private_ci_agent", "private_deploy_agent", "src")
 _PYTHON_TEST_EXTRAS = ("dev", "test", "tests", "ci")
 XIANYU_RADAR_FULL_GATE = "xianyu-radar-full-v1"
+XIANYU_RADAR_CONTAINER_BUILD_POLICY = "xianyu-radar-python-v1"
 CONTROLLED_REPO_AUTO_PYTHON_GATES = {
     "frankichen/xianyu-radar": XIANYU_RADAR_FULL_GATE,
 }
@@ -310,7 +311,11 @@ def python_commands_for_workspace(
             pytest_check,
             {"name": "migration-smoke", "command": migration},
             {"name": "secret-scan", "command": f"{python} scripts/scan_secrets.py 2>&1"},
-            {"name": "container-build", "kind": "container-build"},
+            {
+                "name": "container-build",
+                "kind": "container-build",
+                "build_policy": XIANYU_RADAR_CONTAINER_BUILD_POLICY,
+            },
         ]
         skipped = []
     elif python_gate is not None:
