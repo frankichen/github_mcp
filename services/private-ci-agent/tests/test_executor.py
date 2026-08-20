@@ -382,6 +382,138 @@ def test_executor_has_no_git_gofmt_writeback_entrypoints():
 
 
 
+# ---- openapi-check tests ----
+
+
+def make_openapi_job(source_dir):
+    return Job(
+        job_id="openapi-1", repository="frankichen/sxt", branch="feature/openapi",
+        commit_sha="a" * 40, profile="openapi-check", timeout_seconds=60,
+        lease_token="lease", lease_expires_at="", source_dir=str(source_dir),
+    )
+
+
+class OpenAPIPodman(FakePodman):
+    def __init__(self, failing_command=None, exit_code=1):
+        super().__init__(None)
+        self.failing_command = failing_command
+        self.failure_exit_code = exit_code
+        self.images = []
+
+    def run_command(self, image, job_id, source_dir, caches, command, timeout, network=False, **kwargs):
+        self.images.append(image)
+        self.caches.append(caches)
+        self.commands.append((command, network, timeout))
+        self.call_options.append(kwargs)
+        failed = bool(self.failing_command and self.failing_command in command)
+        return {
+            "exit_code": self.failure_exit_code if failed else 0,
+            "stdout": "", "stderr": "", "timed_out": False,
+        }
+
+
+def make_openapi_executor(podman):
+    executor = make_executor(podman)
+    executor.config = {"source_mirror_enabled": True}
+    executor._verify_openapi_source_identity = lambda job: {
+        "ok": True, "head_sha": job.commit_sha, "tree_sha": "b" * 40,
+    }
+    return executor
+
+
+def test_openapi_check_uses_fixed_node22_image_and_repository_command(tmp_path):
+    from private_ci_agent.profiles import NODE_IMAGE, OPENAPI_CHECK_COMMAND
+
+    podman = OpenAPIPodman()
+    result = make_openapi_executor(podman)._execute_openapi_check(make_openapi_job(tmp_path))
+
+    assert result["status"] == "passed"
+    assert result["exit_code"] == 0
+    assert result["commit_sha"] == "a" * 40
+    assert result["git_tree_sha"] == "b" * 40
+    assert result["image"] == NODE_IMAGE == "docker.io/library/node:22"
+    assert podman.images == [NODE_IMAGE]
+    assert podman.commands[0][0] == OPENAPI_CHECK_COMMAND
+    assert podman.commands[0][1] is True
+    assert "test -f scripts/validate-openapi.sh" in OPENAPI_CHECK_COMMAND
+    assert "test -f .redocly.yaml" in OPENAPI_CHECK_COMMAND
+    for binary in ("bash", "node", "npm", "npx"):
+        assert f"command -v {binary}" in OPENAPI_CHECK_COMMAND
+    assert OPENAPI_CHECK_COMMAND.endswith("OPENAPI_PARALLELISM=1 bash scripts/validate-openapi.sh")
+
+
+def test_openapi_redocly_nonzero_fails_job(tmp_path):
+    podman = OpenAPIPodman("OPENAPI_PARALLELISM=1 bash scripts/validate-openapi.sh", exit_code=1)
+    result = make_openapi_executor(podman)._execute_openapi_check(make_openapi_job(tmp_path))
+
+    assert result["status"] == "failed"
+    assert result["exit_code"] == 1
+    assert result["error_code"] == "OPENAPI_CHECK_FAILED"
+
+
+def test_openapi_missing_script_is_configuration_failure(tmp_path):
+    podman = OpenAPIPodman("test -f scripts/validate-openapi.sh", exit_code=2)
+    result = make_openapi_executor(podman)._execute_openapi_check(make_openapi_job(tmp_path))
+
+    assert result["status"] == "failed"
+    assert result["exit_code"] == 2
+    assert result["error_code"] == "OPENAPI_CHECK_CONFIGURATION_ERROR"
+    assert all(step["status"] != "skipped" for step in result["steps"])
+
+
+def test_openapi_source_identity_preserves_exact_commit_and_tree(tmp_path, monkeypatch):
+    commit_sha = "a" * 40
+    tree_sha = "b" * 40
+
+    def fake_run(command, **_kwargs):
+        if "status" in command:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        revision = command[-1]
+        outputs = {"HEAD": commit_sha, f"{commit_sha}^{{tree}}": tree_sha, "HEAD^{tree}": tree_sha}
+        return SimpleNamespace(returncode=0, stdout=outputs[revision] + "\n", stderr="")
+
+    monkeypatch.setattr(executor_module.subprocess, "run", fake_run)
+    job = make_openapi_job(tmp_path)
+    job.commit_sha = commit_sha
+
+    result = JobExecutor._verify_openapi_source_identity(job)
+
+    assert result == {"ok": True, "head_sha": commit_sha, "tree_sha": tree_sha}
+
+
+def test_openapi_source_tree_mismatch_fails(tmp_path, monkeypatch):
+    commit_sha = "a" * 40
+
+    def fake_run(command, **_kwargs):
+        if "status" in command:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        revision = command[-1]
+        outputs = {"HEAD": commit_sha, f"{commit_sha}^{{tree}}": "b" * 40, "HEAD^{tree}": "c" * 40}
+        return SimpleNamespace(returncode=0, stdout=outputs[revision] + "\n", stderr="")
+
+    monkeypatch.setattr(executor_module.subprocess, "run", fake_run)
+    job = make_openapi_job(tmp_path)
+    job.commit_sha = commit_sha
+
+    result = JobExecutor._verify_openapi_source_identity(job)
+
+    assert result["ok"] is False
+    assert result["error_code"] == "SOURCE_TREE_MISMATCH"
+
+
+def test_repo_auto_plan_does_not_select_openapi_profile(tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    executor = JobExecutor.__new__(JobExecutor)
+    executor.config = {
+        "supported_profiles": ["repo-auto-check", "go-check", "openapi-check"],
+    }
+
+    plan = executor._auto_plan(str(tmp_path), {})
+
+    assert plan["selected_profiles"] == ["go-check"]
+    assert "openapi-check" not in plan["selected_profiles"]
+
+
 # ---- repo-fast-check tests ----
 
 

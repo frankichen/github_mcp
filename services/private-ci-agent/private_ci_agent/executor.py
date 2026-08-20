@@ -69,6 +69,20 @@ class JobExecutor:
             return summary
 
         repo_config = get_repository_overrides(job.repository, job.profile)
+        if job.profile == "openapi-check":
+            self.log_manager.upload(job_id, "[openapi-check] entering fixed controlled profile\n")
+            summary = self._execute_openapi_check(job)
+            self.log_manager.flush(job_id)
+            self.client.finish_job(
+                job_id,
+                summary["exit_code"],
+                summary["status"],
+                summary=summary,
+                error_code=summary.get("error_code"),
+                error_message=summary.get("error_message"),
+            )
+            return summary
+
         if job.profile == "repo-fast-check":
             self.log_manager.upload(job_id, "[fast-check] entering isolated repo-fast-check path\n")
             summary = self._execute_fast_check(job)
@@ -497,6 +511,122 @@ class JobExecutor:
             self.log_manager.upload(job_id, output)
             if not output.endswith("\n"):
                 self.log_manager.upload(job_id, "\n")
+
+    @staticmethod
+    def _verify_openapi_source_identity(job: Job) -> dict:
+        """Verify this checkout is the exact immutable commit/tree requested by the job."""
+        def rev_parse(revision: str) -> tuple[str | None, str | None]:
+            try:
+                result = subprocess.run(
+                    ["git", "-C", job.source_dir, "rev-parse", revision],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return None, type(exc).__name__
+            if result.returncode != 0:
+                return None, (result.stderr or "git rev-parse failed")[-300:]
+            return result.stdout.strip(), None
+
+        actual_head, error = rev_parse("HEAD")
+        if error:
+            return {"ok": False, "error_code": "SOURCE_IDENTITY_UNAVAILABLE", "error_message": error}
+        if actual_head != job.commit_sha:
+            return {
+                "ok": False,
+                "error_code": "SOURCE_HEAD_MISMATCH",
+                "error_message": "source HEAD does not match requested commit_sha",
+                "actual_head_sha": actual_head,
+            }
+
+        expected_tree, error = rev_parse(f"{job.commit_sha}^{{tree}}")
+        if error:
+            return {"ok": False, "error_code": "SOURCE_IDENTITY_UNAVAILABLE", "error_message": error}
+        actual_tree, error = rev_parse("HEAD^{tree}")
+        if error:
+            return {"ok": False, "error_code": "SOURCE_IDENTITY_UNAVAILABLE", "error_message": error}
+        if actual_tree != expected_tree:
+            return {
+                "ok": False,
+                "error_code": "SOURCE_TREE_MISMATCH",
+                "error_message": "source Tree SHA does not match requested commit tree",
+                "expected_tree_sha": expected_tree,
+                "actual_tree_sha": actual_tree,
+            }
+
+        try:
+            status = subprocess.run(
+                ["git", "-C", job.source_dir, "status", "--porcelain", "--untracked-files=all"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"ok": False, "error_code": "SOURCE_IDENTITY_UNAVAILABLE", "error_message": type(exc).__name__}
+        if status.returncode != 0:
+            return {"ok": False, "error_code": "SOURCE_IDENTITY_UNAVAILABLE", "error_message": "git status failed"}
+        if status.stdout.strip():
+            return {"ok": False, "error_code": "SOURCE_WORKTREE_DIRTY", "error_message": "source worktree is not clean"}
+        return {"ok": True, "head_sha": actual_head, "tree_sha": actual_tree}
+
+    def _execute_openapi_check(self, job: Job) -> dict:
+        """Run the repository-owned OpenAPI validator in one fixed Node 22 profile."""
+        job_id = job.job_id
+        started = time.time()
+        self.client.update_job_status(job_id, "running")
+        identity = self._verify_openapi_source_identity(job)
+        if not identity.get("ok"):
+            self.log_manager.upload(job_id, f"[openapi-check] {identity['error_code']}\n")
+            return {
+                "status": "failed", "exit_code": 2, "profile": "openapi-check",
+                "commit_sha": job.commit_sha, "git_tree_sha": identity.get("actual_tree_sha"),
+                "error_code": identity["error_code"], "error_message": identity.get("error_message"),
+                "detected_stacks": ["openapi"], "selected_profiles": ["openapi-check"],
+                "workspaces": [{"path": ".", "stack": "openapi"}], "steps": [],
+            }
+
+        commands = get_commands_for_profile("openapi-check", job.source_dir)
+        image = commands["image"]
+        if not self.podman.image_available(image):
+            message = f"CI image is unavailable: {image}"
+            self.log_manager.upload(job_id, f"CONFIGURATION_ERROR: {message}\n")
+            return {
+                "status": "failed", "exit_code": 2, "profile": "openapi-check",
+                "commit_sha": job.commit_sha, "git_tree_sha": identity["tree_sha"],
+                "image": image, "error_code": "OPENAPI_CHECK_IMAGE_UNAVAILABLE", "error_message": message,
+                "detected_stacks": ["openapi"], "selected_profiles": ["openapi-check"],
+                "workspaces": [{"path": ".", "stack": "openapi"}], "steps": [],
+            }
+
+        spec = commands["setup"][0]
+        caches = {name: CACHE_MAP[name] for name in commands.get("cache_dirs", {}) if name in CACHE_MAP}
+        step = self._run_setup(
+            job, "openapi:.", image, job.source_dir, caches,
+            spec["name"], spec["command"], pass_proxy=True,
+        )
+        if step["status"] == "cancelled":
+            status, exit_code, error_code = "cancelled", -1, "OPENAPI_CHECK_CANCELLED"
+        elif step["status"] == "timed_out":
+            status, exit_code, error_code = "timed_out", step["exit_code"], "OPENAPI_CHECK_TIMEOUT"
+        elif step["exit_code"] == 0:
+            status, exit_code, error_code = "passed", 0, None
+        elif step["exit_code"] == 2:
+            status, exit_code, error_code = "failed", 2, "OPENAPI_CHECK_CONFIGURATION_ERROR"
+        else:
+            status, exit_code, error_code = "failed", step["exit_code"], "OPENAPI_CHECK_FAILED"
+        summary = {
+            "status": status, "exit_code": exit_code, "profile": "openapi-check",
+            "commit_sha": job.commit_sha, "git_tree_sha": identity["tree_sha"],
+            "image": image, "source_mirror_hit": bool(self.config.get("source_mirror_enabled")),
+            "detected_stacks": ["openapi"], "selected_profiles": ["openapi-check"],
+            "workspaces": [{"path": ".", "stack": "openapi"}], "steps": [step],
+            "total_duration_seconds": round(time.time() - started, 3),
+            "log_truncated": self.log_manager.is_truncated(job_id),
+        }
+        if error_code:
+            summary["error_code"] = error_code
+        return summary
 
     FAST_CHECK_ERROR_CODES = {
         "missing_make": "FAST_CHECK_MAKE_MISSING",

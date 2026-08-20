@@ -17,7 +17,7 @@ DEFAULT_CONFIG = {
     "max_log_bytes": 10485760,
     "max_source_bytes": 268435456,
     "podman_binary": "/usr/bin/podman",
-    "supported_profiles": ["repo-auto-check", "repo-fast-check", "python-check", "go-check", "node-check"],
+    "supported_profiles": ["repo-auto-check", "repo-fast-check", "python-check", "go-check", "node-check", "openapi-check"],
     # CI jobs must use the isolated bare mirror by default.  The archive
     # downloader remains an explicit compatibility fallback in config.
     "source_mirror_enabled": True,

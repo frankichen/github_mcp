@@ -20,6 +20,26 @@ def test_deploy_profiles_include_repo_fast_check():
     assert data["profiles"]["repo-fast-check"]["merge_eligible"] is False
 
 
+def test_deploy_profiles_include_fixed_openapi_check():
+    data = yaml.safe_load((DEPLOY_DIR / "profiles.yml").read_text(encoding="utf-8"))
+    profile = data["profiles"]["openapi-check"]
+
+    assert profile["merge_eligible"] is False
+    assert profile["language"] == "node"
+    assert profile["base_image"] == "docker.io/library/node:22"
+    assert profile["command"] == "OPENAPI_PARALLELISM=1 bash scripts/validate-openapi.sh"
+
+
+def test_only_sxt_allows_openapi_check_on_agent_side():
+    data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
+    repositories = data["repositories"]
+
+    assert "openapi-check" in repositories["frankichen/sxt"]["allowed_profiles"]
+    for repository, config in repositories.items():
+        if repository != "frankichen/sxt":
+            assert "openapi-check" not in (config.get("allowed_profiles") or [])
+
+
 def test_sxt_allows_repo_fast_check_on_agent_side():
     data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
     allowed = data["repositories"]["frankichen/sxt"]["allowed_profiles"]

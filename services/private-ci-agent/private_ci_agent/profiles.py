@@ -190,12 +190,30 @@ PYTHON_COMMANDS = {
     "cache_dirs": {"pip": "/srv/private-ci/cache/pip"},
 }
 
+OPENAPI_CHECK_COMMAND = (
+    "test -f scripts/validate-openapi.sh || { echo 'CONFIGURATION_ERROR: scripts/validate-openapi.sh missing' >&2; exit 2; }; "
+    "test -f .redocly.yaml || { echo 'CONFIGURATION_ERROR: .redocly.yaml missing' >&2; exit 2; }; "
+    "command -v bash >/dev/null 2>&1 || { echo 'CONFIGURATION_ERROR: bash missing' >&2; exit 2; }; "
+    "command -v node >/dev/null 2>&1 || { echo 'CONFIGURATION_ERROR: node missing' >&2; exit 2; }; "
+    "command -v npm >/dev/null 2>&1 || { echo 'CONFIGURATION_ERROR: npm missing' >&2; exit 2; }; "
+    "command -v npx >/dev/null 2>&1 || { echo 'CONFIGURATION_ERROR: npx missing' >&2; exit 2; }; "
+    "OPENAPI_PARALLELISM=1 bash scripts/validate-openapi.sh"
+)
+OPENAPI_COMMANDS = {
+    "setup": [{"name": "validate-openapi", "command": OPENAPI_CHECK_COMMAND}],
+    "check": [],
+    "skipped": [],
+    "image": NODE_IMAGE,
+    "cache_dirs": {"npm": "/ci-cache/npm"},
+}
+
 PROFILE_COMMANDS = {
     "go-check": GO_COMMANDS,
     "python-check": PYTHON_COMMANDS,
     "node-check": None,
     "repo-auto-check": None,
     "repo-fast-check": FAST_CHECK_COMMANDS,
+    "openapi-check": OPENAPI_COMMANDS,
 }
 
 

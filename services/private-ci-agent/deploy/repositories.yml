@@ -24,6 +24,7 @@ repositories:
       - repo-fast-check
       - go-check
       - node-check
+      - openapi-check
     max_timeout_seconds: 900
     workspaces:
       - path: .

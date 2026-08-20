@@ -113,6 +113,16 @@ class TestMCPTools:
             assert name in tool_names
 
     @pytest.mark.asyncio
+    async def test_private_ci_start_schema_has_no_command_or_image_injection(self):
+        from app.mcp_server import mcp
+
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        properties = tools["start_private_ci_job"].inputSchema["properties"]
+        assert {"repository", "branch", "commit_sha", "profile"}.issubset(properties)
+        assert "command" not in properties
+        assert "image" not in properties
+
+    @pytest.mark.asyncio
     async def test_get_github_file_tool(self):
         import json
         from app.mcp_server import get_github_file

@@ -8,6 +8,14 @@ profiles:
     description: "Scan controlled Manifest workspaces and orchestrate approved checks"
     execution_mode: sequential
 
+  openapi-check:
+    description: "Run the repository-owned OpenAPI validator with a fixed Node 22 runtime"
+    execution_mode: sequential
+    merge_eligible: false
+    language: node
+    base_image: docker.io/library/node:22
+    command: "OPENAPI_PARALLELISM=1 bash scripts/validate-openapi.sh"
+
   go-check:
     description: "Go version-aware format, vet, test, build"
     language: go
