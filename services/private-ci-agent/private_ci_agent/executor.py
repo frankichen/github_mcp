@@ -252,6 +252,11 @@ class JobExecutor:
 
     def _auto_plan(self, source_dir: str, repo_config: dict) -> dict:
         detected = discover_workspaces(source_dir, repo_config)
+        python_gate = repo_config.get("python_gate")
+        if python_gate:
+            for workspace in detected["workspaces"]:
+                if workspace["stack"] == "python":
+                    workspace["_python_gate"] = python_gate
         allowed = set(self.config.get("supported_profiles") or PROFILE_BY_STACK.values())
         selected = []
         for workspace in detected["workspaces"]:
@@ -284,7 +289,7 @@ class JobExecutor:
         if stack == "go":
             return go_commands_for_workspace(source_dir)
         if stack == "python":
-            return python_commands_for_workspace(source_dir)
+            return python_commands_for_workspace(source_dir, python_gate=workspace.get("_python_gate"))
         return {"error": "unsupported", "message": f"Unsupported stack: {stack}"}
 
     def _execute_workspace(self, job: Job, workspace: dict) -> dict:
@@ -394,8 +399,9 @@ class JobExecutor:
             self.log_manager.upload(job.job_id, f"[{step['step_name']}] {skipped['status']}: {skipped.get('reason')}\n")
 
         for check in commands.get("check", []):
+            command = check.get("command")
             if self._cancelled():
-                step = {"step_name": f"{label}:{check['name']}", "command": check["command"],
+                step = {"step_name": f"{label}:{check['name']}", "command": command,
                         "status": "cancelled", "exit_code": None, "duration_seconds": 0}
                 steps.append(step)
                 passed = False
@@ -407,18 +413,7 @@ class JobExecutor:
             ):
                 step = {
                     "step_name": f"{label}:{check['name']}",
-                    "command": check["command"],
-                    "status": "blocked_by_setup",
-                    "exit_code": None,
-                    "duration_seconds": 0,
-                }
-                steps.append(step)
-                self.log_manager.upload(job.job_id, f"[{step['step_name']}] BLOCKED_BY_SETUP\n")
-                continue
-            if setup_failed and workspace["stack"] == "python":
-                step = {
-                    "step_name": f"{label}:{check['name']}",
-                    "command": check["command"],
+                    "command": command,
                     "status": "blocked_by_setup",
                     "exit_code": None,
                     "duration_seconds": 0,
@@ -434,24 +429,53 @@ class JobExecutor:
                 }
                 if job.changed_files and not getattr(job, "changed_files_truncated", False):
                     extra_env["AI_INTEGRITY_CHANGED_FILES"] = "\n".join(job.changed_files)
-            step = self._run_check(
-                job,
-                label,
-                image,
-                source_dir,
-                caches,
-                check["name"],
-                check["command"],
-                service_env,
-                extra_env=extra_env,
-                pass_proxy=False,
-            )
+            if check.get("kind") == "container-build":
+                step = self._run_container_build(job, label, image, source_dir)
+            else:
+                step = self._run_check(
+                    job,
+                    label,
+                    image,
+                    source_dir,
+                    caches,
+                    check["name"],
+                    command,
+                    service_env,
+                    extra_env=extra_env,
+                    pass_proxy=False,
+                )
             steps.append(step)
             if step["exit_code"] != 0:
                 passed = False
                 exit_code = exit_code or step["exit_code"]
 
         return {"passed": passed, "exit_code": exit_code, "steps": steps}
+
+    def _run_container_build(self, job, label, probe_image, source_dir):
+        name = f"{label}:container-build"
+        self.log_manager.upload(job.job_id, f"[{name}] Starting controlled Rootless Podman build\n")
+        step_id = self.client.start_step(job.job_id, name)
+        start = time.time()
+        result = self.podman.build_candidate(
+            job.job_id, source_dir, job.timeout_seconds, probe_image=probe_image,
+            cancel_event=getattr(self, "cancel_event", None),
+        )
+        self._upload_output(job.job_id, result)
+        status = "passed" if result["exit_code"] == 0 else (
+            "timed_out" if result["timed_out"] else ("cancelled" if result.get("cancelled") else "failed")
+        )
+        duration = time.time() - start
+        self.log_manager.upload(job.job_id, f"[{name}] {status.upper()} (exit={result['exit_code']}, {duration:.1f}s)\n")
+        image = result.get("image")
+        if image and not self.podman.remove_image(image):
+            self.log_manager.upload(job.job_id, f"[{name}] WARNING: candidate image cleanup failed\n")
+        if step_id:
+            self.client.finish_step(job.job_id, step_id, status, result["exit_code"], self.log_manager.get_total(job.job_id))
+        return {
+            "step_name": name, "command": "controlled-rootless-podman-build",
+            "status": status, "exit_code": result["exit_code"],
+            "duration_seconds": duration, "step_id": step_id,
+        }
 
     def _run_setup(self, job, label, image, source_dir, caches, step_name, command, service_env=None, pass_proxy=False):
         name = f"{label}:{step_name}"

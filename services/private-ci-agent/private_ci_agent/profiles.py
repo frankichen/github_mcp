@@ -52,6 +52,10 @@ PLAYWRIGHT_PACKAGE_NAMES = ("playwright", "@playwright/test")
 
 _PYTHON_PACKAGE_DIRS = ("app", "private_ci_agent", "private_deploy_agent", "src")
 _PYTHON_TEST_EXTRAS = ("dev", "test", "tests", "ci")
+XIANYU_RADAR_FULL_GATE = "xianyu-radar-full-v1"
+CONTROLLED_REPO_AUTO_PYTHON_GATES = {
+    "frankichen/xianyu-radar": XIANYU_RADAR_FULL_GATE,
+}
 
 
 def _python_test_extra(root: Path) -> str | None:
@@ -217,7 +221,11 @@ PROFILE_COMMANDS = {
 }
 
 
-def python_commands_for_workspace(source_dir: str, workspace_dir: str | None = None) -> dict:
+def python_commands_for_workspace(
+    source_dir: str,
+    workspace_dir: str | None = None,
+    python_gate: str | None = None,
+) -> dict:
     """Generate strict Python setup/check commands from real workspace files."""
     root = Path(source_dir)
     if workspace_dir not in (None, "", "."):
@@ -274,15 +282,46 @@ def python_commands_for_workspace(source_dir: str, workspace_dir: str | None = N
     has_tests = "tests" in dirs
     targets = [package_dir] + (["tests"] if has_tests else [])
     target_text = " ".join(targets)
-    checks = [
-        {"name": "ruff", "command": f"{python} -m ruff check {target_text} 2>&1"},
-        {"name": "compileall", "command": f"{python} -m compileall -q {target_text} 2>&1"},
-    ]
-    skipped = []
-    if has_tests:
-        checks.append({"name": "pytest", "command": f"{python} -m pytest -q -p no:warnings 2>&1"})
+    ruff = {"name": "ruff", "command": f"{python} -m ruff check {target_text} 2>&1"}
+    compileall = {"name": "compileall", "command": f"{python} -m compileall -q {target_text} 2>&1"}
+    pytest_check = {"name": "pytest", "command": f"{python} -m pytest -q -p no:warnings 2>&1"}
+
+    if python_gate == XIANYU_RADAR_FULL_GATE:
+        required_paths = ("pyproject.toml", "alembic.ini", "alembic", "scripts/scan_secrets.py", "Dockerfile")
+        missing = [name for name in required_paths if not (root / name).exists()]
+        if not has_tests:
+            missing.append("tests")
+        if missing:
+            return {
+                "error": "configuration_error",
+                "message": f"Xianyu Radar full gate prerequisites missing: {sorted(set(missing))}",
+            }
+        migration = (
+            "tmpdir=$(mktemp -d /tmp/xianyu-radar-migration-XXXXXX) && "
+            "trap 'rm -rf \"$tmpdir\"' EXIT && "
+            f"XIANYU_RADAR_DATABASE_PATH=\"$tmpdir/migration.sqlite3\" {python} -m alembic upgrade head && "
+            f"XIANYU_RADAR_DATABASE_PATH=\"$tmpdir/migration.sqlite3\" {python} -m alembic downgrade base && "
+            f"XIANYU_RADAR_DATABASE_PATH=\"$tmpdir/migration.sqlite3\" {python} -m alembic upgrade head 2>&1"
+        )
+        checks = [
+            ruff,
+            {"name": "mypy", "command": f"{python} -m mypy src 2>&1"},
+            compileall,
+            pytest_check,
+            {"name": "migration-smoke", "command": migration},
+            {"name": "secret-scan", "command": f"{python} scripts/scan_secrets.py 2>&1"},
+            {"name": "container-build", "kind": "container-build"},
+        ]
+        skipped = []
+    elif python_gate is not None:
+        return {"error": "configuration_error", "message": f"Unknown controlled Python gate: {python_gate}"}
     else:
-        skipped.append({"name": "pytest", "status": "skipped", "reason": "no_tests_directory"})
+        checks = [ruff, compileall]
+        skipped = []
+        if has_tests:
+            checks.append(pytest_check)
+        else:
+            skipped.append({"name": "pytest", "status": "skipped", "reason": "no_tests_directory"})
 
     return {
         "setup": [{"name": "bootstrap", "command": " && ".join(install_commands) + " 2>&1"}],
@@ -611,10 +650,13 @@ def get_commands_for_profile(profile: str, source_dir: str = "") -> dict:
 
 
 def get_repository_overrides(repository: str, profile: str) -> dict:
-    """Return worker-local workspace hints only; Controller owns repository authorization."""
+    """Return controlled worker-local hints; Controller owns repository authorization."""
+    overrides = {}
+    if profile == "repo-auto-check" and repository in CONTROLLED_REPO_AUTO_PYTHON_GATES:
+        overrides["python_gate"] = CONTROLLED_REPO_AUTO_PYTHON_GATES[repository]
     path = os.environ.get("PRIVATE_CI_REPOSITORY_OVERRIDES_PATH", "/etc/private-ci/repositories.yml")
     if not os.path.exists(path):
-        return {}
+        return overrides
     try:
         with open(path, encoding="utf-8") as handle:
             repos = yaml.safe_load(handle) or {}
@@ -622,9 +664,11 @@ def get_repository_overrides(repository: str, profile: str) -> dict:
         workspaces = entry.get("workspaces") or []
         if not isinstance(workspaces, list):
             logger.warning("Repository workspace override must be a list: %s", repository)
-            return {}
+            return overrides
         sanitized = [dict(item) for item in workspaces if isinstance(item, dict)]
-        return {"workspaces": sanitized} if sanitized else {}
+        if sanitized:
+            overrides["workspaces"] = sanitized
+        return overrides
     except Exception as exc:
         logger.warning("Failed to load repository overrides: %s", exc)
-        return {}
+        return overrides

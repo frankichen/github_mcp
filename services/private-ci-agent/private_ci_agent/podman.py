@@ -241,6 +241,65 @@ class PodmanRunner:
         except (OSError, subprocess.TimeoutExpired):
             return None
 
+    def build_candidate(
+        self,
+        job_id: str,
+        source_dir: str,
+        timeout_seconds: int,
+        probe_image: str,
+        cancel_event: threading.Event | None = None,
+    ) -> dict:
+        """Build the checked-out Dockerfile with fixed rootless Podman arguments."""
+        source_root = os.path.realpath(source_dir)
+        dockerfile = os.path.realpath(os.path.join(source_root, "Dockerfile"))
+        try:
+            if os.path.commonpath([source_root, dockerfile]) != source_root or not os.path.isfile(dockerfile):
+                return {"exit_code": 2, "stdout": "", "stderr": "CONFIGURATION_ERROR: Dockerfile missing", "timed_out": False}
+        except ValueError:
+            return {"exit_code": 2, "stdout": "", "stderr": "CONFIGURATION_ERROR: invalid build context", "timed_out": False}
+
+        safe_job = re.sub(r"[^A-Za-z0-9_.-]", "-", job_id)[:48] or "job"
+        image = f"localhost/private-ci-{safe_job}:candidate"
+        try:
+            proxy_env = self._container_proxy_env()
+        except ValueError:
+            return {"exit_code": -1, "stdout": "", "stderr": "PROXY_CONFIGURATION_INVALID", "timed_out": False, "image": image}
+        if not self._validate_container_proxy(probe_image, f"ci-build-{safe_job}", True, None, proxy_env):
+            return {"exit_code": -1, "stdout": "", "stderr": "PROXY_VALIDATION_FAILED", "timed_out": False, "image": image}
+
+        cmd = [
+            self.podman, "build", "--pull=never",
+            "--network", ROOTLESS_OUTBOUND_NETWORK,
+            "--tag", image, "--file", dockerfile,
+        ]
+        for key, value in sorted(proxy_env.items()):
+            if key in PROXY_ENV_NAMES or key in {"NO_PROXY", "no_proxy"}:
+                cmd.extend(["--build-arg", f"{key}={value}"])
+        cmd.append(source_root)
+
+        result = self._run_process(
+            cmd, f"ci-build-{safe_job}", timeout_seconds, cancel_event or threading.Event()
+        )
+        result["image"] = image
+        if result["exit_code"] == 0:
+            result["stdout"] = (result.get("stdout") or "") + (
+                f"\nControlled Rootless Podman build succeeded: {image}\n"
+            )
+        return result
+
+    def remove_image(self, image: str) -> bool:
+        """Best-effort cleanup for a fixed candidate image tag."""
+        if not image.startswith("localhost/private-ci-") or not image.endswith(":candidate"):
+            return False
+        try:
+            result = subprocess.run(
+                [self.podman, "image", "rm", "--force", image],
+                capture_output=True, text=True, timeout=30,
+            )
+            return result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
     @staticmethod
     def _cache_mounts(cache_dirs: dict) -> tuple[list[str], str | None]:
         mounts: list[str] = []

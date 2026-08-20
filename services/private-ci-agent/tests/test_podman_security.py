@@ -443,3 +443,31 @@ def test_cleanup_stale_keeps_active_job_containers(monkeypatch):
     PodmanRunner("podman").cleanup_stale(["job-123"])
 
     assert removed == [["podman", "rm", "-f", "ci-job-456-stale"]]
+
+
+def test_candidate_build_uses_fixed_rootless_context_and_controlled_proxy(monkeypatch, tmp_path):
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n", encoding="utf-8")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:10808")
+    captured = []
+    runner = PodmanRunner("podman")
+    monkeypatch.setattr(runner, "_validate_container_proxy", lambda *args, **kwargs: True)
+
+    def fake_process(cmd, _name, _timeout, _cancel):
+        captured.append(cmd)
+        return {"exit_code": 0, "stdout": "ok", "stderr": "", "timed_out": False}
+
+    monkeypatch.setattr(runner, "_run_process", fake_process)
+    result = runner.build_candidate(
+        "job/unsafe", str(tmp_path), 60, probe_image="docker.io/library/python:3.12-slim"
+    )
+
+    command = captured[0]
+    assert command[:3] == ["podman", "build", "--pull=never"]
+    assert "--network" in command
+    assert "slirp4netns:allow_host_loopback=true" in command
+    assert "localhost/private-ci-job-unsafe:candidate" in command
+    assert "HTTP_PROXY=http://host.containers.internal:10808" in command
+    assert command[-1] == str(tmp_path.resolve())
+    assert "-c" not in command
+    assert result["exit_code"] == 0
+    assert result["image"] == "localhost/private-ci-job-unsafe:candidate"
