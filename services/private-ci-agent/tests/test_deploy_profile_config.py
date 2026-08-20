@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -134,8 +135,8 @@ import os
 import sys
 from pathlib import Path
 
-name = Path(sys.argv[0]).name
-args = sys.argv[1:]
+name = sys.argv[1]
+args = sys.argv[2:]
 call_log = Path(os.environ["FAKE_CALL_LOG"])
 state_path = Path(os.environ["FAKE_STATE"])
 
@@ -255,23 +256,25 @@ def _run_apply_fixes(
     health_mode="success",
 ):
     repo_root, staged_script = _stage_apply_fixes_repo(tmp_path)
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    fake_tool = bin_dir / "fake-tool"
+    fake_tool = tmp_path / "fake-tool.py"
     fake_tool.write_text(FAKE_TOOL_SOURCE, encoding="utf-8")
-    fake_tool.chmod(0o755)
-    for command in (
+    commands = (
         "docker", "jq", "curl", "git", "systemctl", "touch", "mount", "rm",
         "install", "sleep", "runuser", "mkdir", "chown", "chmod",
-    ):
-        os.symlink(fake_tool, bin_dir / command)
+    )
+    bash_env = tmp_path / "bash_env"
+    functions = ['_fake_tool() { "$FAKE_PYTHON" "$FAKE_TOOL_SCRIPT" "$@"; }']
+    functions.extend(f'{command}() {{ _fake_tool {command} "$@"; }}' for command in commands)
+    bash_env.write_text("\n".join(functions) + "\n", encoding="utf-8")
 
     call_log = tmp_path / "calls.log"
     state_path = tmp_path / "containers.state"
     state_path.write_text("github-action-service\n", encoding="utf-8")
     env = os.environ.copy()
     env.update({
-        "PATH": f"{bin_dir}:{env['PATH']}",
+        "BASH_ENV": str(bash_env),
+        "FAKE_PYTHON": sys.executable,
+        "FAKE_TOOL_SCRIPT": str(fake_tool),
         "FAKE_CALL_LOG": str(call_log),
         "FAKE_STATE": str(state_path),
         "FAKE_DOCKER_RUN_FAIL": "1" if docker_run_fail else "0",
