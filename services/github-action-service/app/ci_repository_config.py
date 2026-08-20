@@ -49,7 +49,7 @@ _DEFAULT_CONFIG = {
         },
         "frankichen/sxt": {
             "enabled": True,
-            "allowed_profiles": ["repo-auto-check", "repo-fast-check", "python-check"],
+            "allowed_profiles": ["repo-auto-check", "repo-fast-check", "go-check", "node-check", "openapi-check"],
             "max_timeout_seconds": 900,
             "deployment": {
                 "enabled": True,
