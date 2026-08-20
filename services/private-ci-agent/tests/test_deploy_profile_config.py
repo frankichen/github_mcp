@@ -126,7 +126,6 @@ def test_node_chromium_dockerfile_uses_inherited_proxy():
     assert "PRIVATE_CI_CONTAINER_PROXY_HOST:-10.0.2.2" in preheat
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
 APPLY_FIXES_SCRIPT = DEPLOY_DIR / "apply-fixes.sh"
 ROLLBACK_CONTAINER = "github-action-service-rollback-aaaaaaaaaaaa"
 
@@ -223,6 +222,30 @@ if name in {"touch", "mount", "rm", "install", "sleep", "runuser", "mkdir", "cho
 sys.exit(0)
 '''
 
+def _stage_apply_fixes_repo(tmp_path):
+    repo_root = tmp_path / "repo"
+    agent_root = repo_root / "services/private-ci-agent"
+    deploy_root = agent_root / "deploy"
+    source_root = agent_root / "private_ci_agent"
+    controller_app = repo_root / "services/github-action-service/app"
+    deploy_root.mkdir(parents=True)
+    source_root.mkdir(parents=True)
+    controller_app.mkdir(parents=True)
+
+    staged_script = deploy_root / "apply-fixes.sh"
+    staged_script.write_bytes(APPLY_FIXES_SCRIPT.read_bytes())
+    staged_script.chmod(0o755)
+    for name in (
+        "config.py", "executor.py", "main.py", "podman.py",
+        "profiles.py", "source.py", "controller_client.py",
+    ):
+        (source_root / name).write_text("# test fixture\n", encoding="utf-8")
+    (controller_app / "version.py").write_text(
+        'SERVICE_VERSION = "12.0.5"\n', encoding="utf-8"
+    )
+    return repo_root, staged_script
+
+
 def _run_apply_fixes(
     tmp_path,
     *,
@@ -231,6 +254,7 @@ def _run_apply_fixes(
     docker_run_creates_container=False,
     health_mode="success",
 ):
+    repo_root, staged_script = _stage_apply_fixes_repo(tmp_path)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     fake_tool = bin_dir / "fake-tool"
@@ -260,8 +284,8 @@ def _run_apply_fixes(
         env["MYGITHUB12_DEPLOY_FAILURE_MODE"] = failure_mode
 
     result = subprocess.run(
-        ["/bin/bash", str(APPLY_FIXES_SCRIPT)],
-        cwd=REPO_ROOT,
+        ["/bin/bash", str(staged_script)],
+        cwd=repo_root,
         env=env,
         capture_output=True,
         text=True,
