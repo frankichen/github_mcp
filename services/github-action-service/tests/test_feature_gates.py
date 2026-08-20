@@ -92,3 +92,26 @@ def test_auto_enrollment_respects_global_github_repository_policy(tmp_path, monk
     assert repo_policy.get_repository_policy_source("frankichen/not-allowed") == "none"
     assert repo_policy.is_repository_allowed("frankichen/not-allowed") is False
     assert repo_policy.is_private_ci_enabled("frankichen/not-allowed") is False
+
+
+def test_github_mcp_auto_enrollment_does_not_allow_deployment(tmp_path, monkeypatch):
+    _configure_policy(tmp_path, monkeypatch)
+
+    repository = "frankichen/github_mcp"
+    assert repo_policy.get_repository_policy_source(repository) == "auto"
+    assert repo_policy.is_private_ci_enabled(repository) is True
+    assert repo_policy.is_test_deploy_enabled(repository) is False
+    assert repo_policy.is_self_deploy_enabled(repository) is False
+
+
+@pytest.mark.asyncio
+async def test_fail_stop_contract_does_not_expand_private_ci_start_inputs():
+    from app.mcp_server import mcp
+
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    properties = tools["start_private_ci_job"].inputSchema["properties"]
+    assert "command" not in properties
+    assert "image" not in properties
+    assert "failure_mode" not in properties
+    assert "deploy_failure_mode" not in properties
+    assert "MYGITHUB12_DEPLOY_FAILURE_MODE" not in properties

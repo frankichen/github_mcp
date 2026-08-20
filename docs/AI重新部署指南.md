@@ -162,6 +162,17 @@ sudo test -f /var/lib/private-ci/gongshi-test-status.json
 
 ## 5. 发布与回滚
 
+### Controller 发布失败模式
+
+`services/private-ci-agent/deploy/apply-fixes.sh` 支持受控环境变量 `MYGITHUB12_DEPLOY_FAILURE_MODE`，仅允许以下两个枚举值：
+
+- `auto-rollback`：默认值；保持既有无人值守语义。新 Controller 启动失败或 health check 失败时，删除失败的新 Controller 容器（如存在），把保留的 rollback container 改回正式名称并启动旧 Controller。
+- `fail-stop`：只禁止失败后的自动恢复动作。新 Controller 启动失败或 health check 失败时，脚本以非 0 退出，保留旧 Controller 的 rollback container，不自动 rename/start 旧 Controller，并尽可能保留失败的新 Controller 供诊断。日志必须包含 `AUTO_ROLLBACK_DISABLED`、失败阶段、rollback container 名称和“人工恢复需要另行授权”的提示。
+
+非法值必须在停止或重命名当前 Controller 之前失败。成功路径不受该模式影响，Controller health 通过后仍继续 cache preheat、Worker restart 和 Worker health/status 检查。
+
+该变量只属于本地正式部署脚本的失败处理合同，不是 MCP caller 输入，不得据此增加任意 command/image、SSH、生产部署 API 或放宽 repository `test_deploy` / `self_deploy` policy。
+
 发布前必须保留：
 
 - 当前 release id；
