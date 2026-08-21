@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 from app import deploy_worker, deployment_store
@@ -39,6 +40,71 @@ def test_minimal_store_migrates_legacy_schema(tmp_path, monkeypatch):
         "SELECT log_revision FROM deployments"
     ).fetchall() == []
 
+
+
+def test_process_once_claims_queued_sxt_and_delegates_to_wsl(tmp_path, monkeypatch):
+    db_path = tmp_path / "deployments.db"
+    status_path = tmp_path / "gongshi-test-status.json"
+    monkeypatch.setenv("DEPLOYMENT_DB_PATH", str(db_path))
+    monkeypatch.setenv("DEPLOY_STATUS_FILE", str(status_path))
+    monkeypatch.setenv("DEPLOY_EXECUTION_MODE", "claim_only")
+    deployment_store._local.db = None
+    deploy_worker._status_repository = "frankichen/sxt"
+
+    status_path.write_text(
+        json.dumps(
+            {
+                "current_release_id": "release-current",
+                "previous_release_id": "release-previous",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    deployment_store.init_deployment_db()
+    db = deployment_store.get_deploy_db()
+    db.execute(
+        """INSERT INTO deployments (
+           deployment_id, repository, environment, commit_sha,
+           private_ci_job_id, requested_scope, current_release_before,
+           target_release, status, created_at, updated_at, log_text
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "dep-regression",
+            "frankichen/sxt",
+            "gongshi-test",
+            "a" * 40,
+            "ci-regression",
+            "fullstack",
+            "release-current",
+            "release-queued",
+            "queued",
+            1.0,
+            1.0,
+            "",
+        ),
+    )
+    db.commit()
+
+    assert deploy_worker.process_once() is True
+
+    row = db.execute(
+        "SELECT * FROM deployments WHERE deployment_id='dep-regression'"
+    ).fetchone()
+    assert row["status"] == "running"
+    assert row["current_step"] == "claimed"
+    assert row["started_at"] is not None
+    assert row["lease_token"]
+    assert row["log_revision"] == 1
+    assert "execution delegated to WSL" in row["log_text"]
+    assert "token=" not in row["log_text"].lower()
+    assert "authorization" not in row["log_text"].lower()
+
+    snapshot = json.loads(status_path.read_text(encoding="utf-8"))
+    assert snapshot["environment"] == "gongshi-test"
+    assert snapshot["current_release_id"] == "release-current"
+    assert snapshot["previous_release_id"] == "release-previous"
+    assert snapshot["current_release_id"] != row["target_release"]
 
 
 def test_claim_only_delegates_sxt_but_executes_auto_gupiao_locally(monkeypatch):

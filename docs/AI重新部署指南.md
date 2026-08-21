@@ -99,7 +99,7 @@ sudo -u deployworker python3 -m venv /opt/private-deploy-agent/venv
 sudo -u deployworker /opt/private-deploy-agent/venv/bin/pip install -r /opt/private-deploy-agent/requirements.txt
 ```
 
-### 写入 Secret
+### 写入 Worker 配置
 
 ```bash
 sudo install -d -m 0750 -o root -g deployworker /etc/private-ci
@@ -108,18 +108,25 @@ sudo chown root:deployworker /etc/private-ci/deploy-worker.env
 sudo chmod 0640 /etc/private-ci/deploy-worker.env
 ```
 
-管理员必须编辑该文件填写真实 Secret。AI 不得回显该文件。
+`private-deploy-agent` 的 queue consumer 当前不读取 GitHub/MCP API credential；不要把 Controller 或 WSL executor 的 Secret 写入这个文件。AI 仍不得读取或回显服务器实际环境文件。
 
-至少需要确认这些非敏感参数正确：
+至少确认这些属于 Worker 自身的非敏感运行配置：
 
 ```dotenv
-ALLOWED_REPOSITORIES=frankichen/sxt
 DEPLOYMENT_DB_PATH=/var/lib/private-ci/deployments.db
-CI_DB_PATH=/var/lib/private-ci/ci.db
 DEPLOY_WORKSPACE=/srv/private-ci/deploy-workspace/sxt
+DEPLOY_STATUS_FILE=/var/lib/private-ci/gongshi-test-status.json
 ENVIRONMENT_URL=http://gongshi-test
 DEPLOY_EXECUTION_MODE=claim_only
 ```
+
+当前 Worker runtime 不消费 `GITHUB_TOKEN`、`ACTION_API_KEY`、`GITHUB_API_URL`、`ALLOWED_REPOSITORIES`、`ALLOW_DEFAULT_BRANCH_WRITE` 或 `CI_DB_PATH`；不得把这些历史变量继续描述为 `private-deploy-agent` 的启动必需项。repository、environment 和 scope 由 Worker 代码内固定 `CONTRACTS` 限制。
+
+配置与 Secret 职责必须分开：
+
+- **Controller (`github-action-service`)**：负责 GitHub API、MCP、CI 和部署编排；其 GitHub/MCP credential 只属于 Controller 自己的受控 Secret 配置。
+- **private-deploy-agent queue consumer**：只读取本地 deployment SQLite、领取固定合同任务、写状态；自身不持有 GitHub/MCP API credential。`claim_only` 下只把 `frankichen/sxt` 任务标记为已领取并交给 WSL executor，不直接执行 `sxt` 发布。
+- **WSL/private-ci deployment executor**：负责固定发布命令和 authenticated callback。其 callback credential 通过 executor 自己的 `DEPLOY_CALLBACK_API_KEY_FILE` 受控 Secret 合同提供，不能复制进 `private-deploy-agent` 的环境文件。
 
 ### 安装 systemd
 
