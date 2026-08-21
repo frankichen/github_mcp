@@ -114,7 +114,7 @@ def process_once() -> bool:
     global _status_repository
     init_deployment_db(); db = get_deploy_db()
     rows = db.execute(
-        "SELECT deployment_id FROM deployments "
+        "SELECT deployment_id, repository FROM deployments "
         "WHERE status='queued' AND repository IN (?, ?) "
         "ORDER BY created_at LIMIT 20",
         ("frankichen/sxt", "frankichen/auto_gupiao"),
