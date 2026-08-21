@@ -125,7 +125,7 @@ DEPLOY_EXECUTION_MODE=claim_only
 配置与 Secret 职责必须分开：
 
 - **Controller (`github-action-service`)**：负责 GitHub API、MCP、CI 和部署编排；其 GitHub/MCP credential 只属于 Controller 自己的受控 Secret 配置。
-- **private-deploy-agent queue consumer**：只读取本地 deployment SQLite、领取固定合同任务、写状态；自身不持有 GitHub/MCP API credential。`claim_only` 下只把 `frankichen/sxt` 任务标记为已领取并交给 WSL executor，不直接执行 `sxt` 发布。
+- **private-deploy-agent queue consumer**：只访问本地 deployment SQLite、领取固定合同任务、写状态；自身不持有 GitHub/MCP API credential。`claim_only` 下只把 `frankichen/sxt` 任务标记为已领取并交给 WSL executor，不直接执行 `sxt` 发布。
 - **WSL/private-ci deployment executor**：负责固定发布命令和 authenticated callback。其 callback credential 通过 executor 自己的 `DEPLOY_CALLBACK_API_KEY_FILE` 受控 Secret 合同提供，不能复制进 `private-deploy-agent` 的环境文件。
 
 ### 安装 systemd
