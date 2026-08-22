@@ -63,6 +63,65 @@ def test_pyproject_dev_extra_installs_test_dependencies(tmp_path):
     assert any("-e '.[dev]'" in command for command in setup)
 
 
+def test_xianyu_repo_auto_full_gate_selects_exact_eight_stages(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname='xianyu-radar'\nversion='1.0.0'\n"
+        "[project.optional-dependencies]\ndev=['mypy>=1.14','pytest>=8','ruff>=0.9']\n",
+        encoding="utf-8",
+    )
+    _mkdir_package(tmp_path, "src")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "alembic").mkdir()
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "scan_secrets.py").write_text("print('ok')\n", encoding="utf-8")
+    (tmp_path / "alembic.ini").write_text("[alembic]\n", encoding="utf-8")
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n", encoding="utf-8")
+
+    executor = object.__new__(JobExecutor)
+    executor.config = {"supported_profiles": ["python-check"]}
+    auto_plan = executor._auto_plan(str(tmp_path), {"python_gate": "xianyu-radar-full-v1"})
+    assert auto_plan["selected_profiles"] == ["python-check"]
+    plan = executor._workspace_commands(auto_plan["workspaces"][0], str(tmp_path))
+
+    assert ["bootstrap"] + [item["name"] for item in plan["check"]] == [
+        "bootstrap", "ruff", "mypy", "compileall", "pytest",
+        "migration-smoke", "secret-scan", "container-build",
+    ]
+    assert plan["check"][-1] == {
+        "name": "container-build",
+        "kind": "container-build",
+        "build_policy": "xianyu-radar-python-v1",
+    }
+    assert "-m mypy src" in plan["check"][1]["command"]
+    assert "-m alembic downgrade base" in plan["check"][4]["command"]
+    assert "scripts/scan_secrets.py" in plan["check"][5]["command"]
+
+
+def test_generic_python_profile_does_not_gain_xianyu_container_build(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname='generic-python'\nversion='1.0.0'\n",
+        encoding="utf-8",
+    )
+    _mkdir_package(tmp_path, "src")
+    (tmp_path / "tests").mkdir()
+
+    plan = python_commands_for_workspace(str(tmp_path))
+
+    assert [item["name"] for item in plan["check"]] == ["ruff", "compileall", "pytest"]
+    assert all(item.get("kind") != "container-build" for item in plan["check"])
+
+
+def test_xianyu_full_gate_fails_closed_when_contract_files_are_missing(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\nversion='1'\n", encoding="utf-8")
+    _mkdir_package(tmp_path, "src")
+    (tmp_path / "tests").mkdir()
+
+    plan = python_commands_for_workspace(str(tmp_path), python_gate="xianyu-radar-full-v1")
+
+    assert plan["error"] == "configuration_error"
+    assert "Dockerfile" in plan["message"]
+
+
 def test_workspace_without_tests_has_structured_skip_and_safe_targets(tmp_path):
     (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
     _mkdir_package(tmp_path, "app")
