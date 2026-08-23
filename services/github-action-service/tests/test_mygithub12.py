@@ -370,3 +370,208 @@ def test_recover_orphaned_index_jobs_fails_previous_process_work(tmp_path, monke
         assert rows[job_id]["error_code"] == "INDEX_CONTROLLER_RESTARTED"
         assert rows[job_id]["finished_at"] is not None
     assert rows["done"]["status"] == "completed"
+
+
+def _seed_workspace_pin(
+    db,
+    *,
+    workspace_id: str,
+    repository: str,
+    branch: str,
+    status: str,
+    lease_expires_at: float,
+    index_commit_sha: str,
+    base_commit_sha: str,
+    head_sha: str,
+):
+    db.execute(
+        "INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            workspace_id,
+            repository,
+            branch,
+            "main",
+            base_commit_sha,
+            head_sha,
+            "f" * 40,
+            status,
+            1,
+            "test",
+            lease_expires_at,
+            index_commit_sha,
+            "{}",
+            None,
+            None,
+            1.0,
+            1.0,
+        ),
+    )
+
+
+def test_expired_workspace_pin_grace_defaults_and_bounds(monkeypatch):
+    monkeypatch.delenv("MYGITHUB12_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS", raising=False)
+    assert (
+        mygithub12._expired_workspace_pin_grace_seconds()
+        == mygithub12.DEFAULT_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS
+    )
+
+    monkeypatch.setenv("MYGITHUB12_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS", "0")
+    assert mygithub12._expired_workspace_pin_grace_seconds() == 0
+
+    monkeypatch.setenv("MYGITHUB12_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS", "999999999")
+    assert (
+        mygithub12._expired_workspace_pin_grace_seconds()
+        == mygithub12.MAX_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS
+    )
+
+    monkeypatch.setenv("MYGITHUB12_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS", "invalid")
+    assert (
+        mygithub12._expired_workspace_pin_grace_seconds()
+        == mygithub12.DEFAULT_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS
+    )
+
+
+def test_workspace_index_pin_grace_is_independent_from_write_status(monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS", "3600")
+    now = 10_000.0
+
+    assert mygithub12._workspace_index_pin_active("active", now + 1, now=now) is True
+    assert mygithub12._workspace_index_pin_active("active", now - 1800, now=now) is True
+    assert mygithub12._workspace_index_pin_active("active", now - 3601, now=now) is False
+    assert mygithub12._workspace_index_pin_active("drifted", now - 1800, now=now) is True
+    assert mygithub12._workspace_index_pin_active("closed", now + 3600, now=now) is False
+
+
+def test_retention_only_protects_workspace_commits_inside_pin_grace(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "workspace-pin-grace.db"))
+    monkeypatch.setenv("MYGITHUB12_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS", "3600")
+    mygithub12.init_db()
+    repository = "o/r"
+    now = 10_000.0
+    warm = [f"{i:040x}" for i in (101, 102, 103)]
+    stale = [f"{i:040x}" for i in (201, 202, 203)]
+    drifted = [f"{i:040x}" for i in (301, 302, 303)]
+    closed = [f"{i:040x}" for i in (401, 402, 403)]
+    job_target = "5" * 40
+    job_base = "6" * 40
+
+    with mygithub12._db() as db:
+        _seed_workspace_pin(
+            db,
+            workspace_id="warm",
+            repository=repository,
+            branch="ai/warm",
+            status="active",
+            lease_expires_at=now - 1800,
+            index_commit_sha=warm[0],
+            base_commit_sha=warm[1],
+            head_sha=warm[2],
+        )
+        _seed_workspace_pin(
+            db,
+            workspace_id="stale",
+            repository=repository,
+            branch="ai/stale",
+            status="active",
+            lease_expires_at=now - 7200,
+            index_commit_sha=stale[0],
+            base_commit_sha=stale[1],
+            head_sha=stale[2],
+        )
+        _seed_workspace_pin(
+            db,
+            workspace_id="drifted",
+            repository=repository,
+            branch="ai/drifted",
+            status="drifted",
+            lease_expires_at=now - 60,
+            index_commit_sha=drifted[0],
+            base_commit_sha=drifted[1],
+            head_sha=drifted[2],
+        )
+        _seed_workspace_pin(
+            db,
+            workspace_id="closed",
+            repository=repository,
+            branch="ai/closed",
+            status="closed",
+            lease_expires_at=now + 7200,
+            index_commit_sha=closed[0],
+            base_commit_sha=closed[1],
+            head_sha=closed[2],
+        )
+        db.execute(
+            """INSERT INTO jobs(job_id,repository,commit_sha,tree_sha,version,strategy,base_commit_sha,status,step,revision,
+               progress_current,progress_total,reused_files,reindexed_files,cancel_requested,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "job-active-pin",
+                repository,
+                job_target,
+                "7" * 40,
+                mygithub12.INDEX_VERSION,
+                "incremental",
+                job_base,
+                "running",
+                "indexing",
+                1,
+                0,
+                1,
+                0,
+                0,
+                0,
+                now,
+            ),
+        )
+        workspace_pins = mygithub12._workspace_protected_index_commits(
+            db, repository, now=now
+        )
+        all_pins = workspace_pins | mygithub12._active_index_job_commits(db, repository)
+
+    assert workspace_pins == set(warm + drifted)
+    assert not (set(stale) & workspace_pins)
+    assert not (set(closed) & workspace_pins)
+    assert {job_target, job_base} <= all_pins
+
+
+def test_list_indexes_reports_the_same_grace_aware_workspace_pin_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "workspace-pin-report.db"))
+    monkeypatch.setenv("MYGITHUB12_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS", "100")
+    monkeypatch.setattr(mygithub12, "_now", lambda: 1000.0)
+    monkeypatch.setattr(mygithub12, "_service_repo", lambda *args, **kwargs: object())
+    mygithub12.init_db()
+    repository = "o/r"
+    recent_commit = "1" * 40
+    stale_commit = "2" * 40
+
+    with mygithub12._db() as db:
+        _seed_retention_snapshot(db, repository, recent_commit, 1)
+        _seed_retention_snapshot(db, repository, stale_commit, 2)
+        _seed_workspace_pin(
+            db,
+            workspace_id="recent-expiry",
+            repository=repository,
+            branch="ai/recent-expiry",
+            status="active",
+            lease_expires_at=950.0,
+            index_commit_sha=recent_commit,
+            base_commit_sha=recent_commit,
+            head_sha=recent_commit,
+        )
+        _seed_workspace_pin(
+            db,
+            workspace_id="stale-expiry",
+            repository=repository,
+            branch="ai/stale-expiry",
+            status="active",
+            lease_expires_at=800.0,
+            index_commit_sha=stale_commit,
+            base_commit_sha=stale_commit,
+            head_sha=stale_commit,
+        )
+
+    result = mygithub12.list_indexes(object(), repository, limit=10)
+    items = {item["commit_sha"]: item for item in result["items"]}
+
+    assert items[recent_commit]["pinned_by_workspace"] is True
+    assert items[stale_commit]["pinned_by_workspace"] is False

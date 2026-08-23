@@ -26,6 +26,8 @@ MAX_INDEX_FILES = int(os.getenv("MYGITHUB12_INDEX_MAX_FILES", "5000"))
 MAX_INDEX_BYTES = int(os.getenv("MYGITHUB12_INDEX_MAX_BYTES", str(50 * 1024 * 1024)))
 MAX_FILE_BYTES = int(os.getenv("MYGITHUB12_INDEX_MAX_FILE_BYTES", str(512 * 1024)))
 DEFAULT_INDEX_RETENTION_PER_REPOSITORY = 50
+DEFAULT_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS = 24 * 60 * 60
+MAX_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS = 7 * 24 * 60 * 60
 MAX_RESULTS = 500
 MAX_BATCH_FILES = 100
 MAX_BATCH_BYTES = 4 * 1024 * 1024
@@ -307,15 +309,58 @@ def _index_retention_limit() -> int:
     return max(0, min(value, 1000))
 
 
-def _protected_index_commits(db: sqlite3.Connection, repository: str) -> set[str]:
+def _expired_workspace_pin_grace_seconds() -> int:
+    raw = os.getenv(
+        "MYGITHUB12_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS",
+        str(DEFAULT_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS),
+    ).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = DEFAULT_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS
+    return max(0, min(value, MAX_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS))
+
+
+def _workspace_index_pin_active(
+    status: str,
+    lease_expires_at: float | int | None,
+    *,
+    now: float | None = None,
+) -> bool:
+    if status not in {"active", "drifted"} or lease_expires_at is None:
+        return False
+    current = _now() if now is None else float(now)
+    return float(lease_expires_at) + _expired_workspace_pin_grace_seconds() > current
+
+
+def _workspace_index_pin_grace_expires_at(
+    status: str, lease_expires_at: float | int | None
+) -> float | None:
+    if status not in {"active", "drifted"} or lease_expires_at is None:
+        return None
+    return float(lease_expires_at) + _expired_workspace_pin_grace_seconds()
+
+
+def _workspace_protected_index_commits(
+    db: sqlite3.Connection, repository: str, *, now: float | None = None
+) -> set[str]:
+    current = _now() if now is None else float(now)
+    cutoff = current - _expired_workspace_pin_grace_seconds()
     protected: set[str] = set()
     for row in db.execute(
         """SELECT index_commit_sha, base_commit_sha, head_sha
            FROM workspaces
-           WHERE repository=? AND status IN ('active','drifted')""",
-        (repository,),
+           WHERE repository=?
+             AND status IN ('active','drifted')
+             AND lease_expires_at>?""",
+        (repository, cutoff),
     ):
         protected.update(str(value) for value in row if value)
+    return protected
+
+
+def _active_index_job_commits(db: sqlite3.Connection, repository: str) -> set[str]:
+    protected: set[str] = set()
     for row in db.execute(
         """SELECT commit_sha, base_commit_sha
            FROM jobs
@@ -324,6 +369,12 @@ def _protected_index_commits(db: sqlite3.Connection, repository: str) -> set[str
     ):
         protected.update(str(value) for value in row if value)
     return protected
+
+
+def _protected_index_commits(db: sqlite3.Connection, repository: str) -> set[str]:
+    return _workspace_protected_index_commits(db, repository) | _active_index_job_commits(
+        db, repository
+    )
 
 
 def _prunable_index_commits(db: sqlite3.Connection, repository: str, keep_limit: int) -> list[str]:
@@ -508,7 +559,7 @@ def list_indexes(service: Any, repository: str, limit: int=50, offset: int=0) ->
     with _db() as db:
         total=db.execute("SELECT COUNT(*) FROM indexes WHERE repository=?",(repository,)).fetchone()[0]
         rows=db.execute("SELECT * FROM indexes WHERE repository=? ORDER BY accessed_at DESC LIMIT ? OFFSET ?",(repository,limit,offset)).fetchall()
-        pins={r[0] for r in db.execute("SELECT DISTINCT index_commit_sha FROM workspaces WHERE repository=? AND status IN ('active','drifted') AND index_commit_sha IS NOT NULL",(repository,))}
+        pins=_workspace_protected_index_commits(db,repository)
     return {"ok":True,"repository":repository,"items":[{"commit_sha":r["commit_sha"],"tree_sha":r["tree_sha"],"index_version":r["version"],"status":r["status"],"file_count":r["file_count"],"symbol_count":r["symbol_count"],"size_bytes":r["size_bytes"],"created_at":r["created_at"],"last_accessed_at":r["accessed_at"],"pinned_by_workspace":r["commit_sha"] in pins} for r in rows],"total":total,"limit":limit,"offset":offset}
 
 

@@ -107,3 +107,153 @@ def test_unknown_branch_create_error_has_dedicated_failure_code(monkeypatch):
     assert exc.value.code == "WORKSPACE_BRANCH_CREATE_FAILED"
     assert exc.value.details["cause_type"] == "RuntimeError"
     assert "do not leak" not in exc.value.message
+
+
+def _seed_workspace(
+    db,
+    *,
+    workspace_id: str,
+    branch: str,
+    lease_expires_at: float,
+    status: str = "active",
+    revision: int = 1,
+):
+    db.execute(
+        "INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            workspace_id,
+            "owner/repo",
+            branch,
+            "main",
+            "a" * 40,
+            "b" * 40,
+            "c" * 40,
+            status,
+            revision,
+            "test-owner",
+            lease_expires_at,
+            "b" * 40,
+            '{"paths":["app/**"]}',
+            None,
+            42,
+            10.0,
+            20.0,
+        ),
+    )
+
+
+def test_workspace_public_separates_write_lease_from_index_pin_grace(monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS", "3600")
+    monkeypatch.setattr(workspace, "_now", lambda: 10_000.0)
+
+    inside_grace = workspace._workspace_public(
+        {
+            "workspace_id": "inside",
+            "status": "active",
+            "lease_expires_at": 9_000.0,
+            "scope_json": "{}",
+        }
+    )
+    beyond_grace = workspace._workspace_public(
+        {
+            "workspace_id": "beyond",
+            "status": "active",
+            "lease_expires_at": 6_000.0,
+            "scope_json": "{}",
+        }
+    )
+    drifted = workspace._workspace_public(
+        {
+            "workspace_id": "drifted",
+            "status": "drifted",
+            "lease_expires_at": 9_500.0,
+            "scope_json": "{}",
+        }
+    )
+
+    assert inside_grace["lease_valid"] is False
+    assert inside_grace["index_pin_active"] is True
+    assert inside_grace["index_pin_grace_expires_at"] == 12_600.0
+    assert beyond_grace["lease_valid"] is False
+    assert beyond_grace["index_pin_active"] is False
+    assert drifted["lease_valid"] is False
+    assert drifted["index_pin_active"] is True
+
+
+def test_expired_workspace_write_is_rejected_then_renewal_restores_lease_and_pin(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "renew-expired.db"))
+    monkeypatch.setenv("MYGITHUB12_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS", "0")
+    monkeypatch.setattr(workspace, "_now", lambda: 1000.0)
+    monkeypatch.setattr(workspace, "_service_repo", lambda *args, **kwargs: object())
+    workspace.init_db()
+    with workspace._db() as db:
+        _seed_workspace(
+            db,
+            workspace_id="ws-expired",
+            branch="ai/expired",
+            lease_expires_at=900.0,
+        )
+
+    with pytest.raises(workspace.MyGithub12Error) as exc:
+        workspace.workspace_write_preflight(
+            object(),
+            "owner/repo",
+            "ai/expired",
+            "b" * 40,
+            workspace_id="ws-expired",
+            expected_workspace_revision=1,
+        )
+    assert exc.value.code == "WORKSPACE_LEASE_REQUIRED"
+
+    renewed = workspace.renew_workspace_lease(
+        object(), "ws-expired", 1, lease_seconds=300
+    )
+
+    assert renewed["revision"] == 2
+    assert renewed["lease_expires_at"] == 1300.0
+    assert renewed["lease_valid"] is True
+    assert renewed["index_pin_active"] is True
+    assert renewed["repository"] == "owner/repo"
+    assert renewed["branch"] == "ai/expired"
+    assert renewed["base_commit_sha"] == "a" * 40
+    assert renewed["head_sha"] == "b" * 40
+    assert renewed["tree_sha"] == "c" * 40
+    assert renewed["scope"] == {"paths": ["app/**"]}
+    assert renewed["pr_number"] == 42
+
+
+def test_workspace_branch_ownership_allows_parallel_branches_but_not_duplicates(
+    tmp_path, monkeypatch
+):
+    import sqlite3
+
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "branch-ownership.db"))
+    workspace.init_db()
+    with workspace._db() as db:
+        _seed_workspace(
+            db,
+            workspace_id="ws-a",
+            branch="ai/feature-a",
+            lease_expires_at=1.0,
+        )
+        _seed_workspace(
+            db,
+            workspace_id="ws-b",
+            branch="ai/feature-b",
+            lease_expires_at=1.0,
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            _seed_workspace(
+                db,
+                workspace_id="ws-a-duplicate",
+                branch="ai/feature-a",
+                lease_expires_at=0.0,
+            )
+
+        rows = db.execute(
+            "SELECT branch FROM workspaces WHERE repository='owner/repo' ORDER BY branch"
+        ).fetchall()
+
+    assert [row[0] for row in rows] == ["ai/feature-a", "ai/feature-b"]

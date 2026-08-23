@@ -21,7 +21,17 @@ _compare=core._compare
 init_db=core.init_db
 
 def _workspace_public(row: sqlite3.Row | dict[str,Any]) -> dict[str,Any]:
-    r=dict(row); r["scope"]=json.loads(r.pop("scope_json") or "{}"); r["lease_valid"]=r["lease_expires_at"]>_now() and r["status"]=="active"; return r
+    r=dict(row)
+    r["scope"]=json.loads(r.pop("scope_json") or "{}")
+    now=_now()
+    r["lease_valid"]=r["lease_expires_at"]>now and r["status"]=="active"
+    r["index_pin_active"]=core._workspace_index_pin_active(
+        r["status"], r["lease_expires_at"], now=now
+    )
+    r["index_pin_grace_expires_at"]=core._workspace_index_pin_grace_expires_at(
+        r["status"], r["lease_expires_at"]
+    )
+    return r
 
 
 def _branch_create_error(exc: Exception, branch: str, base_ref: str) -> MyGithub12Error:
