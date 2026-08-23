@@ -11,6 +11,7 @@ import base64
 import fnmatch
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -24,6 +25,7 @@ INDEX_VERSION = "12.0.0-1"
 MAX_INDEX_FILES = int(os.getenv("MYGITHUB12_INDEX_MAX_FILES", "5000"))
 MAX_INDEX_BYTES = int(os.getenv("MYGITHUB12_INDEX_MAX_BYTES", str(50 * 1024 * 1024)))
 MAX_FILE_BYTES = int(os.getenv("MYGITHUB12_INDEX_MAX_FILE_BYTES", str(512 * 1024)))
+DEFAULT_INDEX_RETENTION_PER_REPOSITORY = 50
 MAX_RESULTS = 500
 MAX_BATCH_FILES = 100
 MAX_BATCH_BYTES = 4 * 1024 * 1024
@@ -32,6 +34,7 @@ MAX_LEASE_SECONDS = 14400
 _EXCLUDED = {".git", "node_modules", "vendor", "dist", "build", "target", ".next", ".venv", "venv", "__pycache__"}
 _SENSITIVE = {".env", "id_rsa", "id_ed25519", "credentials", "credentials.json", "secrets.json", "private.key", "server.key"}
 _LOCK = threading.RLock()
+logger = logging.getLogger(__name__)
 
 
 class MyGithub12Error(Exception):
@@ -264,6 +267,128 @@ def request_index_build(service: Any, repository: str, commit_sha: str, strategy
     return {"ok":True,"deduplicated":False,**get_index_job(job_id)}
 
 
+def recover_orphaned_index_jobs() -> dict[str, int]:
+    """Fail in-process index jobs left behind by a previous Controller.
+
+    MyGithut12 index workers are daemon threads, not a durable external queue.
+    After process restart no queued/running row can still have a live worker in
+    this process, so leaving it active would permanently deduplicate retries.
+    """
+    init_db()
+    now = _now()
+    with _LOCK, _db() as db:
+        rows = db.execute(
+            "SELECT job_id,status FROM jobs WHERE status IN ('queued','running')"
+        ).fetchall()
+        if rows:
+            db.execute(
+                """UPDATE jobs
+                   SET status='failed', step='failed',
+                       error_code='INDEX_CONTROLLER_RESTARTED',
+                       error_message='Controller restarted before the in-process index worker completed; retry the index build',
+                       finished_at=?, revision=revision+1
+                   WHERE status IN ('queued','running')""",
+                (now,),
+            )
+            db.commit()
+    return {
+        "recovered_jobs": len(rows),
+        "queued_jobs": sum(1 for row in rows if row["status"] == "queued"),
+        "running_jobs": sum(1 for row in rows if row["status"] == "running"),
+    }
+
+
+def _index_retention_limit() -> int:
+    raw = os.getenv("MYGITHUB12_INDEX_RETENTION_PER_REPOSITORY", str(DEFAULT_INDEX_RETENTION_PER_REPOSITORY)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = DEFAULT_INDEX_RETENTION_PER_REPOSITORY
+    return max(0, min(value, 1000))
+
+
+def _protected_index_commits(db: sqlite3.Connection, repository: str) -> set[str]:
+    protected: set[str] = set()
+    for row in db.execute(
+        """SELECT index_commit_sha, base_commit_sha, head_sha
+           FROM workspaces
+           WHERE repository=? AND status IN ('active','drifted')""",
+        (repository,),
+    ):
+        protected.update(str(value) for value in row if value)
+    for row in db.execute(
+        """SELECT commit_sha, base_commit_sha
+           FROM jobs
+           WHERE repository=? AND status IN ('queued','running')""",
+        (repository,),
+    ):
+        protected.update(str(value) for value in row if value)
+    return protected
+
+
+def _prunable_index_commits(db: sqlite3.Connection, repository: str, keep_limit: int) -> list[str]:
+    if keep_limit <= 0:
+        return []
+    rows = db.execute(
+        """SELECT commit_sha, MAX(accessed_at) AS last_accessed, MAX(created_at) AS created
+           FROM indexes
+           WHERE repository=? AND status='ready'
+           GROUP BY commit_sha
+           ORDER BY last_accessed DESC, created DESC, commit_sha DESC""",
+        (repository,),
+    ).fetchall()
+    recent = {str(row["commit_sha"]) for row in rows[:keep_limit]}
+    protected = _protected_index_commits(db, repository)
+    keep = recent | protected
+    return [str(row["commit_sha"]) for row in rows if str(row["commit_sha"]) not in keep]
+
+
+def prune_repository_indexes(repository: str, keep_limit: int | None = None) -> dict[str, Any]:
+    """Prune rebuildable historical index snapshots while preserving live pins.
+
+    Source code remains authoritative in GitHub. Each commit is removed in its
+    own transaction so a large historical cleanup cannot create one enormous
+    SQLite write transaction/WAL. Job/workspace history is intentionally kept.
+    """
+    init_db()
+    limit = _index_retention_limit() if keep_limit is None else max(0, min(int(keep_limit), 1000))
+    if limit == 0:
+        return {"repository": repository, "retention_limit": 0, "pruned_commits": 0, "pruned_files": 0, "pruned_symbols": 0}
+    with _LOCK, _db() as db:
+        commits = _prunable_index_commits(db, repository, limit)
+    pruned_files = 0
+    pruned_symbols = 0
+    completed = 0
+    for commit_sha in commits:
+        with _LOCK, _db() as db:
+            # Re-evaluate protection immediately before deletion. A workspace
+            # or index job may have appeared after the candidate list was read.
+            if commit_sha in _protected_index_commits(db, repository):
+                continue
+            file_count = db.execute(
+                "SELECT COUNT(*) FROM files WHERE repository=? AND commit_sha=?",
+                (repository, commit_sha),
+            ).fetchone()[0]
+            symbol_count = db.execute(
+                "SELECT COUNT(*) FROM symbols WHERE repository=? AND commit_sha=?",
+                (repository, commit_sha),
+            ).fetchone()[0]
+            db.execute("DELETE FROM symbols WHERE repository=? AND commit_sha=?", (repository, commit_sha))
+            db.execute("DELETE FROM files WHERE repository=? AND commit_sha=?", (repository, commit_sha))
+            db.execute("DELETE FROM indexes WHERE repository=? AND commit_sha=?", (repository, commit_sha))
+            db.commit()
+            pruned_files += int(file_count)
+            pruned_symbols += int(symbol_count)
+            completed += 1
+    return {
+        "repository": repository,
+        "retention_limit": limit,
+        "pruned_commits": completed,
+        "pruned_files": pruned_files,
+        "pruned_symbols": pruned_symbols,
+    }
+
+
 def _job_cancelled(job_id: str) -> bool:
     with _db() as db:
         row=db.execute("SELECT cancel_requested FROM jobs WHERE job_id=?",(job_id,)).fetchone()
@@ -324,6 +449,18 @@ def _run_index_build(service: Any, identity: dict[str,str], job_id: str, strateg
             db.executemany("INSERT INTO symbols VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",symbol_rows)
             db.execute("INSERT OR REPLACE INTO indexes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(repository,commit_sha,identity["tree_sha"],INDEX_VERSION,"ready",manifest["build_strategy"],base_commit_sha or None,len(file_rows),symbol_count,total,now,now,json.dumps(manifest)))
             db.execute("UPDATE jobs SET status='completed',step='completed',progress_current=progress_total,reused_files=?,reindexed_files=?,finished_at=?,revision=revision+1 WHERE job_id=?",(reused,reindexed,now,job_id))
+        try:
+            result = prune_repository_indexes(repository)
+            if result["pruned_commits"]:
+                logger.info(
+                    "Pruned historical indexes: repository=%s commits=%d files=%d symbols=%d retention=%d",
+                    repository, result["pruned_commits"], result["pruned_files"],
+                    result["pruned_symbols"], result["retention_limit"],
+                )
+        except Exception:
+            # Index creation succeeded and is usable; cache retention failure is
+            # operationally important but must not rewrite a completed build as failed.
+            logger.exception("Historical index pruning failed: repository=%s", repository)
     except MyGithub12Error as exc:
         with _LOCK,_db() as db: db.execute("UPDATE jobs SET status='failed',step='failed',error_code=?,error_message=?,finished_at=?,revision=revision+1 WHERE job_id=?",(exc.code,exc.message,_now(),job_id))
     except Exception as exc:
