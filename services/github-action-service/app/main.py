@@ -29,12 +29,18 @@ async def lifespan(app: FastAPI):
         from app.ci_database import init_db
         from app.deployment_service import init_deployment_db
         from app.attestation_registry import init_registry_db
-        from app.mygithub12 import init_db as init_mygithub12_db
+        from app.mygithub12 import init_db as init_mygithub12_db, recover_orphaned_index_jobs
         ensure_idempotency_storage()
         init_db()
         init_deployment_db()
         init_registry_db()
         init_mygithub12_db()
+        recovered_index_jobs = recover_orphaned_index_jobs()
+        if recovered_index_jobs["recovered_jobs"]:
+            logger.warning(
+                "Recovered orphaned MyGithut12 index jobs after Controller restart: %s",
+                recovered_index_jobs,
+            )
     except Exception:
         logger.exception("Controller database initialization failed")
         raise

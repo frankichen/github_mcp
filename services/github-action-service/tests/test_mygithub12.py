@@ -248,3 +248,125 @@ def test_call_hierarchy_resolves_python_self_and_module_calls(tmp_path, monkeypa
     targets = {edge["to"] for edge in result["edges"]}
     assert targets == {local["symbol_id"], module_helper["symbol_id"]}
     assert execute["symbol_id"] not in targets
+
+
+def _seed_retention_snapshot(db, repository: str, commit_sha: str, order: int):
+    tree_sha = f"{order + 1000:040x}"
+    content = f"def f_{order}():\n    return {order}\n"
+    blob_sha = f"{order + 2000:040x}"
+    now = float(order)
+    db.execute(
+        "INSERT INTO indexes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (repository, commit_sha, tree_sha, mygithub12.INDEX_VERSION, "ready", "full", None, 1, 1, len(content), now, now, "{}"),
+    )
+    db.execute(
+        "INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?)",
+        (repository, commit_sha, f"f{order}.py", blob_sha, len(content), "python", f"{order:064x}", 2, content),
+    )
+    symbol = mygithub12._symbols(repository, commit_sha, f"f{order}.py", blob_sha, "python", content)[0]
+    db.execute(
+        "INSERT INTO symbols VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            repository, commit_sha, symbol["symbol_id"], symbol["name"], symbol["qualified_name"],
+            symbol["kind"], symbol["language"], symbol["path"], symbol["blob_sha"],
+            symbol["start_line"], symbol["end_line"], symbol["signature"], symbol["parent_name"],
+            symbol["bases_json"],
+        ),
+    )
+
+
+def test_index_retention_prunes_lru_but_preserves_workspace_pins(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "retention.db"))
+    mygithub12.init_db()
+    repository = "o/r"
+    commits = [f"{i:040x}" for i in range(1, 6)]
+    with mygithub12._db() as db:
+        for order, commit_sha in enumerate(commits, 1):
+            _seed_retention_snapshot(db, repository, commit_sha, order)
+        db.execute(
+            "INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "ws-retention", repository, "ai/task", "main", commits[0], commits[0],
+                "f" * 40, "active", 1, "test", mygithub12._now() + 600,
+                commits[0], "{}", None, None, mygithub12._now(), mygithub12._now(),
+            ),
+        )
+
+    result = mygithub12.prune_repository_indexes(repository, keep_limit=2)
+
+    assert result == {
+        "repository": repository,
+        "retention_limit": 2,
+        "pruned_commits": 2,
+        "pruned_files": 2,
+        "pruned_symbols": 2,
+    }
+    with mygithub12._db() as db:
+        remaining = {row[0] for row in db.execute("SELECT commit_sha FROM indexes WHERE repository=?", (repository,))}
+        assert remaining == {commits[0], commits[3], commits[4]}
+        assert db.execute("SELECT COUNT(*) FROM files WHERE repository=?", (repository,)).fetchone()[0] == 3
+        assert db.execute("SELECT COUNT(*) FROM symbols WHERE repository=?", (repository,)).fetchone()[0] == 3
+
+
+def test_index_retention_preserves_active_job_target_and_base(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "retention-job.db"))
+    mygithub12.init_db()
+    repository = "o/r"
+    commits = [f"{i:040x}" for i in range(11, 15)]
+    with mygithub12._db() as db:
+        for order, commit_sha in enumerate(commits, 1):
+            _seed_retention_snapshot(db, repository, commit_sha, order)
+        db.execute(
+            """INSERT INTO jobs(job_id,repository,commit_sha,tree_sha,version,strategy,base_commit_sha,status,step,revision,
+               progress_current,progress_total,reused_files,reindexed_files,cancel_requested,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("job-retention", repository, commits[0], "a" * 40, mygithub12.INDEX_VERSION, "incremental", commits[1], "running", "indexing", 1, 0, 1, 0, 0, 0, mygithub12._now()),
+        )
+
+    result = mygithub12.prune_repository_indexes(repository, keep_limit=1)
+
+    assert result["pruned_commits"] == 1
+    with mygithub12._db() as db:
+        remaining = {row[0] for row in db.execute("SELECT commit_sha FROM indexes WHERE repository=?", (repository,))}
+    assert remaining == {commits[0], commits[1], commits[3]}
+
+
+def test_index_retention_zero_disables_pruning(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "retention-disabled.db"))
+    mygithub12.init_db()
+    repository = "o/r"
+    with mygithub12._db() as db:
+        for order in range(1, 4):
+            _seed_retention_snapshot(db, repository, f"{order:040x}", order)
+
+    result = mygithub12.prune_repository_indexes(repository, keep_limit=0)
+
+    assert result["pruned_commits"] == 0
+    with mygithub12._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM indexes WHERE repository=?", (repository,)).fetchone()[0] == 3
+
+
+def test_recover_orphaned_index_jobs_fails_previous_process_work(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "orphaned-jobs.db"))
+    mygithub12.init_db()
+    now = mygithub12._now()
+    with mygithub12._db() as db:
+        for job_id, status in (("queued-old", "queued"), ("running-old", "running"), ("done", "completed")):
+            db.execute(
+                """INSERT INTO jobs(job_id,repository,commit_sha,tree_sha,version,strategy,status,step,revision,
+                   progress_current,progress_total,reused_files,reindexed_files,cancel_requested,created_at,started_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (job_id, "o/r", (job_id[0] * 40), "t" * 40, mygithub12.INDEX_VERSION, "auto", status, status, 1, 0, 1, 0, 0, 0, now, now),
+            )
+
+    result = mygithub12.recover_orphaned_index_jobs()
+
+    assert result == {"recovered_jobs": 2, "queued_jobs": 1, "running_jobs": 1}
+    with mygithub12._db() as db:
+        rows = {row["job_id"]: row for row in db.execute("SELECT * FROM jobs")}
+    for job_id in ("queued-old", "running-old"):
+        assert rows[job_id]["status"] == "failed"
+        assert rows[job_id]["step"] == "failed"
+        assert rows[job_id]["error_code"] == "INDEX_CONTROLLER_RESTARTED"
+        assert rows[job_id]["finished_at"] is not None
+    assert rows["done"]["status"] == "completed"
