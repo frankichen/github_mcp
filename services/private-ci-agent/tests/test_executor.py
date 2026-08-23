@@ -1,5 +1,4 @@
 import os
-import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -963,23 +962,30 @@ def test_dependency_hash_binds_relative_path_and_content(tmp_path):
     )
 
 
-def test_source_immutability_requires_exact_clean_tracked_tree(tmp_path):
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "ci@example.invalid"], check=True)
-    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "CI"], check=True)
-    tracked = tmp_path / "tracked.txt"
-    tracked.write_text("clean\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
-    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "init"], check=True)
-    head = subprocess.check_output(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], text=True).strip()
+def test_source_immutability_requires_exact_clean_tracked_tree(tmp_path, monkeypatch):
+    head = "a" * 40
     job = make_job(tmp_path)
     job.commit_sha = head
+    states = {"head": head, "worktree": 0, "index": 0}
+
+    def fake_run(command, **_kwargs):
+        if command[-2:] == ["rev-parse", "HEAD"]:
+            return SimpleNamespace(returncode=0, stdout=states["head"] + "\n", stderr="")
+        if "--cached" in command:
+            return SimpleNamespace(returncode=states["index"], stdout="", stderr="")
+        if command[-4:] == ["--quiet", "HEAD", "--"] or (
+            "diff" in command and "--cached" not in command
+        ):
+            return SimpleNamespace(returncode=states["worktree"], stdout="", stderr="")
+        raise AssertionError(f"unexpected git command: {command}")
+
+    monkeypatch.setattr(executor_module.subprocess, "run", fake_run)
 
     assert JobExecutor._verify_source_immutable(job) == (True, "")
-    tracked.write_text("dirty\n", encoding="utf-8")
+    states["worktree"] = 1
     assert JobExecutor._verify_source_immutable(job) == (False, "tracked_files_changed")
-    subprocess.run(["git", "-C", str(tmp_path), "checkout", "--", "tracked.txt"], check=True)
-    job.commit_sha = "f" * 40
+    states["worktree"] = 0
+    states["head"] = "b" * 40
     assert JobExecutor._verify_source_immutable(job) == (False, "head_sha_changed")
 
 
