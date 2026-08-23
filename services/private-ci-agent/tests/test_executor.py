@@ -1,4 +1,5 @@
 import os
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -51,6 +52,10 @@ class FakePodman:
 
     def image_available(self, _image):
         return True
+
+    def image_digest(self, image):
+        import hashlib
+        return "sha256:" + hashlib.sha256(image.encode()).hexdigest()
 
     def run_command(self, _image, _job_id, _source_dir, _caches, command, _timeout, network=False, **_kwargs):
         self.caches.append(_caches)
@@ -347,34 +352,36 @@ class AlwaysFailPodman(FakePodman):
         return {"exit_code": exit_code, "stdout": "", "stderr": "", "timed_out": False}
 
 
-def test_gofmt_autofix_formats_workspace_without_git_writeback(tmp_path):
+def test_gofmt_is_readonly_and_fails_unformatted_workspace(tmp_path):
     (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
     go_file = tmp_path / "bad.go"
-    go_file.write_text("package main\nfunc main(){ }\n", encoding="utf-8")
+    original = "package main\nfunc main(){ }\n"
+    go_file.write_text(original, encoding="utf-8")
 
-    class GofmtAutofixPodman(FakePodman):
+    class GofmtReadonlyPodman(FakePodman):
         def run_command(self, image, job_id, source_dir, caches, command, timeout, network=False, **kwargs):
             self.commands.append((command, network, timeout))
-            if "gofmt -w" in command:
+            if "gofmt -l" in command:
                 return {
-                    "exit_code": 0,
-                    "stdout": "GOFMT AUTOFIX FILES:\n./bad.go\nAll Go files properly formatted\n",
+                    "exit_code": 1,
+                    "stdout": "UNFORMATTED GO FILES:\n./bad.go\n",
                     "stderr": "",
                     "timed_out": False,
                 }
             return {"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}
 
-    podman = GofmtAutofixPodman()
+    podman = GofmtReadonlyPodman()
     executor = make_executor(podman)
     result = executor._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
 
-    assert result["passed"] is True
+    assert result["passed"] is False
     gofmt_step = next(step for step in result["steps"] if step["step_name"].endswith(":gofmt"))
-    assert gofmt_step["status"] == "passed"
+    assert gofmt_step["status"] == "failed"
     commands = [command for command, _, _ in podman.commands]
-    assert any("gofmt -w" in command for command in commands)
-    assert not any("git commit" in command or "git push" in command for command in commands)
-    assert any("GOFMT AUTOFIX FILES" in message for message in executor.log_manager.messages)
+    assert any("gofmt -l" in command for command in commands)
+    assert not any("gofmt -w" in command for command in commands)
+    assert go_file.read_text(encoding="utf-8") == original
+
 
 
 def test_executor_has_no_git_gofmt_writeback_entrypoints():
@@ -919,3 +926,101 @@ def test_common_language_setup_failure_blocks_checks(tmp_path):
     assert result["steps"][0]["status"] == "failed"
     assert all(step["status"] == "blocked_by_setup" for step in result["steps"][1:])
     assert len(podman.commands) == 1
+
+
+@pytest.mark.parametrize(("stack", "manifest", "initial", "changed"), [
+    ("go", "go.sum", "module-a h1:one\n", "module-a h1:two\n"),
+    ("node", "package-lock.json", '{"lockfileVersion":3}', '{"lockfileVersion":2}'),
+    ("python", "requirements-prod.txt", "requests==2.32.0\n", "requests==2.33.0\n"),
+    ("rust", "Cargo.lock", 'version = 3\n', 'version = 4\n'),
+    ("maven", "pom.xml", "<project><version>1</version></project>", "<project><version>2</version></project>"),
+    ("gradle", "gradle.lockfile", "dep=1\n", "dep=2\n"),
+    ("dotnet", "packages.lock.json", '{"version":1}', '{"version":2}'),
+])
+def test_dependency_manifest_hash_covers_all_supported_stacks(tmp_path, stack, manifest, initial, changed):
+    path = tmp_path / manifest
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(initial, encoding="utf-8")
+    workspaces = [{"path": ".", "stack": stack}]
+
+    before = JobExecutor._hash_dependency_manifests(str(tmp_path), workspaces)
+    path.write_text(changed, encoding="utf-8")
+    after = JobExecutor._hash_dependency_manifests(str(tmp_path), workspaces)
+
+    assert len(before) == 64
+    assert before != after
+
+
+def test_dependency_hash_binds_relative_path_and_content(tmp_path):
+    first = tmp_path / "a.lock"
+    second = tmp_path / "nested" / "a.lock"
+    first.write_text("same", encoding="utf-8")
+    second.parent.mkdir()
+    second.write_text("same", encoding="utf-8")
+
+    assert JobExecutor._hash_paths(str(tmp_path), ["a.lock"]) != JobExecutor._hash_paths(
+        str(tmp_path), ["nested/a.lock"]
+    )
+
+
+def test_source_immutability_requires_exact_clean_tracked_tree(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "ci@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "CI"], check=True)
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("clean\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "init"], check=True)
+    head = subprocess.check_output(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], text=True).strip()
+    job = make_job(tmp_path)
+    job.commit_sha = head
+
+    assert JobExecutor._verify_source_immutable(job) == (True, "")
+    tracked.write_text("dirty\n", encoding="utf-8")
+    assert JobExecutor._verify_source_immutable(job) == (False, "tracked_files_changed")
+    subprocess.run(["git", "-C", str(tmp_path), "checkout", "--", "tracked.txt"], check=True)
+    job.commit_sha = "f" * 40
+    assert JobExecutor._verify_source_immutable(job) == (False, "head_sha_changed")
+
+
+def test_workspace_image_identity_is_deterministic_and_includes_services(tmp_path):
+    podman = FakePodman()
+    executor = make_executor(podman)
+    executor.services.images = {
+        "postgres": "docker.io/library/postgres:16-alpine",
+        "redis": "docker.io/library/redis:7-alpine",
+    }
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    workspaces = [{"path": ".", "stack": "go", "services": ["redis", "postgres"]}]
+
+    first = executor._workspace_images(workspaces, str(tmp_path))
+    second = executor._workspace_images(workspaces, str(tmp_path))
+
+    assert first == second
+    assert [item["stack"] for item in first] == ["go", "service:postgres", "service:redis"]
+    assert all(item["digest"].startswith("sha256:") for item in first)
+
+
+def test_hidden_dependency_config_path_keeps_leading_dot_in_identity(tmp_path):
+    cargo = tmp_path / ".cargo" / "config.toml"
+    cargo.parent.mkdir()
+    cargo.write_text('[net]\ngit-fetch-with-cli = true\n', encoding="utf-8")
+    workspaces = [{"path": ".", "stack": "rust"}]
+
+    before = JobExecutor._hash_dependency_manifests(str(tmp_path), workspaces)
+    cargo.write_text('[net]\ngit-fetch-with-cli = false\n', encoding="utf-8")
+    after = JobExecutor._hash_dependency_manifests(str(tmp_path), workspaces)
+
+    assert before != after
+
+
+def test_hidden_github_workflow_path_is_bound_into_test_config_identity(tmp_path):
+    workflow = tmp_path / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("name: one\n", encoding="utf-8")
+
+    before = JobExecutor._hash_test_config(str(tmp_path))
+    workflow.write_text("name: two\n", encoding="utf-8")
+    after = JobExecutor._hash_test_config(str(tmp_path))
+
+    assert before != after

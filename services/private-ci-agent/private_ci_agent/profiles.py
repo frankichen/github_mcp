@@ -76,7 +76,7 @@ GO_COMMANDS = {
         {"name": "mod_download", "command": "go mod download 2>&1"},
     ],
     "check": [
-        {"name": "gofmt", "command": "UNFORMATTED=$(gofmt -l . 2>&1); if [ -n \"$UNFORMATTED\" ]; then echo \"GOFMT AUTOFIX FILES:\"; echo \"$UNFORMATTED\"; gofmt -w .; fi; VERIFY=$(gofmt -l . 2>&1); if [ -n \"$VERIFY\" ]; then echo \"UNFORMATTED FILES AFTER AUTOFIX:\"; echo \"$VERIFY\"; exit 1; fi; echo \"All Go files properly formatted\""},
+        {"name": "gofmt", "command": "UNFORMATTED=$(gofmt -l . 2>&1); if [ -n \"$UNFORMATTED\" ]; then echo \"UNFORMATTED GO FILES:\"; echo \"$UNFORMATTED\"; exit 1; fi; echo \"All Go files properly formatted\""},
         {"name": "govet", "command": "go vet ./... 2>&1"},
         {"name": "gotest", "command": "go test -p 6 -count=1 ./... 2>&1"},
         {"name": "gobuild", "command": "go build ./... 2>&1"},
