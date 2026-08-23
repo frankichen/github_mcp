@@ -18,6 +18,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -28,6 +29,12 @@ MAX_FILE_BYTES = int(os.getenv("MYGITHUB12_INDEX_MAX_FILE_BYTES", str(512 * 1024
 DEFAULT_INDEX_RETENTION_PER_REPOSITORY = 50
 DEFAULT_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS = 24 * 60 * 60
 MAX_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_INDEX_BLOB_FETCH_WORKERS = 4
+MAX_INDEX_BLOB_FETCH_WORKERS = 8
+DEFAULT_INDEX_PROGRESS_BATCH_FILES = 32
+MAX_INDEX_PROGRESS_BATCH_FILES = 512
+DEFAULT_INDEX_PROGRESS_INTERVAL_SECONDS = 0.25
+MAX_INDEX_PROGRESS_INTERVAL_SECONDS = 5.0
 MAX_RESULTS = 500
 MAX_BATCH_FILES = 100
 MAX_BATCH_BYTES = 4 * 1024 * 1024
@@ -35,6 +42,16 @@ DEFAULT_LEASE_SECONDS = 1800
 MAX_LEASE_SECONDS = 14400
 _EXCLUDED = {".git", "node_modules", "vendor", "dist", "build", "target", ".next", ".venv", "venv", "__pycache__"}
 _SENSITIVE = {".env", "id_rsa", "id_ed25519", "credentials", "credentials.json", "secrets.json", "private.key", "server.key"}
+_BINARY_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff", ".psd", ".heic", ".avif",
+    ".zip", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",
+    ".jar", ".class", ".war", ".ear", ".apk", ".aab",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".mp4", ".mov", ".avi", ".mkv", ".webm",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".so", ".dll", ".dylib", ".exe", ".o", ".obj", ".a", ".lib",
+    ".db", ".sqlite", ".sqlite3", ".pkl",
+})
 _LOCK = threading.RLock()
 logger = logging.getLogger(__name__)
 
@@ -179,6 +196,55 @@ def _decode_blob(repo: Any, sha: str) -> bytes:
     blob = repo.get_git_blob(sha)
     content = getattr(blob, "content", "") or ""
     return base64.b64decode(content) if getattr(blob, "encoding", "base64") == "base64" else content.encode()
+
+
+def _binary_path(path: str) -> bool:
+    return PurePosixPath(path).suffix.lower() in _BINARY_SUFFIXES
+
+
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _index_blob_fetch_workers() -> int:
+    return _env_int(
+        "MYGITHUB12_INDEX_BLOB_FETCH_WORKERS",
+        DEFAULT_INDEX_BLOB_FETCH_WORKERS,
+        1,
+        MAX_INDEX_BLOB_FETCH_WORKERS,
+    )
+
+
+def _index_progress_batch_files() -> int:
+    return _env_int(
+        "MYGITHUB12_INDEX_PROGRESS_BATCH_FILES",
+        DEFAULT_INDEX_PROGRESS_BATCH_FILES,
+        1,
+        MAX_INDEX_PROGRESS_BATCH_FILES,
+    )
+
+
+def _index_progress_interval_seconds() -> float:
+    return _env_float(
+        "MYGITHUB12_INDEX_PROGRESS_INTERVAL_SECONDS",
+        DEFAULT_INDEX_PROGRESS_INTERVAL_SECONDS,
+        0.05,
+        MAX_INDEX_PROGRESS_INTERVAL_SECONDS,
+    )
 
 
 def _symbol_id(repository: str, commit_sha: str, path: str, name: str, kind: str, line: int) -> str:
@@ -451,47 +517,456 @@ def _finish_cancelled_job(job_id: str) -> None:
         db.execute("UPDATE jobs SET status='cancelled',step='cancelled',finished_at=?,revision=revision+1 WHERE job_id=?",(_now(),job_id))
 
 
+class _IndexJobPulse:
+    """Throttle durable progress writes and cancellation polls for hot index loops."""
+
+    def __init__(self, job_id: str):
+        self.job_id = job_id
+        self.batch_files = _index_progress_batch_files()
+        self.interval_seconds = _index_progress_interval_seconds()
+        self.last_current = 0
+        self.last_pulse_at = time.monotonic()
+
+    def pulse(self, current: int, *, force: bool = False) -> bool:
+        now = time.monotonic()
+        if not force:
+            if current - self.last_current < self.batch_files and now - self.last_pulse_at < self.interval_seconds:
+                return False
+        with _LOCK, _db() as db:
+            row = db.execute(
+                "SELECT cancel_requested FROM jobs WHERE job_id=?", (self.job_id,)
+            ).fetchone()
+            if not row:
+                raise MyGithub12Error("INDEX_NOT_FOUND", "index job was not found", {"job_id": self.job_id})
+            db.execute(
+                "UPDATE jobs SET progress_current=?,revision=revision+1 WHERE job_id=?",
+                (current, self.job_id),
+            )
+        self.last_current = current
+        self.last_pulse_at = now
+        return bool(row["cancel_requested"])
+
+
+def _load_incremental_base(
+    repository: str, base_commit_sha: str
+) -> tuple[dict[str, sqlite3.Row], dict[str, list[sqlite3.Row]]]:
+    if not base_commit_sha:
+        return {}, {}
+    with _db() as db:
+        ready = db.execute(
+            """SELECT 1 FROM indexes
+               WHERE repository=? AND commit_sha=? AND version=? AND status='ready'
+               LIMIT 1""",
+            (repository, base_commit_sha, INDEX_VERSION),
+        ).fetchone()
+        if not ready:
+            return {}, {}
+        files = {
+            row["path"]: row
+            for row in db.execute(
+                "SELECT * FROM files WHERE repository=? AND commit_sha=?",
+                (repository, base_commit_sha),
+            )
+        }
+        symbols_by_path: dict[str, list[sqlite3.Row]] = {}
+        for row in db.execute(
+            "SELECT * FROM symbols WHERE repository=? AND commit_sha=? ORDER BY path,start_line,symbol_id",
+            (repository, base_commit_sha),
+        ):
+            symbols_by_path.setdefault(row["path"], []).append(row)
+    return files, symbols_by_path
+
+
+def _cloned_symbol_tuple(repository: str, commit_sha: str, row: sqlite3.Row) -> tuple[Any, ...]:
+    symbol_id = _symbol_id(
+        repository,
+        commit_sha,
+        row["path"],
+        row["name"],
+        row["kind"],
+        int(row["start_line"]),
+    )
+    return (
+        repository,
+        commit_sha,
+        symbol_id,
+        row["name"],
+        row["qualified_name"],
+        row["kind"],
+        row["language"],
+        row["path"],
+        row["blob_sha"],
+        row["start_line"],
+        row["end_line"],
+        row["signature"],
+        row["parent_name"],
+        row["bases_json"],
+    )
+
+
+def _start_blob_prefetch(
+    repo: Any, changed_entries: list[Any]
+) -> tuple[ThreadPoolExecutor | None, dict[str, Future[bytes]], int]:
+    unique_changed: dict[str, Any] = {}
+    for entry in changed_entries:
+        unique_changed.setdefault(str(entry.sha), entry)
+    if not unique_changed:
+        return None, {}, 0
+    executor = ThreadPoolExecutor(
+        max_workers=_index_blob_fetch_workers(),
+        thread_name_prefix="mygithub12-blob",
+    )
+    futures = {sha: executor.submit(_decode_blob, repo, sha) for sha in unique_changed}
+    return executor, futures, len(unique_changed)
+
+
+def _tree_reuse_source(identity: dict[str, str]) -> sqlite3.Row | None:
+    with _db() as db:
+        return db.execute(
+            """SELECT * FROM indexes
+               WHERE repository=? AND tree_sha=? AND version=? AND status='ready'
+                 AND commit_sha<>?
+               ORDER BY accessed_at DESC, created_at DESC
+               LIMIT 1""",
+            (
+                identity["repository"],
+                identity["tree_sha"],
+                INDEX_VERSION,
+                identity["commit_sha"],
+            ),
+        ).fetchone()
+
+
+def _update_index_manifest_telemetry(identity: dict[str, str], timings_ms: dict[str, float]) -> None:
+    try:
+        with _LOCK, _db() as db:
+            row = _index_row(db, identity)
+            if not row:
+                return
+            manifest = json.loads(row["manifest_json"] or "{}")
+            manifest["timings_ms"] = {key: round(float(value), 3) for key, value in timings_ms.items()}
+            db.execute(
+                """UPDATE indexes SET manifest_json=?
+                   WHERE repository=? AND commit_sha=? AND tree_sha=? AND version=?""",
+                (
+                    json.dumps(manifest),
+                    identity["repository"],
+                    identity["commit_sha"],
+                    identity["tree_sha"],
+                    INDEX_VERSION,
+                ),
+            )
+    except Exception:
+        logger.exception(
+            "Index telemetry update failed: repository=%s commit=%s",
+            identity["repository"], identity["commit_sha"],
+        )
+
+
+def _complete_tree_reuse(
+    identity: dict[str, str],
+    job_id: str,
+    source: sqlite3.Row,
+    timings_ms: dict[str, float],
+    build_started: float,
+) -> None:
+    repository = identity["repository"]
+    commit_sha = identity["commit_sha"]
+    source_commit = str(source["commit_sha"])
+    source_manifest = json.loads(source["manifest_json"] or "{}")
+    with _LOCK, _db() as db:
+        current_source = db.execute(
+            """SELECT * FROM indexes
+               WHERE repository=? AND commit_sha=? AND tree_sha=? AND version=? AND status='ready'""",
+            (repository, source_commit, identity["tree_sha"], INDEX_VERSION),
+        ).fetchone()
+        if not current_source:
+            raise MyGithub12Error(
+                "INDEX_NOT_READY",
+                "tree reuse source disappeared before copy",
+                {"source_commit_sha": source_commit},
+            )
+        source_symbols = db.execute(
+            "SELECT * FROM symbols WHERE repository=? AND commit_sha=? ORDER BY path,start_line,symbol_id",
+            (repository, source_commit),
+        ).fetchall()
+        languages = source_manifest.get("languages")
+        if not isinstance(languages, list):
+            languages = [
+                row[0]
+                for row in db.execute(
+                    "SELECT DISTINCT language FROM files WHERE repository=? AND commit_sha=? ORDER BY language",
+                    (repository, source_commit),
+                )
+            ]
+        db_started = time.monotonic()
+        now = _now()
+        db.execute("DELETE FROM files WHERE repository=? AND commit_sha=?", (repository, commit_sha))
+        db.execute("DELETE FROM symbols WHERE repository=? AND commit_sha=?", (repository, commit_sha))
+        db.execute(
+            """INSERT INTO files(repository,commit_sha,path,blob_sha,size_bytes,language,content_sha256,line_count,content)
+               SELECT repository,?,path,blob_sha,size_bytes,language,content_sha256,line_count,content
+               FROM files WHERE repository=? AND commit_sha=?""",
+            (commit_sha, repository, source_commit),
+        )
+        cloned_symbols = [
+            _cloned_symbol_tuple(repository, commit_sha, row) for row in source_symbols
+        ]
+        if cloned_symbols:
+            db.executemany("INSERT INTO symbols VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", cloned_symbols)
+        copied_file_count = db.execute(
+            "SELECT COUNT(*) FROM files WHERE repository=? AND commit_sha=?",
+            (repository, commit_sha),
+        ).fetchone()[0]
+        if int(copied_file_count) != int(current_source["file_count"]) or len(cloned_symbols) != int(current_source["symbol_count"]):
+            raise MyGithub12Error(
+                "INDEX_BUILD_FAILED",
+                "tree reuse source counts do not match its ready manifest",
+                {"source_commit_sha": source_commit},
+            )
+        manifest = {
+            **identity,
+            "index_version": INDEX_VERSION,
+            "file_count": int(current_source["file_count"]),
+            "symbol_count": int(current_source["symbol_count"]),
+            "size_bytes": int(current_source["size_bytes"]),
+            "languages": languages,
+            "reused_file_count": int(current_source["file_count"]),
+            "reindexed_file_count": 0,
+            "build_strategy": "tree_reuse",
+            "base_commit_sha": source_commit,
+            "tree_reuse_commit_sha": source_commit,
+            "binary_path_skipped_count": (
+                int(source_manifest["binary_path_skipped_count"])
+                if source_manifest.get("binary_path_skipped_count") is not None
+                else None
+            ),
+            "decode_skipped_count": (
+                int(source_manifest["decode_skipped_count"])
+                if source_manifest.get("decode_skipped_count") is not None
+                else None
+            ),
+            "changed_blob_entries": 0,
+            "blob_fetch_requests": 0,
+            "timings_ms": {key: round(float(value), 3) for key, value in timings_ms.items()},
+        }
+        db.execute(
+            "INSERT OR REPLACE INTO indexes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                repository,
+                commit_sha,
+                identity["tree_sha"],
+                INDEX_VERSION,
+                "ready",
+                "tree_reuse",
+                source_commit,
+                manifest["file_count"],
+                manifest["symbol_count"],
+                manifest["size_bytes"],
+                now,
+                now,
+                json.dumps(manifest),
+            ),
+        )
+        db.execute(
+            """UPDATE jobs SET status='completed',step='completed',progress_current=?,progress_total=?,
+               reused_files=?,reindexed_files=0,finished_at=?,revision=revision+1 WHERE job_id=?""",
+            (
+                manifest["file_count"],
+                manifest["file_count"],
+                manifest["file_count"],
+                now,
+                job_id,
+            ),
+        )
+        db.commit()
+    timings_ms["db_write_ms"] = (time.monotonic() - db_started) * 1000
+    timings_ms["build_total_ms"] = (time.monotonic() - build_started) * 1000
+    _update_index_manifest_telemetry(identity, timings_ms)
+
+
+def _run_retention_after_build(repository: str, identity: dict[str, str], timings_ms: dict[str, float]) -> None:
+    started = time.monotonic()
+    try:
+        result = prune_repository_indexes(repository)
+        if result["pruned_commits"]:
+            logger.info(
+                "Pruned historical indexes: repository=%s commits=%d files=%d symbols=%d retention=%d",
+                repository, result["pruned_commits"], result["pruned_files"],
+                result["pruned_symbols"], result["retention_limit"],
+            )
+    except Exception:
+        logger.exception("Historical index pruning failed: repository=%s", repository)
+    finally:
+        timings_ms["retention_ms"] = (time.monotonic() - started) * 1000
+        _update_index_manifest_telemetry(identity, timings_ms)
+
+
 def _run_index_build(service: Any, identity: dict[str,str], job_id: str, strategy: str, base_commit_sha: str) -> None:
-    repository=identity["repository"]; commit_sha=identity["commit_sha"]
+    repository=identity["repository"]
+    commit_sha=identity["commit_sha"]
+    build_started=time.monotonic()
+    timings_ms: dict[str,float]={}
+    executor: ThreadPoolExecutor | None = None
+    futures: dict[str, Future[bytes]] = {}
     try:
         with _LOCK,_db() as db:
             db.execute("UPDATE jobs SET status='running',step='snapshot',started_at=?,revision=revision+1 WHERE job_id=?",(_now(),job_id))
-        repo=_service_repo(service,repository); commit=repo.get_commit(identity["commit_sha"]); tree=repo.get_git_tree(_tree_sha(commit),recursive=True)
-        entries=[e for e in tree.tree if e.type=="blob" and not _excluded(str(e.path)) and int(getattr(e,"size",0) or 0)<=MAX_FILE_BYTES]
-        if len(entries)>MAX_INDEX_FILES: raise MyGithub12Error("INDEX_QUOTA_EXCEEDED","repository file limit exceeded",{"limit":MAX_INDEX_FILES})
-        with _LOCK,_db() as db:
-            db.execute("UPDATE jobs SET step='indexing',progress_total=?,revision=revision+1 WHERE job_id=?",(len(entries),job_id))
-        total=0; symbol_count=0; languages=set(); reused=0; reindexed=0
-        base_files: dict[str,sqlite3.Row]={}
-        if base_commit_sha and strategy in {"auto","incremental"}:
-            with _db() as db: base_files={r["path"]:r for r in db.execute("SELECT * FROM files WHERE repository=? AND commit_sha=?",(repository,base_commit_sha))}
-        file_rows=[]; symbol_rows=[]
-        for idx,e in enumerate(entries,1):
-            if _job_cancelled(job_id):
-                _finish_cancelled_job(job_id)
-                return
-            size=int(getattr(e,"size",0) or 0)
-            if total+size>MAX_INDEX_BYTES: raise MyGithub12Error("INDEX_QUOTA_EXCEEDED","repository byte limit exceeded",{"limit":MAX_INDEX_BYTES})
-            base=base_files.get(str(e.path)); language=_lang(str(e.path))
-            if base and base["blob_sha"]==e.sha:
-                content=base["content"]; digest=base["content_sha256"]; line_count=base["line_count"]; reused+=1
-            else:
-                data=_decode_blob(repo,e.sha)
-                try: content=data.decode("utf-8")
-                except UnicodeDecodeError:
-                    with _LOCK,_db() as db: db.execute("UPDATE jobs SET progress_current=?,revision=revision+1 WHERE job_id=?",(idx,job_id))
-                    continue
-                digest=hashlib.sha256(data).hexdigest(); line_count=len(content.splitlines()); reindexed+=1
-            content_bytes=len(content.encode()); total+=content_bytes; languages.add(language); syms=_symbols(repository,commit_sha,str(e.path),e.sha,language,content); symbol_count+=len(syms)
-            file_rows.append((repository,commit_sha,str(e.path),e.sha,content_bytes,language,digest,line_count,content))
-            for s in syms:
-                symbol_rows.append((repository,commit_sha,s["symbol_id"],s["name"],s["qualified_name"],s["kind"],s["language"],s["path"],s["blob_sha"],s["start_line"],s["end_line"],s["signature"],s["parent_name"],s["bases_json"]))
-            with _LOCK,_db() as db:
-                db.execute("UPDATE jobs SET progress_current=?,revision=revision+1 WHERE job_id=?",(idx,job_id))
+
         if _job_cancelled(job_id):
             _finish_cancelled_job(job_id)
             return
-        manifest={**identity,"index_version":INDEX_VERSION,"file_count":len(file_rows),"symbol_count":symbol_count,"size_bytes":total,"languages":sorted(languages),"reused_file_count":reused,"reindexed_file_count":reindexed,"build_strategy":"incremental" if reused else "full","base_commit_sha":base_commit_sha or None}
+
+        lookup_started=time.monotonic()
+        tree_source=_tree_reuse_source(identity) if strategy in {"auto","incremental"} else None
+        timings_ms["tree_lookup_ms"]=(time.monotonic()-lookup_started)*1000
+        if tree_source is not None:
+            with _LOCK,_db() as db:
+                db.execute(
+                    "UPDATE jobs SET step='tree_reuse',progress_total=?,revision=revision+1 WHERE job_id=?",
+                    (int(tree_source["file_count"]),job_id),
+                )
+            if _job_cancelled(job_id):
+                _finish_cancelled_job(job_id)
+                return
+            _complete_tree_reuse(identity,job_id,tree_source,timings_ms,build_started)
+            _run_retention_after_build(repository,identity,timings_ms)
+            return
+
+        repo=_service_repo(service,repository)
+        tree_started=time.monotonic()
+        tree=repo.get_git_tree(identity["tree_sha"],recursive=True)
+        timings_ms["tree_fetch_ms"]=(time.monotonic()-tree_started)*1000
+        candidate_entries=[
+            e for e in tree.tree
+            if e.type=="blob"
+            and not _excluded(str(e.path))
+            and int(getattr(e,"size",0) or 0)<=MAX_FILE_BYTES
+        ]
+        binary_path_skipped=sum(1 for e in candidate_entries if _binary_path(str(e.path)))
+        entries=[e for e in candidate_entries if not _binary_path(str(e.path))]
+        if len(entries)>MAX_INDEX_FILES:
+            raise MyGithub12Error("INDEX_QUOTA_EXCEEDED","repository file limit exceeded",{"limit":MAX_INDEX_FILES})
+        with _LOCK,_db() as db:
+            db.execute("UPDATE jobs SET step='indexing',progress_total=?,revision=revision+1 WHERE job_id=?",(len(entries),job_id))
+
+        base_started=time.monotonic()
+        base_files: dict[str,sqlite3.Row]={}
+        base_symbols: dict[str,list[sqlite3.Row]]={}
+        if base_commit_sha and strategy in {"auto","incremental"}:
+            base_files,base_symbols=_load_incremental_base(repository,base_commit_sha)
+        timings_ms["base_load_ms"]=(time.monotonic()-base_started)*1000
+
+        changed_entries=[]
+        for e in entries:
+            base=base_files.get(str(e.path))
+            if not base or base["blob_sha"]!=e.sha:
+                changed_entries.append(e)
+        if _job_cancelled(job_id):
+            _finish_cancelled_job(job_id)
+            return
+        executor,futures,blob_fetch_requests=_start_blob_prefetch(repo,changed_entries)
+
+        total=0
+        symbol_count=0
+        languages=set()
+        reused=0
+        reindexed=0
+        decode_skipped=0
+        file_rows=[]
+        symbol_rows=[]
+        pulse=_IndexJobPulse(job_id)
+        if pulse.pulse(0,force=True):
+            _finish_cancelled_job(job_id)
+            if executor:
+                executor.shutdown(wait=False,cancel_futures=True)
+            return
+
+        assemble_started=time.monotonic()
+        blob_fetch_wait_ms=0.0
+        parse_ms=0.0
+        for idx,e in enumerate(entries,1):
+            path=str(e.path)
+            size=int(getattr(e,"size",0) or 0)
+            if total+size>MAX_INDEX_BYTES:
+                raise MyGithub12Error("INDEX_QUOTA_EXCEEDED","repository byte limit exceeded",{"limit":MAX_INDEX_BYTES})
+            base=base_files.get(path)
+            language=_lang(path)
+            if base and base["blob_sha"]==e.sha:
+                content=base["content"]
+                digest=base["content_sha256"]
+                line_count=base["line_count"]
+                reused+=1
+                cloned=[_cloned_symbol_tuple(repository,commit_sha,row) for row in base_symbols.get(path,[])]
+            else:
+                wait_started=time.monotonic()
+                data=futures[str(e.sha)].result() if futures else _decode_blob(repo,e.sha)
+                blob_fetch_wait_ms+=(time.monotonic()-wait_started)*1000
+                try:
+                    content=data.decode("utf-8")
+                except UnicodeDecodeError:
+                    decode_skipped+=1
+                    if pulse.pulse(idx):
+                        _finish_cancelled_job(job_id)
+                        if executor:
+                            executor.shutdown(wait=False,cancel_futures=True)
+                        return
+                    continue
+                digest=hashlib.sha256(data).hexdigest()
+                line_count=len(content.splitlines())
+                reindexed+=1
+                parse_started=time.monotonic()
+                syms=_symbols(repository,commit_sha,path,e.sha,language,content)
+                parse_ms+=(time.monotonic()-parse_started)*1000
+                cloned=[
+                    (
+                        repository,commit_sha,s["symbol_id"],s["name"],s["qualified_name"],
+                        s["kind"],s["language"],s["path"],s["blob_sha"],s["start_line"],
+                        s["end_line"],s["signature"],s["parent_name"],s["bases_json"],
+                    )
+                    for s in syms
+                ]
+            content_bytes=len(content.encode())
+            total+=content_bytes
+            languages.add(language)
+            symbol_count+=len(cloned)
+            file_rows.append((repository,commit_sha,path,e.sha,content_bytes,language,digest,line_count,content))
+            symbol_rows.extend(cloned)
+            if pulse.pulse(idx):
+                _finish_cancelled_job(job_id)
+                if executor:
+                    executor.shutdown(wait=False,cancel_futures=True)
+                return
+
+        if executor:
+            executor.shutdown(wait=True,cancel_futures=False)
+            executor=None
+        if pulse.pulse(len(entries),force=True):
+            _finish_cancelled_job(job_id)
+            return
+        timings_ms["blob_fetch_wait_ms"]=blob_fetch_wait_ms
+        timings_ms["parse_ms"]=parse_ms
+        timings_ms["assemble_ms"]=(time.monotonic()-assemble_started)*1000
+
+        build_strategy="incremental" if reused and strategy in {"auto","incremental"} else "full"
+        manifest={
+            **identity,
+            "index_version":INDEX_VERSION,
+            "file_count":len(file_rows),
+            "symbol_count":symbol_count,
+            "size_bytes":total,
+            "languages":sorted(languages),
+            "reused_file_count":reused,
+            "reindexed_file_count":reindexed,
+            "build_strategy":build_strategy,
+            "base_commit_sha":base_commit_sha or None,
+            "binary_path_skipped_count":binary_path_skipped,
+            "decode_skipped_count":decode_skipped,
+            "changed_blob_entries":len(changed_entries),
+            "blob_fetch_requests":blob_fetch_requests,
+            "timings_ms":{key:round(float(value),3) for key,value in timings_ms.items()},
+        }
+        db_started=time.monotonic()
         with _LOCK,_db() as db:
             now=_now()
             db.execute("DELETE FROM files WHERE repository=? AND commit_sha=?",(repository,commit_sha))
@@ -500,23 +975,21 @@ def _run_index_build(service: Any, identity: dict[str,str], job_id: str, strateg
             db.executemany("INSERT INTO symbols VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",symbol_rows)
             db.execute("INSERT OR REPLACE INTO indexes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(repository,commit_sha,identity["tree_sha"],INDEX_VERSION,"ready",manifest["build_strategy"],base_commit_sha or None,len(file_rows),symbol_count,total,now,now,json.dumps(manifest)))
             db.execute("UPDATE jobs SET status='completed',step='completed',progress_current=progress_total,reused_files=?,reindexed_files=?,finished_at=?,revision=revision+1 WHERE job_id=?",(reused,reindexed,now,job_id))
-        try:
-            result = prune_repository_indexes(repository)
-            if result["pruned_commits"]:
-                logger.info(
-                    "Pruned historical indexes: repository=%s commits=%d files=%d symbols=%d retention=%d",
-                    repository, result["pruned_commits"], result["pruned_files"],
-                    result["pruned_symbols"], result["retention_limit"],
-                )
-        except Exception:
-            # Index creation succeeded and is usable; cache retention failure is
-            # operationally important but must not rewrite a completed build as failed.
-            logger.exception("Historical index pruning failed: repository=%s", repository)
+            db.commit()
+        timings_ms["db_write_ms"]=(time.monotonic()-db_started)*1000
+        timings_ms["build_total_ms"]=(time.monotonic()-build_started)*1000
+        _update_index_manifest_telemetry(identity,timings_ms)
+        _run_retention_after_build(repository,identity,timings_ms)
     except MyGithub12Error as exc:
-        with _LOCK,_db() as db: db.execute("UPDATE jobs SET status='failed',step='failed',error_code=?,error_message=?,finished_at=?,revision=revision+1 WHERE job_id=?",(exc.code,exc.message,_now(),job_id))
+        if executor:
+            executor.shutdown(wait=False,cancel_futures=True)
+        with _LOCK,_db() as db:
+            db.execute("UPDATE jobs SET status='failed',step='failed',error_code=?,error_message=?,finished_at=?,revision=revision+1 WHERE job_id=?",(exc.code,exc.message,_now(),job_id))
     except Exception as exc:
-        with _LOCK,_db() as db: db.execute("UPDATE jobs SET status='failed',step='failed',error_code='INDEX_BUILD_FAILED',error_message=?,finished_at=?,revision=revision+1 WHERE job_id=?",(str(exc)[:1000],_now(),job_id))
-
+        if executor:
+            executor.shutdown(wait=False,cancel_futures=True)
+        with _LOCK,_db() as db:
+            db.execute("UPDATE jobs SET status='failed',step='failed',error_code='INDEX_BUILD_FAILED',error_message=?,finished_at=?,revision=revision+1 WHERE job_id=?",(str(exc)[:1000],_now(),job_id))
 
 def _public_job(row: dict[str,Any]) -> dict[str,Any]:
     return {k:row.get(k) for k in ("job_id","repository","commit_sha","tree_sha","version","strategy","base_commit_sha","status","step","revision","progress_current","progress_total","reused_files","reindexed_files","error_code","error_message","created_at","started_at","finished_at")}

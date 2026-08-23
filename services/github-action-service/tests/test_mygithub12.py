@@ -575,3 +575,471 @@ def test_list_indexes_reports_the_same_grace_aware_workspace_pin_state(tmp_path,
 
     assert items[recent_commit]["pinned_by_workspace"] is True
     assert items[stale_commit]["pinned_by_workspace"] is False
+
+
+class _FastPathEntry:
+    def __init__(self, path: str, sha: str, size: int):
+        self.path = path
+        self.sha = sha
+        self.size = size
+        self.type = "blob"
+
+
+class _FastPathRepo:
+    def __init__(self, entries):
+        self.entries = entries
+        self.tree_calls = 0
+
+    def get_git_tree(self, tree_sha, recursive=True):
+        self.tree_calls += 1
+        return type("Tree", (), {"tree": self.entries})()
+
+
+def _seed_fast_path_job(db, *, job_id: str, repository: str, commit_sha: str, tree_sha: str, strategy: str, base_commit_sha: str | None = None):
+    db.execute(
+        """INSERT INTO jobs(job_id,repository,commit_sha,tree_sha,version,strategy,base_commit_sha,status,step,revision,
+           progress_current,progress_total,reused_files,reindexed_files,cancel_requested,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            job_id,
+            repository,
+            commit_sha,
+            tree_sha,
+            mygithub12.INDEX_VERSION,
+            strategy,
+            base_commit_sha,
+            "queued",
+            "queued",
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            mygithub12._now(),
+        ),
+    )
+
+
+def _seed_fast_path_snapshot(
+    db,
+    *,
+    repository: str,
+    commit_sha: str,
+    tree_sha: str,
+    path: str = "code.py",
+    blob_sha: str = "b" * 40,
+    content: str = "def run():\n    return 1\n",
+    version: str | None = None,
+):
+    version = version or mygithub12.INDEX_VERSION
+    symbols = mygithub12._symbols(repository, commit_sha, path, blob_sha, "python", content)
+    manifest = {
+        "repository": repository,
+        "commit_sha": commit_sha,
+        "tree_sha": tree_sha,
+        "index_version": version,
+        "file_count": 1,
+        "symbol_count": len(symbols),
+        "size_bytes": len(content.encode()),
+        "languages": ["python"],
+        "reused_file_count": 0,
+        "reindexed_file_count": 1,
+        "build_strategy": "full",
+    }
+    db.execute(
+        "INSERT INTO indexes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            repository,
+            commit_sha,
+            tree_sha,
+            version,
+            "ready",
+            "full",
+            None,
+            1,
+            len(symbols),
+            len(content.encode()),
+            mygithub12._now(),
+            mygithub12._now(),
+            json.dumps(manifest),
+        ),
+    )
+    db.execute(
+        "INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?)",
+        (
+            repository,
+            commit_sha,
+            path,
+            blob_sha,
+            len(content.encode()),
+            "python",
+            "d" * 64,
+            len(content.splitlines()),
+            content,
+        ),
+    )
+    for symbol in symbols:
+        db.execute(
+            "INSERT INTO symbols VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                repository,
+                commit_sha,
+                symbol["symbol_id"],
+                symbol["name"],
+                symbol["qualified_name"],
+                symbol["kind"],
+                symbol["language"],
+                symbol["path"],
+                symbol["blob_sha"],
+                symbol["start_line"],
+                symbol["end_line"],
+                symbol["signature"],
+                symbol["parent_name"],
+                symbol["bases_json"],
+            ),
+        )
+    return symbols
+
+
+def test_binary_paths_are_filtered_before_blob_fetch_and_telemetry_is_exposed(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "binary-fast-path.db"))
+    mygithub12.init_db()
+    repository = "o/r"
+    target = "1" * 40
+    tree_sha = "2" * 40
+    entries = [
+        _FastPathEntry("code.py", "3" * 40, 24),
+        _FastPathEntry("assets/logo.png", "4" * 40, 1024),
+        _FastPathEntry("gradle/wrapper/gradle-wrapper.jar", "5" * 40, 4096),
+    ]
+    repo = _FastPathRepo(entries)
+    monkeypatch.setattr(mygithub12, "_service_repo", lambda *args, **kwargs: repo)
+    calls = []
+
+    def fake_decode(_repo, sha):
+        calls.append(sha)
+        assert sha == "3" * 40
+        return b"def run():\n    return 1\n"
+
+    monkeypatch.setattr(mygithub12, "_decode_blob", fake_decode)
+    with mygithub12._db() as db:
+        _seed_fast_path_job(
+            db,
+            job_id="binary-job",
+            repository=repository,
+            commit_sha=target,
+            tree_sha=tree_sha,
+            strategy="full",
+        )
+
+    mygithub12._run_index_build(
+        object(),
+        {"repository": repository, "commit_sha": target, "tree_sha": tree_sha},
+        "binary-job",
+        "full",
+        "",
+    )
+
+    with mygithub12._db() as db:
+        job = db.execute("SELECT * FROM jobs WHERE job_id='binary-job'").fetchone()
+        files = db.execute("SELECT path FROM files WHERE repository=? AND commit_sha=?", (repository, target)).fetchall()
+        index = db.execute("SELECT manifest_json FROM indexes WHERE repository=? AND commit_sha=?", (repository, target)).fetchone()
+    manifest = json.loads(index["manifest_json"])
+    assert job["status"] == "completed"
+    assert job["progress_total"] == 1
+    assert [row["path"] for row in files] == ["code.py"]
+    assert calls == ["3" * 40]
+    assert manifest["binary_path_skipped_count"] == 2
+    assert manifest["changed_blob_entries"] == 1
+    assert manifest["blob_fetch_requests"] == 1
+    assert manifest["build_strategy"] == "full"
+    assert manifest["timings_ms"]["build_total_ms"] >= 0
+    assert manifest["timings_ms"]["retention_ms"] >= 0
+
+
+def test_unknown_non_utf8_content_is_still_safely_skipped(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "unknown-binary.db"))
+    mygithub12.init_db()
+    repository = "o/r"
+    target = "6" * 40
+    tree_sha = "7" * 40
+    repo = _FastPathRepo([_FastPathEntry("payload.unknown", "8" * 40, 2)])
+    monkeypatch.setattr(mygithub12, "_service_repo", lambda *args, **kwargs: repo)
+    monkeypatch.setattr(mygithub12, "_decode_blob", lambda *args, **kwargs: b"\xff\xfe")
+    with mygithub12._db() as db:
+        _seed_fast_path_job(
+            db,
+            job_id="unknown-binary-job",
+            repository=repository,
+            commit_sha=target,
+            tree_sha=tree_sha,
+            strategy="full",
+        )
+
+    mygithub12._run_index_build(
+        object(),
+        {"repository": repository, "commit_sha": target, "tree_sha": tree_sha},
+        "unknown-binary-job",
+        "full",
+        "",
+    )
+
+    with mygithub12._db() as db:
+        index = db.execute("SELECT manifest_json FROM indexes WHERE repository=? AND commit_sha=?", (repository, target)).fetchone()
+        file_count = db.execute("SELECT COUNT(*) FROM files WHERE repository=? AND commit_sha=?", (repository, target)).fetchone()[0]
+    manifest = json.loads(index["manifest_json"])
+    assert file_count == 0
+    assert manifest["decode_skipped_count"] == 1
+    assert manifest["binary_path_skipped_count"] == 0
+
+
+def test_index_job_pulse_batches_progress_and_detects_cancel(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "pulse.db"))
+    monkeypatch.setenv("MYGITHUB12_INDEX_PROGRESS_BATCH_FILES", "32")
+    monkeypatch.setenv("MYGITHUB12_INDEX_PROGRESS_INTERVAL_SECONDS", "5")
+    monkeypatch.setattr(mygithub12.time, "monotonic", lambda: 100.0)
+    mygithub12.init_db()
+    with mygithub12._db() as db:
+        _seed_fast_path_job(
+            db,
+            job_id="pulse-job",
+            repository="o/r",
+            commit_sha="9" * 40,
+            tree_sha="a" * 40,
+            strategy="full",
+        )
+    pulse = mygithub12._IndexJobPulse("pulse-job")
+    for current in range(1, 101):
+        assert pulse.pulse(current) is False
+    assert pulse.pulse(100, force=True) is False
+    with mygithub12._db() as db:
+        row = db.execute("SELECT revision,progress_current FROM jobs WHERE job_id='pulse-job'").fetchone()
+    assert row["progress_current"] == 100
+    assert row["revision"] == 5
+    with mygithub12._db() as db:
+        db.execute("UPDATE jobs SET cancel_requested=1 WHERE job_id='pulse-job'")
+    assert pulse.pulse(100, force=True) is True
+
+
+def test_incremental_base_requires_current_version_ready_index(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "base-version.db"))
+    mygithub12.init_db()
+    repository = "o/r"
+    base = "b" * 40
+    with mygithub12._db() as db:
+        _seed_fast_path_snapshot(
+            db,
+            repository=repository,
+            commit_sha=base,
+            tree_sha="c" * 40,
+            version="old-index-version",
+        )
+    files, symbols = mygithub12._load_incremental_base(repository, base)
+    assert files == {}
+    assert symbols == {}
+
+
+def test_unchanged_blob_reuses_symbol_metadata_with_target_commit_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "symbol-reuse.db"))
+    mygithub12.init_db()
+    repository = "o/r"
+    base = "c" * 40
+    target = "d" * 40
+    blob = "e" * 40
+    content = "class Camera:\n    def bind(self):\n        return True\n"
+    with mygithub12._db() as db:
+        base_symbols = _seed_fast_path_snapshot(
+            db,
+            repository=repository,
+            commit_sha=base,
+            tree_sha="1" * 40,
+            path="camera.py",
+            blob_sha=blob,
+            content=content,
+        )
+        _seed_fast_path_job(
+            db,
+            job_id="symbol-reuse-job",
+            repository=repository,
+            commit_sha=target,
+            tree_sha="2" * 40,
+            strategy="incremental",
+            base_commit_sha=base,
+        )
+    repo = _FastPathRepo([_FastPathEntry("camera.py", blob, len(content.encode()))])
+    monkeypatch.setattr(mygithub12, "_service_repo", lambda *args, **kwargs: repo)
+    monkeypatch.setattr(
+        mygithub12,
+        "_symbols",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unchanged file must not be reparsed")),
+    )
+
+    mygithub12._run_index_build(
+        object(),
+        {"repository": repository, "commit_sha": target, "tree_sha": "2" * 40},
+        "symbol-reuse-job",
+        "incremental",
+        base,
+    )
+
+    with mygithub12._db() as db:
+        job = db.execute("SELECT * FROM jobs WHERE job_id='symbol-reuse-job'").fetchone()
+        target_symbols = db.execute(
+            "SELECT * FROM symbols WHERE repository=? AND commit_sha=? ORDER BY start_line",
+            (repository, target),
+        ).fetchall()
+        manifest = json.loads(db.execute(
+            "SELECT manifest_json FROM indexes WHERE repository=? AND commit_sha=?",
+            (repository, target),
+        ).fetchone()[0])
+    assert job["status"] == "completed"
+    assert job["reused_files"] == 1
+    assert job["reindexed_files"] == 0
+    assert len(target_symbols) == len(base_symbols)
+    for base_symbol, target_symbol in zip(base_symbols, target_symbols):
+        assert target_symbol["name"] == base_symbol["name"]
+        assert target_symbol["qualified_name"] == base_symbol["qualified_name"]
+        assert target_symbol["symbol_id"] == mygithub12._symbol_id(
+            repository,
+            target,
+            target_symbol["path"],
+            target_symbol["name"],
+            target_symbol["kind"],
+            target_symbol["start_line"],
+        )
+        assert target_symbol["symbol_id"] != base_symbol["symbol_id"]
+    assert manifest["build_strategy"] == "incremental"
+    assert manifest["blob_fetch_requests"] == 0
+
+
+def test_blob_prefetch_deduplicates_sha_and_worker_setting_is_bounded(monkeypatch):
+    entries = [
+        _FastPathEntry("a.py", "1" * 40, 1),
+        _FastPathEntry("b.py", "1" * 40, 1),
+        _FastPathEntry("c.py", "2" * 40, 1),
+    ]
+    calls = []
+    monkeypatch.setenv("MYGITHUB12_INDEX_BLOB_FETCH_WORKERS", "99")
+    assert mygithub12._index_blob_fetch_workers() == mygithub12.MAX_INDEX_BLOB_FETCH_WORKERS
+    monkeypatch.setenv("MYGITHUB12_INDEX_BLOB_FETCH_WORKERS", "0")
+    assert mygithub12._index_blob_fetch_workers() == 1
+    monkeypatch.setenv("MYGITHUB12_INDEX_BLOB_FETCH_WORKERS", "4")
+    monkeypatch.setattr(mygithub12, "_decode_blob", lambda _repo, sha: calls.append(sha) or sha.encode())
+    executor, futures, request_count = mygithub12._start_blob_prefetch(object(), entries)
+    try:
+        assert request_count == 2
+        assert set(futures) == {"1" * 40, "2" * 40}
+        assert {sha: future.result() for sha, future in futures.items()} == {
+            "1" * 40: ("1" * 40).encode(),
+            "2" * 40: ("2" * 40).encode(),
+        }
+    finally:
+        executor.shutdown(wait=True)
+    assert sorted(calls) == ["1" * 40, "2" * 40]
+
+
+def test_same_tree_reuse_clones_index_without_github_tree_or_blob_reads(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "tree-reuse.db"))
+    mygithub12.init_db()
+    repository = "o/r"
+    source = "3" * 40
+    target = "4" * 40
+    tree_sha = "5" * 40
+    with mygithub12._db() as db:
+        source_symbols = _seed_fast_path_snapshot(
+            db,
+            repository=repository,
+            commit_sha=source,
+            tree_sha=tree_sha,
+        )
+        _seed_fast_path_job(
+            db,
+            job_id="tree-reuse-job",
+            repository=repository,
+            commit_sha=target,
+            tree_sha=tree_sha,
+            strategy="auto",
+        )
+    monkeypatch.setattr(
+        mygithub12,
+        "_service_repo",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("tree reuse must not access GitHub")),
+    )
+
+    mygithub12._run_index_build(
+        object(),
+        {"repository": repository, "commit_sha": target, "tree_sha": tree_sha},
+        "tree-reuse-job",
+        "auto",
+        "",
+    )
+
+    with mygithub12._db() as db:
+        job = db.execute("SELECT * FROM jobs WHERE job_id='tree-reuse-job'").fetchone()
+        manifest = json.loads(db.execute(
+            "SELECT manifest_json FROM indexes WHERE repository=? AND commit_sha=?",
+            (repository, target),
+        ).fetchone()[0])
+        target_symbols = db.execute(
+            "SELECT * FROM symbols WHERE repository=? AND commit_sha=? ORDER BY start_line",
+            (repository, target),
+        ).fetchall()
+    assert job["status"] == "completed"
+    assert manifest["build_strategy"] == "tree_reuse"
+    assert manifest["tree_reuse_commit_sha"] == source
+    assert manifest["reused_file_count"] == 1
+    assert manifest["blob_fetch_requests"] == 0
+    assert len(target_symbols) == len(source_symbols)
+    assert all(row["symbol_id"] != source_symbols[i]["symbol_id"] for i, row in enumerate(target_symbols))
+    assert "tree_fetch_ms" not in manifest["timings_ms"]
+
+
+def test_full_strategy_bypasses_same_tree_reuse(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "full-bypass.db"))
+    mygithub12.init_db()
+    repository = "o/r"
+    source = "6" * 40
+    target = "7" * 40
+    tree_sha = "8" * 40
+    blob = "9" * 40
+    content = "def fresh():\n    return True\n"
+    with mygithub12._db() as db:
+        _seed_fast_path_snapshot(
+            db,
+            repository=repository,
+            commit_sha=source,
+            tree_sha=tree_sha,
+            blob_sha=blob,
+            content=content,
+        )
+        _seed_fast_path_job(
+            db,
+            job_id="full-bypass-job",
+            repository=repository,
+            commit_sha=target,
+            tree_sha=tree_sha,
+            strategy="full",
+        )
+    repo = _FastPathRepo([_FastPathEntry("code.py", blob, len(content.encode()))])
+    monkeypatch.setattr(mygithub12, "_service_repo", lambda *args, **kwargs: repo)
+    monkeypatch.setattr(mygithub12, "_decode_blob", lambda *args, **kwargs: content.encode())
+
+    mygithub12._run_index_build(
+        object(),
+        {"repository": repository, "commit_sha": target, "tree_sha": tree_sha},
+        "full-bypass-job",
+        "full",
+        source,
+    )
+
+    with mygithub12._db() as db:
+        manifest = json.loads(db.execute(
+            "SELECT manifest_json FROM indexes WHERE repository=? AND commit_sha=?",
+            (repository, target),
+        ).fetchone()[0])
+    assert repo.tree_calls == 1
+    assert manifest["build_strategy"] == "full"
+    assert manifest.get("tree_reuse_commit_sha") is None
+    assert manifest["reused_file_count"] == 0
+    assert manifest["reindexed_file_count"] == 1
