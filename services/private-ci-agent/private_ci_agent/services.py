@@ -36,10 +36,15 @@ class ServiceEnvironment:
     env_file: str
 
     def public_summary(self) -> str:
-        db = self.database_url.rsplit("/", 1)[-1].split("?", 1)[0]
-        return (f"DATABASE_HOST=postgres DATABASE_PORT=5432 DATABASE_NAME={db} "
-                f"REDIS_HOST=redis REDIS_PORT=6379 REDIS_DB={self.redis_db} "
-                "RABBITMQ_HOST=rabbitmq RABBITMQ_PORT=5672")
+        parts = []
+        if self.database_url:
+            db = self.database_url.rsplit("/", 1)[-1].split("?", 1)[0]
+            parts.append(f"DATABASE_HOST=postgres DATABASE_PORT=5432 DATABASE_NAME={db}")
+        if self.redis_addr:
+            parts.append(f"REDIS_HOST=redis REDIS_PORT=6379 REDIS_DB={self.redis_db}")
+        if self.rabbitmq_url:
+            parts.append("RABBITMQ_HOST=rabbitmq RABBITMQ_PORT=5672")
+        return " ".join(parts)
 
 
 class ServiceSetupError(RuntimeError):
@@ -80,7 +85,9 @@ def sanitize_service_stderr(stderr: str) -> str:
 
 
 class ServiceManager:
-    """Own only resources named with the current job prefix."""
+    """Own only explicitly requested per-job service resources."""
+
+    SUPPORTED_SERVICES = ("postgres", "redis", "rabbitmq")
 
     def __init__(self, podman_binary: str = "/usr/bin/podman", config: dict | None = None):
         config = config or {}
@@ -92,10 +99,23 @@ class ServiceManager:
         }
         self.timeout = min(int(config.get("ci_services_timeout_seconds", 90)), 90)
 
-    def prepare(self, job_id: str, workspace: str) -> ServiceEnvironment:
+    def prepare(
+        self,
+        job_id: str,
+        workspace: str,
+        services: list[str] | tuple[str, ...] | None = None,
+    ) -> ServiceEnvironment:
+        requested = tuple(dict.fromkeys(services or ()))
+        invalid = [name for name in requested if name not in self.SUPPORTED_SERVICES]
+        if invalid or not requested:
+            raise ServiceSetupError(
+                "SERVICE_CONFIGURATION_INVALID",
+                f"unsupported or empty service request: {invalid or requested}",
+            )
+
         suffix = safe_job_suffix(job_id)
         network = f"ci-svc-{suffix}"
-        names = {kind: f"ci-{suffix}-{kind}" for kind in self.images}
+        names = {kind: f"ci-{suffix}-{kind}" for kind in requested}
         database = f"lenshub_ci_{suffix}"
         db_password = secrets.token_urlsafe(24)
         rabbit_password = secrets.token_urlsafe(24)
@@ -103,46 +123,101 @@ class ServiceManager:
         rabbit_vhost = f"ci_{suffix[:40]}"
         env_file = os.path.join(workspace, "runtime", "services.env")
         try:
-            # 普通 Job 只读确认受控镜像已预加载，不在运行时隐式 pull，避免
-            # 代理、存储和网络副作用；缺镜像交给受控维护步骤补齐。
-            self._run(["image", "exists", self.images["postgres"]], "POSTGRES_UNAVAILABLE", resource_type="postgres",
-                      operation="inspect", image=self.images["postgres"])
-            self._run(["image", "exists", self.images["redis"]], "REDIS_UNAVAILABLE", resource_type="redis",
-                      operation="inspect", image=self.images["redis"])
-            self._run(["image", "exists", self.images["rabbitmq"]], "RABBITMQ_UNAVAILABLE", resource_type="rabbitmq",
-                      operation="inspect", image=self.images["rabbitmq"])
-            self._run(["pod", "create", "--name", network, "--label", f"{JOB_LABEL}={suffix}",
-                       "--label", f"{RESOURCE_LABEL}=pod", "--userns=keep-id", "--network", "slirp4netns:allow_host_loopback=true",
-                       "--add-host", "postgres:127.0.0.1", "--add-host", "redis:127.0.0.1",
-                       "--add-host", "rabbitmq:127.0.0.1"], "SERVICE_SETUP_FAILED",
-                      resource_type="pod", operation="create", resource_name=network)
-            self._run(["run", "-d", "--http-proxy=false", "--name", names["postgres"], "--label", f"{JOB_LABEL}={suffix}",
-                       "--label", f"{RESOURCE_LABEL}=postgres", "--pod", network, "--user", "0",
-                       "-e", "POSTGRES_USER=lenshub",
-                       "-e", f"POSTGRES_PASSWORD={db_password}", "-e", "POSTGRES_DB=postgres",
-                       self.images["postgres"]], "POSTGRES_UNAVAILABLE", resource_type="postgres",
-                      operation="start_container", image=self.images["postgres"], resource_name=names["postgres"])
-            self._run(["run", "-d", "--http-proxy=false", "--name", names["redis"], "--label", f"{JOB_LABEL}={suffix}",
-                       "--label", f"{RESOURCE_LABEL}=redis", "--pod", network, self.images["redis"], "redis-server",
-                       "--save", "", "--appendonly", "no"], "REDIS_UNAVAILABLE", resource_type="redis",
-                      operation="start_container", image=self.images["redis"], resource_name=names["redis"])
-            self._run(["run", "-d", "--http-proxy=false", "--name", names["rabbitmq"], "--label", f"{JOB_LABEL}={suffix}",
-                       "--label", f"{RESOURCE_LABEL}=rabbitmq", "--pod", network,
-                       "-e", f"RABBITMQ_DEFAULT_USER={rabbit_user}",
-                       "-e", f"RABBITMQ_DEFAULT_PASS={rabbit_password}",
-                       "-e", f"RABBITMQ_DEFAULT_VHOST={rabbit_vhost}", self.images["rabbitmq"]], "RABBITMQ_UNAVAILABLE",
-                      resource_type="rabbitmq", operation="start_container", image=self.images["rabbitmq"], resource_name=names["rabbitmq"])
+            # Job execution stays side-effect bounded: service images must have
+            # been preloaded by controlled maintenance, and only explicitly
+            # requested services are inspected or started.
+            for kind in requested:
+                self._run(
+                    ["image", "exists", self.images[kind]],
+                    f"{kind.upper()}_UNAVAILABLE",
+                    resource_type=kind,
+                    operation="inspect",
+                    image=self.images[kind],
+                )
+
+            pod_args = [
+                "pod", "create", "--name", network,
+                "--label", f"{JOB_LABEL}={suffix}",
+                "--label", f"{RESOURCE_LABEL}=pod",
+                "--userns=keep-id",
+                "--network", "slirp4netns:allow_host_loopback=true",
+            ]
+            for kind in requested:
+                pod_args += ["--add-host", f"{kind}:127.0.0.1"]
+            self._run(
+                pod_args,
+                "SERVICE_SETUP_FAILED",
+                resource_type="pod",
+                operation="create",
+                resource_name=network,
+            )
+
+            if "postgres" in requested:
+                self._run([
+                    "run", "-d", "--http-proxy=false",
+                    "--name", names["postgres"],
+                    "--label", f"{JOB_LABEL}={suffix}",
+                    "--label", f"{RESOURCE_LABEL}=postgres",
+                    "--pod", network, "--user", "0",
+                    "-e", "POSTGRES_USER=lenshub",
+                    "-e", f"POSTGRES_PASSWORD={db_password}",
+                    "-e", "POSTGRES_DB=postgres",
+                    self.images["postgres"],
+                ], "POSTGRES_UNAVAILABLE", resource_type="postgres",
+                    operation="start_container", image=self.images["postgres"],
+                    resource_name=names["postgres"])
+
+            if "redis" in requested:
+                self._run([
+                    "run", "-d", "--http-proxy=false",
+                    "--name", names["redis"],
+                    "--label", f"{JOB_LABEL}={suffix}",
+                    "--label", f"{RESOURCE_LABEL}=redis",
+                    "--pod", network,
+                    self.images["redis"], "redis-server", "--save", "", "--appendonly", "no",
+                ], "REDIS_UNAVAILABLE", resource_type="redis",
+                    operation="start_container", image=self.images["redis"],
+                    resource_name=names["redis"])
+
+            if "rabbitmq" in requested:
+                self._run([
+                    "run", "-d", "--http-proxy=false",
+                    "--name", names["rabbitmq"],
+                    "--label", f"{JOB_LABEL}={suffix}",
+                    "--label", f"{RESOURCE_LABEL}=rabbitmq",
+                    "--pod", network,
+                    "-e", f"RABBITMQ_DEFAULT_USER={rabbit_user}",
+                    "-e", f"RABBITMQ_DEFAULT_PASS={rabbit_password}",
+                    "-e", f"RABBITMQ_DEFAULT_VHOST={rabbit_vhost}",
+                    self.images["rabbitmq"],
+                ], "RABBITMQ_UNAVAILABLE", resource_type="rabbitmq",
+                    operation="start_container", image=self.images["rabbitmq"],
+                    resource_name=names["rabbitmq"])
+
             self._wait_ready(names)
-            self._run(["exec", "-e", f"PGPASSWORD={db_password}", names["postgres"], "psql",
-                       "-U", "lenshub", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c",
-                       f"CREATE DATABASE {database}"], "POSTGRES_SETUP_FAILED", resource_type="postgres",
-                      operation="create_database", image=self.images["postgres"], resource_name=names["postgres"])
+
+            if "postgres" in requested:
+                self._run([
+                    "exec", "-e", f"PGPASSWORD={db_password}", names["postgres"],
+                    "psql", "-U", "lenshub", "-d", "postgres",
+                    "-v", "ON_ERROR_STOP=1", "-c", f"CREATE DATABASE {database}",
+                ], "POSTGRES_SETUP_FAILED", resource_type="postgres",
+                    operation="create_database", image=self.images["postgres"],
+                    resource_name=names["postgres"])
+
             env = ServiceEnvironment(
-                network,
-                f"postgres://lenshub:{quote(db_password, safe='')}@postgres:5432/{database}?sslmode=disable",
-                "redis:6379", "0",
-                f"amqp://{quote(rabbit_user, safe='')}:{quote(rabbit_password, safe='')}@rabbitmq:5672/{quote(rabbit_vhost, safe='')}",
-                env_file,
+                network=network,
+                database_url=(
+                    f"postgres://lenshub:{quote(db_password, safe='')}@postgres:5432/{database}?sslmode=disable"
+                    if "postgres" in requested else ""
+                ),
+                redis_addr="redis:6379" if "redis" in requested else "",
+                redis_db="0" if "redis" in requested else "",
+                rabbitmq_url=(
+                    f"amqp://{quote(rabbit_user, safe='')}:{quote(rabbit_password, safe='')}@rabbitmq:5672/{quote(rabbit_vhost, safe='')}"
+                    if "rabbitmq" in requested else ""
+                ),
+                env_file=env_file,
             )
             self._write_env(env)
             logger.info("services:ready job=%s %s", suffix, env.public_summary())
@@ -162,11 +237,14 @@ class ServiceManager:
 
     def _wait_ready(self, names: dict) -> None:
         deadline = time.monotonic() + self.timeout
-        probes = {
-            "postgres": ["exec", names["postgres"], "pg_isready", "-U", "lenshub", "-d", "postgres"],
-            "redis": ["exec", names["redis"], "redis-cli", "ping"],
-            "rabbitmq": ["exec", names["rabbitmq"], "rabbitmq-diagnostics", "-q", "ping"],
-        }
+        probes = {}
+        if "postgres" in names:
+            probes["postgres"] = ["exec", names["postgres"], "pg_isready", "-U", "lenshub", "-d", "postgres"]
+        if "redis" in names:
+            probes["redis"] = ["exec", names["redis"], "redis-cli", "ping"]
+        if "rabbitmq" in names:
+            probes["rabbitmq"] = ["exec", names["rabbitmq"], "rabbitmq-diagnostics", "-q", "ping"]
+
         attempts = 0
         last_probe_reasons = {}
         while time.monotonic() < deadline:
@@ -192,11 +270,7 @@ class ServiceManager:
                     raise ServiceSetupError(
                         code,
                         self._diagnostic(
-                            code,
-                            "readiness",
-                            kind,
-                            state["exit_code"],
-                            False,
+                            code, "readiness", kind, state["exit_code"], False,
                             f"attempts={attempts} state={state['status']} health={state.get('health', 'unknown')} "
                             f"observed=inspect,logs {reason or last_probe_reasons.get(kind, 'probe_failed')}",
                             self.images[kind],
@@ -204,11 +278,12 @@ class ServiceManager:
                         ),
                     )
             time.sleep(2)
+
         raise ServiceSetupError(
             "SERVICE_SETUP_TIMEOUT",
             self._diagnostic(
                 "SERVICE_SETUP_TIMEOUT", "readiness", "services", -1, True,
-                f"attempts={attempts} postgres/redis/rabbitmq readiness timeout "
+                f"attempts={attempts} service readiness timeout "
                 + " ".join(f"{kind}={reason}" for kind, reason in sorted(last_probe_reasons.items())),
                 resource_name=",".join(names.values()),
             ),

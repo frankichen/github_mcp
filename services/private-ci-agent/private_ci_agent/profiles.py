@@ -74,27 +74,8 @@ GO_COMMANDS = {
         {"name": "version", "command": "go version"},
         {"name": "env", "command": "go env"},
         {"name": "mod_download", "command": "go mod download 2>&1"},
-        {
-            "name": "migrate",
-            "command": (
-                "if [ -f Makefile ] && grep -Eq '^migrate-up:' Makefile; then "
-                "echo '[go:.:migrate] shared Go cache active'; "
-                "if [ -x /ci-cache/.tool-bin/goose ]; then "
-                "timeout --foreground --signal=TERM --kill-after=15s "
-                "\"${CI_MIGRATION_TIMEOUT_SECONDS:-300}s\" "
-                "make --no-print-directory GOOSE=/ci-cache/.tool-bin/goose migrate-up; "
-                "else "
-                "echo '[go:.:migrate] shared goose binary missing; using workspace fallback'; "
-                "timeout --foreground --signal=TERM --kill-after=15s "
-                "\"${CI_MIGRATION_TIMEOUT_SECONDS:-300}s\" "
-                "make --no-print-directory migrate-up; "
-                "fi; "
-                "else echo 'SKIP: Make target migrate-up not present'; fi 2>&1"
-            ),
-        },
     ],
     "check": [
-        {"name": "ai-integrity", "command": "if [ -f Makefile ] && grep -Eq '^ai-integrity-check:' Makefile; then make ai-integrity-check; else echo 'SKIP: Make target ai-integrity-check not present'; fi 2>&1"},
         {"name": "gofmt", "command": "UNFORMATTED=$(gofmt -l . 2>&1); if [ -n \"$UNFORMATTED\" ]; then echo \"GOFMT AUTOFIX FILES:\"; echo \"$UNFORMATTED\"; gofmt -w .; fi; VERIFY=$(gofmt -l . 2>&1); if [ -n \"$VERIFY\" ]; then echo \"UNFORMATTED FILES AFTER AUTOFIX:\"; echo \"$VERIFY\"; exit 1; fi; echo \"All Go files properly formatted\""},
         {"name": "govet", "command": "go vet ./... 2>&1"},
         {"name": "gotest", "command": "go test -p 6 -count=1 ./... 2>&1"},
@@ -320,6 +301,10 @@ def _load_json(path: Path) -> dict:
         return {"_configuration_error": f"invalid package.json: {exc}"}
 
 
+SUPPORTED_WORKSPACE_SERVICES = ("postgres", "redis", "rabbitmq")
+SUPPORTED_WORKSPACE_HOOKS = ("go-migrate", "ai-integrity")
+
+
 def _node_workspace(source_dir: str, rel: str, files: set[str], explicit: dict | None = None) -> dict:
     directory = Path(source_dir) / rel
     package = _load_json(directory / "package.json")
@@ -354,6 +339,40 @@ def _node_workspace(source_dir: str, rel: str, files: set[str], explicit: dict |
     if explicit:
         result["required_scripts"] = list(explicit.get("required_scripts") or [])
         result["optional_scripts"] = list(explicit.get("optional_scripts") or [])
+        controls, error = _workspace_controls(explicit)
+        result.update(controls)
+        if error:
+            result["configuration_error"] = error
+    return result
+
+
+def _workspace_controls(explicit: dict | None) -> tuple[dict, str | None]:
+    if not explicit:
+        return {}, None
+    services = explicit.get("services") or []
+    hooks = explicit.get("hooks") or []
+    if not isinstance(services, list) or not all(isinstance(item, str) for item in services):
+        return {}, "workspace services must be a list of built-in names"
+    if not isinstance(hooks, list) or not all(isinstance(item, str) for item in hooks):
+        return {}, "workspace hooks must be a list of built-in names"
+    invalid_services = sorted(set(services) - set(SUPPORTED_WORKSPACE_SERVICES))
+    if invalid_services:
+        return {}, f"unsupported workspace services: {invalid_services}"
+    invalid_hooks = sorted(set(hooks) - set(SUPPORTED_WORKSPACE_HOOKS))
+    if invalid_hooks:
+        return {}, f"unsupported workspace hooks: {invalid_hooks}"
+    return {
+        "services": list(dict.fromkeys(services)),
+        "hooks": list(dict.fromkeys(hooks)),
+    }, None
+
+
+def _generic_workspace(rel: str, stack: str, explicit: dict | None = None) -> dict:
+    result = {"path": rel or ".", "stack": stack}
+    controls, error = _workspace_controls(explicit)
+    result.update(controls)
+    if error:
+        result["configuration_error"] = error
     return result
 
 
@@ -374,23 +393,23 @@ def discover_workspaces(source_dir: str, repository_config: dict | None = None) 
         files = {p.name for p in directory.iterdir() if p.is_file()}
         kind = item.get("type", "auto")
         if kind in ("auto", "go") and "go.mod" in files:
-            add_workspace({"path": rel, "stack": "go"})
+            add_workspace(_generic_workspace(rel, "go", item))
         if kind in ("auto", "node") and "package.json" in files and not (kind == "auto" and rel == "." and "go.mod" in files and not any(lock in files for lock in LOCK_FILES)):
             node = _node_workspace(source_dir, rel, files, item)
             if item.get("package_manager"):
                 node["package_manager"] = item["package_manager"]
             add_workspace(node)
         if kind in ("auto", "python") and any(name in files for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg", "Pipfile")):
-            add_workspace({"path": rel, "stack": "python"})
+            add_workspace(_generic_workspace(rel, "python", item))
 
     for directory, rel, files in _walk_manifest_dirs(source_dir):
         if "go.mod" in files:
-            add_workspace({"path": rel or ".", "stack": "go"})
+            add_workspace(_generic_workspace(rel or ".", "go"))
         if "package.json" in files:
             if not (rel in ("", ".") and "go.mod" in files and not any(lock in files for lock in LOCK_FILES)):
                 add_workspace(_node_workspace(source_dir, rel, files))
         if any(name in files for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg", "Pipfile")):
-            add_workspace({"path": rel or ".", "stack": "python"})
+            add_workspace(_generic_workspace(rel or ".", "python"))
 
     workspaces = sorted(found.values(), key=lambda value: (value["path"], value["stack"]))
     stacks = []
@@ -588,6 +607,59 @@ def node_commands_for_workspace(
         "image": image,
         "cache_dirs": cache_dirs,
     }
+
+
+WORKSPACE_HOOKS = {
+    "go-migrate": {
+        "stack": "go",
+        "phase": "setup",
+        "step": {
+            "name": "migrate",
+            "command": (
+                "if [ -f Makefile ] && grep -Eq '^migrate-up:' Makefile; then "
+                "echo '[go:.:migrate] shared Go cache active'; "
+                "if [ -x /ci-cache/.tool-bin/goose ]; then "
+                "timeout --foreground --signal=TERM --kill-after=15s "
+                "\"${CI_MIGRATION_TIMEOUT_SECONDS:-300}s\" "
+                "make --no-print-directory GOOSE=/ci-cache/.tool-bin/goose migrate-up; "
+                "else "
+                "echo '[go:.:migrate] shared goose binary missing; using workspace fallback'; "
+                "timeout --foreground --signal=TERM --kill-after=15s "
+                "\"${CI_MIGRATION_TIMEOUT_SECONDS:-300}s\" "
+                "make --no-print-directory migrate-up; "
+                "fi; "
+                "else echo 'SKIP: Make target migrate-up not present'; fi 2>&1"
+            ),
+        },
+    },
+    "ai-integrity": {
+        "stack": "go",
+        "phase": "check",
+        "step": {
+            "name": "ai-integrity",
+            "command": "if [ -f Makefile ] && grep -Eq '^ai-integrity-check:' Makefile; then make ai-integrity-check; else echo 'SKIP: Make target ai-integrity-check not present'; fi 2>&1",
+        },
+    },
+}
+
+
+def apply_workspace_hooks(commands: dict, workspace: dict) -> dict:
+    """Append only operator-controlled built-in hooks; repository files cannot inject shell."""
+    if workspace.get("configuration_error"):
+        return {"error": "configuration_error", "message": workspace["configuration_error"]}
+    result = {
+        **commands,
+        "setup": list(commands.get("setup") or []),
+        "check": list(commands.get("check") or []),
+    }
+    for name in workspace.get("hooks") or []:
+        hook = WORKSPACE_HOOKS.get(name)
+        if not hook:
+            return {"error": "configuration_error", "message": f"Unknown workspace hook: {name}"}
+        if hook["stack"] != workspace.get("stack"):
+            return {"error": "configuration_error", "message": f"Hook {name} is not valid for {workspace.get('stack')}"}
+        result[hook["phase"]].append(dict(hook["step"]))
+    return result
 
 
 def get_commands_for_profile(profile: str, source_dir: str = "") -> dict:

@@ -20,7 +20,7 @@ def test_prepare_uses_isolated_network_and_aliases(monkeypatch, tmp_path):
 
     monkeypatch.setattr("private_ci_agent.services.subprocess.run", fake_run)
     manager = ServiceManager("podman")
-    env = manager.prepare("job-123", str(tmp_path))
+    env = manager.prepare("job-123", str(tmp_path), ["postgres", "redis", "rabbitmq"])
     assert env.network == "ci-svc-job_123"
     assert any("--pod" in command and any("postgres" in item for item in command) for command in commands)
     assert any("--pod" in command and any("redis" in item for item in command) for command in commands)
@@ -31,6 +31,35 @@ def test_prepare_uses_isolated_network_and_aliases(monkeypatch, tmp_path):
     assert (tmp_path / "runtime" / "services.env").stat().st_mode & 0o777 == 0o600
     manager.cleanup("job-123", str(tmp_path))
     assert not (tmp_path / "runtime" / "services.env").exists()
+
+
+def test_prepare_requires_explicit_service_list(tmp_path):
+    with pytest.raises(ServiceSetupError) as raised:
+        ServiceManager("podman").prepare("job-none", str(tmp_path), [])
+    assert raised.value.code == "SERVICE_CONFIGURATION_INVALID"
+
+
+def test_prepare_starts_only_explicitly_requested_services(monkeypatch, tmp_path):
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.services.subprocess.run", fake_run)
+    manager = ServiceManager("podman")
+    env = manager.prepare("job-redis-only", str(tmp_path), ["redis"])
+
+    assert env.database_url == ""
+    assert env.redis_addr == "redis:6379"
+    assert env.rabbitmq_url == ""
+    flattened = [item for command in commands for item in command]
+    assert "docker.io/library/redis:7-alpine" in flattened
+    assert "docker.io/library/postgres:16-alpine" not in flattened
+    assert "docker.io/library/rabbitmq:3-management-alpine" not in flattened
+    assert "postgres:127.0.0.1" not in flattened
+    assert "rabbitmq:127.0.0.1" not in flattened
+    assert "redis:127.0.0.1" in flattened
 
 
 def test_cleanup_is_scoped_to_current_job(monkeypatch):
@@ -114,7 +143,7 @@ def test_missing_service_image_reports_inspect_operation(monkeypatch, tmp_path):
 
     monkeypatch.setattr("private_ci_agent.services.subprocess.run", fake_run)
     with pytest.raises(ServiceSetupError) as raised:
-        ServiceManager("podman").prepare("job-image-missing", str(tmp_path))
+        ServiceManager("podman").prepare("job-image-missing", str(tmp_path), ["postgres"])
 
     assert raised.value.code == "POSTGRES_UNAVAILABLE"
     assert "operation=inspect" in raised.value.diagnostic

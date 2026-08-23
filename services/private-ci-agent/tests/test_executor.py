@@ -64,7 +64,7 @@ def make_executor(podman):
     executor = object.__new__(JobExecutor)
     executor.podman = podman
     executor.services = SimpleNamespace(
-        prepare=lambda _job_id, _workspace: SimpleNamespace(
+        prepare=lambda _job_id, _workspace, _services=None: SimpleNamespace(
             network="ci-job_123", database_url="postgres://lenshub@postgres/lenshub_ci_job",
             redis_addr="redis:6379", redis_db="0", rabbitmq_url="amqp://rabbitmq/vhost",
             public_summary=lambda: "services-ready",
@@ -110,7 +110,7 @@ def test_setup_failure_blocks_go_checks_without_mislabeling_code_failure(tmp_pat
     assert result["passed"] is False
     assert any(step["status"] == "failed" and step["step_name"].endswith(":mod_download") for step in result["steps"])
     blocked = [step for step in result["steps"] if step["status"] == "blocked_by_setup"]
-    assert {step["step_name"].rsplit(":", 1)[-1] for step in blocked} == {"migrate", "govet", "gotest", "gobuild"}
+    assert {step["step_name"].rsplit(":", 1)[-1] for step in blocked} == {"govet", "gotest", "gobuild"}
     assert not any("go vet" in command or "go test" in command or "go build" in command for command, _, _ in podman.commands)
     assert not any("make migrate-up" in command for command, _, _ in podman.commands)
 
@@ -245,13 +245,13 @@ def test_service_failure_log_keeps_safe_diagnostic(monkeypatch, tmp_path):
     executor = make_executor(FakePodman())
     diagnostic = "code=POSTGRES_UNAVAILABLE operation=start_container exit_code=125 resource=postgres image=docker.io/library/postgres:16-alpine timed_out=false reason=image missing"
     executor.services = SimpleNamespace(
-        prepare=lambda _job_id, _workspace: (_ for _ in ()).throw(
+        prepare=lambda _job_id, _workspace, _services: (_ for _ in ()).throw(
             ServiceSetupError("POSTGRES_UNAVAILABLE", diagnostic)
         ),
         cleanup=lambda _job_id, _workspace: None,
     )
     result = executor._execute_workspace(
-        make_job(tmp_path), {"path": ".", "stack": "go"},
+        make_job(tmp_path), {"path": ".", "stack": "go", "services": ["postgres"]},
     )
 
     assert result["passed"] is False
@@ -750,14 +750,61 @@ def test_fast_check_worker_idle_after_job(tmp_path, monkeypatch):
     # The caller (execute) calls client.finish_job()
 
 
-def test_repo_auto_check_has_ai_integrity_step(tmp_path):
-    """repo-auto-check GO_COMMANDS should include ai-integrity as first check."""
-    from private_ci_agent.profiles import GO_COMMANDS
+def test_generic_go_profile_does_not_inherit_repository_hooks():
+    from private_ci_agent.profiles import GO_COMMANDS, apply_workspace_hooks
 
-    check_names = [c["name"] for c in GO_COMMANDS["check"]]
-    assert "ai-integrity" in check_names, f"ai-integrity missing from {check_names}"
-    assert check_names.index("ai-integrity") < check_names.index("gofmt"), \
-        "ai-integrity should run before gofmt"
+    assert "migrate" not in [item["name"] for item in GO_COMMANDS["setup"]]
+    assert "ai-integrity" not in [item["name"] for item in GO_COMMANDS["check"]]
+
+    configured = apply_workspace_hooks(
+        GO_COMMANDS,
+        {"path": ".", "stack": "go", "hooks": ["go-migrate", "ai-integrity"]},
+    )
+    assert "migrate" in [item["name"] for item in configured["setup"]]
+    assert "ai-integrity" in [item["name"] for item in configured["check"]]
+
+
+def test_generic_go_workspace_does_not_start_services(tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    executor = make_executor(FakePodman())
+    calls = []
+    executor.services = SimpleNamespace(
+        prepare=lambda *_args: calls.append(_args),
+        cleanup=lambda *_args: None,
+    )
+
+    result = executor._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "go"})
+
+    assert result["passed"] is True
+    assert calls == []
+
+
+def test_configured_go_workspace_starts_only_requested_services(tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    executor = make_executor(FakePodman())
+    calls = []
+    executor.services = SimpleNamespace(
+        prepare=lambda job_id, workspace, services: (
+            calls.append((job_id, workspace, list(services)))
+            or SimpleNamespace(
+                network="ci-svc-job_123",
+                database_url="",
+                redis_addr="redis:6379",
+                redis_db="0",
+                rabbitmq_url="",
+                public_summary=lambda: "REDIS_HOST=redis REDIS_PORT=6379 REDIS_DB=0",
+            )
+        ),
+        cleanup=lambda *_args: None,
+    )
+
+    result = executor._execute_workspace(
+        make_job(tmp_path),
+        {"path": ".", "stack": "go", "services": ["redis"]},
+    )
+
+    assert result["passed"] is True
+    assert calls == [("job-123", "", ["redis"])] or calls == [("job-123", None, ["redis"])]
 
 
 # ---- cancellation short-circuit ----
