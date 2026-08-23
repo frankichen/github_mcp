@@ -57,6 +57,13 @@ repositories:
     workspaces:
       - path: .
         type: auto
+        services:
+          - postgres
+          - redis
+          - rabbitmq
+        hooks:
+          - go-migrate
+          - ai-integrity
       - path: h5/lenshub-console
         type: node
         package_manager: npm

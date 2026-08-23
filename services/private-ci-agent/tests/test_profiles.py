@@ -8,6 +8,7 @@ import pytest
 from private_ci_agent.profiles import (
     NODE_CHROMIUM_IMAGE,
     NODE_IMAGE,
+    apply_workspace_hooks,
     discover_workspaces,
     go_commands_for_workspace,
     go_image_for_version,
@@ -72,6 +73,49 @@ def test_go_and_node_workspaces_are_combined(tmp_path):
     (tmp_path / "client" / "package-lock.json").write_text("{}")
     result = discover_workspaces(str(tmp_path))
     assert "go" in result["detected_stacks"] and "node" in result["detected_stacks"]
+
+
+def test_operator_workspace_controls_are_preserved_only_for_configured_workspace(tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    config = {
+        "workspaces": [{
+            "path": ".",
+            "type": "go",
+            "services": ["postgres", "redis", "postgres"],
+            "hooks": ["go-migrate", "ai-integrity", "go-migrate"],
+        }]
+    }
+
+    configured = discover_workspaces(str(tmp_path), config)["workspaces"][0]
+    automatic = discover_workspaces(str(tmp_path))["workspaces"][0]
+
+    assert configured["services"] == ["postgres", "redis"]
+    assert configured["hooks"] == ["go-migrate", "ai-integrity"]
+    assert "services" not in automatic
+    assert "hooks" not in automatic
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "fragment"),
+    [
+        ("services", ["postgres", "shell"], "unsupported workspace services"),
+        ("hooks", ["go-migrate", "echo pwned"], "unsupported workspace hooks"),
+    ],
+)
+def test_operator_workspace_controls_reject_unknown_names(tmp_path, field, value, fragment):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    item = {"path": ".", "type": "go", field: value}
+    workspace = discover_workspaces(str(tmp_path), {"workspaces": [item]})["workspaces"][0]
+    assert fragment in workspace["configuration_error"]
+
+
+def test_workspace_hooks_are_stack_scoped():
+    result = apply_workspace_hooks(
+        {"setup": [], "check": []},
+        {"path": ".", "stack": "python", "hooks": ["go-migrate"]},
+    )
+    assert result["error"] == "configuration_error"
+    assert "not valid for python" in result["message"]
 
 
 def test_multiple_lock_files_are_configuration_error(tmp_path):
@@ -277,9 +321,17 @@ def test_go_mod_requirement_selects_compatible_version_and_build(tmp_path):
     assert any(item["name"] == "gobuild" and item["command"] == "go build ./... 2>&1" for item in commands["check"])
     assert commands["cache_dirs"] == {"go": "/ci-cache"}
     assert "GOMODCACHE" in commands["setup"][0]["command"]
-    migration = next(item for item in commands["setup"] if item["name"] == "migrate")
+    assert "migrate" not in [item["name"] for item in commands["setup"]]
+    assert "ai-integrity" not in [item["name"] for item in commands["check"]]
+
+    configured = apply_workspace_hooks(
+        commands,
+        {"path": ".", "stack": "go", "hooks": ["go-migrate", "ai-integrity"]},
+    )
+    migration = next(item for item in configured["setup"] if item["name"] == "migrate")
     assert "/ci-cache/.tool-bin/goose" in migration["command"]
     assert "CI_MIGRATION_TIMEOUT_SECONDS" in migration["command"]
+    assert "ai-integrity" in [item["name"] for item in configured["check"]]
 
 
 def test_go_toolchain_is_the_effective_minimum(tmp_path):

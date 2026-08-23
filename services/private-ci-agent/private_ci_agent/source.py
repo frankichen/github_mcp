@@ -109,7 +109,9 @@ def remove_source_worktree(dest_dir: str, mirror_root: str):
                 repository = os.path.basename(common_dir)[:-4]
     except Exception:
         repository = ""
-    mirror = os.path.join(mirror_root, (repository or "frankichen-sxt") + ".git")
+    if not repository:
+        return
+    mirror = os.path.join(mirror_root, repository + ".git")
     if not os.path.isdir(mirror):
         return
     subprocess.run(["git", "-C", mirror, "worktree", "remove", "--force", dest_dir], capture_output=True, text=True, timeout=30)

@@ -43,6 +43,14 @@ def test_only_sxt_allows_openapi_check_on_agent_side():
             assert "openapi-check" not in (config.get("allowed_profiles") or [])
 
 
+def test_sxt_runtime_overrides_request_only_lenshub_services_and_hooks():
+    data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
+    root = next(item for item in data["repositories"]["frankichen/sxt"]["workspaces"] if item["path"] == ".")
+
+    assert root["services"] == ["postgres", "redis", "rabbitmq"]
+    assert root["hooks"] == ["go-migrate", "ai-integrity"]
+
+
 def test_sxt_allows_repo_fast_check_on_agent_side():
     data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
     allowed = data["repositories"]["frankichen/sxt"]["allowed_profiles"]

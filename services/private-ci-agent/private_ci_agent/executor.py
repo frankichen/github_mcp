@@ -20,6 +20,7 @@ from private_ci_agent.profiles import (
     get_repository_overrides,
     node_commands_for_workspace,
     python_commands_for_workspace,
+    apply_workspace_hooks,
 )
 from private_ci_agent.podman import PodmanRunner
 from private_ci_agent.logs import LogManager
@@ -277,15 +278,21 @@ class JobExecutor:
         return {**detected, "workspaces": workspaces, "selected_profiles": [profile]}
 
     def _workspace_commands(self, workspace: dict, source_dir: str) -> dict:
+        if workspace.get("configuration_error"):
+            return {"error": "configuration_error", "message": workspace["configuration_error"]}
         stack = workspace["stack"]
         if stack == "node":
             required_default = workspace.get("required_scripts") or []
-            return node_commands_for_workspace(workspace, required_default, source_dir=source_dir)
-        if stack == "go":
-            return go_commands_for_workspace(source_dir)
-        if stack == "python":
-            return python_commands_for_workspace(source_dir)
-        return {"error": "unsupported", "message": f"Unsupported stack: {stack}"}
+            commands = node_commands_for_workspace(workspace, required_default, source_dir=source_dir)
+        elif stack == "go":
+            commands = go_commands_for_workspace(source_dir)
+        elif stack == "python":
+            commands = python_commands_for_workspace(source_dir)
+        else:
+            return {"error": "unsupported", "message": f"Unsupported stack: {stack}"}
+        if commands.get("error"):
+            return commands
+        return apply_workspace_hooks(commands, workspace)
 
     def _execute_workspace(self, job: Job, workspace: dict) -> dict:
         path = workspace["path"]
@@ -325,10 +332,11 @@ class JobExecutor:
             caches = {name: CACHE_MAP[name] for name in commands.get("cache_dirs", {}) if name in CACHE_MAP}
         steps = []
         service_env = None
-        if workspace["stack"] == "go":
-            self.log_manager.upload(job.job_id, "[services:prepare] Starting isolated PostgreSQL/Redis/RabbitMQ\n")
+        requested_services = list(workspace.get("services") or [])
+        if requested_services:
+            self.log_manager.upload(job.job_id, f"[services:prepare] Starting isolated services={requested_services}\n")
             try:
-                service_env = self.services.prepare(job.job_id, job.workspace)
+                service_env = self.services.prepare(job.job_id, job.workspace, requested_services)
                 self.log_manager.upload(job.job_id, f"[services:ready] {service_env.public_summary()}\n")
             except ServiceSetupError as exc:
                 self.log_manager.upload(job.job_id, f"[services:failed] {exc.diagnostic}\n")
