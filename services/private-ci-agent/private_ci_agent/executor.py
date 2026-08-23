@@ -33,8 +33,20 @@ CACHE_MAP = {
     "pip": "/srv/private-ci/cache/pip",
     "npm": "/srv/private-ci/cache/npm",
     "playwright": "/srv/private-ci/cache/ms-playwright",
+    "cargo": "/srv/private-ci/cache/cargo",
+    "maven": "/srv/private-ci/cache/maven",
+    "gradle": "/srv/private-ci/cache/gradle",
+    "nuget": "/srv/private-ci/cache/nuget",
 }
-PROFILE_BY_STACK = {"go": "go-check", "python": "python-check", "node": "node-check"}
+PROFILE_BY_STACK = {
+    "go": "go-check",
+    "python": "python-check",
+    "node": "node-check",
+    "rust": "rust-check",
+    "maven": "maven-check",
+    "gradle": "gradle-check",
+    "dotnet": "dotnet-check",
+}
 
 
 class JobExecutor:
@@ -288,6 +300,8 @@ class JobExecutor:
             commands = go_commands_for_workspace(source_dir)
         elif stack == "python":
             commands = python_commands_for_workspace(source_dir)
+        elif stack in {"rust", "maven", "gradle", "dotnet"}:
+            commands = get_commands_for_profile(PROFILE_BY_STACK[stack], source_dir)
         else:
             return {"error": "unsupported", "message": f"Unsupported stack: {stack}"}
         if commands.get("error"):
@@ -411,7 +425,7 @@ class JobExecutor:
                 continue
             if setup_failed and (
                 (workspace["stack"] == "go" and check["name"] in {"govet", "gotest", "gobuild"})
-                or workspace["stack"] in {"node", "python"}
+                or workspace["stack"] in {"node", "python", "rust", "maven", "gradle", "dotnet"}
             ):
                 step = {
                     "step_name": f"{label}:{check['name']}",

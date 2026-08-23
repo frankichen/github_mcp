@@ -171,6 +171,58 @@ PYTHON_COMMANDS = {
     "cache_dirs": {"pip": "/srv/private-ci/cache/pip"},
 }
 
+RUST_IMAGE = "docker.io/library/rust:1.97.1-bookworm"
+MAVEN_IMAGE = "docker.io/library/maven:3.9.16-eclipse-temurin-21"
+GRADLE_IMAGE = "docker.io/library/gradle:9.7.0-jdk21-jammy"
+DOTNET_IMAGE = "mcr.microsoft.com/dotnet/sdk:8.0.424-bookworm-slim"
+
+RUST_COMMANDS = {
+    "setup": [
+        {"name": "fetch", "command": "if [ -f Cargo.lock ]; then cargo fetch --locked; else cargo fetch; fi 2>&1"},
+    ],
+    "check": [
+        {"name": "fmt", "command": "cargo fmt --all -- --check 2>&1"},
+        {"name": "check", "command": "if [ -f Cargo.lock ]; then CARGO_NET_OFFLINE=true cargo check --locked; else CARGO_NET_OFFLINE=true cargo check; fi 2>&1"},
+        {"name": "test", "command": "if [ -f Cargo.lock ]; then CARGO_NET_OFFLINE=true cargo test --locked; else CARGO_NET_OFFLINE=true cargo test; fi 2>&1"},
+    ],
+    "image": RUST_IMAGE,
+    "cache_dirs": {"cargo": "/ci-cache/cargo"},
+}
+
+MAVEN_COMMANDS = {
+    "setup": [
+        {"name": "dependencies", "command": "mvn -B -ntp -DskipTests dependency:go-offline 2>&1"},
+    ],
+    "check": [
+        {"name": "test", "command": "mvn -o -B -ntp test 2>&1"},
+    ],
+    "image": MAVEN_IMAGE,
+    "cache_dirs": {"maven": "/ci-cache/maven"},
+}
+
+GRADLE_COMMANDS = {
+    "setup": [
+        {"name": "dependencies", "command": "gradle --no-daemon testClasses 2>&1"},
+    ],
+    "check": [
+        {"name": "test", "command": "gradle --offline --no-daemon test 2>&1"},
+    ],
+    "image": GRADLE_IMAGE,
+    "cache_dirs": {"gradle": "/ci-cache/gradle"},
+}
+
+DOTNET_COMMANDS = {
+    "setup": [
+        {"name": "restore", "command": "dotnet restore 2>&1"},
+    ],
+    "check": [
+        {"name": "build", "command": "dotnet build --no-restore 2>&1"},
+        {"name": "test", "command": "dotnet test --no-restore 2>&1"},
+    ],
+    "image": DOTNET_IMAGE,
+    "cache_dirs": {"nuget": "/ci-cache/nuget"},
+}
+
 OPENAPI_CHECK_COMMAND = (
     "test -f scripts/validate-openapi.sh || { echo 'CONFIGURATION_ERROR: scripts/validate-openapi.sh missing' >&2; exit 2; }; "
     "test -f .redocly.yaml || { echo 'CONFIGURATION_ERROR: .redocly.yaml missing' >&2; exit 2; }; "
@@ -192,6 +244,10 @@ PROFILE_COMMANDS = {
     "go-check": GO_COMMANDS,
     "python-check": PYTHON_COMMANDS,
     "node-check": None,
+    "rust-check": RUST_COMMANDS,
+    "maven-check": MAVEN_COMMANDS,
+    "gradle-check": GRADLE_COMMANDS,
+    "dotnet-check": DOTNET_COMMANDS,
     "repo-auto-check": None,
     "repo-fast-check": FAST_CHECK_COMMANDS,
     "openapi-check": OPENAPI_COMMANDS,
@@ -401,6 +457,14 @@ def discover_workspaces(source_dir: str, repository_config: dict | None = None) 
             add_workspace(node)
         if kind in ("auto", "python") and any(name in files for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg", "Pipfile")):
             add_workspace(_generic_workspace(rel, "python", item))
+        if kind in ("auto", "rust") and "Cargo.toml" in files:
+            add_workspace(_generic_workspace(rel, "rust", item))
+        if kind in ("auto", "maven") and "pom.xml" in files:
+            add_workspace(_generic_workspace(rel, "maven", item))
+        if kind in ("auto", "gradle") and any(name in files for name in ("build.gradle", "build.gradle.kts")):
+            add_workspace(_generic_workspace(rel, "gradle", item))
+        if kind in ("auto", "dotnet") and any(name.endswith((".sln", ".csproj", ".fsproj")) for name in files):
+            add_workspace(_generic_workspace(rel, "dotnet", item))
 
     for directory, rel, files in _walk_manifest_dirs(source_dir):
         if "go.mod" in files:
@@ -410,6 +474,14 @@ def discover_workspaces(source_dir: str, repository_config: dict | None = None) 
                 add_workspace(_node_workspace(source_dir, rel, files))
         if any(name in files for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg", "Pipfile")):
             add_workspace(_generic_workspace(rel or ".", "python"))
+        if "Cargo.toml" in files:
+            add_workspace(_generic_workspace(rel or ".", "rust"))
+        if "pom.xml" in files:
+            add_workspace(_generic_workspace(rel or ".", "maven"))
+        if any(name in files for name in ("build.gradle", "build.gradle.kts")):
+            add_workspace(_generic_workspace(rel or ".", "gradle"))
+        if any(name.endswith((".sln", ".csproj", ".fsproj")) for name in files):
+            add_workspace(_generic_workspace(rel or ".", "dotnet"))
 
     workspaces = sorted(found.values(), key=lambda value: (value["path"], value["stack"]))
     stacks = []
@@ -423,7 +495,8 @@ def discover_workspaces(source_dir: str, repository_config: dict | None = None) 
 
 def detect_languages(source_dir: str) -> list[str]:
     result = discover_workspaces(source_dir)
-    return [stack for stack in result["detected_stacks"] if stack in ("go", "python", "node")]
+    supported = {"go", "python", "node", "rust", "maven", "gradle", "dotnet"}
+    return [stack for stack in result["detected_stacks"] if stack in supported]
 
 
 def _script_is_one_shot(name: str, command: str) -> bool:
@@ -679,6 +752,8 @@ def get_commands_for_profile(profile: str, source_dir: str = "") -> dict:
         return go_commands_for_workspace(source_dir)
     if profile == "python-check" and source_dir:
         return python_commands_for_workspace(source_dir)
+    if profile in {"rust-check", "maven-check", "gradle-check", "dotnet-check"}:
+        return PROFILE_COMMANDS[profile]
     return PROFILE_COMMANDS[profile]
 
 

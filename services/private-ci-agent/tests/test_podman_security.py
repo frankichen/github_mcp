@@ -1,6 +1,8 @@
 import logging
 import subprocess
 import threading
+
+import pytest
 from types import SimpleNamespace
 
 from private_ci_agent.podman import PodmanRunner, ROOTLESS_OUTBOUND_NETWORK
@@ -155,6 +157,32 @@ def test_npm_cache_mounts_to_controlled_shared_directory(monkeypatch, tmp_path):
     assert mount == f"{cache}:/ci-cache/npm:rw,z"
     assert "NPM_CONFIG_CACHE=/ci-cache/npm" in command
     assert not any("node_modules" in item for item in command)
+
+
+@pytest.mark.parametrize(("cache_name", "env_name", "env_value"), [
+    ("cargo", "CARGO_HOME", "/ci-cache/cargo"),
+    ("maven", "MAVEN_OPTS", "-Dmaven.repo.local=/ci-cache/maven"),
+    ("gradle", "GRADLE_USER_HOME", "/ci-cache/gradle"),
+    ("nuget", "NUGET_PACKAGES", "/ci-cache/nuget"),
+])
+def test_common_language_dependency_cache_is_persistent(monkeypatch, tmp_path, cache_name, env_name, env_value):
+    captured = []
+
+    def fake_run(command, **_kwargs):
+        captured.append(command)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    cache = tmp_path / cache_name
+    result = PodmanRunner("podman").run_command(
+        "docker.io/library/alpine:3", "job-cache", str(tmp_path),
+        {cache_name: str(cache)}, "true", 30, network=False,
+    )
+
+    assert result["exit_code"] == 0
+    command = captured[0]
+    assert f"{cache}:/ci-cache/{cache_name}:rw,z" in command
+    assert f"{env_name}={env_value}" in command
 
 
 def test_playwright_cache_mount_and_environment_are_explicit(monkeypatch, tmp_path):

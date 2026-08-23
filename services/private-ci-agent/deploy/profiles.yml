@@ -48,3 +48,27 @@ profiles:
       - test:ci
       - test
       - build
+
+  rust-check:
+    description: "Rust format, offline check, and test after controlled dependency fetch"
+    language: rust
+    base_image: docker.io/library/rust:1.97.1-bookworm
+    cache: cargo
+
+  maven-check:
+    description: "Maven dependency prefetch and offline test"
+    language: maven
+    base_image: docker.io/library/maven:3.9.16-eclipse-temurin-21
+    cache: maven
+
+  gradle-check:
+    description: "Gradle dependency preparation and offline test"
+    language: gradle
+    base_image: docker.io/library/gradle:9.7.0-jdk21-jammy
+    cache: gradle
+
+  dotnet-check:
+    description: ".NET restore, build, and test with pinned .NET 8 LTS SDK"
+    language: dotnet
+    base_image: mcr.microsoft.com/dotnet/sdk:8.0.424-bookworm-slim
+    cache: nuget

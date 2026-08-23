@@ -874,3 +874,48 @@ def test_auto_plan_uses_worker_capabilities_without_repository_registration(tmp_
     assert "error" not in plan
     assert plan["selected_profiles"] == ["python-check"]
     assert plan["detected_stacks"] == ["python"]
+
+
+@pytest.mark.parametrize(("filename", "stack", "profile"), [
+    ("Cargo.toml", "rust", "rust-check"),
+    ("pom.xml", "maven", "maven-check"),
+    ("build.gradle", "gradle", "gradle-check"),
+    ("sample.csproj", "dotnet", "dotnet-check"),
+])
+def test_auto_plan_selects_common_language_profiles(tmp_path, filename, stack, profile):
+    (tmp_path / filename).write_text("placeholder", encoding="utf-8")
+    executor = JobExecutor.__new__(JobExecutor)
+    executor.config = {"supported_profiles": ["repo-auto-check", profile]}
+
+    plan = executor._auto_plan(str(tmp_path), {})
+
+    assert "error" not in plan
+    assert plan["selected_profiles"] == [profile]
+    assert plan["detected_stacks"] == [stack]
+
+
+@pytest.mark.parametrize("stack", ["rust", "maven", "gradle", "dotnet"])
+def test_common_language_setup_uses_proxy_and_checks_are_network_isolated(tmp_path, stack, monkeypatch):
+    cache = tmp_path / f"{stack}-cache"
+    cache_name = {"rust": "cargo", "maven": "maven", "gradle": "gradle", "dotnet": "nuget"}[stack]
+    monkeypatch.setitem(executor_module.CACHE_MAP, cache_name, str(cache))
+    podman = FakePodman()
+
+    result = make_executor(podman)._execute_workspace(make_job(tmp_path), {"path": ".", "stack": stack})
+
+    assert result["passed"] is True
+    assert podman.call_options[0]["pass_proxy"] is True
+    assert podman.commands[0][1] is True
+    for (_, network, _), options in zip(podman.commands[1:], podman.call_options[1:]):
+        assert network is False
+        assert options["pass_proxy"] is False
+
+
+def test_common_language_setup_failure_blocks_checks(tmp_path):
+    podman = FakePodman("cargo fetch")
+    result = make_executor(podman)._execute_workspace(make_job(tmp_path), {"path": ".", "stack": "rust"})
+
+    assert result["passed"] is False
+    assert result["steps"][0]["status"] == "failed"
+    assert all(step["status"] == "blocked_by_setup" for step in result["steps"][1:])
+    assert len(podman.commands) == 1
