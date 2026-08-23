@@ -823,6 +823,7 @@ def complete_job(job_id: str, exit_code: int, status: str, summary: Optional[dic
 
     started = row["started_at"]
     duration = ts - started if started else 0
+    worker_id = row["worker_id"]
 
     summary_json = json.dumps(summary) if summary else None
 
@@ -832,6 +833,14 @@ def complete_job(job_id: str, exit_code: int, status: str, summary: Optional[dic
            WHERE job_id = ?""",
         (status, exit_code, summary_json, ts, duration, error_code, error_message, job_id),
     )
+    if worker_id:
+        # Compare-and-clear: a delayed finish for an older job must never clear
+        # a worker that has already leased a newer job.
+        db.execute(
+            """UPDATE ci_workers SET status = 'idle', current_job_id = NULL
+               WHERE worker_id = ? AND current_job_id = ?""",
+            (worker_id, job_id),
+        )
 
     repo = row["repository"]
     _upsert_repo_queue_state(db, repo, running_delta=-1)
@@ -870,7 +879,14 @@ def release_job(job_id: str):
     row = db.execute("SELECT * FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
     if not row:
         return
+    worker_id = row["worker_id"]
     db.execute("UPDATE ci_jobs SET status = 'queued', worker_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL WHERE job_id = ?", (job_id,))
+    if worker_id:
+        db.execute(
+            """UPDATE ci_workers SET status = 'idle', current_job_id = NULL
+               WHERE worker_id = ? AND current_job_id = ?""",
+            (worker_id, job_id),
+        )
     _upsert_repo_queue_state(db, row["repository"], queued_delta=1, running_delta=-1)
     _add_event(db, job_id, "released", "{}")
     db.commit()
