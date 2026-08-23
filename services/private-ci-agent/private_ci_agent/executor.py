@@ -100,7 +100,7 @@ class JobExecutor:
         if job.profile == "repo-auto-check":
             plan = self._auto_plan(job.source_dir, repo_config)
         else:
-            plan = self._explicit_plan(job.profile, job.source_dir)
+            plan = self._explicit_plan(job.profile, job.source_dir, repo_config)
 
         metadata = {
             "detected_stacks": plan.get("detected_stacks", []),
@@ -264,9 +264,12 @@ class JobExecutor:
             return {"error": "unsupported", "message": "No supported project Manifest detected", **detected}
         return {**detected, "selected_profiles": selected}
 
-    def _explicit_plan(self, profile: str, source_dir: str) -> dict:
+    def _explicit_plan(self, profile: str, source_dir: str, repo_config: dict | None = None) -> dict:
         if profile == "node-check":
-            detected = discover_workspaces(source_dir, {"workspaces": [{"path": ".", "type": "node"}]})
+            # Respect repository workspace declarations and normal auto-discovery.
+            # A mixed Go root may carry package.json only as an orchestrator and
+            # must not become a Node workspace unless it has a supported lockfile.
+            detected = discover_workspaces(source_dir, repo_config or None)
             workspaces = [item for item in detected["workspaces"] if item["stack"] == "node"]
         else:
             stack = profile.removesuffix("-check")
