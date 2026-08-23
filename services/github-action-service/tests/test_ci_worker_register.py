@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 os.environ.setdefault("GITHUB_TOKEN", "test_token_value")
 os.environ.setdefault("ACTION_API_KEY", "test_api_key_32_bytes_long")
 
-from app.ci_database import _worker_row_to_dict, init_db, register_worker
+from app.ci_database import _worker_row_to_dict, init_db, register_worker, reconcile_worker_startup
 from app.routers import ci_worker
 
 
@@ -255,3 +255,91 @@ def test_heartbeat_falls_back_to_auth_when_lease_token_missing(client, monkeypat
 
     assert response.status_code == 200
     assert renewed_with == [("job-lease-2", "worker-token")]
+
+
+
+def test_worker_reconcile_requires_worker_auth(client):
+    response = client.post("/internal/ci/workers/reconcile", json={"action": "startup_reconcile"})
+    assert response.status_code == 401
+
+
+def test_worker_reconcile_uses_server_controlled_semantics(client, monkeypatch):
+    recovered = []
+    reconciled = []
+
+    async def accept(_request):
+        return "wsl-ci-test"
+
+    monkeypatch.setattr(ci_worker, "verify_ci_worker", accept)
+    monkeypatch.setattr(ci_worker, "recover_worker_jobs", lambda worker_id: recovered.append(worker_id))
+    monkeypatch.setattr(
+        ci_worker,
+        "reconcile_worker_startup",
+        lambda worker_id: reconciled.append(worker_id) or {
+            "current_job_id": "job-old",
+            "current_job_status": "queued",
+            "lease_expired": False,
+            "action": "cleared",
+        },
+    )
+
+    response = client.post(
+        "/internal/ci/workers/reconcile",
+        json={
+            "worker_id": "wsl-ci-test",
+            "action": "startup_reconcile",
+            "terminal_states": ["running"],
+        },
+        headers={"Authorization": "Bearer test", "X-Worker-ID": "wsl-ci-test"},
+    )
+
+    assert response.status_code == 200
+    assert recovered == ["wsl-ci-test"]
+    assert reconciled == ["wsl-ci-test"]
+    assert response.json()["action"] == "cleared"
+
+
+def test_worker_reconcile_rejects_cross_worker_identity(client, monkeypatch):
+    async def accept(_request):
+        return "wsl-ci-test"
+
+    monkeypatch.setattr(ci_worker, "verify_ci_worker", accept)
+    response = client.post(
+        "/internal/ci/workers/reconcile",
+        json={"worker_id": "other-worker", "action": "startup_reconcile"},
+        headers={"Authorization": "Bearer test", "X-Worker-ID": "wsl-ci-test"},
+    )
+    assert response.status_code == 403
+
+
+def test_reconcile_worker_startup_clears_stale_pointer(tmp_path, monkeypatch):
+    db_path = tmp_path / "ci.db"
+    import app.ci_database as database
+    monkeypatch.setattr(database, "DB_PATH", str(db_path))
+    database._local.db = None
+    init_db()
+    try:
+        assert register_worker("wsl-ci-test", "test-token", ["go-check"], 1)
+        db = database._get_db()
+        db.execute(
+            "UPDATE ci_workers SET status='busy', current_job_id='missing-job' WHERE worker_id='wsl-ci-test'"
+        )
+        db.commit()
+
+        result = reconcile_worker_startup("wsl-ci-test")
+
+        assert result == {
+            "current_job_id": "missing-job",
+            "current_job_status": None,
+            "lease_expired": False,
+            "action": "cleared",
+        }
+        row = db.execute(
+            "SELECT status,current_job_id FROM ci_workers WHERE worker_id='wsl-ci-test'"
+        ).fetchone()
+        assert row["status"] == "idle"
+        assert row["current_job_id"] is None
+    finally:
+        if database._local.db is not None:
+            database._local.db.close()
+            database._local.db = None

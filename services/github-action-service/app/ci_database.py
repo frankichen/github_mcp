@@ -247,6 +247,50 @@ def get_worker(worker_id: str) -> Optional[dict]:
     return _worker_row_to_dict(row, now_ts())
 
 
+def reconcile_worker_startup(worker_id: str) -> Optional[dict]:
+    """Clear a restarting worker's stale current-job pointer.
+
+    Registration already releases any in-flight jobs owned by this worker back
+    to the queue.  This helper completes that server-controlled recovery by
+    clearing the worker pointer and returning bounded diagnostic state.  The
+    caller cannot supply terminal states or mutate arbitrary jobs.
+    """
+    db = _get_db()
+    with _db_write_lock:
+        row = db.execute(
+            """SELECT w.current_job_id, j.status AS job_status, j.lease_expires_at
+               FROM ci_workers w
+               LEFT JOIN ci_jobs j ON w.current_job_id = j.job_id
+               WHERE w.worker_id = ?""",
+            (worker_id,),
+        ).fetchone()
+        if not row:
+            return None
+
+        current_job_id = row["current_job_id"]
+        if not current_job_id:
+            return {
+                "current_job_id": None,
+                "current_job_status": None,
+                "lease_expired": False,
+                "action": "none",
+            }
+
+        lease_expires_at = row["lease_expires_at"]
+        lease_expired = bool(lease_expires_at is not None and lease_expires_at <= now_ts())
+        db.execute(
+            "UPDATE ci_workers SET status = 'idle', current_job_id = NULL WHERE worker_id = ?",
+            (worker_id,),
+        )
+        db.commit()
+        return {
+            "current_job_id": current_job_id,
+            "current_job_status": row["job_status"],
+            "lease_expired": lease_expired,
+            "action": "cleared",
+        }
+
+
 def _worker_row_to_dict(row, ts) -> dict:
     heartbeat_age = ts - row["last_heartbeat"]
     online = heartbeat_age < 60
