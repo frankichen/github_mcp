@@ -118,10 +118,12 @@ repositories:
     }
 
 
-def test_apply_fixes_syncs_source_module():
+def test_apply_fixes_syncs_entire_runtime_package():
     script = (DEPLOY_DIR / "apply-fixes.sh").read_text(encoding="utf-8")
 
-    assert "profiles.py source.py controller_client.py" in script
+    assert 'private_ci_agent/"*.py' in script
+    assert 'f="$(basename "${src}")"' in script
+    assert "for f in config.py executor.py" not in script
 
 
 def test_playwright_cache_maintenance_is_pinned_and_not_a_job_step():
@@ -264,7 +266,7 @@ def _stage_apply_fixes_repo(tmp_path):
     staged_script.chmod(0o755)
     for name in (
         "config.py", "executor.py", "main.py", "podman.py",
-        "profiles.py", "source.py", "controller_client.py",
+        "profiles.py", "source.py", "controller_client.py", "services.py",
     ):
         (source_root / name).write_text("# test fixture\n", encoding="utf-8")
     (controller_app / "version.py").write_text(
@@ -327,6 +329,13 @@ def _run_apply_fixes(
 
 def _output(result):
     return result.stdout + result.stderr
+
+
+def test_apply_fixes_installs_new_runtime_modules_without_allowlist(tmp_path):
+    result, calls, _state = _run_apply_fixes(tmp_path)
+    assert result.returncode == 0
+    assert any("services.py" in call for call in calls if call.startswith("install "))
+    assert "updated services.py" in _output(result)
 
 def test_apply_fixes_default_mode_auto_rolls_back_start_failure(tmp_path):
     result, calls, state = _run_apply_fixes(
