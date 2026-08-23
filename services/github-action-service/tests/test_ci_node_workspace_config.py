@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import yaml
 
 from app import ci_repository_config as config
@@ -25,3 +27,16 @@ def test_sxt_profile_allowlist_and_workspaces(tmp_path, monkeypatch):
     assert config.is_profile_allowed("frankichen/sxt", "openapi-check")
     assert not config.is_profile_allowed("frankichen/sxt", "python-check")
     assert not config.is_profile_allowed("frankichen/other", "openapi-check")
+
+
+def test_checked_in_sxt_config_keeps_runtime_services_and_hooks_explicit():
+    path = Path(__file__).parents[1] / "config" / "ci_repositories.yml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    root = next(
+        item
+        for item in data["repositories"]["frankichen/sxt"]["workspaces"]
+        if item["path"] == "."
+    )
+
+    assert root["services"] == ["postgres", "redis", "rabbitmq"]
+    assert root["hooks"] == ["go-migrate", "ai-integrity"]
