@@ -90,6 +90,15 @@ repository config 只能选择 hook 名称，不能提供命令文本。
 
 #### B1. Profile 安全要求
 
+2026-08-23 实施时固定的受控运行时基线：
+
+- Rust: `docker.io/library/rust:1.97.1-bookworm`
+- Maven: `docker.io/library/maven:3.9.16-eclipse-temurin-21`
+- Gradle: `docker.io/library/gradle:9.7.0-jdk21-jammy`
+- .NET: `mcr.microsoft.com/dotnet/sdk:8.0.424-bookworm-slim`
+
+这些 tag 不允许由 MCP caller 或 repository 内容覆盖；后续版本升级必须通过正常代码审查修改固定常量和对应测试。
+
 每个 Profile 必须：
 
 - 使用代码内固定/受控 image；不接受 caller image。

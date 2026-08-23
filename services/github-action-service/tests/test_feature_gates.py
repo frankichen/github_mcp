@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 import yaml
@@ -33,6 +34,10 @@ def _configure_policy(tmp_path, monkeypatch, repositories=None):
                             "python-check",
                             "go-check",
                             "node-check",
+                            "rust-check",
+                            "maven-check",
+                            "gradle-check",
+                            "dotnet-check",
                         ],
                         "max_timeout_seconds": 900,
                     },
@@ -60,10 +65,26 @@ def test_auto_enrollment_enables_private_ci_but_not_deployment(tmp_path, monkeyp
         "python-check",
         "go-check",
         "node-check",
+        "rust-check",
+        "maven-check",
+        "gradle-check",
+        "dotnet-check",
     }
     assert repo_policy.is_test_deploy_enabled(repository) is False
     assert repo_policy.is_self_deploy_enabled(repository) is False
     assert repo_policy.get_deployment_config(repository) == {}
+
+
+def test_checked_in_auto_enrollment_includes_common_stacks_but_not_openapi():
+    expected = {"rust-check", "maven-check", "gradle-check", "dotnet-check"}
+    assert expected.issubset(set(repo_policy._DEFAULT_AUTO_PROFILES))
+    assert "openapi-check" not in repo_policy._DEFAULT_AUTO_PROFILES
+
+    path = Path(__file__).parents[1] / "config" / "ci_repositories.yml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profiles = set(data["auto_enroll"]["defaults"]["allowed_profiles"])
+    assert expected.issubset(profiles)
+    assert "openapi-check" not in profiles
 
 
 def test_explicit_repository_entry_overrides_auto_enrollment(tmp_path, monkeypatch):
@@ -112,6 +133,8 @@ async def test_fail_stop_contract_does_not_expand_private_ci_start_inputs():
     properties = tools["start_private_ci_job"].inputSchema["properties"]
     assert "command" not in properties
     assert "image" not in properties
+    assert "services" not in properties
+    assert "hooks" not in properties
     assert "failure_mode" not in properties
     assert "deploy_failure_mode" not in properties
     assert "MYGITHUB12_DEPLOY_FAILURE_MODE" not in properties

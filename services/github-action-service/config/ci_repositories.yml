@@ -11,6 +11,10 @@ auto_enroll:
       - python-check
       - go-check
       - node-check
+      - rust-check
+      - maven-check
+      - gradle-check
+      - dotnet-check
     max_timeout_seconds: 900
     merge_policy:
       private_ci_authoritative: true

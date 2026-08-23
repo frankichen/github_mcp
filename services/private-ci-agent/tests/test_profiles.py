@@ -6,8 +6,13 @@ import subprocess
 import pytest
 
 from private_ci_agent.profiles import (
+    DOTNET_IMAGE,
+    GRADLE_IMAGE,
+    MAVEN_IMAGE,
     NODE_CHROMIUM_IMAGE,
     NODE_IMAGE,
+    PROFILE_COMMANDS,
+    RUST_IMAGE,
     apply_workspace_hooks,
     discover_workspaces,
     go_commands_for_workspace,
@@ -65,6 +70,19 @@ def test_python_file_alone_does_not_trigger_python(tmp_path):
 def test_python_manifest_triggers_python(tmp_path):
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
     assert "python" in discover_workspaces(str(tmp_path))["detected_stacks"]
+
+
+@pytest.mark.parametrize(("filename", "stack"), [
+    ("Cargo.toml", "rust"),
+    ("pom.xml", "maven"),
+    ("build.gradle.kts", "gradle"),
+    ("sample.csproj", "dotnet"),
+])
+def test_common_language_manifests_are_auto_detected(tmp_path, filename, stack):
+    (tmp_path / filename).write_text("placeholder", encoding="utf-8")
+    result = discover_workspaces(str(tmp_path))
+    assert stack in result["detected_stacks"]
+    assert any(item["stack"] == stack for item in result["workspaces"])
 
 
 def test_go_and_node_workspaces_are_combined(tmp_path):
@@ -349,3 +367,28 @@ def test_old_go_version_is_not_selected_for_new_go_mod(tmp_path):
 def test_arbitrary_image_name_is_rejected():
     with pytest.raises(ValueError):
         go_image_for_version("docker.io/attacker/golang:1.26.4")
+
+
+@pytest.mark.parametrize(("profile", "image", "cache_name"), [
+    ("rust-check", RUST_IMAGE, "cargo"),
+    ("maven-check", MAVEN_IMAGE, "maven"),
+    ("gradle-check", GRADLE_IMAGE, "gradle"),
+    ("dotnet-check", DOTNET_IMAGE, "nuget"),
+])
+def test_common_language_profiles_use_pinned_images_and_persistent_cache(profile, image, cache_name):
+    commands = PROFILE_COMMANDS[profile]
+    assert commands["image"] == image
+    assert cache_name in commands["cache_dirs"]
+    tag = image.rsplit(":", 1)[-1]
+    assert tag not in {"latest", "1", "3", "8", "8.0"}
+
+
+def test_common_language_profile_commands_keep_setup_online_and_checks_offline_capable():
+    assert "cargo fetch" in PROFILE_COMMANDS["rust-check"]["setup"][0]["command"]
+    assert "CARGO_NET_OFFLINE=true" in PROFILE_COMMANDS["rust-check"]["check"][1]["command"]
+    assert "dependency:go-offline" in PROFILE_COMMANDS["maven-check"]["setup"][0]["command"]
+    assert "mvn -o" in PROFILE_COMMANDS["maven-check"]["check"][0]["command"]
+    assert "testClasses" in PROFILE_COMMANDS["gradle-check"]["setup"][0]["command"]
+    assert "--offline" in PROFILE_COMMANDS["gradle-check"]["check"][0]["command"]
+    assert "dotnet restore" in PROFILE_COMMANDS["dotnet-check"]["setup"][0]["command"]
+    assert all("--no-restore" in item["command"] for item in PROFILE_COMMANDS["dotnet-check"]["check"])

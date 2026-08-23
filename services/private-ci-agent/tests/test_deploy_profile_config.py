@@ -33,6 +33,24 @@ def test_deploy_profiles_include_fixed_openapi_check():
     assert profile["command"] == "OPENAPI_PARALLELISM=1 bash scripts/validate-openapi.sh"
 
 
+def test_deploy_profiles_include_pinned_common_language_images():
+    data = yaml.safe_load((DEPLOY_DIR / "profiles.yml").read_text(encoding="utf-8"))["profiles"]
+    expected = {
+        "rust-check": ("docker.io/library/rust:1.97.1-bookworm", "cargo"),
+        "maven-check": ("docker.io/library/maven:3.9.16-eclipse-temurin-21", "maven"),
+        "gradle-check": ("docker.io/library/gradle:9.7.0-jdk21-jammy", "gradle"),
+        "dotnet-check": ("mcr.microsoft.com/dotnet/sdk:8.0.424-bookworm-slim", "nuget"),
+    }
+    for profile, (image, cache) in expected.items():
+        assert data[profile]["base_image"] == image
+        assert data[profile]["cache"] == cache
+
+
+def test_deploy_profiles_cover_every_builtin_profile():
+    data = yaml.safe_load((DEPLOY_DIR / "profiles.yml").read_text(encoding="utf-8"))
+    assert set(data["profiles"]) == set(PROFILE_COMMANDS)
+
+
 def test_only_sxt_allows_openapi_check_on_agent_side():
     data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
     repositories = data["repositories"]

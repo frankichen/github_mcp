@@ -275,6 +275,10 @@ class PodmanRunner:
                     # Browser binaries are a shared, immutable maintenance cache.
                     # Use shared SELinux relabeling (:z), never the exclusive :Z.
                     mounts.extend(["-v", f"{cache_path}:/ci-cache/ms-playwright:rw,z"])
+            elif cache_name in {"cargo", "maven", "gradle", "nuget"}:
+                needs_cache_parent = True
+                if PodmanRunner._ensure_cache_dir(cache_path):
+                    mounts.extend(["-v", f"{cache_path}:/ci-cache/{cache_name}:rw,z"])
             elif os.path.exists(cache_path):
                 mounts.extend(["-v", f"{cache_path}:{cache_path}:Z"])
         if needs_cache_parent:
@@ -359,6 +363,14 @@ class PodmanRunner:
             safe_env["NPM_CONFIG_CACHE"] = "/ci-cache/npm"
         if "playwright" in cache_dirs:
             safe_env["PLAYWRIGHT_BROWSERS_PATH"] = "/ci-cache/ms-playwright"
+        if "cargo" in cache_dirs:
+            safe_env["CARGO_HOME"] = "/ci-cache/cargo"
+        if "maven" in cache_dirs:
+            safe_env["MAVEN_OPTS"] = "-Dmaven.repo.local=/ci-cache/maven"
+        if "gradle" in cache_dirs:
+            safe_env["GRADLE_USER_HOME"] = "/ci-cache/gradle"
+        if "nuget" in cache_dirs:
+            safe_env["NUGET_PACKAGES"] = "/ci-cache/nuget"
         safe_env = {k: v for k, v in safe_env.items()
                     if not any(f.lower() in k.lower()
                                for f in ["TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH"])}
@@ -564,6 +576,14 @@ class PodmanRunner:
             safe_env["NPM_CONFIG_CACHE"] = "/ci-cache/npm"
         if "playwright" in cache_dirs:
             safe_env["PLAYWRIGHT_BROWSERS_PATH"] = "/ci-cache/ms-playwright"
+        if "cargo" in cache_dirs:
+            safe_env["CARGO_HOME"] = "/ci-cache/cargo"
+        if "maven" in cache_dirs:
+            safe_env["MAVEN_OPTS"] = "-Dmaven.repo.local=/ci-cache/maven"
+        if "gradle" in cache_dirs:
+            safe_env["GRADLE_USER_HOME"] = "/ci-cache/gradle"
+        if "nuget" in cache_dirs:
+            safe_env["NUGET_PACKAGES"] = "/ci-cache/nuget"
         if env:
             allowed = {
                 "DATABASE_URL", "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "RABBITMQ_URL",

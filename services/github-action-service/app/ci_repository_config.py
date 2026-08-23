@@ -17,7 +17,10 @@ from app.github_policy import repository_is_allowed as github_repository_is_allo
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = os.environ.get("CI_REPOS_CONFIG_PATH", "/app/config/ci_repositories.yml")
-_DEFAULT_AUTO_PROFILES = ["repo-auto-check", "python-check", "go-check", "node-check"]
+_DEFAULT_AUTO_PROFILES = [
+    "repo-auto-check", "python-check", "go-check", "node-check",
+    "rust-check", "maven-check", "gradle-check", "dotnet-check",
+]
 _DEFAULT_AUTO_MERGE_POLICY = {
     "private_ci_authoritative": True,
     "required_private_ci_profile": "repo-auto-check",
