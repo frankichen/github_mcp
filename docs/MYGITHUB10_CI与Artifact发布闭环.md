@@ -32,8 +32,8 @@ main SHA CI 通过 → 构建 artifact → manifest/checksums/tar.zst
 → health check → 注册 release
 ```
 
-## Go 安全自动修复与回滚
+## Go 只读格式校验与回滚
 
-私有 CI 的 Go profile 会在隔离工作区内执行 `gofmt -w`，随后再次校验格式；CI 不创建提交、不推送远端分支。`gofmt_safe.sh` 仍作为发布执行器侧的只读检查脚本保留。
+私有 CI 的 Go profile 只执行 `gofmt -l` 校验；发现未格式化文件时直接失败并列出文件，不再在 CI source worktree 内执行 `gofmt -w`。格式修复必须由开发分支显式提交后重新验收，从而保证通过 CI 的 source tree 与请求的 exact Git commit 一致。`gofmt_safe.sh` 继续作为发布执行器侧的只读检查脚本保留。
 
 回滚使用已验证的上一 release、manifest 和 checksums，恢复 `current` 指针并重新 health check；不删除 release、不执行 destructive migration、不 force push。本 PR 未部署、未重启服务、未修改数据库和 `frankichen/sxt`。

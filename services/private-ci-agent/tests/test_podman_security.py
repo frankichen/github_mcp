@@ -471,3 +471,39 @@ def test_cleanup_stale_keeps_active_job_containers(monkeypatch):
     PodmanRunner("podman").cleanup_stale(["job-123"])
 
     assert removed == [["podman", "rm", "-f", "ci-job-456-stale"]]
+
+
+def test_image_digest_prefers_registry_repo_digest(monkeypatch):
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="docker.io/library/python@sha256:" + "a" * 64 + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    identity = PodmanRunner("podman").image_digest("docker.io/library/python:3.12-slim")
+
+    assert identity == "sha256:" + "a" * 64
+    assert len(calls) == 1
+    assert "{{index .RepoDigests 0}}" in calls[0]
+
+
+def test_image_digest_falls_back_to_local_immutable_id(monkeypatch):
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        if "{{index .RepoDigests 0}}" in command:
+            return SimpleNamespace(returncode=1, stdout="", stderr="no repo digest")
+        return SimpleNamespace(returncode=0, stdout="sha256:" + "b" * 64 + "\n", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    identity = PodmanRunner("podman").image_digest("localhost/node-chromium:22")
+
+    assert identity == "sha256:" + "b" * 64
+    assert len(calls) == 2
+    assert "{{.Id}}" in calls[1]

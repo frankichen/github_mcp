@@ -246,6 +246,8 @@ Worker summary evidence 明确输出 `source_immutable=true/false`：
 
 ### Phase C acceptance
 
+实施补充：为满足 `source_immutable`，Go `gofmt` 从旧的 CI worktree 自动写回改为只读 `gofmt -l` 门禁；未格式化代码必须在开发分支修复后重新运行 CI。新 attestation 使用所有实际 workspace/service image 的不可变 identity 聚合值，而不是只记录 Go runtime。
+
 - [ ] dependency manifest hash 对 Go/Node/Python/Rust/Maven/Gradle/.NET 都有确定性单测。
 - [ ] manifest 内容变化会导致 hash 变化。
 - [ ] manifest 文件集合/路径变化会导致 hash 变化。

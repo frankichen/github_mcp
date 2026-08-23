@@ -86,7 +86,8 @@ class TestMCPTools:
         assert capabilities["supports_development_workspaces"] is True
         assert capabilities["supports_workspace_revision_cas"] is True
         assert len(capabilities["build_sha"]) == 40
-        assert capabilities["supports_gofmt_autofix"] is True
+        assert capabilities["supports_gofmt_autofix"] is False
+        assert capabilities["supports_gofmt_readonly_check"] is True
 
     @pytest.mark.asyncio
     async def test_mcp_tools_are_registered(self):

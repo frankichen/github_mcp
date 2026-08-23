@@ -226,18 +226,34 @@ class PodmanRunner:
         }
 
     def image_digest(self, image: str) -> str | None:
-        """Return the local image digest without exposing registry credentials."""
+        """Return one immutable local image identity without exposing credentials.
+
+        Registry-backed images use their RepoDigest. Controlled local-only images
+        (for example the prewarmed node-chromium runtime) may not have RepoDigests,
+        so fall back to the immutable local image ID.
+        """
         try:
-            result = subprocess.run(
+            digest = subprocess.run(
                 [self.podman, "image", "inspect", "--format", "{{index .RepoDigests 0}}", image],
                 capture_output=True,
                 text=True,
                 timeout=15,
             )
-            if result.returncode != 0:
+            if digest.returncode == 0:
+                value = digest.stdout.strip()
+                if "@" in value:
+                    return value.split("@", 1)[1]
+
+            identity = subprocess.run(
+                [self.podman, "image", "inspect", "--format", "{{.Id}}", image],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if identity.returncode != 0:
                 return None
-            value = result.stdout.strip()
-            return value.split("@", 1)[1] if "@" in value else None
+            value = identity.stdout.strip()
+            return value if value.startswith("sha256:") else None
         except (OSError, subprocess.TimeoutExpired):
             return None
 

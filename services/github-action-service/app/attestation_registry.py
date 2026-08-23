@@ -19,7 +19,9 @@ from app.ci_database import get_job
 ATTESTATION_ERRORS = {
     "not_found": "ATTESTATION_NOT_FOUND", "expired": "ATTESTATION_EXPIRED", "revoked": "ATTESTATION_REVOKED",
     "job": "ATTESTATION_JOB_NOT_PASSED", "superseded": "ATTESTATION_JOB_SUPERSEDED", "base": "ATTESTATION_BASE_CHANGED",
-    "tree": "ATTESTATION_TREE_MISMATCH", "toolchain": "ATTESTATION_TOOLCHAIN_MISMATCH", "dependency": "ATTESTATION_DEPENDENCY_MISMATCH", "config": "ATTESTATION_CONFIG_MISMATCH",
+    "tree": "ATTESTATION_TREE_MISMATCH", "source": "ATTESTATION_SOURCE_MUTATED",
+    "toolchain": "ATTESTATION_TOOLCHAIN_MISMATCH", "dependency": "ATTESTATION_DEPENDENCY_MISMATCH",
+    "config": "ATTESTATION_CONFIG_MISMATCH",
 }
 
 
@@ -38,7 +40,8 @@ def init_registry_db() -> None:
       attestation_id TEXT PRIMARY KEY, repository TEXT NOT NULL, tested_commit_sha TEXT NOT NULL,
       tested_tree_sha TEXT NOT NULL, base_sha TEXT NOT NULL, private_ci_job_id TEXT NOT NULL,
       profile TEXT NOT NULL, ci_image_digest TEXT NOT NULL, go_version TEXT, node_version TEXT,
-      npm_version TEXT, go_sum_sha256 TEXT NOT NULL DEFAULT '', admin_lock_sha256 TEXT NOT NULL DEFAULT '',
+      npm_version TEXT, dependency_manifest_sha256 TEXT NOT NULL DEFAULT '',
+      go_sum_sha256 TEXT NOT NULL DEFAULT '', admin_lock_sha256 TEXT NOT NULL DEFAULT '',
       console_lock_sha256 TEXT NOT NULL DEFAULT '', test_config_sha256 TEXT NOT NULL,
       changed_files_sha256 TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, created_at REAL NOT NULL,
       expires_at REAL NOT NULL, revoked_at REAL
@@ -56,6 +59,14 @@ def init_registry_db() -> None:
     );
     CREATE INDEX IF NOT EXISTS idx_artifact_identity ON release_artifacts(repository, branch, commit_sha, status);
     """)
+    attestation_columns = {
+        row[1] for row in db.execute("PRAGMA table_info(ci_tree_attestations)").fetchall()
+    }
+    if "dependency_manifest_sha256" not in attestation_columns:
+        db.execute(
+            "ALTER TABLE ci_tree_attestations "
+            "ADD COLUMN dependency_manifest_sha256 TEXT NOT NULL DEFAULT ''"
+        )
     columns = {row[1] for row in db.execute("PRAGMA table_info(release_artifacts)").fetchall()}
     additions = {"storage_dir": "TEXT NOT NULL DEFAULT ''", "archive_path": "TEXT NOT NULL DEFAULT ''", "provenance_sha256": "TEXT NOT NULL DEFAULT ''", "go_version": "TEXT NOT NULL DEFAULT ''", "node_version": "TEXT NOT NULL DEFAULT ''", "npm_version": "TEXT NOT NULL DEFAULT ''", "artifact_format_version": "INTEGER NOT NULL DEFAULT 1"}
     for name, definition in additions.items():
@@ -116,18 +127,42 @@ def create_attestation_for_passed_job(*, job_id: str, expires_in_seconds: int = 
     tested_tree_sha = summary.get("git_tree_sha", "")
     base_sha = evidence.get("base_sha") or job.get("base_sha", "")
     ci_image_digest = summary.get("image_digest", "")
-    go_version, node_version, npm_version = summary.get("go_version", ""), summary.get("node_version", ""), summary.get("npm_version", "")
-    go_sum_sha256, admin_lock_sha256 = evidence.get("go_sum_sha256", ""), evidence.get("admin_lock_sha256", "")
-    console_lock_sha256, test_config_sha256 = evidence.get("console_lock_sha256", ""), evidence.get("test_config_sha256", "")
+    go_version = summary.get("go_version", "") or ""
+    node_version = summary.get("node_version", "") or ""
+    npm_version = summary.get("npm_version", "") or ""
+    dependency_manifest_sha256 = evidence.get("dependency_manifest_sha256", "")
+    test_config_sha256 = evidence.get("test_config_sha256", "")
     changed_files = evidence.get("changed_files", job.get("changed_files", []))
     if profile != "repo-auto-check" or len(tested_commit_sha) != 40 or len(tested_tree_sha) != 40:
         raise ValueError(ATTESTATION_ERRORS["job"])
-    if not all((base_sha, ci_image_digest, go_version, node_version, npm_version, go_sum_sha256, admin_lock_sha256, console_lock_sha256, test_config_sha256)):
+    if evidence.get("source_immutable") is not True:
+        raise ValueError(ATTESTATION_ERRORS["source"])
+    if not all((base_sha, ci_image_digest, dependency_manifest_sha256, test_config_sha256)):
         raise ValueError("ATTESTATION_EVIDENCE_INCOMPLETE")
-    init_registry_db(); attestation_id = str(uuid.uuid4()); now = time.time(); expiry = now + min(max(int(expires_in_seconds), 60), 30 * 86400)
+
+    init_registry_db()
+    attestation_id = str(uuid.uuid4())
+    now = time.time()
+    expiry = now + min(max(int(expires_in_seconds), 60), 30 * 86400)
     db = _db()
-    db.execute("INSERT INTO ci_tree_attestations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (attestation_id, repository, tested_commit_sha, tested_tree_sha, base_sha, job_id, profile, ci_image_digest, go_version, node_version, npm_version, go_sum_sha256, admin_lock_sha256, console_lock_sha256, test_config_sha256, _sha(changed_files), "active", now, expiry, None))
-    db.commit(); row = db.execute("SELECT * FROM ci_tree_attestations WHERE attestation_id=?", (attestation_id,)).fetchone(); db.close()
+    db.execute(
+        """INSERT INTO ci_tree_attestations(
+        attestation_id,repository,tested_commit_sha,tested_tree_sha,base_sha,private_ci_job_id,
+        profile,ci_image_digest,go_version,node_version,npm_version,dependency_manifest_sha256,
+        go_sum_sha256,admin_lock_sha256,console_lock_sha256,test_config_sha256,
+        changed_files_sha256,status,created_at,expires_at,revoked_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            attestation_id, repository, tested_commit_sha, tested_tree_sha, base_sha, job_id, profile,
+            ci_image_digest, go_version, node_version, npm_version, dependency_manifest_sha256,
+            "", "", "", test_config_sha256, _sha(changed_files), "active", now, expiry, None,
+        ),
+    )
+    db.commit()
+    row = db.execute(
+        "SELECT * FROM ci_tree_attestations WHERE attestation_id=?", (attestation_id,)
+    ).fetchone()
+    db.close()
     return _row(row)
 
 
@@ -137,20 +172,57 @@ def get_attestation(attestation_id: str) -> dict | None:
 
 def validate_attestation(attestation_id: str) -> dict:
     item = get_attestation(attestation_id)
-    if not item: return {"ok": False, "error_code": ATTESTATION_ERRORS["not_found"], "reusable": False}
-    if item["status"] == "revoked": return {"ok": False, "error_code": ATTESTATION_ERRORS["revoked"], "reusable": False}
-    if item["expires_at"] <= time.time(): return {"ok": False, "error_code": ATTESTATION_ERRORS["expired"], "reusable": False}
+    if not item:
+        return {"ok": False, "error_code": ATTESTATION_ERRORS["not_found"], "reusable": False}
+    if item["status"] == "revoked":
+        return {"ok": False, "error_code": ATTESTATION_ERRORS["revoked"], "reusable": False}
+    if item["expires_at"] <= time.time():
+        return {"ok": False, "error_code": ATTESTATION_ERRORS["expired"], "reusable": False}
     job = get_job(item["private_ci_job_id"])
-    if not job or job.get("status") != "passed" or job.get("exit_code") != 0: return {"ok": False, "error_code": ATTESTATION_ERRORS["job"], "reusable": False}
-    if job.get("superseded_by_job_id"): return {"ok": False, "error_code": ATTESTATION_ERRORS["superseded"], "reusable": False}
-    summary = job.get("summary") if isinstance(job.get("summary"), dict) else {}; evidence = summary.get("evidence") if isinstance(summary.get("evidence"), dict) else {}
-    if item["repository"] != job.get("repository") or item["tested_commit_sha"] != job.get("commit_sha"): return {"ok": False, "error_code": ATTESTATION_ERRORS["tree"], "reusable": False}
-    if item["tested_tree_sha"] != summary.get("git_tree_sha"): return {"ok": False, "error_code": ATTESTATION_ERRORS["tree"], "reusable": False}
-    if item["base_sha"] != (evidence.get("base_sha") or job.get("base_sha")): return {"ok": False, "error_code": ATTESTATION_ERRORS["base"], "reusable": False}
-    if item["profile"] != job.get("profile") or item["ci_image_digest"] != summary.get("image_digest") or item["go_version"] != summary.get("go_version") or item["node_version"] != summary.get("node_version") or item["npm_version"] != summary.get("npm_version"): return {"ok": False, "error_code": ATTESTATION_ERRORS["toolchain"], "reusable": False}
-    if any(item[key] != evidence.get(key, "") for key in ("go_sum_sha256", "admin_lock_sha256", "console_lock_sha256")): return {"ok": False, "error_code": ATTESTATION_ERRORS["dependency"], "reusable": False}
-    if item["test_config_sha256"] != evidence.get("test_config_sha256", ""): return {"ok": False, "error_code": ATTESTATION_ERRORS["config"], "reusable": False}
-    if item["changed_files_sha256"] != _sha(evidence.get("changed_files", job.get("changed_files", []))): return {"ok": False, "error_code": ATTESTATION_ERRORS["config"], "reusable": False}
+    if not job or job.get("status") != "passed" or job.get("exit_code") != 0:
+        return {"ok": False, "error_code": ATTESTATION_ERRORS["job"], "reusable": False}
+    if job.get("superseded_by_job_id"):
+        return {"ok": False, "error_code": ATTESTATION_ERRORS["superseded"], "reusable": False}
+
+    summary = job.get("summary") if isinstance(job.get("summary"), dict) else {}
+    evidence = summary.get("evidence") if isinstance(summary.get("evidence"), dict) else {}
+    if item["repository"] != job.get("repository") or item["tested_commit_sha"] != job.get("commit_sha"):
+        return {"ok": False, "error_code": ATTESTATION_ERRORS["tree"], "reusable": False}
+    if item["tested_tree_sha"] != summary.get("git_tree_sha"):
+        return {"ok": False, "error_code": ATTESTATION_ERRORS["tree"], "reusable": False}
+    if item["base_sha"] != (evidence.get("base_sha") or job.get("base_sha")):
+        return {"ok": False, "error_code": ATTESTATION_ERRORS["base"], "reusable": False}
+
+    # New attestations require a source tree that stayed equal to the requested
+    # Git commit throughout CI. Old rows have no generic dependency identity
+    # and retain their legacy validation path below.
+    if item.get("dependency_manifest_sha256") and evidence.get("source_immutable") is not True:
+        return {"ok": False, "error_code": ATTESTATION_ERRORS["source"], "reusable": False}
+
+    if item["profile"] != job.get("profile") or item["ci_image_digest"] != summary.get("image_digest"):
+        return {"ok": False, "error_code": ATTESTATION_ERRORS["toolchain"], "reusable": False}
+    for key in ("go_version", "node_version", "npm_version"):
+        if item.get(key) and item.get(key) != (summary.get(key) or ""):
+            return {"ok": False, "error_code": ATTESTATION_ERRORS["toolchain"], "reusable": False}
+
+    dependency_identity = item.get("dependency_manifest_sha256", "")
+    if dependency_identity:
+        if dependency_identity != evidence.get("dependency_manifest_sha256", ""):
+            return {"ok": False, "error_code": ATTESTATION_ERRORS["dependency"], "reusable": False}
+    elif any(
+        item[key] != evidence.get(key, "")
+        for key in ("go_sum_sha256", "admin_lock_sha256", "console_lock_sha256")
+    ):
+        # Backward-compatible validation for attestations created before the
+        # generic dependency identity existed.
+        return {"ok": False, "error_code": ATTESTATION_ERRORS["dependency"], "reusable": False}
+
+    if item["test_config_sha256"] != evidence.get("test_config_sha256", ""):
+        return {"ok": False, "error_code": ATTESTATION_ERRORS["config"], "reusable": False}
+    if item["changed_files_sha256"] != _sha(
+        evidence.get("changed_files", job.get("changed_files", []))
+    ):
+        return {"ok": False, "error_code": ATTESTATION_ERRORS["config"], "reusable": False}
     return {"ok": True, "reusable": True, "attestation": item}
 
 

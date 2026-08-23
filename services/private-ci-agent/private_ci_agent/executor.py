@@ -7,6 +7,7 @@ import threading
 import time
 import hashlib
 import subprocess
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from private_ci_agent.models import Job
@@ -130,10 +131,10 @@ class JobExecutor:
         metadata["evidence"] = {
             "base_sha": job.base_sha,
             "changed_files": list(job.changed_files),
-            "go_sum_sha256": self._hash_files(job.source_dir, ["go.sum"]),
-            "admin_lock_sha256": self._hash_files(job.source_dir, ["h5/lenshub-admin/package-lock.json", "h5/lenshub-admin/pnpm-lock.yaml"]),
-            "console_lock_sha256": self._hash_files(job.source_dir, ["h5/lenshub-console/package-lock.json", "h5/lenshub-console/pnpm-lock.yaml"]),
-            "test_config_sha256": self._hash_files(job.source_dir, [".github/workflows/ci.yml", ".github/workflows/repo-auto-check.yml", "scripts/ci.yml"]),
+            "dependency_manifest_sha256": self._hash_dependency_manifests(
+                job.source_dir, plan.get("workspaces", [])
+            ),
+            "test_config_sha256": self._hash_test_config(job.source_dir),
         }
         go_workspace = next((item for item in plan.get("workspaces", []) if item.get("stack") == "go"), None)
         if go_workspace:
@@ -143,7 +144,6 @@ class JobExecutor:
                 metadata["selected_go_version"] = go_commands["selected_go_version"]
                 metadata["source_image"] = go_commands["source_image"]
                 metadata["selected_image"] = go_commands["selected_image"]
-                metadata["image_digest"] = self.podman.image_digest(go_commands["selected_image"])
         self.log_manager.upload(job_id, f"detected_stacks={metadata['detected_stacks']}\n")
         self.log_manager.upload(job_id, f"selected_profiles={metadata['selected_profiles']}\n")
         self.log_manager.upload(job_id, f"workspaces={metadata['workspaces']}\n")
@@ -198,6 +198,38 @@ class JobExecutor:
             self.client.finish_job(job_id, -1, "cancelled", summary=summary)
             return summary
 
+        images = self._workspace_images(plan.get("workspaces", []), job.source_dir)
+        metadata["images"] = images
+        image_identity_ok = bool(images) and all(item.get("digest") for item in images)
+        metadata["image_digest"] = self._hash_json(images) if image_identity_ok else ""
+        if not image_identity_ok:
+            all_passed = False
+            final_exit_code = final_exit_code or 2
+            all_steps.append({
+                "step_name": "images:identity",
+                "status": "failed",
+                "exit_code": 2,
+                "error_code": "IMAGE_DIGEST_UNAVAILABLE",
+            })
+            self.log_manager.upload(
+                job_id,
+                "IMAGE_DIGEST_UNAVAILABLE: every runtime/service image must have an immutable local identity\n",
+            )
+
+        source_ok, source_error = self._verify_source_immutable(job)
+        metadata["source_immutable"] = source_ok
+        metadata["evidence"]["source_immutable"] = source_ok
+        if not source_ok:
+            all_passed = False
+            final_exit_code = final_exit_code or 2
+            all_steps.append({
+                "step_name": "source:immutable",
+                "status": "failed",
+                "exit_code": 2,
+                "error_code": "SOURCE_MUTATED",
+            })
+            self.log_manager.upload(job_id, f"SOURCE_MUTATED: {source_error}\n")
+
         summary = {
             "status": "passed" if all_passed else "failed",
             "exit_code": final_exit_code,
@@ -220,17 +252,150 @@ class JobExecutor:
             return None
 
     @staticmethod
-    def _hash_files(root, names):
-        digest = hashlib.sha256(); found = False
-        for name in names:
-            path = os.path.join(root, name)
+    def _hash_json(value) -> str:
+        return hashlib.sha256(
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    @classmethod
+    def _hash_paths(cls, root: str, names: list[str]) -> str:
+        records = []
+        for name in sorted(set(names)):
+            normalized = name.replace("\\", "/")
+            while normalized.startswith("./"):
+                normalized = normalized[2:]
+            path = os.path.join(root, *normalized.split("/"))
             if not os.path.isfile(path):
                 continue
-            found = True
+            digest = hashlib.sha256()
             with open(path, "rb") as handle:
                 for block in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(name.encode() + b"\0" + block)
-        return digest.hexdigest() if found else ""
+                    digest.update(block)
+            records.append([normalized, digest.hexdigest()])
+        return cls._hash_json(records)
+
+    @classmethod
+    def _hash_dependency_manifests(cls, root: str, workspaces: list[dict]) -> str:
+        fixed = {
+            "go": ("go.mod", "go.sum", "go.work", "go.work.sum", "vendor/modules.txt"),
+            "node": (
+                "package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml",
+                "yarn.lock", "bun.lock", "bun.lockb",
+            ),
+            "python": (
+                "pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py",
+                "setup.cfg", "Pipfile", "Pipfile.lock", "poetry.lock", "uv.lock",
+            ),
+            "rust": ("Cargo.toml", "Cargo.lock", ".cargo/config", ".cargo/config.toml"),
+            "maven": (
+                "pom.xml", ".mvn/extensions.xml", ".mvn/maven.config",
+                ".mvn/wrapper/maven-wrapper.properties",
+            ),
+            "gradle": (
+                "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+                "gradle.properties", "gradle.lockfile", "gradle/libs.versions.toml",
+                "gradle/wrapper/gradle-wrapper.properties", "gradle/verification-metadata.xml",
+            ),
+            "dotnet": (
+                "Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props",
+                "NuGet.Config", "global.json", "packages.lock.json",
+            ),
+        }
+        names = []
+        for workspace in workspaces:
+            rel = "" if workspace.get("path") in ("", ".") else workspace["path"].strip("/") + "/"
+            stack = workspace.get("stack")
+            for name in fixed.get(stack, ()):
+                names.append(rel + name)
+
+            directory = Path(root) / rel
+            try:
+                if stack == "python":
+                    for path in directory.glob("requirements*.txt"):
+                        if path.is_file():
+                            names.append(rel + path.name)
+                elif stack == "gradle":
+                    for pattern in ("gradle/dependency-locks/*.lockfile", "*.lockfile"):
+                        for path in directory.glob(pattern):
+                            if path.is_file():
+                                names.append(path.relative_to(root).as_posix())
+                elif stack == "dotnet":
+                    for pattern in ("*.sln", "*.csproj", "*.fsproj", "*.vbproj"):
+                        for path in directory.glob(pattern):
+                            if path.is_file():
+                                names.append(path.relative_to(root).as_posix())
+            except (OSError, ValueError):
+                pass
+        return cls._hash_paths(root, names)
+
+    @classmethod
+    def _hash_test_config(cls, root: str) -> str:
+        names = [
+            "Makefile", "Taskfile.yml", "Taskfile.yaml", "justfile", "tox.ini",
+            "pytest.ini", "ruff.toml", ".golangci.yml", ".golangci.yaml",
+        ]
+        workflows = os.path.join(root, ".github", "workflows")
+        if os.path.isdir(workflows):
+            for name in sorted(os.listdir(workflows)):
+                if name.endswith((".yml", ".yaml")):
+                    names.append(f".github/workflows/{name}")
+        return cls._hash_paths(root, names)
+
+    def _workspace_images(self, workspaces: list[dict], source_dir: str) -> list[dict]:
+        records = []
+        service_images = getattr(self.services, "images", {}) or {}
+        for workspace in workspaces:
+            workspace_path = workspace.get("path", ".")
+            workspace_source = (
+                source_dir
+                if workspace_path in ("", ".")
+                else os.path.join(source_dir, workspace_path)
+            )
+            commands = self._workspace_commands(workspace, workspace_source)
+            if not commands.get("error"):
+                image = commands.get("image", "")
+                records.append({
+                    "workspace": workspace_path,
+                    "stack": workspace.get("stack", ""),
+                    "image": image,
+                    "digest": self.podman.image_digest(image) or "",
+                })
+            for service in workspace.get("services") or []:
+                image = service_images.get(service, "")
+                if not image:
+                    continue
+                records.append({
+                    "workspace": workspace_path,
+                    "stack": f"service:{service}",
+                    "image": image,
+                    "digest": self.podman.image_digest(image) or "",
+                })
+        return sorted(
+            records, key=lambda item: (item["workspace"], item["stack"], item["image"])
+        )
+
+    @staticmethod
+    def _verify_source_immutable(job: Job) -> tuple[bool, str]:
+        try:
+            head = subprocess.run(
+                ["git", "-C", job.source_dir, "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=20,
+            )
+            if head.returncode != 0 or head.stdout.strip() != job.commit_sha:
+                return False, "head_sha_changed"
+            worktree = subprocess.run(
+                ["git", "-C", job.source_dir, "diff", "--quiet", "HEAD", "--"],
+                timeout=20,
+            )
+            index = subprocess.run(
+                ["git", "-C", job.source_dir, "diff", "--cached", "--quiet", "HEAD", "--"],
+                timeout=20,
+            )
+            if worktree.returncode != 0 or index.returncode != 0:
+                return False, "tracked_files_changed"
+            return True, ""
+        except (OSError, subprocess.TimeoutExpired):
+            return False, "immutability_check_failed"
 
     @staticmethod
     def _performance(steps, total_start):
