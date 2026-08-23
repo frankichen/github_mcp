@@ -37,6 +37,7 @@ from app.ci_database import (
     get_steps,
     recover_expired_leases,
     recover_worker_jobs,
+    reconcile_worker_startup,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,41 @@ async def worker_register(request: Request):
         return {"status": "registered", "worker_id": worker_id.strip()}
     else:
         raise HTTPException(status_code=503, detail={"error": "worker_registration_unavailable", "message": "Worker registration storage is temporarily unavailable"})
+
+
+@router.post("/workers/reconcile")
+async def worker_reconcile(request: Request):
+    """Reconcile one authenticated worker after process restart.
+
+    Recovery semantics are fixed on the server.  Request-provided terminal
+    state lists are intentionally ignored so a worker cannot redefine the CI
+    state machine.
+    """
+    worker_id = await verify_ci_worker(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail={"error": "bad_request", "message": "Request body must be an object"})
+
+    requested_worker_id = body.get("worker_id")
+    if requested_worker_id not in (None, "", worker_id):
+        raise HTTPException(status_code=403, detail={"error": "forbidden", "message": "worker_id does not match authenticated worker"})
+    if body.get("action", "startup_reconcile") != "startup_reconcile":
+        raise HTTPException(status_code=400, detail={"error": "bad_request", "message": "unsupported reconcile action"})
+
+    try:
+        # Idempotent with registration: registration releases active jobs;
+        # reconciliation clears the stale worker pointer left behind.
+        recover_worker_jobs(worker_id)
+        result = reconcile_worker_startup(worker_id)
+    except Exception:
+        logger.exception("Worker startup reconciliation failed: worker_id=%s", worker_id)
+        raise HTTPException(status_code=503, detail={"error": "worker_reconcile_unavailable"})
+    if result is None:
+        raise HTTPException(status_code=404, detail={"error": "worker_not_found"})
+    return {"status": "ok", "worker_id": worker_id, **result}
 
 
 @router.post("/workers/heartbeat")
