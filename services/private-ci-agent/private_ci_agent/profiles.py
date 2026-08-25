@@ -466,22 +466,25 @@ def discover_workspaces(source_dir: str, repository_config: dict | None = None) 
         if kind in ("auto", "dotnet") and any(name.endswith((".sln", ".csproj", ".fsproj")) for name in files):
             add_workspace(_generic_workspace(rel, "dotnet", item))
 
-    for directory, rel, files in _walk_manifest_dirs(source_dir):
-        if "go.mod" in files:
-            add_workspace(_generic_workspace(rel or ".", "go"))
-        if "package.json" in files:
-            if not (rel in ("", ".") and "go.mod" in files and not any(lock in files for lock in LOCK_FILES)):
-                add_workspace(_node_workspace(source_dir, rel, files))
-        if any(name in files for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg", "Pipfile")):
-            add_workspace(_generic_workspace(rel or ".", "python"))
-        if "Cargo.toml" in files:
-            add_workspace(_generic_workspace(rel or ".", "rust"))
-        if "pom.xml" in files:
-            add_workspace(_generic_workspace(rel or ".", "maven"))
-        if any(name in files for name in ("build.gradle", "build.gradle.kts")):
-            add_workspace(_generic_workspace(rel or ".", "gradle"))
-        if any(name.endswith((".sln", ".csproj", ".fsproj")) for name in files):
-            add_workspace(_generic_workspace(rel or ".", "dotnet"))
+    # Operator-provided workspaces are an explicit allowlist. When present, do
+    # not widen the CI plan by recursively auto-discovering unrelated manifests.
+    if not configured:
+        for directory, rel, files in _walk_manifest_dirs(source_dir):
+            if "go.mod" in files:
+                add_workspace(_generic_workspace(rel or ".", "go"))
+            if "package.json" in files:
+                if not (rel in ("", ".") and "go.mod" in files and not any(lock in files for lock in LOCK_FILES)):
+                    add_workspace(_node_workspace(source_dir, rel, files))
+            if any(name in files for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg", "Pipfile")):
+                add_workspace(_generic_workspace(rel or ".", "python"))
+            if "Cargo.toml" in files:
+                add_workspace(_generic_workspace(rel or ".", "rust"))
+            if "pom.xml" in files:
+                add_workspace(_generic_workspace(rel or ".", "maven"))
+            if any(name in files for name in ("build.gradle", "build.gradle.kts")):
+                add_workspace(_generic_workspace(rel or ".", "gradle"))
+            if any(name.endswith((".sln", ".csproj", ".fsproj")) for name in files):
+                add_workspace(_generic_workspace(rel or ".", "dotnet"))
 
     workspaces = sorted(found.values(), key=lambda value: (value["path"], value["stack"]))
     stacks = []

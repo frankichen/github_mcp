@@ -124,6 +124,9 @@ def test_apply_fixes_syncs_entire_runtime_package():
     assert 'private_ci_agent/"*.py' in script
     assert 'f="$(basename "${src}")"' in script
     assert "for f in config.py executor.py" not in script
+    assert 'deploy/repositories.yml"' in script
+    assert "/etc/private-ci/repositories.yml" in script
+    assert "install -o root -g root -m 644" in script
 
 
 def test_playwright_cache_maintenance_is_pinned_and_not_a_job_step():
@@ -264,6 +267,9 @@ def _stage_apply_fixes_repo(tmp_path):
     staged_script = deploy_root / "apply-fixes.sh"
     staged_script.write_bytes(APPLY_FIXES_SCRIPT.read_bytes())
     staged_script.chmod(0o755)
+    (deploy_root / "repositories.yml").write_text(
+        "repositories: {}\n", encoding="utf-8"
+    )
     for name in (
         "config.py", "executor.py", "main.py", "podman.py",
         "profiles.py", "source.py", "controller_client.py", "services.py",
