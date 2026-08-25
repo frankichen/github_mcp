@@ -13,7 +13,7 @@
 - [x] DX-002 记录当前 155 工具 Manifest 和 118+37 组成。
 - [x] DX-003 建立规划、需求、设计、接口、开发和验收文档。
 - [ ] DX-004 后续实施窗口 fresh-read 最新 main 并更新基线。
-- [ ] DX-005 建立 DX-1 Draft PR 和实施状态摘要。
+- [x] DX-005 建立 DX-1 Draft PR 和实施状态摘要（Draft PR #54）。
 - [ ] DX-006 修复文档与代码、Manifest、Capability 不一致的历史描述。
 
 ## P0：现有可靠性缺口
