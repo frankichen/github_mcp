@@ -1,3 +1,4 @@
+import asyncio
 import json
 import subprocess
 from pathlib import Path
@@ -462,6 +463,56 @@ def test_blue_green_generation_and_shared_leader_lease(tmp_path, monkeypatch):
     assert takeover["acquired"] is True
     assert takeover["generation_id"] == "green"
     assert runtime_generation.runtime_status()["ready_for_side_effects"] is True
+
+
+@pytest.mark.asyncio
+async def test_active_generation_renews_leader_lease_beyond_original_ttl(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "renewal.db"))
+    monkeypatch.setenv("MYGITHUB12_BUILD_SHA", SHA_A)
+    monkeypatch.setenv("MYGITHUB12_RUNTIME_MODE", "production")
+    monkeypatch.setenv("MYGITHUB12_GENERATION_ID", "active-renewing")
+    monkeypatch.setenv("MYGITHUB12_RUNTIME_ROLE", "active")
+    now = [1_000.0]
+    monkeypatch.setattr(runtime_generation.time, "time", lambda: now[0])
+
+    runtime_generation.register_generation()
+    initial = runtime_generation.acquire_leader(ttl_seconds=5)
+    assert initial["acquired"] is True
+    initial_expiry = initial["expires_at"]
+    sleep_calls = 0
+
+    async def advance_time(seconds):
+        nonlocal sleep_calls
+        now[0] += seconds
+        sleep_calls += 1
+        if sleep_calls == 4:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(runtime_generation.asyncio, "sleep", advance_time)
+    with pytest.raises(asyncio.CancelledError):
+        await runtime_generation.maintain_leader_lease(
+            ttl_seconds=5,
+            renew_interval_seconds=2,
+        )
+
+    status = runtime_generation.runtime_status()
+    assert now[0] > initial_expiry
+    assert status["leader"]["is_leader"] is True
+    assert status["leader"]["expires_at"] > now[0]
+    assert status["ready_for_side_effects"] is True
+
+
+@pytest.mark.asyncio
+async def test_standby_generation_does_not_maintain_leader_lease(monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_RUNTIME_ROLE", "standby")
+
+    async def unexpected_sleep(_seconds):
+        raise AssertionError("standby must not start a lease renewal loop")
+
+    monkeypatch.setattr(runtime_generation.asyncio, "sleep", unexpected_sleep)
+    await runtime_generation.maintain_leader_lease()
 
 
 def test_profile_discovery_is_strict_for_configured_repo_but_skips_unconfigured(monkeypatch):

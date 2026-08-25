@@ -76,7 +76,7 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.1.0"
+        assert capabilities["version"] == "12.1.1"
         assert capabilities["tool_count"] == 159
         assert capabilities["supports_development_task_orchestration"] is True
         assert capabilities["supports_development_sessions"] is True

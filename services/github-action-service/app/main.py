@@ -1,7 +1,8 @@
+import asyncio
 import logging
 import json
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.openapi.utils import get_openapi
@@ -25,13 +26,19 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     validate_runtime_metadata()
     os.makedirs(os.path.dirname(settings.IDEMPOTENCY_DB_PATH), exist_ok=True)
+    leader_lease_task = None
     try:
         from app.ci_database import init_db
         from app.deployment_service import init_deployment_db
         from app.attestation_registry import init_registry_db
         from app.mygithub12 import init_db as init_mygithub12_db, recover_orphaned_index_jobs
         from app.development_session_store import init_session_db, recover_sessions
-        from app.runtime_generation import init_runtime_db, register_generation, acquire_leader
+        from app.runtime_generation import (
+            acquire_leader,
+            init_runtime_db,
+            maintain_leader_lease,
+            register_generation,
+        )
         from app.ci_repository_config import validate_profile_discovery
         ensure_idempotency_storage()
         init_db()
@@ -75,6 +82,11 @@ async def lifespan(app: FastAPI):
                 generation.get("role"),
                 generation.get("generation_id"),
             )
+        if generation.get("role") == "active":
+            leader_lease_task = asyncio.create_task(
+                maintain_leader_lease(),
+                name="runtime-leader-lease",
+            )
     except Exception:
         logger.exception("Controller database initialization failed")
         raise
@@ -98,12 +110,18 @@ async def lifespan(app: FastAPI):
             logger.error("Failed to list registered tools during startup: %s", e)
     except Exception as e:
         logger.warning(f"MCP session init error: {e}")
-    yield
-    if mcp_task is not None and tg is not None:
-        try:
-            await tg.__aexit__(None, None, None)
-        except Exception:
-            pass
+    try:
+        yield
+    finally:
+        if leader_lease_task is not None:
+            leader_lease_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await leader_lease_task
+        if mcp_task is not None and tg is not None:
+            try:
+                await tg.__aexit__(None, None, None)
+            except Exception:
+                pass
 
 
 app = FastAPI(

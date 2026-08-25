@@ -1,6 +1,8 @@
 """Blue/green runtime identity and a shared SQLite leader lease."""
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import socket
 import sqlite3
@@ -17,6 +19,10 @@ SCHEMA_COMPAT_MAX = 1
 _ALLOWED_ROLES = {"active", "standby", "draining"}
 _db = core._db
 _LOCK = core._LOCK
+logger = logging.getLogger(__name__)
+
+DEFAULT_LEADER_TTL_SECONDS = 30
+DEFAULT_LEADER_RENEW_INTERVAL_SECONDS = 10
 
 
 def generation_id() -> str:
@@ -75,7 +81,10 @@ def heartbeat() -> None:
         db.execute("UPDATE runtime_generations SET heartbeat_at=?,role=? WHERE generation_id=?", (time.time(), runtime_role(), generation_id()))
 
 
-def acquire_leader(lease_name: str = "controller-maintenance", ttl_seconds: int = 30) -> dict[str, Any]:
+def acquire_leader(
+    lease_name: str = "controller-maintenance",
+    ttl_seconds: int = DEFAULT_LEADER_TTL_SECONDS,
+) -> dict[str, Any]:
     init_runtime_db(); gid=generation_id(); role=runtime_role(); now=time.time(); ttl=max(5,min(int(ttl_seconds),300))
     if role != "active":
         return {"acquired": False, "reason": "runtime_not_active", "generation_id": gid, "role": role}
@@ -92,6 +101,29 @@ def acquire_leader(lease_name: str = "controller-maintenance", ttl_seconds: int 
             (lease_name,gid,token,now+ttl,now),
         ); db.commit()
     return {"acquired":True,"generation_id":gid,"role":role,"lease_name":lease_name,"lease_token":token,"expires_at":now+ttl}
+
+
+async def maintain_leader_lease(
+    lease_name: str = "controller-maintenance",
+    ttl_seconds: int = DEFAULT_LEADER_TTL_SECONDS,
+    renew_interval_seconds: float = DEFAULT_LEADER_RENEW_INTERVAL_SECONDS,
+) -> None:
+    """Keep an active generation's lease alive while failing closed on errors."""
+    if runtime_role() != "active":
+        return
+    ttl = max(5, min(int(ttl_seconds), 300))
+    interval = max(0.1, min(float(renew_interval_seconds), ttl / 2))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            heartbeat()
+            result = acquire_leader(lease_name=lease_name, ttl_seconds=ttl)
+            if not result.get("acquired"):
+                logger.warning("Runtime leader lease renewal was not acquired: %s", result)
+        except Exception:
+            # Readiness derives from the expiring database lease, so repeated
+            # renewal failures automatically disable side effects.
+            logger.exception("Runtime leader lease renewal failed")
 
 
 def leader_status(lease_name: str = "controller-maintenance") -> dict[str, Any]:

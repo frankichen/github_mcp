@@ -69,7 +69,7 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.1.0"
+    assert manifest["service_version"] == "12.1.1"
     assert manifest["legacy_tool_count"] == 118
     assert manifest["new_tool_count"] == 41
     assert manifest["tool_count"] == EXPECTED_TOOL_COUNT
