@@ -7,8 +7,14 @@ import pytest
 from app.mcp_server import mcp
 
 
-EXPECTED_TOOL_COUNT = 155
-MYGITHUB12_TOOLS = {
+EXPECTED_TOOL_COUNT = 159
+DX1_TOOLS = [
+    "prepare_development_task",
+    "apply_development_change_set",
+    "validate_development_task",
+    "finalize_development_task",
+]
+MYGITHUB12_BASE_TOOLS = {
     "get_repository_index_status", "request_repository_index_build",
     "get_repository_index_job", "wait_repository_index_job",
     "cancel_repository_index_job", "list_repository_indexes",
@@ -40,8 +46,13 @@ async def test_registered_tool_manifest_is_stable_and_unique():
     assert len(actual_names) == len(set(actual_names))
     assert all(name and name.strip() == name for name in actual_names)
     tools = {tool.name: tool for tool in actual}
-    assert MYGITHUB12_TOOLS <= set(actual_names)
-    assert len(MYGITHUB12_TOOLS) == 37
+    assert MYGITHUB12_BASE_TOOLS <= set(actual_names)
+    assert len(MYGITHUB12_BASE_TOOLS) == 37
+    assert actual_names[-4:] == DX1_TOOLS
+    for name in DX1_TOOLS:
+        assert tools[name].annotations.readOnlyHint is False
+        assert tools[name].annotations.destructiveHint is False
+        assert tools[name].annotations.idempotentHint is False
     assert tools["build_github_patch"].annotations.readOnlyHint is True
     assert tools["search_repository_text"].annotations.readOnlyHint is True
     assert "result" not in (tools["get_private_ci_job"].outputSchema.get("properties") or {})
@@ -58,8 +69,9 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.0.5"
+    assert manifest["service_version"] == "12.1.0"
     assert manifest["legacy_tool_count"] == 118
-    assert manifest["new_tool_count"] == 37
+    assert manifest["new_tool_count"] == 41
     assert manifest["tool_count"] == EXPECTED_TOOL_COUNT
-    assert set(manifest["new_tools"]) == MYGITHUB12_TOOLS
+    assert manifest["new_tools"][-4:] == DX1_TOOLS
+    assert set(manifest["new_tools"][:-4]) == MYGITHUB12_BASE_TOOLS
