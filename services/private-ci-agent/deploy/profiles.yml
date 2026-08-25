@@ -30,7 +30,9 @@ profiles:
   python-check:
     description: "Python lint, compile, test"
     language: python
-    base_image: docker.io/library/python:3.12-slim
+    base_image: localhost/private-ci-python:3.12-git-v1
+    required_runtime_dependencies:
+      - git
 
   node-check:
     description: "Node.js workspace checks from package.json scripts"

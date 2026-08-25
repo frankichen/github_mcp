@@ -46,6 +46,14 @@ def test_deploy_profiles_include_pinned_common_language_images():
         assert data[profile]["cache"] == cache
 
 
+def test_python_profile_uses_worker_owned_git_runtime():
+    data = yaml.safe_load((DEPLOY_DIR / "profiles.yml").read_text(encoding="utf-8"))["profiles"]
+    profile = data["python-check"]
+
+    assert profile["base_image"] == "localhost/private-ci-python:3.12-git-v1"
+    assert profile["required_runtime_dependencies"] == ["git"]
+
+
 def test_deploy_profiles_cover_every_builtin_profile():
     data = yaml.safe_load((DEPLOY_DIR / "profiles.yml").read_text(encoding="utf-8"))
     assert set(data["profiles"]) == set(PROFILE_COMMANDS)
@@ -168,6 +176,22 @@ def test_node_chromium_dockerfile_uses_inherited_proxy():
     assert "Acquire::https::Proxy=${https_apt_proxy}" in dockerfile
     assert "proxy.runtime.conf" in preheat
     assert "PRIVATE_CI_CONTAINER_PROXY_HOST:-10.0.2.2" in preheat
+
+
+def test_python_ci_runtime_explicitly_installs_and_probes_git():
+    dockerfile = (DEPLOY_DIR / "Dockerfile.python-ci").read_text(encoding="utf-8")
+    preheat = (DEPLOY_DIR / "prepare-python-ci").read_text(encoding="utf-8")
+    deploy = (DEPLOY_DIR / "apply-fixes.sh").read_text(encoding="utf-8")
+    preflight = (DEPLOY_DIR / "private-ci-preflight").read_text(encoding="utf-8")
+
+    assert "FROM docker.io/library/python:3.12-slim" in dockerfile
+    assert "apt-get \"$@\" install -y --no-install-recommends git ca-certificates" in dockerfile
+    assert "git --version" in dockerfile
+    assert "localhost/private-ci-python:3.12-git-v1" in preheat
+    assert "--network none \"${IMAGE}\" git --version" in preheat
+    assert "prepare-python-ci" in deploy
+    assert "Dockerfile.python-ci" in deploy
+    assert "Shared Python CI image is missing required dependency: git" in preflight
 
 
 APPLY_FIXES_SCRIPT = DEPLOY_DIR / "apply-fixes.sh"
@@ -437,7 +461,9 @@ def test_apply_fixes_success_path_continues_in_fail_stop_mode(tmp_path):
     result, calls, state = _run_apply_fixes(tmp_path, failure_mode="fail-stop")
     assert result.returncode == 0, _output(result)
     assert "DONE. Worker restarted with local shared image and caches preheated." in _output(result)
-    assert len([call for call in calls if call.startswith("runuser ")]) == 3
+    preheat_calls = [call for call in calls if call.startswith("runuser ")]
+    assert len(preheat_calls) == 4
+    assert any("prepare-python-ci" in call for call in preheat_calls)
     assert "systemctl restart private-ci-agent.service" in calls
     assert "systemctl is-active --quiet private-ci-agent.service" in calls
     assert f"docker rename {ROLLBACK_CONTAINER} github-action-service" not in calls

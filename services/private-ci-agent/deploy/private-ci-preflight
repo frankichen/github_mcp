@@ -15,6 +15,7 @@ RUN_DIR="/srv/private-ci/run"
 CONTROLLER_HOST="${PRIVATE_CI_CONTROLLER_HOST:-100.127.108.20}"
 CONTROLLER_PORT="${PRIVATE_CI_CONTROLLER_PORT:-8765}"
 NODE_CHROMIUM_IMAGE="${PRIVATE_CI_NODE_CHROMIUM_IMAGE:-localhost/node-chromium:22}"
+PYTHON_CI_IMAGE="${PRIVATE_CI_PYTHON_IMAGE:-localhost/private-ci-python:3.12-git-v1}"
 
 CIWORKER_UID=1500
 CIWORKER_GID=1500
@@ -134,6 +135,14 @@ run_preflight() {
         log_pass "Shared Node Chromium image available: ${NODE_CHROMIUM_IMAGE}"
     else
         log_warn "Shared Node Chromium image is not prewarmed: ${NODE_CHROMIUM_IMAGE}"
+    fi
+
+    if ! podman_run_as_ciworker image exists "${PYTHON_CI_IMAGE}" >/dev/null 2>&1; then
+        log_fail "Shared Python CI image is missing: ${PYTHON_CI_IMAGE}"
+    elif podman_run_as_ciworker run --rm --network none "${PYTHON_CI_IMAGE}" git --version >/dev/null 2>&1; then
+        log_pass "Shared Python CI image provides required dependency: git"
+    else
+        log_fail "Shared Python CI image is missing required dependency: git"
     fi
 
     local proxy_host proxy_port=10808

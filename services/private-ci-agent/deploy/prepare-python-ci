@@ -1,0 +1,71 @@
+#!/bin/bash
+set -euo pipefail
+
+if [ "$(id -u)" != "1500" ]; then
+    echo "[python-image] run as ciworker (uid 1500)" >&2
+    exit 2
+fi
+cd /tmp
+
+BUILD_TMPDIR="${PRIVATE_CI_BUILD_TMPDIR:-/tmp}"
+mkdir -p "${BUILD_TMPDIR}"
+export TMPDIR="${BUILD_TMPDIR}" BUILDAH_TMPDIR="${BUILD_TMPDIR}"
+
+AGENT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+IMAGE="${PRIVATE_CI_PYTHON_IMAGE:-localhost/private-ci-python:3.12-git-v1}"
+BASE_IMAGE="docker.io/library/python:3.12-slim"
+
+if [ -r /srv/private-ci/run/proxy.runtime.conf ]; then
+    set -a
+    # shellcheck source=/dev/null
+    . /srv/private-ci/run/proxy.runtime.conf
+    set +a
+fi
+
+CONTAINER_PROXY_HOST="${PRIVATE_CI_CONTAINER_PROXY_HOST:-10.0.2.2}"
+rewrite_loopback_proxy_url() {
+    local value="$1"
+    value="${value//127.0.0.1/${CONTAINER_PROXY_HOST}}"
+    value="${value//localhost/${CONTAINER_PROXY_HOST}}"
+    value="${value//\[::1\]/${CONTAINER_PROXY_HOST}}"
+    value="${value//::1/${CONTAINER_PROXY_HOST}}"
+    printf '%s' "${value}"
+}
+for proxy_var in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
+    proxy_value="${!proxy_var:-}"
+    if [ -n "${proxy_value}" ]; then
+        export "${proxy_var}=$(rewrite_loopback_proxy_url "${proxy_value}")"
+    fi
+done
+
+if /usr/bin/podman image exists "${IMAGE}" 2>/dev/null; then
+    /usr/bin/podman run --rm --network none "${IMAGE}" git --version >/dev/null
+    echo "[python-image] ready image=${IMAGE} source=local-store"
+    exit 0
+fi
+if ! /usr/bin/podman image exists "${BASE_IMAGE}" 2>/dev/null; then
+    echo "[python-image] base image missing locally: ${BASE_IMAGE}" >&2
+    exit 1
+fi
+
+context="$(mktemp -d /tmp/private-ci-python.XXXXXX)"
+trap 'rm -rf "${context}"' EXIT
+install -m 0644 "${AGENT_ROOT}/deploy/Dockerfile.python-ci" "${context}/Dockerfile"
+
+echo "[python-image] building shared image=${IMAGE}"
+/usr/bin/buildah bud \
+    --pull=never \
+    --network=slirp4netns:allow_host_loopback=true \
+    --tag "${IMAGE}" \
+    --file "${context}/Dockerfile" \
+    "${context}"
+
+/usr/bin/podman image exists "${IMAGE}" || {
+    echo "[python-image] image build did not produce ${IMAGE}" >&2
+    exit 1
+}
+/usr/bin/podman run --rm --network none "${IMAGE}" git --version >/dev/null || {
+    echo "[python-image] required runtime dependency is unavailable: git" >&2
+    exit 1
+}
+echo "[python-image] ready image=${IMAGE} source=local-store"

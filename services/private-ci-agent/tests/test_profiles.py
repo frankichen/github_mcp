@@ -12,6 +12,7 @@ from private_ci_agent.profiles import (
     NODE_CHROMIUM_IMAGE,
     NODE_IMAGE,
     PROFILE_COMMANDS,
+    PYTHON_CI_IMAGE,
     RUST_IMAGE,
     apply_workspace_hooks,
     discover_workspaces,
@@ -20,6 +21,7 @@ from private_ci_agent.profiles import (
     go_version_requirements,
     node_browser_image,
     node_commands_for_workspace,
+    python_ci_image,
     select_node_scripts,
 )
 
@@ -248,6 +250,21 @@ def test_node_chromium_image_is_restricted_to_approved_prefix(monkeypatch):
     monkeypatch.setattr(profiles_module, "NODE_CHROMIUM_IMAGE", "docker.io/attacker/node-chromium:22")
     with pytest.raises(ValueError):
         node_browser_image()
+
+
+def test_python_ci_image_is_restricted_to_worker_owned_prefix(monkeypatch):
+    import private_ci_agent.profiles as profiles_module
+
+    monkeypatch.setattr(profiles_module, "PYTHON_CI_IMAGE", "docker.io/attacker/python:latest")
+    with pytest.raises(ValueError):
+        python_ci_image()
+
+    monkeypatch.setattr(
+        profiles_module,
+        "PYTHON_CI_IMAGE",
+        "localhost/private-ci-python:3.12-git-v1",
+    )
+    assert python_ci_image() == PYTHON_CI_IMAGE
 
     monkeypatch.setattr(profiles_module, "NODE_CHROMIUM_IMAGE", "localhost/node-chromium:22")
     assert node_browser_image() == "localhost/node-chromium:22"
