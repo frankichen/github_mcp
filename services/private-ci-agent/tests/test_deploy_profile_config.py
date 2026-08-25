@@ -69,6 +69,18 @@ def test_sxt_runtime_overrides_request_only_lenshub_services_and_hooks():
     assert root["hooks"] == ["go-migrate", "ai-integrity"]
 
 
+def test_sxt_runtime_overrides_include_react_console_node_workspace():
+    data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
+    react = next(
+        item for item in data["repositories"]["frankichen/sxt"]["workspaces"]
+        if item["path"] == "h5/lenshub-console-react"
+    )
+
+    assert react["type"] == "node"
+    assert react["package_manager"] == "npm"
+    assert react["required_scripts"] == ["test:run", "typecheck", "build"]
+
+
 def test_sxt_allows_repo_fast_check_on_agent_side():
     data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
     allowed = data["repositories"]["frankichen/sxt"]["allowed_profiles"]

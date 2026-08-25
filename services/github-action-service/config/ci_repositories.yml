@@ -77,6 +77,13 @@ repositories:
           - build
         optional_scripts:
           - lint
+      - path: h5/lenshub-console-react
+        type: node
+        package_manager: npm
+        required_scripts:
+          - test:run
+          - typecheck
+          - build
 
   frankichen/auto_gupiao:
     enabled: true
