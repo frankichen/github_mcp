@@ -4,6 +4,7 @@
 """
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -254,7 +255,49 @@ PROFILE_COMMANDS = {
 }
 
 
-def python_commands_for_workspace(source_dir: str, workspace_dir: str | None = None) -> dict:
+def _python_workspace_identity(
+    root: Path,
+    *,
+    repository: str,
+    logical_workspace: str,
+    profile: str,
+) -> tuple[str, str]:
+    """Return checkout-independent workspace and manifest identities."""
+    manifest = hashlib.sha256()
+    for name in (
+        "pyproject.toml", "requirements.txt", "requirements-dev.txt",
+        "setup.py", "setup.cfg", "Pipfile", "Pipfile.lock",
+    ):
+        path = root / name
+        if not path.is_file():
+            continue
+        manifest.update(name.encode("utf-8"))
+        manifest.update(b"\0")
+        manifest.update(path.read_bytes())
+        manifest.update(b"\0")
+    manifest_sha256 = manifest.hexdigest()
+    material = json.dumps(
+        {
+            "repository": repository or "local/unknown",
+            "workspace": logical_workspace.strip("/") or ".",
+            "profile": profile,
+            "runtime": PYTHON_COMMANDS["image"],
+            "manifest_sha256": manifest_sha256,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()[:16], manifest_sha256
+
+
+def python_commands_for_workspace(
+    source_dir: str,
+    workspace_dir: str | None = None,
+    *,
+    repository: str = "",
+    logical_workspace: str | None = None,
+    profile: str = "python-check",
+) -> dict:
     """Generate strict Python setup/check commands from real workspace files."""
     root = Path(source_dir)
     if workspace_dir not in (None, "", "."):
@@ -265,7 +308,6 @@ def python_commands_for_workspace(source_dir: str, workspace_dir: str | None = N
     try:
         files = {path.name for path in root.iterdir() if path.is_file()}
         dirs = {path.name for path in root.iterdir() if path.is_dir()}
-        workspace_identity = str(root.resolve(strict=True))
     except OSError as exc:
         return {"error": "configuration_error", "message": f"cannot inspect Python workspace: {exc}"}
 
@@ -284,7 +326,15 @@ def python_commands_for_workspace(source_dir: str, workspace_dir: str | None = N
     if package_dir is None:
         return {"error": "configuration_error", "message": "Python workspace has no approved package directory"}
 
-    workspace_key = __import__("hashlib").sha256(workspace_identity.encode("utf-8")).hexdigest()[:16]
+    try:
+        workspace_key, manifest_sha256 = _python_workspace_identity(
+            root,
+            repository=repository,
+            logical_workspace=logical_workspace if logical_workspace is not None else (workspace_dir or "."),
+            profile=profile,
+        )
+    except OSError as exc:
+        return {"error": "configuration_error", "message": f"cannot hash Python workspace manifest: {exc}"}
     venv_root = f"/ci-venv/{workspace_key}"
     python = f"{venv_root}/bin/python"
     pip_install = (
@@ -328,6 +378,8 @@ def python_commands_for_workspace(source_dir: str, workspace_dir: str | None = N
         "image": PYTHON_COMMANDS["image"],
         "cache_dirs": dict(PYTHON_COMMANDS["cache_dirs"]),
         "workspace_key": workspace_key,
+        "manifest_sha256": manifest_sha256,
+        "runtime_identity": PYTHON_COMMANDS["image"],
     }
 
 

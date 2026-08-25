@@ -67,6 +67,33 @@ class DependencyEnvironmentCache:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         return handle
 
+    @staticmethod
+    def _payload_sha256(root: Path) -> str:
+        digest = hashlib.sha256()
+        for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+            dirs.sort()
+            files.sort()
+            current_path = Path(current)
+            for name in [*dirs, *files]:
+                path = current_path / name
+                relative = path.relative_to(root).as_posix()
+                digest.update(relative.encode("utf-8"))
+                digest.update(b"\0")
+                if path.is_symlink():
+                    digest.update(b"L\0")
+                    digest.update(os.readlink(path).encode("utf-8"))
+                elif path.is_dir():
+                    digest.update(b"D")
+                elif path.is_file():
+                    digest.update(b"F\0")
+                    with path.open("rb") as handle:
+                        while chunk := handle.read(1024 * 1024):
+                            digest.update(chunk)
+                else:
+                    digest.update(b"X")
+                digest.update(b"\0")
+        return digest.hexdigest()
+
     def inspect(self, key: str) -> dict:
         entry = self._entry(key)
         metadata = entry / "metadata.json"
@@ -79,6 +106,15 @@ class DependencyEnvironmentCache:
             return {"hit": False, "key": key, "reason": "metadata_invalid"}
         if value.get("format") != CACHE_FORMAT_VERSION or value.get("key") != key:
             return {"hit": False, "key": key, "reason": "identity_invalid"}
+        expected_payload_sha256 = value.get("payload_sha256")
+        if not isinstance(expected_payload_sha256, str) or len(expected_payload_sha256) != 64:
+            return {"hit": False, "key": key, "reason": "payload_identity_missing"}
+        try:
+            actual_payload_sha256 = self._payload_sha256(payload)
+        except OSError:
+            return {"hit": False, "key": key, "reason": "payload_unreadable"}
+        if actual_payload_sha256 != expected_payload_sha256:
+            return {"hit": False, "key": key, "reason": "payload_corrupt"}
         return {"hit": True, "key": key, "metadata": value}
 
     @staticmethod
@@ -131,7 +167,10 @@ class DependencyEnvironmentCache:
         try:
             info = self.inspect(key)
             if not info["hit"]:
-                return info
+                quarantined = False
+                if info.get("reason") != "missing" and self._entry(key).exists():
+                    quarantined = self._quarantine_unlocked(key)
+                return {**info, "quarantined": quarantined}
             dest = Path(destination)
             dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             tmp = dest.parent / f".{dest.name}.restore-{uuid.uuid4().hex}"
@@ -152,6 +191,8 @@ class DependencyEnvironmentCache:
             existing = self.inspect(key)
             if existing["hit"]:
                 return {**existing, "published": False, "deduplicated": True}
+            if self._entry(key).exists():
+                self._quarantine_unlocked(key)
             source_path = Path(source)
             if not source_path.is_dir():
                 raise EnvironmentCacheError("CI_ENV_CACHE_BUILD_FAILED")
@@ -160,9 +201,10 @@ class DependencyEnvironmentCache:
                 payload = temp / "payload"
                 shutil.copytree(source_path, payload, symlinks=True)
                 value = {
+                    **{k: v for k, v in metadata.items() if isinstance(k, str)},
                     "format": CACHE_FORMAT_VERSION,
                     "key": key,
-                    **{k: v for k, v in metadata.items() if isinstance(k, str)},
+                    "payload_sha256": self._payload_sha256(payload),
                 }
                 (temp / "metadata.json").write_text(
                     json.dumps(value, sort_keys=True, separators=(",", ":")), encoding="utf-8"
@@ -186,18 +228,21 @@ class DependencyEnvironmentCache:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             lock.close()
 
+    def _quarantine_unlocked(self, key: str) -> bool:
+        entry = self._entry(key)
+        if not entry.exists():
+            return False
+        quarantine = self.root / f"{key}.invalid-{uuid.uuid4().hex[:8]}"
+        try:
+            os.replace(entry, quarantine)
+        except OSError:
+            self._remove_tree(entry)
+        return True
+
     def quarantine(self, key: str) -> bool:
         lock = self._lock(key)
         try:
-            entry = self._entry(key)
-            if not entry.exists():
-                return False
-            quarantine = self.root / f"{key}.invalid-{uuid.uuid4().hex[:8]}"
-            try:
-                os.replace(entry, quarantine)
-            except OSError:
-                self._remove_tree(entry)
-            return True
+            return self._quarantine_unlocked(key)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             lock.close()

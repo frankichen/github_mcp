@@ -13,18 +13,43 @@ _GLOBAL_FILES = {
 _GLOBAL_PREFIXES = (".github/", "scripts/", "ci/", "docker/", "deploy/")
 
 
-def select_affected(changed_files: list[str], workspaces: list[dict], *, truncated: bool = False) -> dict:
+def select_affected(
+    changed_files: list[str],
+    workspaces: list[dict],
+    *,
+    truncated: bool = False,
+    affected_only: bool = True,
+) -> dict:
     normalized = sorted({str(path).strip("/") for path in changed_files if str(path).strip("/")})
     public = [
         {"path": str(item.get("path") or "."), "stack": str(item.get("stack") or "")}
         for item in workspaces if isinstance(item, dict)
     ]
+    tests = sorted(
+        path for path in normalized
+        if "/tests/" in f"/{path.lower()}"
+        or PurePosixPath(path).name.startswith("test_")
+        or path.endswith(("_test.go", ".spec.ts", ".test.ts", ".spec.js", ".test.js"))
+    )
+    if not affected_only:
+        reasons = ["full_ci_all_workspaces"]
+        if truncated:
+            reasons.append("changed_files_truncated")
+        if not normalized:
+            reasons.append("changed_files_empty")
+        return {
+            "complete": not truncated and bool(normalized),
+            "changed_files": normalized,
+            "selected_workspaces": public,
+            "selected_tests": tests,
+            "reasons": reasons,
+        }
     if truncated or not normalized:
         return {
             "complete": False,
             "changed_files": normalized,
             "selected_workspaces": public,
-            "selected_tests": [],
+            "selected_tests": tests,
             "reasons": ["changed_files_truncated" if truncated else "changed_files_empty_fallback_all"],
         }
 
@@ -58,11 +83,6 @@ def select_affected(changed_files: list[str], workspaces: list[dict], *, truncat
         complete = True
         reasons = ["global_dependency_or_ci_change"] if global_change else ["path_prefix_match"]
 
-    tests = sorted(
-        path for path in normalized
-        if "/tests/" in f"/{path.lower()}" or PurePosixPath(path).name.startswith("test_")
-        or path.endswith(("_test.go", ".spec.ts", ".test.ts", ".spec.js", ".test.js"))
-    )
     return {
         "complete": complete,
         "changed_files": normalized,

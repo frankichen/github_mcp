@@ -11,6 +11,12 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from private_ci_agent.models import Job
+from private_ci_agent.affected_selection import select_affected
+from private_ci_agent.contract_integrity import verify_product_contract_integrity
+from private_ci_agent.environment_cache import (
+    DependencyEnvironmentCache,
+    EnvironmentCacheError,
+)
 from private_ci_agent.profiles import (
     FAST_CHECK_COMMANDS,
     GO_COMMANDS,
@@ -58,6 +64,9 @@ class JobExecutor:
         self.podman = PodmanRunner(config.get("podman_binary", "/usr/bin/podman"))
         self.log_manager = LogManager(controller_client, config.get("max_log_bytes", 10485760))
         self.services = ServiceManager(config.get("podman_binary", "/usr/bin/podman"), config)
+        self.environment_cache = DependencyEnvironmentCache(
+            os.path.join(config.get("cache_root", "/srv/private-ci/cache"), "environments")
+        )
 
     def _cancelled(self) -> bool:
         cancel_event = getattr(self, "cancel_event", None)
@@ -81,6 +90,42 @@ class JobExecutor:
             summary = self._cancel_summary(job_id)
             self.client.finish_job(job_id, -1, "cancelled", summary=summary)
             return summary
+
+        if job.profile in {"repo-fast-check", "repo-auto-check"}:
+            contract_gate = verify_product_contract_integrity(
+                job.repository, job.source_dir, job.base_sha, job.commit_sha
+            )
+            if contract_gate.get("applicable"):
+                self.log_manager.upload(
+                    job_id,
+                    "[contract-integrity] checked_entries="
+                    f"{contract_gate.get('checked_entries', 0)}\n",
+                )
+                if not contract_gate.get("ok"):
+                    for finding in contract_gate.get("errors", []):
+                        self.log_manager.upload(
+                            job_id,
+                            "[contract-integrity] "
+                            f"{finding.get('code')} {finding.get('path')}: "
+                            f"{finding.get('message')}\n",
+                        )
+                    summary = {
+                        "status": "failed",
+                        "exit_code": 2,
+                        "steps": [],
+                        "contract_integrity": contract_gate,
+                    }
+                    self.log_manager.flush(job_id)
+                    self.client.finish_job(
+                        job_id,
+                        2,
+                        "failed",
+                        summary=summary,
+                        error_code="CONTRACT_INTEGRITY_FAILED",
+                        error_message="trusted product contract integrity gate failed",
+                    )
+                    return summary
+                job.contract_integrity_attested = True
 
         repo_config = get_repository_overrides(job.repository, job.profile)
         if job.profile == "openapi-check":
@@ -116,6 +161,13 @@ class JobExecutor:
         else:
             plan = self._explicit_plan(job.profile, job.source_dir, repo_config)
 
+        affected = select_affected(
+            job.changed_files,
+            plan.get("workspaces", []),
+            truncated=job.changed_files_truncated,
+            affected_only=False,
+        )
+
         metadata = {
             "detected_stacks": plan.get("detected_stacks", []),
             "selected_profiles": plan.get("selected_profiles", []),
@@ -125,12 +177,15 @@ class JobExecutor:
             "node_version": self._command_version("node", "--version"),
             "npm_version": self._command_version("npm", "--version"),
             "cpu_count": os.cpu_count(),
+            "affected_selection": affected,
         }
         tree = subprocess.run(["git", "-C", job.source_dir, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True, timeout=20)
         metadata["git_tree_sha"] = tree.stdout.strip() if tree.returncode == 0 else None
         metadata["evidence"] = {
             "base_sha": job.base_sha,
             "changed_files": list(job.changed_files),
+            "changed_files_total": job.changed_files_total or len(job.changed_files),
+            "changed_files_truncated": job.changed_files_truncated,
             "dependency_manifest_sha256": self._hash_dependency_manifests(
                 job.source_dir, plan.get("workspaces", [])
             ),
@@ -147,6 +202,9 @@ class JobExecutor:
         self.log_manager.upload(job_id, f"detected_stacks={metadata['detected_stacks']}\n")
         self.log_manager.upload(job_id, f"selected_profiles={metadata['selected_profiles']}\n")
         self.log_manager.upload(job_id, f"workspaces={metadata['workspaces']}\n")
+        self.log_manager.upload(
+            job_id, f"affected_selection={metadata['affected_selection']['reasons']}\n"
+        )
 
         if plan.get("error"):
             message = plan.get("message", plan["error"])
@@ -188,6 +246,11 @@ class JobExecutor:
                     if not result["passed"]:
                         all_passed = False
                         final_exit_code = final_exit_code or result["exit_code"]
+                metadata["environment_cache"] = [
+                    result["environment_cache"]
+                    for result in results
+                    if result.get("environment_cache")
+                ]
         finally:
             self.log_manager.flush(job_id)
             self.services.cleanup(job_id, job.workspace)
@@ -198,7 +261,7 @@ class JobExecutor:
             self.client.finish_job(job_id, -1, "cancelled", summary=summary)
             return summary
 
-        images = self._workspace_images(plan.get("workspaces", []), job.source_dir)
+        images = self._workspace_images(plan.get("workspaces", []), job.source_dir, job=job)
         metadata["images"] = images
         image_identity_ok = self._images_have_immutable_identity(images)
         metadata["image_digest"] = self._hash_json(images) if images and image_identity_ok else ""
@@ -345,7 +408,9 @@ class JobExecutor:
     def _images_have_immutable_identity(images: list[dict]) -> bool:
         return all(bool(item.get("digest")) for item in images)
 
-    def _workspace_images(self, workspaces: list[dict], source_dir: str) -> list[dict]:
+    def _workspace_images(
+        self, workspaces: list[dict], source_dir: str, *, job: Job | None = None
+    ) -> list[dict]:
         records = []
         service_images = getattr(self.services, "images", {}) or {}
         for workspace in workspaces:
@@ -355,7 +420,7 @@ class JobExecutor:
                 if workspace_path in ("", ".")
                 else os.path.join(source_dir, workspace_path)
             )
-            commands = self._workspace_commands(workspace, workspace_source)
+            commands = self._workspace_commands(workspace, workspace_source, job=job)
             if commands.get("error"):
                 continue
             image = commands.get("image", "")
@@ -460,7 +525,9 @@ class JobExecutor:
             return {"error": "unsupported", "message": f"No {profile} Manifest detected", **detected, "selected_profiles": [profile]}
         return {**detected, "workspaces": workspaces, "selected_profiles": [profile]}
 
-    def _workspace_commands(self, workspace: dict, source_dir: str) -> dict:
+    def _workspace_commands(
+        self, workspace: dict, source_dir: str, *, job: Job | None = None
+    ) -> dict:
         if workspace.get("configuration_error"):
             return {"error": "configuration_error", "message": workspace["configuration_error"]}
         stack = workspace["stack"]
@@ -470,7 +537,12 @@ class JobExecutor:
         elif stack == "go":
             commands = go_commands_for_workspace(source_dir)
         elif stack == "python":
-            commands = python_commands_for_workspace(source_dir)
+            commands = python_commands_for_workspace(
+                source_dir,
+                repository=job.repository if job else "",
+                logical_workspace=workspace.get("path", "."),
+                profile=job.profile if job else "python-check",
+            )
         elif stack in {"rust", "maven", "gradle", "dotnet"}:
             commands = get_commands_for_profile(PROFILE_BY_STACK[stack], source_dir)
         else:
@@ -479,10 +551,72 @@ class JobExecutor:
             return commands
         return apply_workspace_hooks(commands, workspace)
 
+    def _restore_python_environment(
+        self,
+        job: Job,
+        workspace: dict,
+        commands: dict,
+        image: str,
+        destination: str,
+    ) -> dict:
+        cache = getattr(self, "environment_cache", None)
+        if cache is None:
+            return {"enabled": False, "reason": "not_configured"}
+        image_digest = self.podman.image_digest(image) or ""
+        if not image_digest:
+            return {"enabled": False, "reason": "image_digest_unavailable"}
+        key = cache.build_key(
+            repository=job.repository,
+            workspace=workspace.get("path", "."),
+            stack="python",
+            profile=job.profile,
+            manifest_sha256=commands["manifest_sha256"],
+            image_digest=image_digest,
+            runtime_identity=commands["runtime_identity"],
+        )
+        try:
+            restored = cache.restore(key, destination)
+        except (EnvironmentCacheError, OSError) as exc:
+            return {
+                "enabled": True,
+                "key": key,
+                "hit": False,
+                "reason": type(exc).__name__,
+            }
+        return {
+            "enabled": True,
+            "key": key,
+            "workspace": workspace.get("path", "."),
+            "manifest_sha256": commands["manifest_sha256"],
+            "image_digest": image_digest,
+            **restored,
+        }
+
+    def _publish_python_environment(
+        self, cache_state: dict, source: str, commands: dict
+    ) -> dict:
+        cache = getattr(self, "environment_cache", None)
+        if cache is None or not cache_state.get("enabled") or cache_state.get("hit"):
+            return cache_state
+        try:
+            published = cache.publish(
+                cache_state["key"],
+                source,
+                {
+                    "workspace": cache_state.get("workspace", "."),
+                    "manifest_sha256": commands["manifest_sha256"],
+                    "image_digest": cache_state.get("image_digest", ""),
+                    "runtime_identity": commands["runtime_identity"],
+                },
+            )
+        except (EnvironmentCacheError, OSError) as exc:
+            return {**cache_state, "published": False, "publish_error": type(exc).__name__}
+        return {**cache_state, **published}
+
     def _execute_workspace(self, job: Job, workspace: dict) -> dict:
         path = workspace["path"]
         source_dir = job.source_dir if path == "." else f"{job.source_dir}/{path}"
-        commands = self._workspace_commands(workspace, source_dir)
+        commands = self._workspace_commands(workspace, source_dir, job=job)
         label = f"{workspace['stack']}:{path}"
         if commands.get("error"):
             return {"passed": False, "exit_code": 2, "steps": [{"step_name": label, "status": "configuration_error", "exit_code": 2}]}
@@ -504,8 +638,13 @@ class JobExecutor:
                 os.makedirs(cache_root, mode=0o700)
             caches = {"go": cache_root}
         elif workspace["stack"] == "python":
-            # Python venv must persist across container steps.
-            cache_root = os.path.join(job.workspace or os.path.dirname(job.source_dir), "python-venv")
+            # Every job restores a sealed environment into a private writable
+            # directory. Multiple Python workspaces never share that directory.
+            cache_root = os.path.join(
+                job.workspace or os.path.dirname(job.source_dir),
+                "python-environments",
+                commands["workspace_key"],
+            )
             os.makedirs(cache_root, mode=0o700, exist_ok=True)
             os.chmod(cache_root, 0o700)
             caches = {"python_venv": cache_root}
@@ -516,6 +655,30 @@ class JobExecutor:
         else:
             caches = {name: CACHE_MAP[name] for name in commands.get("cache_dirs", {}) if name in CACHE_MAP}
         steps = []
+        environment_cache = None
+        if workspace["stack"] == "python":
+            environment_cache = self._restore_python_environment(
+                job, workspace, commands, image, cache_root
+            )
+            if environment_cache.get("hit"):
+                steps.append(
+                    {
+                        "step_name": f"{label}:environment-cache",
+                        "status": "restored",
+                        "exit_code": None,
+                        "cache_key": environment_cache["key"],
+                    }
+                )
+                self.log_manager.upload(
+                    job.job_id,
+                    f"[{label}:environment-cache] HIT key={environment_cache['key'][:16]}\n",
+                )
+            else:
+                self.log_manager.upload(
+                    job.job_id,
+                    f"[{label}:environment-cache] MISS reason="
+                    f"{environment_cache.get('reason', 'missing')}\n",
+                )
         service_env = None
         requested_services = list(workspace.get("services") or [])
         if requested_services:
@@ -540,7 +703,8 @@ class JobExecutor:
         exit_code = 0
 
         setup_failed = False
-        for setup in commands.get("setup", []):
+        setup_commands = [] if environment_cache and environment_cache.get("hit") else commands.get("setup", [])
+        for setup in setup_commands:
             if self._cancelled():
                 step = {"step_name": f"{label}:{setup.get('name', 'setup') if isinstance(setup, dict) else 'setup'}",
                         "status": "cancelled", "exit_code": None, "duration_seconds": 0}
@@ -577,6 +741,17 @@ class JobExecutor:
                 setup_failed = True
                 passed = False
                 exit_code = exit_code or step["exit_code"]
+
+        if environment_cache and not setup_failed and not environment_cache.get("hit"):
+            environment_cache = self._publish_python_environment(
+                environment_cache, cache_root, commands
+            )
+            if environment_cache.get("published"):
+                self.log_manager.upload(
+                    job.job_id,
+                    f"[{label}:environment-cache] PUBLISHED "
+                    f"key={environment_cache['key'][:16]}\n",
+                )
 
         for skipped in commands.get("skipped", []):
             step = {"step_name": f"{label}:{skipped['name']}", "status": skipped["status"], "exit_code": None}
@@ -627,6 +802,8 @@ class JobExecutor:
                 }
                 if job.changed_files and not getattr(job, "changed_files_truncated", False):
                     extra_env["AI_INTEGRITY_CHANGED_FILES"] = "\n".join(job.changed_files)
+                if job.contract_integrity_attested:
+                    extra_env["AI_INTEGRITY_CONTRACT_GATE_ATTESTED"] = "1"
             step = self._run_check(
                 job,
                 label,
@@ -644,7 +821,12 @@ class JobExecutor:
                 passed = False
                 exit_code = exit_code or step["exit_code"]
 
-        return {"passed": passed, "exit_code": exit_code, "steps": steps}
+        return {
+            "passed": passed,
+            "exit_code": exit_code,
+            "steps": steps,
+            "environment_cache": environment_cache,
+        }
 
     def _run_setup(self, job, label, image, source_dir, caches, step_name, command, service_env=None, pass_proxy=False):
         name = f"{label}:{step_name}"
@@ -829,35 +1011,23 @@ class JobExecutor:
     }
 
     def _execute_fast_check(self, job: Job) -> dict:
-        """Run the repository integrity target without network access."""
+        """Run repository-controlled Make behavior only inside isolated Podman."""
         job_id = job.job_id
         source_dir = job.source_dir
         started = time.time()
         self.client.update_job_status(job_id, "running")
 
-        make = subprocess.run(["which", "make"], capture_output=True, text=True, timeout=10)
-        if make.returncode != 0:
-            return self._fast_check_configuration_error(
-                job_id, "FAST_CHECK_MAKE_MISSING", "make is not installed"
-            )
-
-        target = subprocess.run(
-            ["make", "-C", source_dir, "-n", "ai-integrity-check"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        if target.returncode != 0:
-            return self._fast_check_configuration_error(
-                job_id,
-                "FAST_CHECK_ENTRYPOINT_MISSING",
-                "Make target ai-integrity-check is unavailable",
-            )
-
         image = FAST_CHECK_COMMANDS["image"]
         if not self.podman.image_available(image, allow_pull=False):
             return self._fast_check_configuration_error(
                 job_id, "FAST_CHECK_IMAGE_UNAVAILABLE", f"Image {image} is not prewarmed"
+            )
+        image_digest = self.podman.image_digest(image)
+        if not image_digest:
+            return self._fast_check_configuration_error(
+                job_id,
+                "FAST_CHECK_IMAGE_IDENTITY_UNAVAILABLE",
+                "Fast-check image has no immutable local identity",
             )
 
         artifacts_dir = os.path.join(
@@ -870,6 +1040,15 @@ class JobExecutor:
         }
         if job.changed_files and not getattr(job, "changed_files_truncated", False):
             env["AI_INTEGRITY_CHANGED_FILES"] = "\n".join(job.changed_files)
+        if job.contract_integrity_attested:
+            env["AI_INTEGRITY_CONTRACT_GATE_ATTESTED"] = "1"
+
+        affected = select_affected(
+            job.changed_files,
+            [{"path": ".", "stack": "integrity"}],
+            truncated=job.changed_files_truncated,
+            affected_only=True,
+        )
 
         step_name = "repo-fast-check:ai-integrity"
         step_id = self.client.start_step(job_id, step_name)
@@ -879,6 +1058,8 @@ class JobExecutor:
             job_id,
             source_dir,
             {},
+            "command -v make >/dev/null 2>&1 || exit 127; "
+            "make -n ai-integrity-check >/dev/null 2>&1 || exit 42; "
             "make ai-integrity-check 2>&1",
             60,
             env=env,
@@ -886,6 +1067,7 @@ class JobExecutor:
             extra_mounts=[f"{artifacts_dir}:/ci-artifacts:Z"],
             pass_proxy=False,
             cancel_event=getattr(self, "cancel_event", None),
+            source_read_only=True,
         )
         self._upload_output(job_id, result)
         timed_out = bool(result.get("timed_out"))
@@ -930,8 +1112,9 @@ class JobExecutor:
             "base_sha": job.base_sha,
             "commit_sha": job.commit_sha,
             "image": image,
-            "image_digest": self.podman.image_digest(image),
+            "image_digest": image_digest,
             "source_mirror_hit": bool(self.config.get("source_mirror_enabled")),
+            "affected_selection": affected,
             "resource_policy": self.podman.resource_summary(),
             "ai_integrity_seconds": round(duration, 3),
             "total_duration_seconds": round(time.time() - started, 3),
@@ -944,6 +1127,10 @@ class JobExecutor:
             summary["error_code"] = self.FAST_CHECK_ERROR_CODES["timeout"]
         elif cancelled:
             summary["error_code"] = "FAST_CHECK_CANCELLED"
+        elif exit_code == 127:
+            summary["error_code"] = self.FAST_CHECK_ERROR_CODES["missing_make"]
+        elif exit_code == 42:
+            summary["error_code"] = self.FAST_CHECK_ERROR_CODES["entrypoint_missing"]
         elif exit_code != 0:
             summary["error_code"] = self.FAST_CHECK_ERROR_CODES["integrity_failed"]
         return summary
