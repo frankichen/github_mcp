@@ -33,6 +33,7 @@ _IDENTITY_KEYS = {
     "duration_seconds", "cancel_requested", "superseded_by_job_id", "workspace_id",
     "revision", "pull_number", "number", "mergeable", "merge_state_status",
     "draft", "state", "index_version", "strategy", "progress_current",
+    "development_session_id", "session_id", "session_revision", "workspace_revision", "generation_id", "role",
     "progress_total", "terminal", "changed", "timed_out", "resource_uri",
 }
 _SMALL_COLLECTION_KEYS = {
@@ -54,7 +55,7 @@ def _sha256(data: bytes) -> str:
 
 
 def _resource_root() -> Path:
-    root = Path(os.environ.get("MCP_RESPONSE_RESOURCE_DIR", "/data/mcp-response-resources"))
+    root = Path(os.environ.get("MYGITHUB12_SHARED_RESOURCE_DIR") or os.environ.get("MCP_RESPONSE_RESOURCE_DIR", "/data/mcp-response-resources"))
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         os.chmod(root, 0o700)
@@ -78,6 +79,13 @@ def _resource_paths(resource_id: str) -> tuple[Path, Path]:
 
 
 def cleanup_expired_response_resources(now: float | None = None) -> int:
+    if os.environ.get("MYGITHUB12_RUNTIME_ROLE"):
+        try:
+            from app.runtime_generation import is_cleanup_leader
+            if not is_cleanup_leader():
+                return 0
+        except Exception:
+            return 0
     root = _resource_root()
     now = time.time() if now is None else now
     removed = 0
@@ -107,27 +115,32 @@ def store_response_resource(value: Any) -> dict[str, Any]:
     payload_path, meta_path = _resource_paths(resource_id)
     now = time.time()
     digest = _sha256(data)
-    payload_path.write_bytes(data)
-    meta_path.write_text(
-        json.dumps(
-            {
-                "resource_id": resource_id,
-                "created_at": now,
-                "expires_at": now + RESPONSE_RESOURCE_TTL_SECONDS,
-                "total_bytes": len(data),
-                "sha256": digest,
-                "mime_type": "application/json",
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
-        encoding="utf-8",
+    payload_tmp = payload_path.with_suffix(".json.tmp")
+    meta_tmp = meta_path.with_suffix(".json.tmp")
+    fd = os.open(payload_tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    meta_text = json.dumps(
+        {
+            "resource_id": resource_id,
+            "created_at": now,
+            "expires_at": now + RESPONSE_RESOURCE_TTL_SECONDS,
+            "total_bytes": len(data),
+            "sha256": digest,
+            "mime_type": "application/json",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
-    try:
-        os.chmod(payload_path, 0o600)
-        os.chmod(meta_path, 0o600)
-    except OSError:
-        pass
+    fd = os.open(meta_tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(meta_text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(payload_tmp, payload_path)
+    os.replace(meta_tmp, meta_path)
     return {
         "resource_uri": f"{RESOURCE_URI_PREFIX}{resource_id}",
         "total_bytes": len(data),

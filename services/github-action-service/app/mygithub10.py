@@ -474,7 +474,7 @@ def _parse_patch_details(patch: str) -> tuple[list[tuple[str, str, list[tuple[in
             new_lines: list[str] = []
             last_side = ""
             index += 1
-            while index < len(lines) and not lines[index].startswith(("--- ", "@@ ")):
+            while index < len(lines) and not lines[index].startswith(("diff --git ", "--- ", "@@ ")):
                 line = lines[index]
                 if line.startswith("\\ No newline at end of file"):
                     if last_side == "old" and old_lines:
@@ -975,7 +975,7 @@ def capabilities(build_sha: str) -> dict[str, Any]:
     return {
         "name": "MyGithut12",
         "version": SERVICE_VERSION,
-        "tool_count": 155,
+        "tool_count": 159,
         "build_sha": build_sha,
         "build_sha_source": "environment" if new_build_env or legacy_build_env else "vcs_fallback",
         "runtime_mode": os.environ.get("MYGITHUB12_RUNTIME_MODE", os.environ.get("MYGITHUB10_RUNTIME_MODE", "development")),
@@ -1034,13 +1034,25 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_repository_patch_analysis": True,
         "supports_affected_test_selection": True,
         "supports_repository_contract_change_detection": True,
+        "supports_development_task_orchestration": True,
+        "supports_development_sessions": True,
+        "supports_local_git_mirror_reads": True,
+        "supports_context_pack_v2": True,
+        "supports_fast_feedback_ci": True,
+        "supports_dependency_environment_cache": True,
+        "supports_ci_affected_selection": True,
+        "supports_ci_failure_pack": True,
+        "supports_blue_green_runtime": True,
+        "supports_runtime_generation_leader": True,
+        "supports_cross_generation_resources": True,
+        "tool_manifest_count": 159,
         "recommended_large_file_workflow": ["get_github_file_manifest", "read_github_file_chunk", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "commit_github_uploaded_files"],
-        "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_IN_PROGRESS", "WORKSPACE_LEASE_REQUIRED", "WORKSPACE_REVISION_MISMATCH", "WORKSPACE_BRANCH_DRIFTED"],
+        "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_IN_PROGRESS", "WORKSPACE_LEASE_REQUIRED", "WORKSPACE_REVISION_MISMATCH", "WORKSPACE_BRANCH_DRIFTED", "DEVELOPMENT_SESSION_NOT_FOUND", "DEVELOPMENT_SESSION_CLOSED", "DEVELOPMENT_SESSION_STATE_INVALID", "DEVELOPMENT_SESSION_REVISION_MISMATCH", "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "MIRROR_UNAVAILABLE", "MIRROR_ORIGIN_MISMATCH", "MIRROR_FETCH_FAILED", "MIRROR_OBJECT_MISSING", "MIRROR_IDENTITY_MISMATCH", "FAST_CI_NOT_MERGE_ELIGIBLE", "CI_PROFILE_DISCOVERY_MISMATCH", "CI_ENV_CACHE_INVALID", "CI_ENV_CACHE_BUILD_FAILED", "AFFECTED_SELECTION_INCOMPLETE", "FAILURE_PACK_UNAVAILABLE", "RUNTIME_SCHEMA_INCOMPATIBLE", "RUNTIME_GENERATION_NOT_READY", "RUNTIME_LEADER_CONFLICT", "CROSS_GENERATION_RESOURCE_UNAVAILABLE", "CROSS_GENERATION_UPLOAD_UNAVAILABLE"],
         "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}],
     }
 
 
-_UPLOAD_ROOT = Path(os.environ.get("MYGITHUB10_UPLOAD_DIR", tempfile.gettempdir())) / "mygithub10-uploads"
+_UPLOAD_ROOT = Path(os.environ["MYGITHUB12_SHARED_UPLOAD_DIR"]) if os.environ.get("MYGITHUB12_SHARED_UPLOAD_DIR") else Path(os.environ.get("MYGITHUB10_UPLOAD_DIR", tempfile.gettempdir())) / "mygithub10-uploads"
 
 
 def _upload_paths(upload_id: str) -> tuple[Path, Path]:

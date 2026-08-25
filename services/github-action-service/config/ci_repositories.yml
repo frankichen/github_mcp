@@ -8,6 +8,7 @@ auto_enroll:
     auto_detect: true
     allowed_profiles:
       - repo-auto-check
+      - repo-fast-check
       - python-check
       - go-check
       - node-check
