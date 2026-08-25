@@ -30,16 +30,50 @@ async def lifespan(app: FastAPI):
         from app.deployment_service import init_deployment_db
         from app.attestation_registry import init_registry_db
         from app.mygithub12 import init_db as init_mygithub12_db, recover_orphaned_index_jobs
+        from app.development_session_store import init_session_db, recover_sessions
+        from app.runtime_generation import init_runtime_db, register_generation, acquire_leader
+        from app.ci_repository_config import validate_profile_discovery
         ensure_idempotency_storage()
         init_db()
         init_deployment_db()
         init_registry_db()
         init_mygithub12_db()
-        recovered_index_jobs = recover_orphaned_index_jobs()
-        if recovered_index_jobs["recovered_jobs"]:
-            logger.warning(
-                "Recovered orphaned MyGithut12 index jobs after Controller restart: %s",
-                recovered_index_jobs,
+        init_session_db()
+        init_runtime_db()
+        generation = register_generation()
+        maintenance_leader = {"acquired": False, "reason": "runtime_not_active"}
+        if generation.get("role") == "active":
+            maintenance_leader = acquire_leader()
+            if not maintenance_leader.get("acquired"):
+                logger.warning(
+                    "Startup maintenance is fail-closed because another runtime owns the leader lease: %s",
+                    maintenance_leader,
+                )
+        profile_discovery = validate_profile_discovery(
+            os.environ.get("MYGITHUB12_PROFILE_DISCOVERY_REPOSITORY", "frankichen/github_mcp")
+        )
+        if not profile_discovery.get("ok"):
+            raise RuntimeError(f"CI profile discovery mismatch: {profile_discovery}")
+        if maintenance_leader.get("acquired"):
+            from app.mcp_server import _service as session_service
+            recovered_sessions = recover_sessions(
+                lambda workspace_id: __import__("app.mygithub12", fromlist=["get_workspace"]).get_workspace(
+                    session_service, workspace_id
+                )
+            )
+            if recovered_sessions.get("recovery_required"):
+                logger.warning("Recovered interrupted development sessions: %s", recovered_sessions)
+            recovered_index_jobs = recover_orphaned_index_jobs()
+            if recovered_index_jobs["recovered_jobs"]:
+                logger.warning(
+                    "Recovered orphaned MyGithut12 index jobs after Controller restart: %s",
+                    recovered_index_jobs,
+                )
+        else:
+            logger.info(
+                "Skipping startup Session/Index recovery for runtime role=%s generation=%s",
+                generation.get("role"),
+                generation.get("generation_id"),
             )
     except Exception:
         logger.exception("Controller database initialization failed")
