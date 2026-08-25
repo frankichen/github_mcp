@@ -882,6 +882,53 @@ def test_auto_plan_uses_worker_capabilities_without_repository_registration(tmp_
     assert plan["detected_stacks"] == ["python"]
 
 
+def test_explicit_node_plan_uses_repository_workspace_overrides(tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    (tmp_path / "package.json").write_text('{"name":"root"}\n', encoding="utf-8")
+    react = tmp_path / "h5" / "lenshub-console-react"
+    react.mkdir(parents=True)
+    react.joinpath("package.json").write_text(
+        '{"scripts":{"test:run":"vitest run","typecheck":"tsc --noEmit","build":"vite build"}}\n',
+        encoding="utf-8",
+    )
+    react.joinpath("package-lock.json").write_text("{}\n", encoding="utf-8")
+    repo_config = {
+        "workspaces": [
+            {"path": ".", "type": "auto", "services": ["postgres"]},
+            {
+                "path": "h5/lenshub-console-react",
+                "type": "node",
+                "package_manager": "npm",
+                "required_scripts": ["test:run", "typecheck", "build"],
+            },
+        ]
+    }
+    executor = JobExecutor.__new__(JobExecutor)
+
+    plan = executor._explicit_plan("node-check", str(tmp_path), repo_config)
+
+    assert "error" not in plan
+    assert [(item["path"], item["stack"]) for item in plan["workspaces"]] == [
+        ("h5/lenshub-console-react", "node")
+    ]
+    assert plan["workspaces"][0]["required_scripts"] == ["test:run", "typecheck", "build"]
+
+
+def test_explicit_non_node_profile_keeps_root_only_scope(tmp_path):
+    nested = tmp_path / "services" / "worker"
+    nested.mkdir(parents=True)
+    nested.joinpath("pyproject.toml").write_text(
+        "[project]\nname='nested'\nversion='0.1.0'\n",
+        encoding="utf-8",
+    )
+    executor = JobExecutor.__new__(JobExecutor)
+
+    plan = executor._explicit_plan("python-check", str(tmp_path), {})
+
+    assert plan["error"] == "unsupported"
+    assert plan["workspaces"] == []
+
+
 @pytest.mark.parametrize(("filename", "stack", "profile"), [
     ("Cargo.toml", "rust", "rust-check"),
     ("pom.xml", "maven", "maven-check"),
@@ -1005,6 +1052,29 @@ def test_workspace_image_identity_is_deterministic_and_includes_services(tmp_pat
     assert first == second
     assert [item["stack"] for item in first] == ["go", "service:postgres", "service:redis"]
     assert all(item["digest"].startswith("sha256:") for item in first)
+
+
+def test_image_identity_gate_accepts_no_planned_images_but_rejects_missing_identity():
+    assert JobExecutor._images_have_immutable_identity([]) is True
+    assert JobExecutor._images_have_immutable_identity([
+        {"image": "docker.io/library/node:22", "digest": "sha256:node"}
+    ]) is True
+    assert JobExecutor._images_have_immutable_identity([
+        {"image": "docker.io/library/node:22", "digest": ""}
+    ]) is False
+
+
+def test_workspace_images_skip_non_executable_configuration_error_services(tmp_path):
+    executor = make_executor(FakePodman())
+    executor.services.images = {"postgres": "docker.io/library/postgres:16-alpine"}
+    workspaces = [{
+        "path": ".",
+        "stack": "node",
+        "services": ["postgres"],
+        "configuration_error": "Node workspace requires exactly one supported lock file",
+    }]
+
+    assert executor._workspace_images(workspaces, str(tmp_path)) == []
 
 
 def test_hidden_dependency_config_path_keeps_leading_dot_in_identity(tmp_path):

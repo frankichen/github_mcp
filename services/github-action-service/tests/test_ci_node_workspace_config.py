@@ -40,3 +40,16 @@ def test_checked_in_sxt_config_keeps_runtime_services_and_hooks_explicit():
 
     assert root["services"] == ["postgres", "redis", "rabbitmq"]
     assert root["hooks"] == ["go-migrate", "ai-integrity"]
+
+
+def test_checked_in_sxt_config_includes_react_console_node_workspace():
+    path = Path(__file__).parents[1] / "config" / "ci_repositories.yml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    react = next(
+        item for item in data["repositories"]["frankichen/sxt"]["workspaces"]
+        if item["path"] == "h5/lenshub-console-react"
+    )
+
+    assert react["type"] == "node"
+    assert react["package_manager"] == "npm"
+    assert react["required_scripts"] == ["test:run", "typecheck", "build"]

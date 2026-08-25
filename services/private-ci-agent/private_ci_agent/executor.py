@@ -114,7 +114,7 @@ class JobExecutor:
         if job.profile == "repo-auto-check":
             plan = self._auto_plan(job.source_dir, repo_config)
         else:
-            plan = self._explicit_plan(job.profile, job.source_dir)
+            plan = self._explicit_plan(job.profile, job.source_dir, repo_config)
 
         metadata = {
             "detected_stacks": plan.get("detected_stacks", []),
@@ -200,8 +200,8 @@ class JobExecutor:
 
         images = self._workspace_images(plan.get("workspaces", []), job.source_dir)
         metadata["images"] = images
-        image_identity_ok = bool(images) and all(item.get("digest") for item in images)
-        metadata["image_digest"] = self._hash_json(images) if image_identity_ok else ""
+        image_identity_ok = self._images_have_immutable_identity(images)
+        metadata["image_digest"] = self._hash_json(images) if images and image_identity_ok else ""
         if not image_identity_ok:
             all_passed = False
             final_exit_code = final_exit_code or 2
@@ -341,6 +341,10 @@ class JobExecutor:
                     names.append(f".github/workflows/{name}")
         return cls._hash_paths(root, names)
 
+    @staticmethod
+    def _images_have_immutable_identity(images: list[dict]) -> bool:
+        return all(bool(item.get("digest")) for item in images)
+
     def _workspace_images(self, workspaces: list[dict], source_dir: str) -> list[dict]:
         records = []
         service_images = getattr(self.services, "images", {}) or {}
@@ -352,14 +356,15 @@ class JobExecutor:
                 else os.path.join(source_dir, workspace_path)
             )
             commands = self._workspace_commands(workspace, workspace_source)
-            if not commands.get("error"):
-                image = commands.get("image", "")
-                records.append({
-                    "workspace": workspace_path,
-                    "stack": workspace.get("stack", ""),
-                    "image": image,
-                    "digest": self.podman.image_digest(image) or "",
-                })
+            if commands.get("error"):
+                continue
+            image = commands.get("image", "")
+            records.append({
+                "workspace": workspace_path,
+                "stack": workspace.get("stack", ""),
+                "image": image,
+                "digest": self.podman.image_digest(image) or "",
+            })
             for service in workspace.get("services") or []:
                 image = service_images.get(service, "")
                 if not image:
@@ -442,14 +447,15 @@ class JobExecutor:
             return {"error": "unsupported", "message": "No supported project Manifest detected", **detected}
         return {**detected, "selected_profiles": selected}
 
-    def _explicit_plan(self, profile: str, source_dir: str) -> dict:
-        if profile == "node-check":
-            detected = discover_workspaces(source_dir, {"workspaces": [{"path": ".", "type": "node"}]})
-            workspaces = [item for item in detected["workspaces"] if item["stack"] == "node"]
+    def _explicit_plan(self, profile: str, source_dir: str, repo_config: dict | None = None) -> dict:
+        stack = profile.removesuffix("-check")
+        configured_workspaces = (repo_config or {}).get("workspaces") or []
+        if profile == "node-check" and configured_workspaces:
+            discovery_config = repo_config
         else:
-            stack = profile.removesuffix("-check")
-            detected = discover_workspaces(source_dir, {"workspaces": [{"path": ".", "type": stack}]})
-            workspaces = [item for item in detected["workspaces"] if item["stack"] == stack]
+            discovery_config = {"workspaces": [{"path": ".", "type": stack}]}
+        detected = discover_workspaces(source_dir, discovery_config)
+        workspaces = [item for item in detected["workspaces"] if item["stack"] == stack]
         if not workspaces:
             return {"error": "unsupported", "message": f"No {profile} Manifest detected", **detected, "selected_profiles": [profile]}
         return {**detected, "workspaces": workspaces, "selected_profiles": [profile]}
