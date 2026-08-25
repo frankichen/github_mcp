@@ -267,6 +267,9 @@ def _stage_apply_fixes_repo(tmp_path):
     staged_script = deploy_root / "apply-fixes.sh"
     staged_script.write_bytes(APPLY_FIXES_SCRIPT.read_bytes())
     staged_script.chmod(0o755)
+    (deploy_root / "repositories.yml").write_text(
+        "repositories: {}\n", encoding="utf-8"
+    )
     for name in (
         "config.py", "executor.py", "main.py", "podman.py",
         "profiles.py", "source.py", "controller_client.py", "services.py",

@@ -124,7 +124,9 @@ def test_operator_workspace_allowlist_is_authoritative(tmp_path):
     )
 
     assert result["detected_stacks"] == ["go"]
-    assert result["workspaces"] == [{"path": ".", "stack": "go"}]
+    assert [(item["path"], item["stack"]) for item in result["workspaces"]] == [
+        (".", "go")
+    ]
 
 
 @pytest.mark.parametrize(
