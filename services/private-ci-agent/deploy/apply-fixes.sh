@@ -87,7 +87,7 @@ install -o nobody -g nogroup -m 755 \
     "${REPO_ROOT}/services/private-ci-agent/deploy/private-ci-preflight" \
     "${AGENT_DIR}/bin/private-ci-preflight"
 
-for f in prepare-node-chromium prepare-go-cache prepare-playwright-cache; do
+for f in prepare-python-ci prepare-node-chromium prepare-go-cache prepare-playwright-cache; do
     src="${REPO_ROOT}/services/private-ci-agent/deploy/${f}"
     [ -f "${src}" ] || continue
     install -o nobody -g nogroup -m 755 "${src}" "${AGENT_DIR}/deploy/${f}"
@@ -96,6 +96,9 @@ done
 install -o nobody -g nogroup -m 644 \
     "${REPO_ROOT}/services/private-ci-agent/deploy/Dockerfile.node-chromium" \
     "${AGENT_DIR}/deploy/Dockerfile.node-chromium"
+install -o nobody -g nogroup -m 644 \
+    "${REPO_ROOT}/services/private-ci-agent/deploy/Dockerfile.python-ci" \
+    "${AGENT_DIR}/deploy/Dockerfile.python-ci"
 
 # ── 4. 重建并重启 controller（github-action-service）────────
 # 容器内代码通过镜像打包（build: .），heartbeat lease_token 修复需重建。
@@ -177,14 +180,21 @@ if [ "${controller_ready}" -ne 1 ]; then
 fi
 sleep 5
 
-# ── 5. 预热本地共享 Node Chromium 镜像 ─────────────────────
+# ── 5. 预热本地共享 Python CI 镜像 ─────────────────────────
+log "Preheating shared Python CI image"
+runuser -u ciworker -- env HOME=/home/ciworker XDG_RUNTIME_DIR=/run/user/1500 \
+    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1500/bus \
+    PYTHONPATH="${AGENT_DIR}" \
+    "${AGENT_DIR}/deploy/prepare-python-ci" || die "Python CI image preheat failed"
+
+# ── 6. 预热本地共享 Node Chromium 镜像 ─────────────────────
 log "Preheating shared local Node Chromium image"
 runuser -u ciworker -- env HOME=/home/ciworker XDG_RUNTIME_DIR=/run/user/1500 \
     DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1500/bus \
     PYTHONPATH="${AGENT_DIR}" \
     "${AGENT_DIR}/deploy/prepare-node-chromium" || die "Node Chromium image preheat failed"
 
-# ── 6. 预热共享 Go 缓存（goose 模块进 file:// 命中）────────
+# ── 7. 预热共享 Go 缓存（goose 模块进 file:// 命中）────────
 log "Preheating shared Go module cache (goose)"
 mkdir -p /srv/private-ci/cache/go
 chown "${CIWORKER_UID}:${CIWORKER_UID}" /srv/private-ci/cache/go
@@ -194,14 +204,14 @@ runuser -u ciworker -- env HOME=/home/ciworker XDG_RUNTIME_DIR=/run/user/1500 \
     PYTHONPATH="${AGENT_DIR}" \
     "${AGENT_DIR}/deploy/prepare-go-cache" || die "go cache preheat failed"
 
-# ── 7. 预热共享 Playwright 浏览器缓存 ──────────────────────
+# ── 8. 预热共享 Playwright 浏览器缓存 ──────────────────────
 log "Preheating shared Playwright browser cache"
 runuser -u ciworker -- env HOME=/home/ciworker XDG_RUNTIME_DIR=/run/user/1500 \
     DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1500/bus \
     PYTHONPATH="${AGENT_DIR}" \
     "${AGENT_DIR}/deploy/prepare-playwright-cache" || die "Playwright cache preheat failed"
 
-# ── 8. 重启 worker 加载新代码 ─────────────────────────────
+# ── 9. 重启 worker 加载新代码 ─────────────────────────────
 log "Restarting private-ci-agent.service"
 systemctl restart private-ci-agent.service
 sleep 3

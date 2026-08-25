@@ -30,6 +30,9 @@ def test_requirements_dev_workspace_does_not_install_requirements_twice(tmp_path
 
     assert any("-r requirements-dev.txt" in command for command in setup)
     assert not any(command.endswith("-r requirements.txt 2>&1") for command in setup)
+    assert [item["name"] for item in plan["preflight"]] == ["runtime-dependencies"]
+    assert "missing required runtime dependency: git" in plan["preflight"][0]["command"]
+    assert "git --version" in plan["preflight"][0]["command"]
     assert [item["name"] for item in plan["check"]] == ["ruff", "compileall", "pytest"]
     assert "app tests" in plan["check"][0]["command"]
 
@@ -127,6 +130,8 @@ class SetupFailPodman:
 
     def run_command(self, _image, _job_id, _source_dir, caches, command, _timeout, **kwargs):
         self.calls.append((command, caches, kwargs))
+        if "command -v git" in command:
+            return {"exit_code": 0, "stdout": "git version 2.47.3", "stderr": "", "timed_out": False}
         return {"exit_code": 1, "stdout": "", "stderr": "setup failed", "timed_out": False}
 
 
@@ -175,10 +180,12 @@ def test_python_setup_failure_blocks_all_checks(tmp_path):
     )
 
     assert result["passed"] is False
-    assert len(podman.calls) == 1
-    assert podman.calls[0][2]["pass_proxy"] is True
-    assert executor.client.started == ["python:.:bootstrap"]
-    assert executor.client.finished[0][1:3] == ("failed", 1)
+    assert len(podman.calls) == 2
+    assert podman.calls[0][2]["network"] is False
+    assert podman.calls[0][2]["pass_proxy"] is False
+    assert podman.calls[1][2]["pass_proxy"] is True
+    assert executor.client.started == ["python:.:runtime-dependencies", "python:.:bootstrap"]
+    assert executor.client.finished[1][1:3] == ("failed", 1)
     blocked = [step for step in result["steps"] if step["status"] == "blocked_by_setup"]
     assert {step["step_name"].rsplit(":", 1)[-1] for step in blocked} == {"ruff", "compileall", "pytest"}
 
@@ -197,10 +204,12 @@ def test_python_checks_stay_network_isolated_without_proxy(tmp_path):
     )
 
     assert result["passed"] is True
-    assert len(podman.calls) == 4
-    assert podman.calls[0][2]["network"] is True
-    assert podman.calls[0][2]["pass_proxy"] is True
-    for _, _, options in podman.calls[1:]:
+    assert len(podman.calls) == 5
+    assert podman.calls[0][2]["network"] is False
+    assert podman.calls[0][2]["pass_proxy"] is False
+    assert podman.calls[1][2]["network"] is True
+    assert podman.calls[1][2]["pass_proxy"] is True
+    for _, _, options in podman.calls[2:]:
         assert options["network"] is False
         assert options["pass_proxy"] is False
         assert options["env"]["CI_COMMIT_SHA"] == "a" * 40
@@ -229,6 +238,36 @@ def test_python_venv_is_scoped_by_workspace_identity(tmp_path):
     assert f"/ci-venv/{second['workspace_key']}/bin/python" in second["check"][0]["command"]
     assert "PIP_CACHE_DIR=/ci-venv/" not in first["setup"][0]["command"]
     assert "--retries 6 --timeout 60 install --no-input --quiet" in first["setup"][0]["command"]
+    assert first["image"] == "localhost/private-ci-python:3.12-git-v1"
+    assert first["runtime_identity"] == first["image"]
+
+
+def test_python_runtime_dependency_preflight_fails_closed(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "requirements.txt").write_text("requests\n", encoding="utf-8")
+    _mkdir_package(source, "app")
+    podman = SetupFailPodman()
+
+    def missing_git(_image, _job_id, _source_dir, caches, command, _timeout, **kwargs):
+        podman.calls.append((command, caches, kwargs))
+        return {
+            "exit_code": 2,
+            "stdout": "",
+            "stderr": "CONFIGURATION_ERROR: missing required runtime dependency: git",
+            "timed_out": False,
+        }
+
+    podman.run_command = missing_git
+    result = _executor(podman)._execute_workspace(
+        _job(source, tmp_path),
+        {"path": ".", "stack": "python"},
+    )
+
+    assert result["passed"] is False
+    assert result["exit_code"] == 2
+    assert len(podman.calls) == 1
+    assert result["steps"][0]["step_name"] == "python:.:runtime-dependencies"
 
 
 def test_python_venv_identity_is_stable_across_checkout_roots(tmp_path):

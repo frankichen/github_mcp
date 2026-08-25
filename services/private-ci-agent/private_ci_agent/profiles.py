@@ -28,6 +28,13 @@ LOCK_FILES = {
     "bun.lockb": "bun",
 }
 NODE_IMAGE = "docker.io/library/node:22"
+PYTHON_CI_IMAGE = os.environ.get(
+    "PRIVATE_CI_PYTHON_IMAGE",
+    "localhost/private-ci-python:3.12-git-v1",
+)
+APPROVED_PYTHON_CI_PREFIXES = (
+    "localhost/private-ci-python:",
+)
 # 浏览器 smoke 需要 Chromium 系统库（libnspr4/libnss3 等），node:22 基础镜像
 # 不包含它们。受控运行镜像由 Worker 维护脚本构建一次并留在同一个
 # rootless Podman image store 中；所有分支/worktree 使用同一个本地标签，job
@@ -49,6 +56,13 @@ def node_browser_image() -> str:
     if not any(NODE_CHROMIUM_IMAGE.startswith(prefix) for prefix in APPROVED_NODE_CHROMIUM_PREFIXES):
         raise ValueError(f"unapproved Node Chromium image: {NODE_CHROMIUM_IMAGE}")
     return NODE_CHROMIUM_IMAGE
+
+
+def python_ci_image() -> str:
+    """Return the Worker-owned Python runtime with required system tools."""
+    if not any(PYTHON_CI_IMAGE.startswith(prefix) for prefix in APPROVED_PYTHON_CI_PREFIXES):
+        raise ValueError(f"unapproved Python CI image: {PYTHON_CI_IMAGE}")
+    return PYTHON_CI_IMAGE
 PLAYWRIGHT_PACKAGE_NAMES = ("playwright", "@playwright/test")
 
 _PYTHON_PACKAGE_DIRS = ("app", "private_ci_agent", "private_deploy_agent", "src")
@@ -168,7 +182,7 @@ PYTHON_COMMANDS = {
     "setup": [],
     "check": [],
     "skipped": [],
-    "image": "docker.io/library/python:3.12-slim",
+    "image": PYTHON_CI_IMAGE,
     "cache_dirs": {"pip": "/srv/private-ci/cache/pip"},
 }
 
@@ -361,6 +375,16 @@ def python_commands_for_workspace(
     has_tests = "tests" in dirs
     targets = [package_dir] + (["tests"] if has_tests else [])
     target_text = " ".join(targets)
+    preflight = [
+        {
+            "name": "runtime-dependencies",
+            "command": (
+                "command -v git >/dev/null 2>&1 || { "
+                "echo 'CONFIGURATION_ERROR: missing required runtime dependency: git' >&2; exit 2; }; "
+                "git --version"
+            ),
+        },
+    ]
     checks = [
         {"name": "ruff", "command": f"{python} -m ruff check {target_text} 2>&1"},
         {"name": "compileall", "command": f"{python} -m compileall -q {target_text} 2>&1"},
@@ -373,13 +397,14 @@ def python_commands_for_workspace(
 
     return {
         "setup": [{"name": "bootstrap", "command": " && ".join(install_commands) + " 2>&1"}],
+        "preflight": preflight,
         "check": checks,
         "skipped": skipped,
-        "image": PYTHON_COMMANDS["image"],
+        "image": python_ci_image(),
         "cache_dirs": dict(PYTHON_COMMANDS["cache_dirs"]),
         "workspace_key": workspace_key,
         "manifest_sha256": manifest_sha256,
-        "runtime_identity": PYTHON_COMMANDS["image"],
+        "runtime_identity": python_ci_image(),
     }
 
 

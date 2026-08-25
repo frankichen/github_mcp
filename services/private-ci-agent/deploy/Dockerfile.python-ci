@@ -1,0 +1,22 @@
+# Worker-owned Python CI runtime. Python workspaces use real Git operations for
+# local mirrors and product contract integrity checks, so git is a required
+# runtime dependency rather than a host-provided test convenience.
+FROM docker.io/library/python:3.12-slim
+
+RUN set -eu; \
+    http_apt_proxy="${http_proxy:-${HTTP_PROXY:-}}"; \
+    https_apt_proxy="${https_proxy:-${HTTPS_PROXY:-${http_apt_proxy}}}"; \
+    set -- \
+        -o Acquire::Retries=3 \
+        -o Acquire::http::Timeout=30 \
+        -o Acquire::https::Timeout=30; \
+    if [ -n "${http_apt_proxy}" ]; then \
+        set -- "$@" -o "Acquire::http::Proxy=${http_apt_proxy}"; \
+    fi; \
+    if [ -n "${https_apt_proxy}" ]; then \
+        set -- "$@" -o "Acquire::https::Proxy=${https_apt_proxy}"; \
+    fi; \
+    apt-get "$@" update; \
+    apt-get "$@" install -y --no-install-recommends git ca-certificates; \
+    git --version; \
+    rm -rf /var/lib/apt/lists/*

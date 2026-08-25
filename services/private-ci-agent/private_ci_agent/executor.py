@@ -655,6 +655,25 @@ class JobExecutor:
         else:
             caches = {name: CACHE_MAP[name] for name in commands.get("cache_dirs", {}) if name in CACHE_MAP}
         steps = []
+        for preflight in commands.get("preflight", []):
+            step = self._run_check(
+                job,
+                label,
+                image,
+                source_dir,
+                caches,
+                preflight["name"],
+                preflight["command"],
+                pass_proxy=False,
+            )
+            steps.append(step)
+            if step["exit_code"] != 0:
+                return {
+                    "passed": False,
+                    "exit_code": step["exit_code"],
+                    "steps": steps,
+                    "environment_cache": None,
+                }
         environment_cache = None
         if workspace["stack"] == "python":
             environment_cache = self._restore_python_environment(
