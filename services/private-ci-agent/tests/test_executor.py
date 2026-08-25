@@ -914,6 +914,21 @@ def test_explicit_node_plan_uses_repository_workspace_overrides(tmp_path):
     assert plan["workspaces"][0]["required_scripts"] == ["test:run", "typecheck", "build"]
 
 
+def test_explicit_non_node_profile_keeps_root_only_scope(tmp_path):
+    nested = tmp_path / "services" / "worker"
+    nested.mkdir(parents=True)
+    nested.joinpath("pyproject.toml").write_text(
+        "[project]\nname='nested'\nversion='0.1.0'\n",
+        encoding="utf-8",
+    )
+    executor = JobExecutor.__new__(JobExecutor)
+
+    plan = executor._explicit_plan("python-check", str(tmp_path), {})
+
+    assert plan["error"] == "unsupported"
+    assert plan["workspaces"] == []
+
+
 @pytest.mark.parametrize(("filename", "stack", "profile"), [
     ("Cargo.toml", "rust", "rust-check"),
     ("pom.xml", "maven", "maven-check"),

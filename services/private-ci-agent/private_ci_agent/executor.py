@@ -449,7 +449,12 @@ class JobExecutor:
 
     def _explicit_plan(self, profile: str, source_dir: str, repo_config: dict | None = None) -> dict:
         stack = profile.removesuffix("-check")
-        detected = discover_workspaces(source_dir, repo_config)
+        configured_workspaces = (repo_config or {}).get("workspaces") or []
+        if profile == "node-check" and configured_workspaces:
+            discovery_config = repo_config
+        else:
+            discovery_config = {"workspaces": [{"path": ".", "type": stack}]}
+        detected = discover_workspaces(source_dir, discovery_config)
         workspaces = [item for item in detected["workspaces"] if item["stack"] == stack]
         if not workspaces:
             return {"error": "unsupported", "message": f"No {profile} Manifest detected", **detected, "selected_profiles": [profile]}
