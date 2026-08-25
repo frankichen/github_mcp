@@ -36,6 +36,7 @@ def test_rootless_command_does_not_use_env_host_or_forward_tokens(monkeypatch, t
             "CI_WORKER_TOKEN": "must-not-pass",
             "CI_COMMIT_SHA": "a" * 40,
             "CI_REPOSITORY_ROOT": "/repo",
+            "AI_INTEGRITY_CONTRACT_GATE_ATTESTED": "1",
         },
         network=False,
     )
@@ -47,6 +48,7 @@ def test_rootless_command_does_not_use_env_host_or_forward_tokens(monkeypatch, t
     assert all("TOKEN" not in item and "must-not-pass" not in item for item in command)
     assert "CI_COMMIT_SHA=" + "a" * 40 in command
     assert "CI_REPOSITORY_ROOT=/repo" in command
+    assert "AI_INTEGRITY_CONTRACT_GATE_ATTESTED=1" in command
     assert not any(item.startswith(("HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "http_proxy=", "https_proxy=", "all_proxy=")) for item in command)
     assert "127.0.0.1:10808" not in command
     assert "--network=none" in command

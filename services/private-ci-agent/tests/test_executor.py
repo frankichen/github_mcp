@@ -526,6 +526,100 @@ def test_repo_auto_plan_does_not_select_openapi_profile(tmp_path):
 import subprocess as sp_mod
 
 
+def _contract_test_git(repo, *args):
+    result = sp_mod.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=True
+    )
+    return result.stdout.strip()
+
+
+def _contract_test_commit(repo, message):
+    _contract_test_git(repo, "add", "-A")
+    sp_mod.run(
+        [
+            "git", "-C", str(repo),
+            "-c", "user.name=CI", "-c", "user.email=ci@example.invalid",
+            "commit", "-m", message,
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    return _contract_test_git(repo, "rev-parse", "HEAD")
+
+
+def _contract_test_repo(tmp_path, with_policy=False):
+    repo = tmp_path / "contract-repo"
+    repo.mkdir()
+    _contract_test_git(repo, "init")
+    if with_policy:
+        policy = repo / "docs" / "product-contracts" / "README.md"
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        policy.write_text("# Product contract integrity\n", encoding="utf-8")
+    return repo
+
+
+def test_trusted_contract_gate_blocks_frozen_history_mutation(tmp_path):
+    repo = _contract_test_repo(tmp_path)
+    requirement = repo / "P2P服务资源授权与就近分配需求.md"
+    requirement.write_text(
+        "# P2P\n状态：已确认，作为后续开发和验收的产品依据\nprovider_types required\n",
+        encoding="utf-8",
+    )
+    base = _contract_test_commit(repo, "base")
+    policy = repo / "docs" / "product-contracts" / "README.md"
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text("# Product contract integrity\n", encoding="utf-8")
+    requirement.write_text(
+        "# P2P\n状态：已确认，作为后续开发和验收的产品依据\nprovider_types ignored\n",
+        encoding="utf-8",
+    )
+    head = _contract_test_commit(repo, "mutate")
+
+    result = executor_module.verify_product_contract_integrity("frankichen/sxt", str(repo), base, head)
+
+    assert result["ok"] is False
+    assert any(item["code"] == "HISTORICAL_CONTRACT_MUTATION" for item in result["errors"])
+
+
+def test_trusted_contract_gate_allows_contract_only_revision(tmp_path):
+    repo = _contract_test_repo(tmp_path, with_policy=True)
+    base = _contract_test_commit(repo, "policy")
+    contract = repo / "docs" / "product-contracts" / "p2p" / "2026-08-25-r2-routing.md"
+    contract.parent.mkdir(parents=True, exist_ok=True)
+    contract.write_text(
+        "contract_id: p2p-routing\ncontract_revision: r2\ncontract_status: frozen\n"
+        "approved_source: wiki-133-journal-681\nsupersedes: r1\n",
+        encoding="utf-8",
+    )
+    head = _contract_test_commit(repo, "contract r2")
+
+    result = executor_module.verify_product_contract_integrity("frankichen/sxt", str(repo), base, head)
+
+    assert result["ok"] is True
+    assert result["new_contract_revisions"] == ["docs/product-contracts/p2p/2026-08-25-r2-routing.md"]
+
+
+def test_trusted_contract_gate_blocks_contract_and_implementation_mix(tmp_path):
+    repo = _contract_test_repo(tmp_path, with_policy=True)
+    base = _contract_test_commit(repo, "policy")
+    contract = repo / "docs" / "product-contracts" / "p2p" / "2026-08-25-r2-routing.md"
+    contract.parent.mkdir(parents=True, exist_ok=True)
+    contract.write_text(
+        "contract_id: p2p-routing\ncontract_revision: r2\ncontract_status: frozen\n"
+        "approved_source: wiki-133-journal-681\nsupersedes: r1\n",
+        encoding="utf-8",
+    )
+    runtime = repo / "internal" / "devicebind" / "service.go"
+    runtime.parent.mkdir(parents=True, exist_ok=True)
+    runtime.write_text("package devicebind\n", encoding="utf-8")
+    head = _contract_test_commit(repo, "mixed")
+
+    result = executor_module.verify_product_contract_integrity("frankichen/sxt", str(repo), base, head)
+
+    assert result["ok"] is False
+    assert any(item["code"] == "CONTRACT_AND_IMPLEMENTATION_MIXED" for item in result["errors"])
+
+
+
 class FakeFastCheckClient(FakeClient):
     """Records finish_job calls for fast-check tests."""
 
@@ -549,6 +643,9 @@ class FakeFastCheckClient(FakeClient):
 def make_fast_check_executor(subprocess_runner=None):
     """Build a JobExecutor with everything needed for _execute_fast_check."""
     class FastCheckPodman:
+        def __init__(self):
+            self.calls = []
+
         def image_available(self, _image, allow_pull=False):
             return not allow_pull
 
@@ -559,6 +656,7 @@ def make_fast_check_executor(subprocess_runner=None):
             return {"mode": "test"}
 
         def run_command(self, _image, _job_id, source_dir, _caches, _command, _timeout, **_kwargs):
+            self.calls.append(_kwargs)
             runner = subprocess_runner or sp_mod.run
             result = runner(
                 ["make", "-C", source_dir, "ai-integrity-check"],
@@ -609,6 +707,7 @@ def test_repo_fast_check_success(tmp_path, monkeypatch):
     )
 
     executor = make_fast_check_executor(_default_fast_check_subprocess)
+    setattr(job, "contract_integrity_attested", True)
 
     # Patch subprocess.run
     orig_run = sp_mod.run
@@ -636,6 +735,7 @@ def test_repo_fast_check_success(tmp_path, monkeypatch):
     integrity_step = next(s for s in steps if s["step_name"] == "repo-fast-check:ai-integrity")
     assert integrity_step["status"] == "passed"
     assert integrity_step["exit_code"] == 0
+    assert executor.podman.calls[-1]["env"]["AI_INTEGRITY_CONTRACT_GATE_ATTESTED"] == "1"
     # Verify env vars were set
     # (env is set via os.environ.copy() — hard to assert in unit test, but the code path ran)
 

@@ -604,6 +604,7 @@ class PodmanRunner:
             allowed = {
                 "DATABASE_URL", "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "RABBITMQ_URL",
                 "AI_INTEGRITY_BASE_SHA", "AI_INTEGRITY_REPORT", "AI_INTEGRITY_CHANGED_FILES",
+                "AI_INTEGRITY_CONTRACT_GATE_ATTESTED",
                 "CI_COMMIT_SHA", "CI_REPOSITORY_ROOT",
             }
             safe_env.update({key: value for key, value in env.items() if key in allowed})
