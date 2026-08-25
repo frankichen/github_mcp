@@ -11,6 +11,8 @@ _TEST_ENV = {
     "MAX_FILES_PER_COMMIT": "5",
     "IDEMPOTENCY_DB_PATH": "/tmp/github-action-service-tests-idempotency.db",
     "CI_DB_PATH": "/tmp/github-action-service-tests-ci.db",
+    "DEPLOYMENT_DB_PATH": "/tmp/github-action-service-tests-deployments.db",
+    "MYGITHUB12_DB_PATH": "/tmp/github-action-service-tests-mygithub12.db",
 }
 
 for _name, _value in _TEST_ENV.items():

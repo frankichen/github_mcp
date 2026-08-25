@@ -5,6 +5,7 @@ import pytest
 
 import private_ci_agent.executor as executor_module
 from private_ci_agent.executor import JobExecutor
+from private_ci_agent.environment_cache import DependencyEnvironmentCache
 from private_ci_agent.models import Job
 from private_ci_agent.podman import PodmanRunner
 from private_ci_agent.services import ServiceSetupError
@@ -220,6 +221,39 @@ def test_node_workspace_uses_persistent_npm_cache_and_controlled_setup_proxy(tmp
     assert result["passed"] is True
     assert all(caches == {"npm": str(cache)} for caches in podman.caches)
     assert podman.call_options[0]["pass_proxy"] is True
+
+
+def test_python_environment_cache_restores_across_job_checkout_roots(tmp_path):
+    sources = [tmp_path / "checkout-a", tmp_path / "checkout-b"]
+    for source in sources:
+        source.mkdir()
+        (source / "requirements.txt").write_text("pyyaml==6.0.2\n", encoding="utf-8")
+        package = source / "app"
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+
+    shared_cache = DependencyEnvironmentCache(str(tmp_path / "environment-cache"))
+    workspace = {"path": ".", "stack": "python"}
+    results = []
+    podmans = []
+    for index, source in enumerate(sources):
+        podman = FakePodman()
+        executor = make_executor(podman)
+        executor.environment_cache = shared_cache
+        job = Job(
+            job_id=f"python-cache-{index}", repository="owner/repo", branch="feature/x",
+            commit_sha="a" * 40, profile="repo-auto-check", timeout_seconds=30,
+            lease_token="lease", lease_expires_at="", source_dir=str(source),
+            workspace=str(tmp_path / f"job-{index}"),
+        )
+        results.append(executor._execute_workspace(job, workspace))
+        podmans.append(podman)
+
+    assert results[0]["environment_cache"]["published"] is True
+    assert results[1]["environment_cache"]["hit"] is True
+    assert results[1]["environment_cache"]["restored"] is True
+    assert len(podmans[0].commands) == len(podmans[1].commands) + 1
+    assert any(step["status"] == "restored" for step in results[1]["steps"])
 
 
 def test_vue_workspace_maps_shared_playwright_cache_without_node_modules(tmp_path, monkeypatch):
@@ -523,9 +557,6 @@ def test_repo_auto_plan_does_not_select_openapi_profile(tmp_path):
 # ---- repo-fast-check tests ----
 
 
-import subprocess as sp_mod
-
-
 class FakeFastCheckClient(FakeClient):
     """Records finish_job calls for fast-check tests."""
 
@@ -546,9 +577,12 @@ class FakeFastCheckClient(FakeClient):
         })
 
 
-def make_fast_check_executor(subprocess_runner=None):
+def make_fast_check_executor(exit_code=0):
     """Build a JobExecutor with everything needed for _execute_fast_check."""
     class FastCheckPodman:
+        def __init__(self):
+            self.calls = []
+
         def image_available(self, _image, allow_pull=False):
             return not allow_pull
 
@@ -558,18 +592,12 @@ def make_fast_check_executor(subprocess_runner=None):
         def resource_summary(self):
             return {"mode": "test"}
 
-        def run_command(self, _image, _job_id, source_dir, _caches, _command, _timeout, **_kwargs):
-            runner = subprocess_runner or sp_mod.run
-            result = runner(
-                ["make", "-C", source_dir, "ai-integrity-check"],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
+        def run_command(self, _image, _job_id, source_dir, _caches, command, _timeout, **kwargs):
+            self.calls.append({"source_dir": source_dir, "command": command, **kwargs})
             return {
-                "exit_code": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
+                "exit_code": exit_code,
+                "stdout": "All checks passed" if exit_code == 0 else "",
+                "stderr": "simulated failure" if exit_code else "",
                 "timed_out": False,
             }
 
@@ -582,20 +610,7 @@ def make_fast_check_executor(subprocess_runner=None):
     e.log_manager = FakeLogManager()
     e.client = FakeFastCheckClient()
     e.config = {}
-    if subprocess_runner is not None:
-        e._fast_check_subprocess = subprocess_runner
     return e
-
-
-def _default_fast_check_subprocess(cmd, **_kw):
-    """Simulate subprocess.run for fast-check: succeeds for standard tool checks."""
-    if isinstance(cmd, list) and cmd[0] == "which":
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-    if isinstance(cmd, list) and cmd[1:3] == ["-C", "cat-file"]:
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-    if isinstance(cmd, list) and "ai-integrity-check" in cmd:
-        return SimpleNamespace(returncode=0, stdout="All checks passed", stderr="")
-    return SimpleNamespace(returncode=0, stdout="", stderr="")
 
 
 def test_repo_fast_check_success(tmp_path, monkeypatch):
@@ -606,23 +621,10 @@ def test_repo_fast_check_success(tmp_path, monkeypatch):
         commit_sha="a" * 40, profile="repo-fast-check", timeout_seconds=60,
         lease_token="lt", lease_expires_at="", base_sha="b" * 40,
         changed_files=["main.go"], source_dir=str(tmp_path), workspace=str(tmp_path / "ws"),
+        contract_integrity_attested=True,
     )
 
-    executor = make_fast_check_executor(_default_fast_check_subprocess)
-
-    # Patch subprocess.run
-    orig_run = sp_mod.run
-
-    def fake_run(cmd, **kw):
-        if isinstance(cmd, list) and cmd[0] == "which":
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if isinstance(cmd, list) and len(cmd) >= 3 and cmd[1] == "-C" and cmd[2] == str(tmp_path) and "cat-file" in cmd:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if isinstance(cmd, list) and cmd[1:3] == ["-C", str(tmp_path)] and "ai-integrity-check" in cmd:
-            return SimpleNamespace(returncode=0, stdout="All checks passed", stderr="")
-        return orig_run(cmd, **kw)
-
-    monkeypatch.setattr(sp_mod, "run", fake_run)
+    executor = make_fast_check_executor()
     monkeypatch.setattr(os, "makedirs", lambda *a, **kw: None)
     monkeypatch.setattr(os.path, "isfile", lambda p: False)  # report not found (OK)
 
@@ -636,11 +638,15 @@ def test_repo_fast_check_success(tmp_path, monkeypatch):
     integrity_step = next(s for s in steps if s["step_name"] == "repo-fast-check:ai-integrity")
     assert integrity_step["status"] == "passed"
     assert integrity_step["exit_code"] == 0
-    # Verify env vars were set
-    # (env is set via os.environ.copy() — hard to assert in unit test, but the code path ran)
+    call = executor.podman.calls[-1]
+    assert call["network"] is False
+    assert call["pass_proxy"] is False
+    assert call["source_read_only"] is True
+    assert "make -n ai-integrity-check" in call["command"]
+    assert call["env"]["AI_INTEGRITY_CONTRACT_GATE_ATTESTED"] == "1"
 
 
-def test_repo_fast_check_missing_make(tmp_path, monkeypatch):
+def test_repo_fast_check_missing_make(tmp_path):
     """fast-check with make not installed → configuration_error."""
     job = Job(
         job_id="fast-2", repository="frankichen/sxt", branch="feature/x",
@@ -649,23 +655,16 @@ def test_repo_fast_check_missing_make(tmp_path, monkeypatch):
         source_dir=str(tmp_path), workspace=str(tmp_path / "ws"),
     )
 
-    executor = make_fast_check_executor()
-
-    def fake_run(cmd, **kw):
-        if isinstance(cmd, list) and cmd[0] == "which" and cmd[1] == "make":
-            return SimpleNamespace(returncode=1, stdout="", stderr="make not found")
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(sp_mod, "run", fake_run)
+    executor = make_fast_check_executor(exit_code=127)
 
     summary = executor._execute_fast_check(job)
 
     assert summary["status"] == "failed"
-    assert summary["exit_code"] == 2
+    assert summary["exit_code"] == 127
     assert summary["error_code"] == "FAST_CHECK_MAKE_MISSING"
 
 
-def test_repo_fast_check_entrypoint_missing(tmp_path, monkeypatch):
+def test_repo_fast_check_entrypoint_missing(tmp_path):
     """fast-check when make ai-integrity-check target doesn't exist."""
     job = Job(
         job_id="fast-3", repository="frankichen/sxt", branch="feature/x",
@@ -674,22 +673,30 @@ def test_repo_fast_check_entrypoint_missing(tmp_path, monkeypatch):
         source_dir=str(tmp_path), workspace=str(tmp_path / "ws"),
     )
 
-    executor = make_fast_check_executor()
-
-    def fake_run(cmd, **kw):
-        if isinstance(cmd, list) and cmd[0] == "which":
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if isinstance(cmd, list) and "ai-integrity-check" in cmd and "-n" in cmd:
-            return SimpleNamespace(returncode=2, stdout="", stderr="No rule to make target")
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(sp_mod, "run", fake_run)
+    executor = make_fast_check_executor(exit_code=42)
 
     summary = executor._execute_fast_check(job)
 
     assert summary["status"] == "failed"
-    assert summary["exit_code"] == 2
+    assert summary["exit_code"] == 42
     assert summary["error_code"] == "FAST_CHECK_ENTRYPOINT_MISSING"
+
+
+def test_repo_fast_check_requires_immutable_image_identity(tmp_path):
+    job = Job(
+        job_id="fast-image", repository="frankichen/sxt", branch="feature/x",
+        commit_sha="a" * 40, profile="repo-fast-check", timeout_seconds=60,
+        lease_token="lt", lease_expires_at="", source_dir=str(tmp_path),
+        workspace=str(tmp_path / "ws"),
+    )
+    executor = make_fast_check_executor()
+    executor.podman.image_digest = lambda _image: None
+
+    summary = executor._execute_fast_check(job)
+
+    assert summary["status"] == "failed"
+    assert summary["error_code"] == "FAST_CHECK_IMAGE_IDENTITY_UNAVAILABLE"
+    assert executor.podman.calls == []
 
 
 def test_repo_fast_check_integrity_failure(tmp_path, monkeypatch):
@@ -702,18 +709,7 @@ def test_repo_fast_check_integrity_failure(tmp_path, monkeypatch):
         changed_files=["bad.go"], source_dir=str(tmp_path), workspace=str(tmp_path / "ws"),
     )
 
-    executor = make_fast_check_executor()
-
-    def fake_run(cmd, **kw):
-        if isinstance(cmd, list) and cmd[0] == "which":
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if isinstance(cmd, list) and len(cmd) >= 3 and cmd[1] == "-C" and "cat-file" in cmd:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if isinstance(cmd, list) and cmd[1:3] == ["-C", str(tmp_path)] and "ai-integrity-check" in cmd and "-n" not in cmd:
-            return SimpleNamespace(returncode=1, stdout="FAIL: .only found in test", stderr="")
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(sp_mod, "run", fake_run)
+    executor = make_fast_check_executor(exit_code=1)
     monkeypatch.setattr(os, "makedirs", lambda *a, **kw: None)
     monkeypatch.setattr(os.path, "isfile", lambda p: False)
 
@@ -735,17 +731,6 @@ def test_fast_check_worker_idle_after_job(tmp_path, monkeypatch):
     )
 
     executor = make_fast_check_executor()
-
-    def fake_run(cmd, **kw):
-        if isinstance(cmd, list) and cmd[0] == "which":
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if isinstance(cmd, list) and len(cmd) >= 3 and cmd[1] == "-C" and "cat-file" in cmd:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if isinstance(cmd, list) and "ai-integrity-check" in cmd and "-n" not in cmd:
-            return SimpleNamespace(returncode=0, stdout="All checks passed", stderr="")
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(sp_mod, "run", fake_run)
     monkeypatch.setattr(os, "makedirs", lambda *a, **kw: None)
     monkeypatch.setattr(os.path, "isfile", lambda p: False)
 
@@ -754,6 +739,34 @@ def test_fast_check_worker_idle_after_job(tmp_path, monkeypatch):
     assert summary["status"] == "passed"
     # finish_job was called by execute() (not _execute_fast_check itself)
     # The caller (execute) calls client.finish_job()
+
+
+def test_repo_fast_check_never_parses_malicious_makefile_on_host(tmp_path, monkeypatch):
+    marker = tmp_path / "host-evaluated"
+    (tmp_path / "Makefile").write_text(
+        f"X := $(shell touch {marker})\nai-integrity-check:\n\t@true\n",
+        encoding="utf-8",
+    )
+    job = Job(
+        job_id="fast-security", repository="example/repo", branch="feature/x",
+        commit_sha="a" * 40, profile="repo-fast-check", timeout_seconds=60,
+        lease_token="lt", lease_expires_at="", base_sha="b" * 40,
+        source_dir=str(tmp_path), workspace=str(tmp_path / "ws"),
+    )
+
+    def reject_host_make(command, **_kwargs):
+        if isinstance(command, list) and command and command[0] in {"make", "which"}:
+            raise AssertionError("repository Makefile evaluated on host")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(executor_module.subprocess, "run", reject_host_make)
+    executor = make_fast_check_executor()
+
+    summary = executor._execute_fast_check(job)
+
+    assert summary["status"] == "passed"
+    assert not marker.exists()
+    assert executor.podman.calls[-1]["source_read_only"] is True
 
 
 def test_generic_go_profile_does_not_inherit_repository_hooks():

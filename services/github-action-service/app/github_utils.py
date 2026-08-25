@@ -2060,6 +2060,8 @@ def search_github_pull_request_history(
 
             created = pr.created_at
             updated = pr.updated_at
+            merged_dt = None
+            closed_dt = None
 
             def _safe_merged_at():
                 try:
@@ -2242,6 +2244,7 @@ def list_github_issue_history(
 
             author_login = issue.user.login if issue.user else None
             matched = []
+            closed_dt = None
 
             if activity in ("all", "authored"):
                 if author_login == login:
@@ -2262,7 +2265,7 @@ def list_github_issue_history(
                         closed_dt = issue.closed_at
                     except Exception:
                         pass
-                    if (not since_dt or closed_dt >= since_dt) and \
+                    if closed_dt and (not since_dt or closed_dt >= since_dt) and \
                        (not until_dt or closed_dt <= until_dt):
                         matched.append("closed")
 
@@ -2654,6 +2657,27 @@ def get_github_development_history(
 
     timings["total"] = _perf_time.time() - total_start
     result["timings"] = timings
+    if not include_details:
+        compact_specs = {
+            "commits": ("sha", "repository", "message", "authored_at", "committed_at"),
+            "pull_requests": ("repository", "pull_number", "title", "state", "draft", "head_branch", "head_sha", "base_branch", "updated_at", "matched_activities"),
+            "reviews": ("repository", "pull_number", "review_id", "state", "submitted_at"),
+            "issues": ("repository", "issue_number", "title", "state", "updated_at", "matched_activities"),
+            "github_actions": ("repository", "run_id", "name", "status", "conclusion", "head_sha", "created_at", "updated_at"),
+            "private_ci": ("job_id", "repository", "branch", "commit_sha", "base_sha", "profile", "status", "exit_code", "created_at", "started_at", "finished_at", "duration_seconds"),
+            "open_work": ("repository", "branch", "head_sha", "pull_number", "title", "state", "draft", "updated_at"),
+        }
+        for section, keys in compact_specs.items():
+            items = result.get(section, []) or []
+            total = len(items)
+            # A compact history request is a decision surface, not a log dump.
+            # Keep the full payload available through normal detailed mode.
+            result[section] = [
+                {key: item.get(key) for key in keys if key in item}
+                for item in items[:25] if isinstance(item, dict)
+            ]
+            result[f"{section}_total"] = total
+            result[f"{section}_truncated"] = total > len(result[section])
     return {"ok": True, **result}
 
 

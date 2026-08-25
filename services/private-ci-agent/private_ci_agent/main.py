@@ -182,6 +182,13 @@ def main():
                             lease_expires_at=result["lease_expires_at"],
                             base_sha=result.get("base_sha", ""),
                             changed_files=result.get("changed_files", []),
+                            changed_files_total=int(
+                                result.get("changed_files_total")
+                                or len(result.get("changed_files", []))
+                            ),
+                            changed_files_truncated=bool(
+                                result.get("changed_files_truncated")
+                            ),
                         )
                         _current_job_id = job.job_id
                         _current_lease_token = job.lease_token

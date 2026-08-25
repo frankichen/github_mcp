@@ -34,6 +34,7 @@ from app import attestation_registry
 from app.version import runtime_build_sha
 from app.observability import current_request_id
 from app.mygithub12_mcp import register_mygithub12_tools
+from app.mygithub12_dx_mcp import register_dx_tools
 from app.mcp_response import (
     MAX_RESPONSE_RESOURCE_CHUNK_BYTES,
     StructuredFastMCP,
@@ -1337,6 +1338,10 @@ mcp.tool(
     name="read_mcp_response_resource",
     description="Read one bounded UTF-8 chunk from an oversized MCP response resource with SHA and continuation metadata.",
 )(read_mcp_response_resource)
+
+# Stable DX-1 high-level orchestration surface. Keep registration after the
+# pre-12.1 tool set so manifest ordering remains backward compatible.
+register_dx_tools(mcp, _github_call, _service, _finalize_durable_write)
 
 
 # ========================================================================

@@ -16,6 +16,9 @@ class Job:
     lease_expires_at: str
     base_sha: str = ""
     changed_files: list[str] = field(default_factory=list)
+    changed_files_total: int = 0
+    changed_files_truncated: bool = False
+    contract_integrity_attested: bool = False
     workspace: str = ""
     source_dir: str = ""
     status: str = "leased"

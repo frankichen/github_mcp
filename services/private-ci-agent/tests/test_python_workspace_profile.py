@@ -217,14 +217,68 @@ def test_python_venv_is_scoped_by_workspace_identity(tmp_path):
     _mkdir_package(first_root, "app")
     _mkdir_package(second_root, "app")
 
-    first = python_commands_for_workspace(str(first_root))
-    second = python_commands_for_workspace(str(second_root))
+    first = python_commands_for_workspace(
+        str(first_root), repository="owner/repo", logical_workspace="services/a"
+    )
+    second = python_commands_for_workspace(
+        str(second_root), repository="owner/repo", logical_workspace="services/b"
+    )
 
     assert first["workspace_key"] != second["workspace_key"]
     assert f"/ci-venv/{first['workspace_key']}/bin/python" in first["check"][0]["command"]
     assert f"/ci-venv/{second['workspace_key']}/bin/python" in second["check"][0]["command"]
     assert "PIP_CACHE_DIR=/ci-venv/" not in first["setup"][0]["command"]
     assert "--retries 6 --timeout 60 install --no-input --quiet" in first["setup"][0]["command"]
+
+
+def test_python_venv_identity_is_stable_across_checkout_roots(tmp_path):
+    roots = [tmp_path / "job-a" / "service", tmp_path / "job-b" / "service"]
+    for root in roots:
+        root.mkdir(parents=True)
+        (root / "requirements.txt").write_text("pyyaml==6.0.2\n", encoding="utf-8")
+        _mkdir_package(root, "app")
+
+    first = python_commands_for_workspace(
+        str(roots[0]), repository="owner/repo", logical_workspace="services/api"
+    )
+    second = python_commands_for_workspace(
+        str(roots[1]), repository="owner/repo", logical_workspace="services/api"
+    )
+
+    assert first["workspace_key"] == second["workspace_key"]
+    assert first["manifest_sha256"] == second["manifest_sha256"]
+
+
+def test_python_venv_identity_isolates_repository_profile_and_manifest(tmp_path):
+    root = tmp_path / "service"
+    root.mkdir()
+    manifest = root / "requirements.txt"
+    manifest.write_text("pyyaml==6.0.2\n", encoding="utf-8")
+    _mkdir_package(root, "app")
+
+    baseline = python_commands_for_workspace(
+        str(root), repository="owner/repo-a", logical_workspace="services/api"
+    )
+    other_repository = python_commands_for_workspace(
+        str(root), repository="owner/repo-b", logical_workspace="services/api"
+    )
+    other_profile = python_commands_for_workspace(
+        str(root), repository="owner/repo-a", logical_workspace="services/api",
+        profile="repo-auto-check",
+    )
+    manifest.write_text("pyyaml==6.0.3\n", encoding="utf-8")
+    changed_manifest = python_commands_for_workspace(
+        str(root), repository="owner/repo-a", logical_workspace="services/api"
+    )
+
+    assert len(
+        {
+            baseline["workspace_key"],
+            other_repository["workspace_key"],
+            other_profile["workspace_key"],
+            changed_manifest["workspace_key"],
+        }
+    ) == 4
 
 
 class Completed:

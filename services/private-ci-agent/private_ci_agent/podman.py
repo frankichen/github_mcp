@@ -535,6 +535,7 @@ class PodmanRunner:
         pass_proxy: bool = False,
         extra_mounts: list[str] | None = None,
         cancel_event: threading.Event | None = None,
+        source_read_only: bool = False,
     ) -> dict:
         """Run one command with explicit network and proxy boundaries."""
         container_name = self._container_name(job_id, source_dir)
@@ -560,7 +561,7 @@ class PodmanRunner:
             "--tmpfs=/tmp:rw,noexec,nosuid,size=256m",
             "--tmpfs=/run:rw,noexec,nosuid,size=64m",
             "--tmpfs=/data:rw,noexec,nosuid,size=64m",
-            "-v", f"{source_dir}:/workspace:Z",
+            "-v", f"{source_dir}:/workspace:{'ro,' if source_read_only else ''}Z",
             "-v", f"{project_root}:/repo:ro",
             "--workdir", "/workspace",
         ] + net_arg + cache_mounts
@@ -604,6 +605,7 @@ class PodmanRunner:
             allowed = {
                 "DATABASE_URL", "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "RABBITMQ_URL",
                 "AI_INTEGRITY_BASE_SHA", "AI_INTEGRITY_REPORT", "AI_INTEGRITY_CHANGED_FILES",
+                "AI_INTEGRITY_CONTRACT_GATE_ATTESTED",
                 "CI_COMMIT_SHA", "CI_REPOSITORY_ROOT",
             }
             safe_env.update({key: value for key, value in env.items() if key in allowed})

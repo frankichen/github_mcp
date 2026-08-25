@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = os.environ.get("CI_REPOS_CONFIG_PATH", "/app/config/ci_repositories.yml")
 _DEFAULT_AUTO_PROFILES = [
-    "repo-auto-check", "python-check", "go-check", "node-check",
+    "repo-auto-check", "repo-fast-check", "python-check", "go-check", "node-check",
     "rust-check", "maven-check", "gradle-check", "dotnet-check",
 ]
 _DEFAULT_AUTO_MERGE_POLICY = {
@@ -258,3 +258,64 @@ def is_self_deploy_enabled(repository: str) -> bool:
         and deployment.get("enabled", False)
         and deployment.get("self_deploy", False)
     )
+
+_CONTROLLER_KNOWN_PROFILES = {
+    "repo-auto-check", "repo-fast-check", "python-check", "go-check", "node-check",
+    "rust-check", "maven-check", "gradle-check", "dotnet-check", "openapi-check",
+}
+
+
+def validate_profile_discovery(repository: str = "") -> dict:
+    """Validate controller policy/profile discovery without inventing repository policy.
+
+    A repository-specific check is strict only when that repository actually has
+    an explicit or auto-enrolled CI policy.  The global startup check validates
+    the configured union.  Empty/minimal test configurations are valid and are
+    reported as skipped instead of being mistaken for production drift.
+    """
+    if repository:
+        source = get_repository_policy_source(repository)
+        if source == "none":
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "repository_not_configured",
+                "repository": repository,
+                "policy_source": source,
+                "allowed_profiles": [],
+                "unknown_profiles": [],
+                "required_profiles_missing": [],
+            }
+        allowed = set(get_allowed_profiles(repository))
+        unknown = sorted(allowed - _CONTROLLER_KNOWN_PROFILES)
+        missing_fast = "repo-fast-check" not in allowed
+        return {
+            "ok": not unknown and not missing_fast,
+            "skipped": False,
+            "repository": repository,
+            "policy_source": source,
+            "allowed_profiles": sorted(allowed),
+            "unknown_profiles": unknown,
+            "required_profiles_missing": ["repo-fast-check"] if missing_fast else [],
+        }
+
+    allowed = set(get_allowed_profiles())
+    if not allowed:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "no_ci_profiles_configured",
+            "repository": None,
+            "allowed_profiles": [],
+            "unknown_profiles": [],
+            "required_profiles_missing": [],
+        }
+    unknown = sorted(allowed - _CONTROLLER_KNOWN_PROFILES)
+    return {
+        "ok": not unknown,
+        "skipped": False,
+        "repository": None,
+        "allowed_profiles": sorted(allowed),
+        "unknown_profiles": unknown,
+        "required_profiles_missing": [],
+    }

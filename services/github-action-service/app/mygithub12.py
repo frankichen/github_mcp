@@ -75,14 +75,41 @@ def _db_path() -> str:
     return os.path.join(os.path.dirname(legacy) or "/data", "mygithub12.db")
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """Commit/rollback like sqlite3.Connection, then always release the handle."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def _db() -> sqlite3.Connection:
     path = _db_path()
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    db = sqlite3.connect(path, timeout=30)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA busy_timeout=30000")
-    return db
+    parent = os.path.dirname(path) or "."
+    last_error: sqlite3.OperationalError | None = None
+    for attempt in range(2):
+        os.makedirs(parent, exist_ok=True)
+        db: sqlite3.Connection | None = None
+        try:
+            db = sqlite3.connect(path, timeout=30, factory=_ClosingConnection)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA busy_timeout=30000")
+            return db
+        except sqlite3.OperationalError as exc:
+            if db is not None:
+                db.close()
+            last_error = exc
+            if attempt or "unable to open database file" not in str(exc).lower():
+                raise
+            # A restart/test cleanup may remove the SQLite parent between the
+            # directory check and WAL initialization. Recreate it once and
+            # retry; persistent permission/path errors still fail closed.
+            os.makedirs(parent, exist_ok=True)
+    assert last_error is not None
+    raise last_error
 
 
 def init_db() -> None:
@@ -1081,19 +1108,39 @@ def get_files_batch(service: Any, repository: str, commit_sha: str, paths_json: 
     paths=_parse(paths_json,list,"paths_json",[])
     if not paths or len(paths)>MAX_BATCH_FILES: raise MyGithub12Error("BATCH_FILE_LIMIT_EXCEEDED","invalid batch path count",{"max_files":MAX_BATCH_FILES})
     identity=resolve_identity(service,repository,commit_sha=commit_sha); repo=_service_repo(service,repository); used=0; items=[]; max_total_bytes=max(1,min(max_total_bytes,MAX_BATCH_BYTES))
+    mirror_setting=os.getenv("MYGITHUB12_MIRROR_READS_ENABLED","").strip().lower()
+    mirror_enabled=mirror_setting in {"1","true","yes","on"}
+    mirror_fallbacks=0
     for raw in paths:
         path=_safe_path(str(raw))
+        read_source="github_api"; mirror_generation=None; mirror_error_code=None
         try:
-            e=repo.get_contents(path,ref=commit_sha)
-            if isinstance(e,list): raise ValueError("path is a directory")
-            data=bytes(e.decoded_content)
+            data=None; blob_sha=None
+            if mirror_enabled:
+                try:
+                    from app.local_git_mirror import read_blob
+                    data,mirror_evidence=read_blob(repository,commit_sha,path)
+                    blob_sha=mirror_evidence["blob_sha"]
+                    mirror_generation=mirror_evidence.get("mirror_generation")
+                    read_source="mirror"
+                except (MyGithub12Error, OSError) as mirror_exc:
+                    mirror_fallbacks+=1
+                    mirror_error_code=getattr(mirror_exc,"code","MIRROR_UNAVAILABLE")
+                    data=None
+            if data is None:
+                e=repo.get_contents(path,ref=commit_sha)
+                if isinstance(e,list): raise ValueError("path is a directory")
+                data=bytes(e.decoded_content); blob_sha=e.sha
             if used+len(data)>max_total_bytes: items.append({"path":path,"ok":False,"error_code":"BATCH_TOTAL_BYTES_EXCEEDED"}); continue
             used+=len(data)
             try: text=data.decode(); binary=False
             except UnicodeDecodeError: text=""; binary=True
-            items.append({"path":path,"ok":True,"blob_sha":e.sha,"size_bytes":len(data),"content_sha256":hashlib.sha256(data).hexdigest(),"binary":binary,"content":text if include_content and not binary else None,"truncated":False})
-        except Exception as exc: items.append({"path":path,"ok":False,"error_code":"FILE_NOT_FOUND","message":str(exc)[:300]})
-    return {"ok":True,**identity,"items":items,"total_bytes":used}
+            item={"path":path,"ok":True,"blob_sha":blob_sha,"size_bytes":len(data),"content_sha256":hashlib.sha256(data).hexdigest(),"binary":binary,"content":text if include_content and not binary else None,"truncated":False,"read_source":read_source}
+            if mirror_generation: item["mirror_generation"]=mirror_generation
+            if mirror_error_code: item["mirror_fallback_error_code"]=mirror_error_code
+            items.append(item)
+        except Exception as exc: items.append({"path":path,"ok":False,"error_code":"FILE_NOT_FOUND","message":str(exc)[:300],"read_source":read_source})
+    return {"ok":True,**identity,"items":items,"total_bytes":used,"mirror_enabled":mirror_enabled,"mirror_fallbacks":mirror_fallbacks}
 
 
 def _file_rows(repository: str, commit_sha: str, globs: list[str] | None=None) -> list[sqlite3.Row]:
@@ -1404,14 +1451,30 @@ def change_context_pack(service: Any, repository: str, base_commit_sha: str, hea
 
 def analyze_patch(service: Any, repository: str, base_commit_sha: str, patch: str) -> dict[str,Any]:
     resolve_identity(service,repository,commit_sha=base_commit_sha)
-    if not patch or len(patch.encode())>262144: raise MyGithub12Error("PATCH_ANALYSIS_INVALID","patch is empty or too large")
-    paths=re.findall(r"(?m)^\+\+\+ (?:b/)?(.+)$",patch); paths=[p for p in paths if p!="/dev/null"]
+    if not patch or len(patch.encode())>262144:
+        raise MyGithub12Error("PATCH_ANALYSIS_INVALID","patch is empty or too large")
+    # Reuse the same strict parser that apply_github_patch uses. This keeps the
+    # read-only analysis path useful as a production parser smoke without
+    # relaxing write-side validation or creating a second parser state machine.
+    from app import mygithub10
+    try:
+        parsed, parser_metadata = mygithub10._parse_patch_details(patch)
+    except mygithub10.MyGithub10Error as exc:
+        raise MyGithub12Error(exc.code, exc.message, exc.details) from exc
+    paths=[path for path, _, _ in parsed]
     tests=affected_tests(service,repository,base_commit_sha,paths_json=json.dumps(paths),patch=patch); contract_candidates=[]
     for p in paths:
         lp=p.lower()
         if "migration" in lp or lp.endswith(".sql"): contract_candidates.append({"path":p,"kind":"database","classification":"unknown"})
         elif "openapi" in lp or "swagger" in lp: contract_candidates.append({"path":p,"kind":"api","classification":"unknown"})
-    return {"ok":True,"repository":repository,"base_commit_sha":base_commit_sha,"applicable":"unknown","changed_paths":paths,"affected_tests":tests["tests"],"contract_changes":contract_candidates,"diagnostics":[],"authoritative":False}
+    return {
+        "ok":True,"repository":repository,"base_commit_sha":base_commit_sha,"applicable":"unknown",
+        "changed_paths":paths,"parsed_files":len(parsed),
+        "file_patches":[{"path":path,"operation":operation,"hunk_count":len(hunks)} for path,operation,hunks in parsed],
+        "patch_normalized":parser_metadata.get("patch_normalized",False),
+        "normalization_warnings":parser_metadata.get("normalization_warnings",[]),
+        "affected_tests":tests["tests"],"contract_changes":contract_candidates,"diagnostics":[],"authoritative":False,
+    }
 
 
 
