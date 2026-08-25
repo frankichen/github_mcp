@@ -113,6 +113,20 @@ def test_operator_workspace_controls_are_preserved_only_for_configured_workspace
     assert "hooks" not in automatic
 
 
+def test_operator_workspace_allowlist_is_authoritative(tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    gradle = tmp_path / "tools" / "android-tester"
+    gradle.mkdir(parents=True)
+    (gradle / "build.gradle").write_text("plugins {}\n", encoding="utf-8")
+
+    result = discover_workspaces(
+        str(tmp_path), {"workspaces": [{"path": ".", "type": "go"}]}
+    )
+
+    assert result["detected_stacks"] == ["go"]
+    assert result["workspaces"] == [{"path": ".", "stack": "go"}]
+
+
 @pytest.mark.parametrize(
     ("field", "value", "fragment"),
     [

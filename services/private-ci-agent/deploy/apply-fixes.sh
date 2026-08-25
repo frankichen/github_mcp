@@ -72,6 +72,13 @@ for src in "${REPO_ROOT}/services/private-ci-agent/private_ci_agent/"*.py; do
     log "  updated ${f}"
 done
 
+# 同步受审的 repository workspace allowlist。该文件只包含非敏感 CI 配置，
+# Worker 以 /etc/private-ci/repositories.yml 作为本地权威覆盖。
+REPOSITORY_OVERRIDES="${REPO_ROOT}/services/private-ci-agent/deploy/repositories.yml"
+[ -f "${REPOSITORY_OVERRIDES}" ] || die "private CI repository overrides are missing"
+install -o root -g root -m 644 "${REPOSITORY_OVERRIDES}" /etc/private-ci/repositories.yml
+log "  updated /etc/private-ci/repositories.yml"
+
 # 同步 Worker 启动、预检和部署辅助脚本
 install -o nobody -g nogroup -m 755 \
     "${REPO_ROOT}/services/private-ci-agent/run-agent-with-proxy.sh" \

@@ -124,6 +124,9 @@ def test_apply_fixes_syncs_entire_runtime_package():
     assert 'private_ci_agent/"*.py' in script
     assert 'f="$(basename "${src}")"' in script
     assert "for f in config.py executor.py" not in script
+    assert 'deploy/repositories.yml"' in script
+    assert "/etc/private-ci/repositories.yml" in script
+    assert "install -o root -g root -m 644" in script
 
 
 def test_playwright_cache_maintenance_is_pinned_and_not_a_job_step():
