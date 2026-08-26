@@ -115,14 +115,38 @@ def test_auto_enrollment_respects_global_github_repository_policy(tmp_path, monk
     assert repo_policy.is_private_ci_enabled("frankichen/not-allowed") is False
 
 
-def test_github_mcp_auto_enrollment_does_not_allow_deployment(tmp_path, monkeypatch):
-    _configure_policy(tmp_path, monkeypatch)
+def test_github_mcp_explicit_infrastructure_deploy_contract(tmp_path, monkeypatch):
+    _configure_policy(
+        tmp_path,
+        monkeypatch,
+        repositories={
+            "frankichen/github_mcp": {
+                "enabled": True,
+                "private_ci": True,
+                "auto_detect": True,
+                "allowed_profiles": ["repo-auto-check", "repo-fast-check", "python-check"],
+                "max_timeout_seconds": 900,
+                "infrastructure_deployment": {
+                    "enabled": True,
+                    "environment": "mygithub12-production",
+                    "scope": "control-plane",
+                    "private_ci": True,
+                    "profile": "repo-auto-check",
+                    "executor_id": "mygithub12-infrastructure-deploy-01",
+                    "heartbeat_ttl_seconds": 30,
+                },
+            }
+        },
+    )
 
     repository = "frankichen/github_mcp"
-    assert repo_policy.get_repository_policy_source(repository) == "auto"
+    assert repo_policy.get_repository_policy_source(repository) == "explicit"
     assert repo_policy.is_private_ci_enabled(repository) is True
     assert repo_policy.is_test_deploy_enabled(repository) is False
-    assert repo_policy.is_self_deploy_enabled(repository) is False
+    assert repo_policy.is_infrastructure_deploy_enabled(repository) is True
+    assert repo_policy.is_self_deploy_enabled(repository) is True
+    assert repo_policy.get_deployment_config(repository) == {}
+    assert repo_policy.get_infrastructure_deployment_config(repository)["scope"] == "control-plane"
 
 
 @pytest.mark.asyncio
