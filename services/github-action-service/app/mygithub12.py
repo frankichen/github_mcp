@@ -1232,12 +1232,38 @@ def plan_private_ci_job(service: Any, repository: str, commit_sha: str, profile:
         return {**base_result, "applicable": True, "reason": "applicable", "selected_profiles": [requested_profile], "required_paths": required_paths}
 
     requested_stack = requested_profile.removesuffix("-check")
-    matching = [workspace for workspace in workspaces if workspace["stack"] == requested_stack]
+    if requested_profile == "node-check" and configured:
+        explicit_detected_stacks = detected_stacks
+        matching = [workspace for workspace in workspaces if workspace["stack"] == requested_stack]
+    else:
+        root_files = direct_files(".")
+        matching: list[dict[str,Any]] = []
+        if requested_stack == "go" and "go.mod" in root_files:
+            matching.append({"path": ".", "stack": "go"})
+        elif requested_stack == "node" and "package.json" in root_files:
+            managers = sorted({manager for filename, manager in lock_files.items() if filename in root_files})
+            workspace: dict[str,Any] = {"path": ".", "stack": "node", "package_manager": managers[0] if len(managers) == 1 else None}
+            if len(managers) != 1:
+                workspace["configuration_error"] = "supported_lock_file_missing" if not managers else "multiple_supported_lock_files"
+            matching.append(workspace)
+        elif requested_stack == "python" and root_files.intersection(python_manifests):
+            matching.append({"path": ".", "stack": "python"})
+        elif requested_stack == "rust" and "Cargo.toml" in root_files:
+            matching.append({"path": ".", "stack": "rust"})
+        elif requested_stack == "maven" and "pom.xml" in root_files:
+            matching.append({"path": ".", "stack": "maven"})
+        elif requested_stack == "gradle" and ({"build.gradle", "build.gradle.kts"} & root_files):
+            matching.append({"path": ".", "stack": "gradle"})
+        elif requested_stack == "dotnet" and any(name.endswith((".sln", ".csproj", ".fsproj")) for name in root_files):
+            matching.append({"path": ".", "stack": "dotnet"})
+        explicit_detected_stacks = [requested_stack] if matching else []
+
+    explicit_result = {**base_result, "detected_stacks": explicit_detected_stacks, "workspaces": matching}
     if not matching:
-        return {**base_result, "workspaces": [], "reason": f"no_{requested_stack}_manifest"}
+        return {**explicit_result, "reason": f"no_{requested_stack}_manifest"}
     if any(workspace.get("configuration_error") for workspace in matching):
-        return {**base_result, "workspaces": matching, "reason": "workspace_configuration_error"}
-    return {**base_result, "workspaces": matching, "applicable": True, "reason": "applicable", "selected_profiles": [requested_profile]}
+        return {**explicit_result, "reason": "workspace_configuration_error"}
+    return {**explicit_result, "applicable": True, "reason": "applicable", "selected_profiles": [requested_profile]}
 
 
 def list_repository_tree(service: Any, repository: str, commit_sha: str, path: str="", max_depth: int=5, include_globs_json: str="[]", exclude_globs_json: str="[]", limit: int=500, cursor: str="") -> dict[str,Any]:

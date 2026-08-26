@@ -1075,24 +1075,26 @@ def _configure_ci_plan(monkeypatch, paths, allowed_profiles, repository_config=N
 def test_private_ci_plan_auto_selects_only_detected_manifest_stacks(monkeypatch):
     _configure_ci_plan(
         monkeypatch,
-        ["go.mod", "h5/app/package.json", "h5/app/package-lock.json"],
+        ["go.mod", "h5/app/package.json", "h5/app/package-lock.json", "services/github-action-service/requirements.txt"],
         ["repo-auto-check", "go-check", "node-check", "python-check"],
     )
     result = mygithub12.plan_private_ci_job(_CIPlanService(), "o/r", "a" * 40, "repo-auto-check")
     assert result["applicable"] is True
-    assert result["detected_stacks"] == ["go", "node"]
-    assert result["selected_profiles"] == ["go-check", "node-check"]
+    assert result["detected_stacks"] == ["go", "node", "python"]
+    assert result["selected_profiles"] == ["go-check", "node-check", "python-check"]
     assert result["workspaces"] == [
         {"path": ".", "stack": "go"},
         {"path": "h5/app", "stack": "node", "package_manager": "npm"},
+        {"path": "services/github-action-service", "stack": "python"},
     ]
 
 
-def test_private_ci_plan_rejects_python_profile_without_python_manifest(monkeypatch):
-    _configure_ci_plan(monkeypatch, ["go.mod"], ["python-check"])
+def test_private_ci_plan_explicit_python_matches_worker_root_only_semantics(monkeypatch):
+    _configure_ci_plan(monkeypatch, ["services/github-action-service/requirements.txt"], ["python-check"])
     result = mygithub12.plan_private_ci_job(_CIPlanService(), "o/r", "a" * 40, "python-check")
     assert result["applicable"] is False
     assert result["reason"] == "no_python_manifest"
+    assert result["detected_stacks"] == []
     assert result["workspaces"] == []
 
 
