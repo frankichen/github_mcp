@@ -49,11 +49,12 @@ class TestMCPTools:
         assert middleware._validate_origin("https://evil.example") is False
 
     @pytest.mark.asyncio
-    async def test_mygithub10_schema_and_gofmt_contract(self):
+    async def test_mygithub10_schema_and_gofmt_contract(self, monkeypatch):
         from app.mcp_server import mcp
 
+        monkeypatch.setenv("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", "true")
         tools = {tool.name: tool for tool in await mcp.list_tools()}
-        for name in ("build_github_patch", "replace_github_text_once", "edit_github_file_ranges", "apply_github_patch", "get_mygithub_capabilities"):
+        for name in ("build_github_patch", "replace_github_text_once", "edit_github_file_ranges", "apply_github_patch", "get_mygithub_capabilities", "plan_private_ci_job"):
             assert name in tools
         assert "expected_blob_sha" in tools["edit_github_file_ranges"].description
         assert "expected_old_text" in tools["edit_github_file_ranges"].description
@@ -81,10 +82,17 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.1.3"
-        assert capabilities["tool_count"] == 162
-        assert capabilities["tool_manifest_count"] == 162
+        assert capabilities["version"] == "12.2.0"
+        assert capabilities["tool_count"] == 163
+        assert capabilities["tool_manifest_count"] == 163
+        assert capabilities["compatibility_tool_count"] == 163
+        assert capabilities["deprecated_tools_exposed"] is True
+        assert capabilities["hidden_deprecated_tool_count"] == 0
+        assert capabilities["hidden_deprecated_tools"] == []
+        assert len(capabilities["tool_schema_sha256"]) == 64
+        assert capabilities["schema_generation_id"].startswith("schema-v1:")
         assert capabilities["supports_exact_text_replace"] is True
+        assert capabilities["supports_private_ci_applicability_planning"] is True
         assert capabilities["supports_development_task_orchestration"] is True
         assert capabilities["supports_development_sessions"] is True
         assert capabilities["supports_local_git_mirror_reads"] is True
