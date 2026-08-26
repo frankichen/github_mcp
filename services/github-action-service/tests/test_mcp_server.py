@@ -65,6 +65,10 @@ class TestMCPTools:
         assert exact_schema["expected_match_count"]["default"] == 1
         assert "without caller-supplied line numbers" in tools["replace_github_text_once"].description
         assert "start_line" not in tools["build_github_patch"].description
+        builder_schema = tools["build_github_patch"].inputSchema
+        assert builder_schema["properties"]["operation"]["default"] == "modify"
+        assert builder_schema["properties"]["operation"]["enum"] == ["modify", "add", "delete"]
+        assert "operation" not in builder_schema["required"]
         operations_schema = tools["edit_github_file_ranges"].inputSchema["properties"]["operations_json"]
         for field in (
             "expected_blob_sha",
@@ -82,7 +86,7 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.3.2"
+        assert capabilities["version"] == "12.3.3"
         assert capabilities["max_upload_chunk_bytes"] == 24576
         assert capabilities["recommended_upload_chunk_bytes"] == 16384
         assert capabilities["preferred_upload_encoding"] == "text_for_utf8_base64_for_binary"

@@ -57,7 +57,7 @@ private-deploy-agent（服务器端）
 
 ## GitHub Action Service
 
-MyGithut12 当前版本为 `12.3.2`。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。小范围唯一文本替换优先使用 `replace_github_text_once`，大文件仍使用 manifest、chunk read/upload 和 finalize/commit 流程，不退化为普通全文提交。
+MyGithut12 源码当前版本为 `12.3.3`；生产运行版本必须以 `get_mygithub_capabilities` 的实时结果为准。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。小范围唯一文本替换优先使用 `replace_github_text_once`，大文件仍使用 manifest、chunk read/upload 和 finalize/commit 流程，不退化为普通全文提交。
 
 ChatGPT/MCP 分块上传使用 transport-safe 合同：`max_upload_chunk_bytes=24576`，推荐 `recommended_upload_chunk_bytes=16384`。UTF-8 Patch、源码和文档优先使用 `text` 字段，`content_base64` 仅用于必须按二进制传输的内容；非法 Base64、空 payload 或同时传两种编码会返回稳定错误码，不再降级成泛化 `INTERNAL_ERROR`。多文件 `finalize -> apply_development_change_set` 的原子 Commit 语义保持不变。
 
@@ -93,7 +93,7 @@ docker compose up -d --build
 
 ## MyGithut12 运行状态
 
-MyGithut12 `12.3.2` 的 compatibility registration 为 166 个工具，canonical production Schema 为 163 个可见工具。除 Schema 降噪、CI Profile 预检和基础设施自部署控制面外，MyGithut12 自身成功合并 PR 后还会立即为新的 base/main exact SHA 请求 Repository Index identity；现有 same-tree cache 可以在 Tree 未变化时 100% 复用索引数据，同时仍保留新 Commit 独立合法的 index identity。Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
+MyGithut12 `12.3.3` 源码的 compatibility registration 仍为 166 个工具，canonical production Schema 仍为 163 个可见工具；生产 Schema 身份必须以运行时 capability 为准。除 Schema 降噪、CI Profile 预检和基础设施自部署控制面外，MyGithut12 自身成功合并 PR 后还会立即为新的 base/main exact SHA 请求 Repository Index identity；现有 same-tree cache 可以在 Tree 未变化时 100% 复用索引数据，同时仍保留新 Commit 独立合法的 index identity。Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
 
 ## Private Deploy Agent
 

@@ -283,6 +283,80 @@ def test_build_patch_is_pure_and_preserves_no_final_newline_and_unicode_path():
     assert mygithub10._apply_file_patch(old.encode(), parsed[0][2]) == new.encode()
 
 
+def test_build_patch_explicit_add_round_trips_through_strict_apply():
+    new = "第一行🙂\r\n第二行"
+    result = mygithub10.build_patch("新/文件.txt", "", "", new, operation="add")
+    assert result["operation"] == "add"
+    assert "new file mode 100644\n" in result["patch"]
+    assert "--- /dev/null\n" in result["patch"]
+    path, operation, hunks = mygithub10._parse_patch(result["patch"])[0]
+    assert (path, operation) == ("新/文件.txt", "add")
+    assert mygithub10._apply_file_patch(b"", hunks, allow_empty_old=True, path=path) == new.encode()
+    dry_run = mygithub10.apply_patch(
+        ReadService(MissingRepo(b"")), "owner/repo", "feature", "head-1", "{}", result["patch"], "add", True
+    )
+    assert dry_run["changed_files"][0]["operation"] == "add"
+    assert dry_run["changed_files"][0]["new_blob_sha"] == mygithub10._git_blob_sha(new.encode())
+
+
+def test_build_patch_explicit_empty_add_is_strictly_reapplicable():
+    result = mygithub10.build_patch("empty.txt", "", "", "", operation="add")
+    assert mygithub10._parse_patch(result["patch"]) == [("empty.txt", "add", [])]
+    dry_run = mygithub10.apply_patch(
+        ReadService(MissingRepo(b"")), "owner/repo", "feature", "head-1", "{}", result["patch"], "add empty", True
+    )
+    assert dry_run["changed_files"][0]["new_blob_sha"] == mygithub10._git_blob_sha(b"")
+
+
+@pytest.mark.parametrize("old", ["", "旧🙂\r\n尾"])
+def test_build_patch_explicit_delete_round_trips_through_strict_apply(old):
+    blob = mygithub10._git_blob_sha(old.encode())
+    result = mygithub10.build_patch("delete.txt", blob, old, "", operation="delete")
+    assert result["operation"] == "delete"
+    assert "deleted file mode 100644\n" in result["patch"]
+    assert "+++ /dev/null\n" in result["patch"]
+    assert mygithub10._parse_patch(result["patch"])[0][1] == "delete"
+    dry_run = mygithub10.apply_patch(
+        ReadService(ReadRepo(old.encode(), blob=blob)),
+        "owner/repo", "feature", "head-1", json.dumps({"delete.txt": blob}), result["patch"], "delete", True,
+    )
+    assert dry_run["changed_files"][0]["new_blob_sha"] is None
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_blob_sha", "original", "replacement"),
+    [
+        ("upsert", "", "", "new\n"),
+        ("add", "a" * 40, "", "new\n"),
+        ("add", "", "old\n", "new\n"),
+        ("delete", "", "old\n", ""),
+        ("delete", mygithub10._git_blob_sha(b"old\n"), "old\n", "new\n"),
+    ],
+)
+def test_build_patch_rejects_invalid_explicit_operation_contract(operation, expected_blob_sha, original, replacement):
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        mygithub10.build_patch("x.txt", expected_blob_sha, original, replacement, operation=operation)
+    assert exc.value.code == "PATCH_INVALID_FORMAT"
+
+
+def test_build_patch_operation_changes_fingerprint_and_strict_target_semantics():
+    added = mygithub10.build_patch("x.txt", "", "", "new\n", operation="add")
+    modified = mygithub10.build_patch("x.txt", "", "", "new\n")
+    assert added["operation_fingerprint"] != modified["operation_fingerprint"]
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        mygithub10.apply_patch(
+            ReadService(ReadRepo(b"already\n", blob="blob-1")),
+            "owner/repo", "feature", "head-1", "{}", added["patch"], "add", True,
+        )
+    assert exc.value.code == "PATCH_TARGET_EXISTS"
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        mygithub10.apply_patch(
+            ReadService(MissingRepo(b"")),
+            "owner/repo", "feature", "head-1", "{}", modified["patch"], "modify", True,
+        )
+    assert exc.value.code == "FILE_NOT_FOUND"
+
+
 @pytest.mark.parametrize(
     ("original", "operations", "expected", "added", "deleted"),
     [

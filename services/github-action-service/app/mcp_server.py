@@ -11,7 +11,7 @@ import subprocess
 import inspect
 import uuid
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
 import httpx
 from pydantic import Field
@@ -1257,7 +1257,7 @@ async def replace_github_text_once(
 
 @mcp.tool(
     name="build_github_patch",
-    description="Build a deterministic minimal unified diff from complete old/new UTF-8 file text. Pure dry-run: never reads or writes GitHub.",
+    description="Build a deterministic strict unified diff from complete UTF-8 file text. operation defaults to modify; explicit add/delete emit /dev/null semantics. Pure dry-run: never reads or writes GitHub.",
     annotations=ToolAnnotations(
         readOnlyHint=True,
         destructiveHint=False,
@@ -1265,9 +1265,18 @@ async def replace_github_text_once(
         openWorldHint=False,
     ),
 )
-async def build_github_patch(path: str, expected_blob_sha: str, original_text: str, replacement_text: str) -> str:
+async def build_github_patch(
+    path: str,
+    expected_blob_sha: str,
+    original_text: str,
+    replacement_text: str,
+    operation: Literal["modify", "add", "delete"] = "modify",
+) -> str:
     try:
-        return json.dumps(mygithub10.build_patch(path, expected_blob_sha, original_text, replacement_text), ensure_ascii=False)
+        return json.dumps(
+            mygithub10.build_patch(path, expected_blob_sha, original_text, replacement_text, operation),
+            ensure_ascii=False,
+        )
     except Exception as exc:
         return _mygithub10_error(exc)
 

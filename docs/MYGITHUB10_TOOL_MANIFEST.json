@@ -2345,7 +2345,7 @@
       "read_only": true,
       "consequential": false,
       "category": "github",
-      "description": "Build a deterministic minimal unified diff from complete old/new UTF-8 file text. Pure dry-run: never reads or writes GitHub.",
+      "description": "Build a deterministic strict unified diff from complete UTF-8 file text. operation defaults to modify; explicit add/delete emit /dev/null semantics. Pure dry-run: never reads or writes GitHub.",
       "input_schema": {
         "properties": {
           "path": {
@@ -2362,6 +2362,16 @@
           },
           "replacement_text": {
             "title": "Replacement Text",
+            "type": "string"
+          },
+          "operation": {
+            "default": "modify",
+            "enum": [
+              "modify",
+              "add",
+              "delete"
+            ],
+            "title": "Operation",
             "type": "string"
           }
         },
