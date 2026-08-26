@@ -143,6 +143,7 @@ def parse_change_set(change_set_json: str) -> dict[str,Any]:
     if mode=="upload":
         uploads=change.get("uploaded_files")
         if not isinstance(uploads,list) or not uploads or not all(isinstance(item,dict) for item in uploads): raise MyGithub12Error("PATCH_INVALID_FORMAT","upload mode requires one or more finalized uploaded files")
+        if len(uploads)>mygithub10.MAX_UPLOAD_CHANGE_SET_FILES: raise MyGithub12Error("PATCH_INVALID_FORMAT",f"upload mode exceeds file limit: {mygithub10.MAX_UPLOAD_CHANGE_SET_FILES}")
         paths=[]; upload_ids=[]
         for item in uploads:
             path=item.get("path"); upload_id=item.get("upload_id")
@@ -167,11 +168,14 @@ def execute_change_set(service: Any, session: dict[str,Any], workspace: dict[str
         items=change["uploaded_files"]
         for item in items: mygithub10._safe_path(item["path"])
         if dry_run:
-            # Verify every finalized upload without consuming any upload body.
-            changed_files=[]
+            # Reuse the exact HEAD/blob CAS preflight used by the real commit, then verify every finalized upload without consuming any body.
+            mygithub10.preflight_upload_targets(service,session["repository"],session["branch"],expected_head_sha,items)
+            changed_files=[]; total_size=0
             for item in items:
                 _,_,meta=mygithub10._load_upload(item["upload_id"])
                 if not meta.get("finalized"): raise MyGithub12Error("UPLOAD_NOT_FINALIZED",f"finalize upload before change-set commit: {item['upload_id']}")
+                total_size+=int(meta["size"])
+                if total_size>mygithub10.MAX_UPLOAD_CHANGE_SET_BYTES: raise MyGithub12Error("UPLOAD_SIZE_EXCEEDED",f"upload mode exceeds aggregate size limit: {mygithub10.MAX_UPLOAD_CHANGE_SET_BYTES}")
                 changed_files.append({"path":item["path"],"operation":"upsert","size_bytes":meta["size"],"content_sha256":meta["sha256"]})
             result={"ok":True,"dry_run":True,"repository":session["repository"],"branch":session["branch"],"expected_head_sha":expected_head_sha,"changed_files":changed_files}
         elif len(items)==1:

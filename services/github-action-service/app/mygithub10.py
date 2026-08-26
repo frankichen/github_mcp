@@ -35,6 +35,8 @@ MAX_PATCH_BYTES = 262144
 MAX_TEXT_EDIT_FILE_BYTES = 4 * 1024 * 1024
 MAX_UPLOAD_CHUNK_BYTES = 131072
 MAX_UPLOAD_BYTES = 1048576
+MAX_UPLOAD_CHANGE_SET_FILES = 64
+MAX_UPLOAD_CHANGE_SET_BYTES = 64 * MAX_UPLOAD_BYTES
 UPLOAD_TTL_SECONDS = 3600
 MAX_FILE_EDIT_OPERATIONS = 1000
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?(?:\r?\n)?$")
@@ -689,7 +691,7 @@ def _apply_file_patch(
     return "".join(output).encode("utf-8")
 
 
-def _commit_files(client, repository: str, branch: str, expected_head_sha: str, changed: dict[str, bytes | None], expected_blob_shas: dict[str, str], message: str) -> dict[str, Any]:
+def _preflight_file_write(client, repository: str, branch: str, expected_head_sha: str, paths: list[str], expected_blob_shas: dict[str, str]) -> tuple[Any, Any, Any, str, dict[str, str | None]]:
     service = client
     service._check_repository_allowed(repository)
     service._check_default_branch_write(repository, branch)
@@ -699,10 +701,8 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
     actual_head = ref.object.sha
     if expected_head_sha and actual_head != expected_head_sha:
         raise MyGithub10Error("PATCH_HEAD_CHANGED", f"branch HEAD changed before write for {repository}:{branch}", {"expected": expected_head_sha, "actual": actual_head, "repository": repository, "branch": branch, "phase": "before_write", "error_code": "HEAD_CHANGED"})
-    elements = []
-    old_shas = {}
-    new_shas = {}
-    for path, content in changed.items():
+    old_shas: dict[str, str | None] = {}
+    for path in paths:
         _safe_path(path)
         try:
             entry = repo.get_contents(path, ref=actual_head)
@@ -715,6 +715,21 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
         expected = expected_blob_shas.get(path, "")
         if expected and expected != (old_sha or ""):
             raise MyGithub10Error("BLOB_CHANGED", f"file blob changed before write: {path}", {"expected": expected, "actual": old_sha, "repository": repository, "branch": branch, "path": path})
+    return gh, repo, ref, actual_head, old_shas
+
+
+def preflight_upload_targets(client, repository: str, branch: str, expected_head_sha: str, uploaded_files: list[dict[str, Any]]) -> dict[str, Any]:
+    paths = [str(item["path"]) for item in uploaded_files]
+    expected_blob_shas = {str(item["path"]): str(item.get("expected_blob_sha") or "") for item in uploaded_files}
+    _, _, _, actual_head, old_shas = _preflight_file_write(client, repository, branch, expected_head_sha, paths, expected_blob_shas)
+    return {"head_sha": actual_head, "old_blob_shas": old_shas}
+
+
+def _commit_files(client, repository: str, branch: str, expected_head_sha: str, changed: dict[str, bytes | None], expected_blob_shas: dict[str, str], message: str) -> dict[str, Any]:
+    gh, repo, ref, actual_head, old_shas = _preflight_file_write(client, repository, branch, expected_head_sha, list(changed), expected_blob_shas)
+    elements = []
+    new_shas = {}
+    for path, content in changed.items():
         if content is None:
             elements.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
         else:
@@ -1200,6 +1215,8 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "exact_text_replace_semantics": {"match": "exact UTF-8 substring", "required_match_count": 1, "normalization": "none", "line_numbers": "not used"},
         "supports_chunked_upload": True,
         "supports_atomic_multi_upload_change_set": True,
+        "max_atomic_multi_upload_files": MAX_UPLOAD_CHANGE_SET_FILES,
+        "max_atomic_multi_upload_bytes": MAX_UPLOAD_CHANGE_SET_BYTES,
         "supports_dry_run": True,
         "supports_expected_head_sha": True,
         "supports_expected_blob_sha": True,
@@ -1409,6 +1426,8 @@ def commit_upload(client, repository: str, branch: str, expected_head_sha: str, 
 def commit_uploads(client, repository: str, branch: str, expected_head_sha: str, uploaded_files: list[dict[str, Any]], commit_message: str, idempotency_key: str = "", audit_context: dict[str, Any] | None = None) -> dict[str, Any]:
     if not isinstance(uploaded_files, list) or len(uploaded_files) < 2:
         raise MyGithub10Error("PATCH_INVALID_FORMAT", "multi-upload commit requires at least two uploaded files")
+    if len(uploaded_files) > MAX_UPLOAD_CHANGE_SET_FILES:
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", f"multi-upload commit exceeds file limit: {MAX_UPLOAD_CHANGE_SET_FILES}")
     items: list[dict[str, str]] = []
     seen_paths: set[str] = set()
     seen_upload_ids: set[str] = set()
@@ -1452,10 +1471,17 @@ def commit_uploads(client, repository: str, branch: str, expected_head_sha: str,
     changed: dict[str, bytes] = {}
     expected_blob_shas: dict[str, str] = {}
     upload_evidence: list[dict[str, Any]] = []
+    upload_sources: list[tuple[dict[str, str], Path, dict[str, Any]]] = []
+    total_size = 0
     for item in items:
         data_path, _, meta = _load_upload(item["upload_id"])
         if not meta.get("finalized"):
             raise MyGithub10Error("UPLOAD_NOT_FINALIZED", f"finalize upload before change-set commit: {item['upload_id']}")
+        total_size += int(meta["size"])
+        if total_size > MAX_UPLOAD_CHANGE_SET_BYTES:
+            raise MyGithub10Error("UPLOAD_SIZE_EXCEEDED", f"multi-upload commit exceeds aggregate size limit: {MAX_UPLOAD_CHANGE_SET_BYTES}")
+        upload_sources.append((item, data_path, meta))
+    for item, data_path, meta in upload_sources:
         changed[item["path"]] = data_path.read_bytes()
         expected_blob_shas[item["path"]] = item["expected_blob_sha"]
         upload_evidence.append({"upload_id": item["upload_id"], "sha256": meta["sha256"], "size": meta["size"]})
