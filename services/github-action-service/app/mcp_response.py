@@ -382,7 +382,7 @@ class StructuredFastMCP(FastMCP):
             return tools
         return [tool for tool in tools if tool.name not in self._DEPRECATED_TOOL_NAMES]
 
-    def tool_schema_identity(self, tools: list[Any]) -> dict[str, Any]:
+    async def tool_schema_identity(self, tools: list[Any] | None = None) -> dict[str, Any]:
         """Return a stable fingerprint for the exact tool schema visible to this connector."""
         def jsonable(value: Any) -> Any:
             if value is None:
@@ -391,8 +391,10 @@ class StructuredFastMCP(FastMCP):
                 return value.model_dump(mode="json", exclude_none=True)
             return value
 
+        registered = await super().list_tools()
+        visible = tools if tools is not None else await self.list_tools()
         canonical = []
-        for tool in sorted(tools, key=lambda item: item.name):
+        for tool in sorted(visible, key=lambda item: item.name):
             canonical.append({
                 "name": tool.name,
                 "description": tool.description or "",
@@ -407,15 +409,21 @@ class StructuredFastMCP(FastMCP):
             separators=(",", ":"),
         ).encode("utf-8")
         digest = hashlib.sha256(encoded).hexdigest()
-        hidden_count = 0 if self.deprecated_tools_exposed() else len(self._DEPRECATED_TOOL_NAMES)
+        visible_names = {tool.name for tool in visible}
+        hidden_deprecated = sorted(
+            tool.name
+            for tool in registered
+            if tool.name in self._DEPRECATED_TOOL_NAMES and tool.name not in visible_names
+        )
         return {
-            "tool_count": len(tools),
-            "tool_manifest_count": len(tools),
+            "tool_count": len(visible),
+            "tool_manifest_count": len(visible),
             "tool_schema_sha256": digest,
             "schema_generation_id": f"schema-v1:{digest[:16]}",
             "deprecated_tools_exposed": self.deprecated_tools_exposed(),
-            "hidden_deprecated_tool_count": hidden_count,
-            "compatibility_tool_count": len(tools) + hidden_count,
+            "hidden_deprecated_tool_count": len(hidden_deprecated),
+            "hidden_deprecated_tools": hidden_deprecated,
+            "compatibility_tool_count": len(registered),
         }
 
     def tool(self, *args: Any, **kwargs: Any):
