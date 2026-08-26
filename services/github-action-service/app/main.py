@@ -137,6 +137,7 @@ app.include_router(health.router, tags=["Health"])
 app.include_router(github.router, tags=["GitHub"])
 app.include_router(ci_worker.router, tags=["CI Worker"])
 app.include_router(deployments.router, tags=["Deployments"])
+app.include_router(infrastructure_deployments.router)
 app.include_router(ci_monitor.router, tags=["CI Monitor"])
 
 app.include_router(index_v12.router, prefix="/internal/mygithub12", tags=["MyGithut12 Index"])
