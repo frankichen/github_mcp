@@ -78,6 +78,7 @@ class TestMCPTools:
         assert capabilities["name"] == "MyGithut12"
         assert capabilities["version"] == "12.1.2"
         assert capabilities["tool_count"] == 161
+        assert capabilities["tool_manifest_count"] == 161
         assert capabilities["supports_development_task_orchestration"] is True
         assert capabilities["supports_development_sessions"] is True
         assert capabilities["supports_local_git_mirror_reads"] is True
