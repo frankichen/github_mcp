@@ -5,6 +5,7 @@ import logging
 import base64
 import asyncio
 import os
+import re
 import subprocess
 import inspect
 import uuid
