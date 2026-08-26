@@ -356,7 +356,67 @@ def _structured_wrapper(function: Callable[..., Any]) -> Callable[..., Any]:
 
 
 class StructuredFastMCP(FastMCP):
-    """FastMCP adapter that preserves direct Python handlers but fixes the MCP wire shape."""
+    """FastMCP adapter that keeps compatibility handlers while exposing a canonical schema."""
+
+    _DEPRECATED_TOOL_NAMES = frozenset({
+        "get_github_file",
+        "commit_github_files",
+        "get_test_deployment_logs",
+    })
+
+    @staticmethod
+    def deprecated_tools_exposed() -> bool:
+        """Expose deprecated compatibility tools only when explicitly requested outside production."""
+        configured = os.environ.get("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", "").strip().lower()
+        if configured:
+            return configured in {"1", "true", "yes", "on"}
+        runtime_mode = os.environ.get(
+            "MYGITHUB12_RUNTIME_MODE",
+            os.environ.get("MYGITHUB10_RUNTIME_MODE", "development"),
+        ).strip().lower()
+        return runtime_mode != "production"
+
+    async def list_tools(self):
+        tools = await super().list_tools()
+        if self.deprecated_tools_exposed():
+            return tools
+        return [tool for tool in tools if tool.name not in self._DEPRECATED_TOOL_NAMES]
+
+    def tool_schema_identity(self, tools: list[Any]) -> dict[str, Any]:
+        """Return a stable fingerprint for the exact tool schema visible to this connector."""
+        def jsonable(value: Any) -> Any:
+            if value is None:
+                return None
+            if hasattr(value, "model_dump"):
+                return value.model_dump(mode="json", exclude_none=True)
+            return value
+
+        canonical = []
+        for tool in sorted(tools, key=lambda item: item.name):
+            canonical.append({
+                "name": tool.name,
+                "description": tool.description or "",
+                "input_schema": tool.inputSchema,
+                "output_schema": getattr(tool, "outputSchema", None),
+                "annotations": jsonable(getattr(tool, "annotations", None)),
+            })
+        encoded = json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        hidden_count = 0 if self.deprecated_tools_exposed() else len(self._DEPRECATED_TOOL_NAMES)
+        return {
+            "tool_count": len(tools),
+            "tool_manifest_count": len(tools),
+            "tool_schema_sha256": digest,
+            "schema_generation_id": f"schema-v1:{digest[:16]}",
+            "deprecated_tools_exposed": self.deprecated_tools_exposed(),
+            "hidden_deprecated_tool_count": hidden_count,
+            "compatibility_tool_count": len(tools) + hidden_count,
+        }
 
     def tool(self, *args: Any, **kwargs: Any):
         register = super().tool(*args, **kwargs)
