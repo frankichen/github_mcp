@@ -1048,9 +1048,12 @@ def _mygithub10_error(exc: Exception) -> str:
     return json.dumps({"ok": False, "error": {"code": "INTERNAL_ERROR", "message": "MyGithut operation failed", "details": {}, "trace_id": str(uuid.uuid4())}}, ensure_ascii=False)
 
 
-@mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithut12 capability and compatibility contract.")
+@mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithut12 capability and canonical connector schema identity.")
 async def get_mygithub_capabilities() -> str:
-    return json.dumps(mygithub10.capabilities(runtime_build_sha()), ensure_ascii=False)
+    capabilities = mygithub10.capabilities(runtime_build_sha())
+    visible_tools = await mcp.list_tools()
+    capabilities.update(await mcp.tool_schema_identity(visible_tools))
+    return json.dumps(capabilities, ensure_ascii=False)
 
 
 @mcp.tool(name="get_github_file_manifest", description="Return exact Git Blob metadata for a file without returning file content.")
