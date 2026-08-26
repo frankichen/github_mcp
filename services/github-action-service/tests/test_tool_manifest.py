@@ -60,11 +60,16 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     tools = {tool.name: tool for tool in actual}
     assert MYGITHUB12_BASE_TOOLS <= set(actual_names)
     assert len(MYGITHUB12_BASE_TOOLS) == 39
-    assert actual_names[-4:] == DX1_TOOLS
+    assert actual_names[-7:-3] == DX1_TOOLS
+    assert actual_names[-3:] == INFRASTRUCTURE_DEPLOY_TOOLS
     for name in DX1_TOOLS:
         assert tools[name].annotations.readOnlyHint is False
         assert tools[name].annotations.destructiveHint is False
         assert tools[name].annotations.idempotentHint is False
+    assert tools["plan_infrastructure_deployment"].annotations.readOnlyHint is True
+    assert tools["start_infrastructure_deployment"].annotations.readOnlyHint is False
+    assert tools["start_infrastructure_deployment"].annotations.destructiveHint is True
+    assert tools["get_infrastructure_deployment"].annotations.readOnlyHint is True
     assert tools["plan_private_ci_job"].annotations.readOnlyHint is True
     assert tools["build_github_patch"].annotations.readOnlyHint is True
     assert tools["search_repository_text"].annotations.readOnlyHint is True
