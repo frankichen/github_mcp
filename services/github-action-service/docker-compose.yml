@@ -13,6 +13,7 @@ services:
       - .env
     environment:
       DEPLOYMENT_DB_PATH: /data/private-ci/deployments.db
+      INFRASTRUCTURE_DEPLOYMENT_DB_PATH: /data/private-ci/infrastructure-deployments.db
       DEPLOY_STATUS_FILE: /data/private-ci/gongshi-test-status.json
       DEPLOY_CALLBACK_API_KEY_FILE: /run/secrets/deploy_callback_api_key
       MYGITHUB12_RUNTIME_MODE: production

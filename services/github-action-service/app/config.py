@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     SERVICE_URL: str = "https://github.555044.xyz"
     DEPLOY_CALLBACK_API_KEY: SecretStr = SecretStr("")
     DEPLOY_CALLBACK_API_KEY_FILE: Optional[str] = None
+    INFRASTRUCTURE_DEPLOY_CALLBACK_API_KEY: SecretStr = SecretStr("")
+    INFRASTRUCTURE_DEPLOY_CALLBACK_API_KEY_FILE: Optional[str] = None
     DIAGNOSTIC_MODE: bool = False
     MYGITHUB10_ARTIFACT_BUILD_ENABLED: bool = False
     MYGITHUB10_ARTIFACT_DEPLOY_ENABLED: bool = False
@@ -86,6 +88,13 @@ class Settings(BaseSettings):
             if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o077:
                 raise ValueError("DEPLOY_CALLBACK_API_KEY_FILE must be a mode 0600 regular file")
             self.DEPLOY_CALLBACK_API_KEY = SecretStr(path.read_text(encoding="utf-8").strip())
+        infrastructure_callback_file = (self.INFRASTRUCTURE_DEPLOY_CALLBACK_API_KEY_FILE or "").strip()
+        if infrastructure_callback_file:
+            path = Path(infrastructure_callback_file)
+            metadata = path.stat()
+            if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise ValueError("INFRASTRUCTURE_DEPLOY_CALLBACK_API_KEY_FILE must be a mode 0600 regular file")
+            self.INFRASTRUCTURE_DEPLOY_CALLBACK_API_KEY = SecretStr(path.read_text(encoding="utf-8").strip())
         return self
 
 

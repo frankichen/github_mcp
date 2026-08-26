@@ -65,6 +65,30 @@ _DEFAULT_CONFIG = {
                 "status_file_env": "DEPLOY_STATUS_FILE",
             },
         },
+        "frankichen/github_mcp": {
+            "enabled": True,
+            "private_ci": True,
+            "auto_detect": True,
+            "allowed_profiles": ["repo-auto-check", "repo-fast-check", "python-check"],
+            "max_timeout_seconds": 900,
+            "merge_policy": {
+                "private_ci_authoritative": True,
+                "required_private_ci_profile": "repo-auto-check",
+                "github_checks_mode": "required_only",
+                "allow_non_required_check_failures": True,
+                "allow_quota_or_infrastructure_failures": True,
+                "required_workflows": [],
+            },
+            "infrastructure_deployment": {
+                "enabled": True,
+                "environment": "mygithub12-production",
+                "scope": "control-plane",
+                "private_ci": True,
+                "profile": "repo-auto-check",
+                "executor_id": "mygithub12-infrastructure-deploy-01",
+                "heartbeat_ttl_seconds": 30,
+            },
+        },
         "frankichen/auto_gupiao": {
             "enabled": True,
             "private_ci": True,
@@ -247,6 +271,23 @@ def is_test_deploy_enabled(repository: str) -> bool:
     return bool(entry.get("enabled", False) and deployment.get("enabled", False))
 
 
+def get_infrastructure_deployment_config(repository: str) -> dict:
+    """Return only the explicit MyGithut12 infrastructure deployment contract."""
+    if get_repository_policy_source(repository) != "explicit":
+        return {}
+    entry = get_repository_config(repository)
+    return dict(entry.get("infrastructure_deployment") or {})
+
+
+def is_infrastructure_deploy_enabled(repository: str) -> bool:
+    """Return whether repository has an explicit infrastructure self-deploy contract."""
+    if get_repository_policy_source(repository) != "explicit":
+        return False
+    entry = get_repository_config(repository)
+    infrastructure = entry.get("infrastructure_deployment") or {}
+    return bool(entry.get("enabled", False) and infrastructure.get("enabled", False))
+
+
 def is_self_deploy_enabled(repository: str) -> bool:
     """Return whether an explicit fixed deployment contract allows self deployment."""
     if get_repository_policy_source(repository) != "explicit":
@@ -255,8 +296,13 @@ def is_self_deploy_enabled(repository: str) -> bool:
     deployment = entry.get("deployment") or {}
     return bool(
         entry.get("enabled", False)
-        and deployment.get("enabled", False)
-        and deployment.get("self_deploy", False)
+        and (
+            (
+                deployment.get("enabled", False)
+                and deployment.get("self_deploy", False)
+            )
+            or is_infrastructure_deploy_enabled(repository)
+        )
     )
 
 _CONTROLLER_KNOWN_PROFILES = {

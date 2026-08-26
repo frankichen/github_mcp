@@ -86,6 +86,31 @@ repositories:
           - typecheck
           - build
 
+  frankichen/github_mcp:
+    enabled: true
+    private_ci: true
+    auto_detect: true
+    allowed_profiles:
+      - repo-auto-check
+      - repo-fast-check
+      - python-check
+    max_timeout_seconds: 900
+    merge_policy:
+      private_ci_authoritative: true
+      required_private_ci_profile: repo-auto-check
+      github_checks_mode: required_only
+      allow_non_required_check_failures: true
+      allow_quota_or_infrastructure_failures: true
+      required_workflows: []
+    infrastructure_deployment:
+      enabled: true
+      environment: mygithub12-production
+      scope: control-plane
+      private_ci: true
+      profile: repo-auto-check
+      executor_id: mygithub12-infrastructure-deploy-01
+      heartbeat_ttl_seconds: 30
+
   frankichen/auto_gupiao:
     enabled: true
     private_ci: true

@@ -1,0 +1,22 @@
+[Unit]
+Description=MyGithut12 Fixed Infrastructure Deploy Executor
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/mygithub12-infrastructure-deploy-executor
+EnvironmentFile=/etc/private-ci/mygithub12-infrastructure-deploy-executor.env
+ExecStart=/opt/mygithub12-infrastructure-deploy-executor/venv/bin/python /opt/mygithub12-infrastructure-deploy-executor/infrastructure_deploy_executor.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

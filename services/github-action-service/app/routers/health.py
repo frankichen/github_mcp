@@ -49,6 +49,9 @@ async def readiness():
         "idempotency_db": settings.IDEMPOTENCY_DB_PATH,
         "ci_db": os.environ.get("CI_DB_PATH", "/data/ci.db"),
         "deployment_db": os.environ.get("DEPLOYMENT_DB_PATH", "/data/deployments.db"),
+        "infrastructure_deployment_db": os.environ.get(
+            "INFRASTRUCTURE_DEPLOYMENT_DB_PATH", "/data/infrastructure-deployments.db"
+        ),
         "mygithub12_db": mygithub12_db_path(),
     }
     results = await asyncio.gather(

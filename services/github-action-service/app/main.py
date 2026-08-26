@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.openapi.utils import get_openapi
 
-from app.routers import health, github, ci_worker, deployments, ci_monitor, index_v12
+from app.routers import health, github, ci_worker, deployments, infrastructure_deployments, ci_monitor, index_v12
 from app.config import settings
 from app.exceptions import AppError
 from app.idempotency import IdempotencyMiddleware, ensure_idempotency_storage
@@ -30,6 +30,7 @@ async def lifespan(app: FastAPI):
     try:
         from app.ci_database import init_db
         from app.deployment_service import init_deployment_db
+        from app.infrastructure_deployment_service import init_infrastructure_deployment_db
         from app.attestation_registry import init_registry_db
         from app.mygithub12 import init_db as init_mygithub12_db, recover_orphaned_index_jobs
         from app.development_session_store import init_session_db, recover_sessions
@@ -43,6 +44,7 @@ async def lifespan(app: FastAPI):
         ensure_idempotency_storage()
         init_db()
         init_deployment_db()
+        init_infrastructure_deployment_db()
         init_registry_db()
         init_mygithub12_db()
         init_session_db()
@@ -135,6 +137,7 @@ app.include_router(health.router, tags=["Health"])
 app.include_router(github.router, tags=["GitHub"])
 app.include_router(ci_worker.router, tags=["CI Worker"])
 app.include_router(deployments.router, tags=["Deployments"])
+app.include_router(infrastructure_deployments.router)
 app.include_router(ci_monitor.router, tags=["CI Monitor"])
 
 app.include_router(index_v12.router, prefix="/internal/mygithub12", tags=["MyGithut12 Index"])

@@ -1268,7 +1268,7 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_blue_green_runtime": True,
         "supports_runtime_generation_leader": True,
         "supports_cross_generation_resources": True,
-        "tool_manifest_count": 163,
+        "tool_manifest_count": 166,
         "recommended_small_text_workflow": ["replace_github_text_once", "apply_github_patch", "edit_github_file_ranges"],
         "recommended_large_file_workflow": ["get_github_file_manifest", "read_github_file_chunk", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "commit_github_uploaded_files"],
         "recommended_atomic_multi_upload_workflow": ["prepare_development_task", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "apply_development_change_set"],
