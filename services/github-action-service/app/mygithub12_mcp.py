@@ -1,4 +1,4 @@
-"""Register the 36 MyGithut12 MCP tools."""
+"""Register the MyGithut12 MCP tools."""
 from __future__ import annotations
 
 import json
@@ -210,6 +210,10 @@ def register_mygithub12_tools(mcp, github_call, service) -> None:
     @mcp.tool(name="analyze_repository_patch", description="Analyze a bounded unified diff against an exact commit without writing GitHub.", annotations=_READ_ONLY)
     async def analyze_repository_patch(repository: str, base_commit_sha: str, patch: str) -> str:
         return await _call(github_call, mygithub12.analyze_patch, service, repository, base_commit_sha, patch)
+
+    @mcp.tool(name="analyze_repository_patch_from_ref", description="Analyze a strict unified diff stored in an exact GitHub blob against an exact repository commit without writing GitHub.", annotations=_READ_ONLY)
+    async def analyze_repository_patch_from_ref(repository: str, base_commit_sha: str, patch_repository: str, patch_ref: str, patch_path: str, expected_patch_blob_sha: str, expected_patch_sha256: str, expected_patch_size_bytes: int) -> str:
+        return await _call(github_call, mygithub12.analyze_patch_from_ref, service, repository, base_commit_sha, patch_repository, patch_ref, patch_path, expected_patch_blob_sha, expected_patch_sha256, expected_patch_size_bytes)
 
     @mcp.tool(name="get_affected_tests", description="Select evidence-labelled test candidates from changed commits, paths, symbols or a patch.", annotations=_READ_ONLY)
     async def get_affected_tests(repository: str, head_commit_sha: str, base_commit_sha: str = "", paths_json: str = "[]", symbol_ids_json: str = "[]", patch: str = "") -> str:

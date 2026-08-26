@@ -5,7 +5,7 @@
   "controller_image": "not-read-from-runtime",
   "pygithub_version": "2.5.0",
   "mcp_sdk_version": "1.28.1",
-  "tool_count": 118,
+  "tool_count": 119,
   "tools": [
     {
       "name": "get_github_file",
@@ -2230,6 +2230,36 @@
         ],
         "title": "apply_github_patchArguments",
         "type": "object"
+      }
+    },
+    {
+      "name": "apply_github_patch_from_ref",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Apply a strict unified diff stored in an exact GitHub blob with source identity verification.",
+      "input_schema": {
+        "properties": {
+          "repository": {"title": "Repository", "type": "string"},
+          "branch": {"title": "Branch", "type": "string"},
+          "expected_head_sha": {"title": "Expected Head Sha", "type": "string"},
+          "expected_blob_shas_json": {"title": "Expected Blob Shas Json", "type": "string"},
+          "patch_repository": {"title": "Patch Repository", "type": "string"},
+          "patch_ref": {"title": "Patch Ref", "type": "string"},
+          "patch_path": {"title": "Patch Path", "type": "string"},
+          "expected_patch_blob_sha": {"title": "Expected Patch Blob Sha", "type": "string"},
+          "expected_patch_sha256": {"title": "Expected Patch Sha256", "type": "string"},
+          "expected_patch_size_bytes": {"title": "Expected Patch Size Bytes", "type": "integer"},
+          "commit_message": {"title": "Commit Message", "type": "string"},
+          "dry_run": {"default": true, "title": "Dry Run", "type": "boolean"},
+          "idempotency_key": {"default": "", "title": "Idempotency Key", "type": "string"},
+          "create_pull_request": {"default": false, "title": "Create Pull Request", "type": "boolean"},
+          "pull_request_json": {"default": "{}", "title": "Pull Request Json", "type": "string"},
+          "workspace_id": {"default": "", "title": "Workspace Id", "type": "string"},
+          "expected_workspace_revision": {"default": 0, "title": "Expected Workspace Revision", "type": "integer"}
+        },
+        "required": ["repository", "branch", "expected_head_sha", "expected_blob_shas_json", "patch_repository", "patch_ref", "patch_path", "expected_patch_blob_sha", "expected_patch_sha256", "expected_patch_size_bytes", "commit_message"],
+        "title": "apply_github_patch_from_refArguments", "type": "object"
       }
     },
     {
