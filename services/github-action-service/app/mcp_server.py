@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import base64
+import binascii
 import asyncio
 import os
 import re
@@ -1276,10 +1277,24 @@ async def begin_github_file_upload() -> str:
     except Exception as exc: return _mygithub10_error(exc)
 
 
-@mcp.tool(name="append_github_file_upload_chunk", description="Append one contiguous SHA-checked upload chunk.")
+@mcp.tool(name="append_github_file_upload_chunk", description="Append one contiguous SHA-checked upload chunk. Use text for UTF-8 text and content_base64 only for binary; keep chunks within the transport-safe limits returned by begin_github_file_upload.")
 async def append_github_file_upload_chunk(upload_id: str, offset: int, content_base64: str = "", text: str = "", chunk_sha256: str = "", idempotency_key: str = "") -> str:
     try:
-        content = base64.b64decode(content_base64) if content_base64 else text.encode("utf-8")
+        if bool(content_base64) == bool(text):
+            if content_base64:
+                raise mygithub10.MyGithub10Error("UPLOAD_CHUNK_ENCODING_AMBIGUOUS", "provide exactly one of content_base64 or text")
+            raise mygithub10.MyGithub10Error("UPLOAD_CHUNK_EMPTY", "provide exactly one non-empty upload chunk payload")
+        if content_base64:
+            try:
+                content = base64.b64decode(content_base64, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise mygithub10.MyGithub10Error(
+                    "UPLOAD_CHUNK_BASE64_INVALID",
+                    "content_base64 is invalid; for UTF-8 text use the text field",
+                    {"encoded_length": len(content_base64)},
+                ) from exc
+        else:
+            content = text.encode("utf-8")
         return json.dumps(await _github_call(mygithub10.append_upload, upload_id, offset, content, chunk_sha256, idempotency_key), ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
 

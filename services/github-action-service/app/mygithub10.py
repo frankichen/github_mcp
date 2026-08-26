@@ -33,7 +33,9 @@ MAX_INLINE_RESPONSE_BYTES = 65536
 MAX_FILE_CHUNK_BYTES = 65536
 MAX_PATCH_BYTES = 262144
 MAX_TEXT_EDIT_FILE_BYTES = 4 * 1024 * 1024
-MAX_UPLOAD_CHUNK_BYTES = 131072
+# MCP tool arguments have a 64 KiB inline transport ceiling; leave headroom for JSON/Base64 overhead.
+MAX_UPLOAD_CHUNK_BYTES = 24576
+RECOMMENDED_UPLOAD_CHUNK_BYTES = 16384
 MAX_UPLOAD_BYTES = 1048576
 MAX_UPLOAD_CHANGE_SET_FILES = 64
 MAX_UPLOAD_CHANGE_SET_BYTES = 64 * MAX_UPLOAD_BYTES
@@ -1202,6 +1204,8 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "max_file_chunk_bytes": MAX_FILE_CHUNK_BYTES,
         "max_patch_bytes": MAX_PATCH_BYTES,
         "max_upload_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES,
+        "recommended_upload_chunk_bytes": RECOMMENDED_UPLOAD_CHUNK_BYTES,
+        "preferred_upload_encoding": "text_for_utf8_base64_for_binary",
         "supports_file_manifest": True,
         "supports_byte_chunks": True,
         "supports_mcp_resources": True,
@@ -1268,7 +1272,7 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "recommended_small_text_workflow": ["replace_github_text_once", "apply_github_patch", "edit_github_file_ranges"],
         "recommended_large_file_workflow": ["get_github_file_manifest", "read_github_file_chunk", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "commit_github_uploaded_files"],
         "recommended_atomic_multi_upload_workflow": ["prepare_development_task", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "apply_development_change_set"],
-        "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "PATCH_TEXT_MISMATCH", "IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_IN_PROGRESS", "WORKSPACE_LEASE_REQUIRED", "WORKSPACE_REVISION_MISMATCH", "WORKSPACE_BRANCH_DRIFTED", "DEVELOPMENT_SESSION_NOT_FOUND", "DEVELOPMENT_SESSION_CLOSED", "DEVELOPMENT_SESSION_STATE_INVALID", "DEVELOPMENT_SESSION_REVISION_MISMATCH", "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "MIRROR_UNAVAILABLE", "MIRROR_ORIGIN_MISMATCH", "MIRROR_FETCH_FAILED", "MIRROR_OBJECT_MISSING", "MIRROR_IDENTITY_MISMATCH", "FAST_CI_NOT_MERGE_ELIGIBLE", "CI_PROFILE_DISCOVERY_MISMATCH", "CI_ENV_CACHE_INVALID", "CI_ENV_CACHE_BUILD_FAILED", "AFFECTED_SELECTION_INCOMPLETE", "FAILURE_PACK_UNAVAILABLE", "RUNTIME_SCHEMA_INCOMPATIBLE", "RUNTIME_GENERATION_NOT_READY", "RUNTIME_LEADER_CONFLICT", "CROSS_GENERATION_RESOURCE_UNAVAILABLE", "CROSS_GENERATION_UPLOAD_UNAVAILABLE"],
+        "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "PATCH_TEXT_MISMATCH", "IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_IN_PROGRESS", "UPLOAD_CHUNK_BASE64_INVALID", "UPLOAD_CHUNK_ENCODING_AMBIGUOUS", "UPLOAD_CHUNK_EMPTY", "UPLOAD_CHUNK_LIMIT_EXCEEDED", "UPLOAD_CHUNK_SHA_MISMATCH", "UPLOAD_OFFSET_MISMATCH", "UPLOAD_SIZE_EXCEEDED", "UPLOAD_NOT_FINALIZED", "WORKSPACE_LEASE_REQUIRED", "WORKSPACE_REVISION_MISMATCH", "WORKSPACE_BRANCH_DRIFTED", "DEVELOPMENT_SESSION_NOT_FOUND", "DEVELOPMENT_SESSION_CLOSED", "DEVELOPMENT_SESSION_STATE_INVALID", "DEVELOPMENT_SESSION_REVISION_MISMATCH", "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "MIRROR_UNAVAILABLE", "MIRROR_ORIGIN_MISMATCH", "MIRROR_FETCH_FAILED", "MIRROR_OBJECT_MISSING", "MIRROR_IDENTITY_MISMATCH", "FAST_CI_NOT_MERGE_ELIGIBLE", "CI_PROFILE_DISCOVERY_MISMATCH", "CI_ENV_CACHE_INVALID", "CI_ENV_CACHE_BUILD_FAILED", "AFFECTED_SELECTION_INCOMPLETE", "FAILURE_PACK_UNAVAILABLE", "RUNTIME_SCHEMA_INCOMPATIBLE", "RUNTIME_GENERATION_NOT_READY", "RUNTIME_LEADER_CONFLICT", "CROSS_GENERATION_RESOURCE_UNAVAILABLE", "CROSS_GENERATION_UPLOAD_UNAVAILABLE"],
         "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}],
     }
 
@@ -1322,7 +1326,13 @@ def begin_upload() -> dict[str, Any]:
     os.close(fd)
     meta_path.write_text(_json({"upload_id": upload_id, "created_at": time.time(), "expires_at": time.time() + UPLOAD_TTL_SECONDS, "size": 0, "sha256": None, "finalized": False}), encoding="utf-8")
     os.chmod(meta_path, 0o600)
-    return {"upload_id": upload_id, "expires_at": time.time() + UPLOAD_TTL_SECONDS, "max_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES}
+    return {
+        "upload_id": upload_id,
+        "expires_at": time.time() + UPLOAD_TTL_SECONDS,
+        "max_chunk_bytes": MAX_UPLOAD_CHUNK_BYTES,
+        "recommended_chunk_bytes": RECOMMENDED_UPLOAD_CHUNK_BYTES,
+        "preferred_encoding": "text_for_utf8_base64_for_binary",
+    }
 
 
 def _load_upload(upload_id: str) -> tuple[Path, Path, dict[str, Any]]:
