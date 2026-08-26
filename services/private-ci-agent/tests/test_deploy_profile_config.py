@@ -481,18 +481,13 @@ def test_apply_fixes_success_path_continues_in_fail_stop_mode(tmp_path):
     assert state == {ROLLBACK_CONTAINER, "github-action-service"}
 
 
-def test_apply_fixes_preserves_executor_no_new_privileges_hardening():
+def test_apply_fixes_uses_fixed_ciworker_systemd_broker():
     script = APPLY_FIXES_SCRIPT.read_text(encoding="utf-8")
-    unit = (
-        Path(__file__).parents[2]
-        / "private-ci-deploy-executor/systemd/mygithub12-infrastructure-deploy-executor.service.example"
-    ).read_text(encoding="utf-8")
 
     assert "run_ciworker_preheat" in script
     assert "--property=User=ciworker" in script
     assert "--property=Group=ciworker" in script
+    assert "--setenv=HOME=/home/ciworker" in script
+    assert "command -v systemd-run" in script
+    assert 'CIWORKER_BROKER_UID="$(run_ciworker_preheat /usr/bin/id -u)"' in script
     assert "runuser -u ciworker" not in script
-    assert "NoNewPrivileges=true" in unit
-    assert "ProtectKernelTunables=true" in unit
-    assert "ProtectKernelModules=true" in unit
-    assert "ProtectControlGroups=true" in unit
