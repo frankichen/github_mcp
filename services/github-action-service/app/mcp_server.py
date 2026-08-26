@@ -1175,6 +1175,36 @@ async def edit_github_file_ranges(
         return _mygithub10_error(exc)
 
 
+@mcp.tool(name="replace_github_text_once", description="Replace exactly one UTF-8 text block without caller-supplied line numbers. Requires exact HEAD/blob identity and expected_match_count=1; no newline, whitespace, or Unicode normalization is performed. Supports dry-run, idempotency, Workspace CAS, and durable read-back.")
+async def replace_github_text_once(
+    repository: str,
+    branch: str,
+    expected_head_sha: str,
+    path: str,
+    expected_blob_sha: str,
+    old_text: str,
+    new_text: str,
+    commit_message: str,
+    expected_match_count: int = 1,
+    dry_run: bool = True,
+    idempotency_key: str = "",
+    workspace_id: str = "",
+    expected_workspace_revision: int = 0,
+) -> str:
+    try:
+        await _github_call(mygithub12.workspace_write_preflight, _service, repository, branch, expected_head_sha, workspace_id, expected_workspace_revision)
+        result = await _github_call(
+            mygithub10.replace_text_once, _service, repository, branch, expected_head_sha,
+            path, expected_blob_sha, old_text, new_text, commit_message, expected_match_count,
+            dry_run, idempotency_key, _write_audit_context(workspace_id, expected_workspace_revision),
+        )
+        if not dry_run:
+            result = await _finalize_durable_write(result, workspace_id, expected_workspace_revision)
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        return _mygithub10_error(exc)
+
+
 @mcp.tool(
     name="build_github_patch",
     description="Build a deterministic minimal unified diff from complete old/new UTF-8 file text. Pure dry-run: never reads or writes GitHub.",

@@ -53,11 +53,16 @@ class TestMCPTools:
         from app.mcp_server import mcp
 
         tools = {tool.name: tool for tool in await mcp.list_tools()}
-        for name in ("build_github_patch", "edit_github_file_ranges", "apply_github_patch", "get_mygithub_capabilities"):
+        for name in ("build_github_patch", "replace_github_text_once", "edit_github_file_ranges", "apply_github_patch", "get_mygithub_capabilities"):
             assert name in tools
         assert "expected_blob_sha" in tools["edit_github_file_ranges"].description
         assert "expected_old_text" in tools["edit_github_file_ranges"].description
         assert "replacement_text" in tools["edit_github_file_ranges"].description
+        exact_schema = tools["replace_github_text_once"].inputSchema["properties"]
+        assert "start_line" not in exact_schema
+        assert "end_line" not in exact_schema
+        assert exact_schema["expected_match_count"]["default"] == 1
+        assert "without caller-supplied line numbers" in tools["replace_github_text_once"].description
         assert "start_line" not in tools["build_github_patch"].description
         operations_schema = tools["edit_github_file_ranges"].inputSchema["properties"]["operations_json"]
         for field in (
@@ -76,9 +81,10 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.1.2"
-        assert capabilities["tool_count"] == 161
-        assert capabilities["tool_manifest_count"] == 161
+        assert capabilities["version"] == "12.1.3"
+        assert capabilities["tool_count"] == 162
+        assert capabilities["tool_manifest_count"] == 162
+        assert capabilities["supports_exact_text_replace"] is True
         assert capabilities["supports_development_task_orchestration"] is True
         assert capabilities["supports_development_sessions"] is True
         assert capabilities["supports_local_git_mirror_reads"] is True

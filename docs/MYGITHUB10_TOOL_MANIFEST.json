@@ -5,7 +5,7 @@
   "controller_image": "not-read-from-runtime",
   "pygithub_version": "2.5.0",
   "mcp_sdk_version": "1.28.1",
-  "tool_count": 119,
+  "tool_count": 120,
   "tools": [
     {
       "name": "get_github_file",
@@ -2310,6 +2310,33 @@
           "commit_message"
         ],
         "title": "edit_github_file_rangesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "replace_github_text_once",
+      "read_only": false,
+      "consequential": true,
+      "category": "github",
+      "description": "Replace exactly one UTF-8 text block without caller-supplied line numbers. Requires exact HEAD/blob identity and expected_match_count=1; no newline, whitespace, or Unicode normalization is performed. Supports dry-run, idempotency, Workspace CAS, and durable read-back.",
+      "input_schema": {
+        "properties": {
+          "repository": {"title": "Repository", "type": "string"},
+          "branch": {"title": "Branch", "type": "string"},
+          "expected_head_sha": {"title": "Expected Head Sha", "type": "string"},
+          "path": {"title": "Path", "type": "string"},
+          "expected_blob_sha": {"title": "Expected Blob Sha", "type": "string"},
+          "old_text": {"title": "Old Text", "type": "string"},
+          "new_text": {"title": "New Text", "type": "string"},
+          "commit_message": {"title": "Commit Message", "type": "string"},
+          "expected_match_count": {"default": 1, "title": "Expected Match Count", "type": "integer"},
+          "dry_run": {"default": true, "title": "Dry Run", "type": "boolean"},
+          "idempotency_key": {"default": "", "title": "Idempotency Key", "type": "string"},
+          "workspace_id": {"default": "", "title": "Workspace Id", "type": "string"},
+          "expected_workspace_revision": {"default": 0, "title": "Expected Workspace Revision", "type": "integer"}
+        },
+        "required": ["repository", "branch", "expected_head_sha", "path", "expected_blob_sha", "old_text", "new_text", "commit_message"],
+        "title": "replace_github_text_onceArguments",
         "type": "object"
       }
     },

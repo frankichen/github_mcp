@@ -34,6 +34,7 @@ async def main() -> int:
         "wait_test_deployment",
         "apply_github_patch",
         "edit_github_file_ranges",
+        "replace_github_text_once",
         "build_github_patch",
         "get_mygithub_capabilities",
     }
