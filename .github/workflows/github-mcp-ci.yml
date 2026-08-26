@@ -32,6 +32,7 @@ jobs:
         run: |
           export CI_DB_PATH="$RUNNER_TEMP/ci.db"
           export DEPLOYMENT_DB_PATH="$RUNNER_TEMP/deployments.db"
+          export INFRASTRUCTURE_DEPLOYMENT_DB_PATH="$RUNNER_TEMP/infrastructure-deployments.db"
           export DEPLOY_STATUS_FILE="$RUNNER_TEMP/gongshi-test-status.json"
           export AUTO_GUPIAO_DEPLOY_STATUS_FILE="$RUNNER_TEMP/auto-gupiao-status.json"
           export IDEMPOTENCY_DB_PATH="$RUNNER_TEMP/idempotency.db"

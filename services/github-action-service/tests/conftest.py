@@ -12,6 +12,7 @@ _TEST_ENV = {
     "IDEMPOTENCY_DB_PATH": "/tmp/github-action-service-tests-idempotency.db",
     "CI_DB_PATH": "/tmp/github-action-service-tests-ci.db",
     "DEPLOYMENT_DB_PATH": "/tmp/github-action-service-tests-deployments.db",
+    "INFRASTRUCTURE_DEPLOYMENT_DB_PATH": "/tmp/github-action-service-tests-infrastructure-deployments.db",
     "MYGITHUB12_DB_PATH": "/tmp/github-action-service-tests-mygithub12.db",
 }
 
