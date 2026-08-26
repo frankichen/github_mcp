@@ -1106,7 +1106,16 @@ async def apply_github_patch(repository: str, branch: str, expected_head_sha: st
         return _mygithub10_error(exc)
 
 
-@mcp.tool(name="apply_github_patch_from_ref", description="Apply a strict unified diff stored in an exact GitHub blob, with source identity verification, exact target HEAD/blob checks, optional workspace CAS, dry-run and idempotency.")
+@mcp.tool(
+    name="apply_github_patch_from_ref",
+    description="Apply a strict unified diff stored in an exact GitHub blob, with source identity verification, exact target HEAD/blob checks, optional workspace CAS, dry-run and idempotency.",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
 async def apply_github_patch_from_ref(
     repository: str, branch: str, expected_head_sha: str, expected_blob_shas_json: str,
     patch_repository: str, patch_ref: str, patch_path: str, expected_patch_blob_sha: str,

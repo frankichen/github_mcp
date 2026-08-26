@@ -187,5 +187,6 @@ async def test_apply_patch_from_ref_workspace_preflight_blocks_core(workspace_er
         "a" * 40, "b" * 64, 1, "write", False, "ref-key", workspace_id="ws-1", expected_workspace_revision=2,
     )
     data = json.loads(raw)
-    assert data["code"] == workspace_error
+    assert data["ok"] is False
+    assert data["error"]["code"] == workspace_error
     assert called is False
