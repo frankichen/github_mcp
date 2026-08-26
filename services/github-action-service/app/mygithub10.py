@@ -1044,6 +1044,8 @@ def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, op
 
 def replace_text_once(client, repository: str, branch: str, expected_head_sha: str, path: str, expected_blob_sha: str, old_text: str, new_text: str, commit_message: str, expected_match_count: int = 1, dry_run: bool = True, idempotency_key: str = "", audit_context: dict[str, Any] | None = None) -> dict[str, Any]:
     _safe_path(path)
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_head_sha or ""):
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "expected_head_sha must be a full lowercase Git commit SHA")
     if not isinstance(old_text, str) or not isinstance(new_text, str):
         raise MyGithub10Error("PATCH_INVALID_FORMAT", "old_text and new_text must be strings")
     if not old_text:

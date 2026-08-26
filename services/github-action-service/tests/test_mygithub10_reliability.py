@@ -619,10 +619,11 @@ def test_new_file_patch_rejects_existing_target_and_commits_exact_bytes(monkeypa
 
 def test_exact_text_replace_avoids_line_numbers_and_preserves_crlf_unicode():
     original = "头部🙂\r\nkey: old\r\n尾部\r\n"
+    head = "c" * 40
     blob = mygithub10._git_blob_sha(original.encode())
-    service = ReadService(ReadRepo(original.encode(), blob=blob))
+    service = ReadService(ReadRepo(original.encode(), head=head, blob=blob))
     result = mygithub10.replace_text_once(
-        service, "owner/repo", "feature", "head-1", "config.yaml", blob,
+        service, "owner/repo", "feature", head, "config.yaml", blob,
         "key: old\r\n", "key: 新🙂\r\n", "replace", 1, True,
     )
     expected = original.replace("key: old\r\n", "key: 新🙂\r\n", 1).encode()
@@ -634,11 +635,12 @@ def test_exact_text_replace_avoids_line_numbers_and_preserves_crlf_unicode():
 
 def test_exact_text_replace_rejects_missing_ambiguous_and_overlapping_anchor():
     for original, old_text, expected_count in (("a\nb\n", "x\n", 0), ("x\nx\n", "x\n", 2), ("aaa\n", "aa", 2)):
+        head = "c" * 40
         blob = mygithub10._git_blob_sha(original.encode())
-        service = ReadService(ReadRepo(original.encode(), blob=blob))
+        service = ReadService(ReadRepo(original.encode(), head=head, blob=blob))
         with pytest.raises(mygithub10.MyGithub10Error) as exc:
             mygithub10.replace_text_once(
-                service, "owner/repo", "feature", "head-1", "x.txt", blob,
+                service, "owner/repo", "feature", head, "x.txt", blob,
                 old_text, "y\n", "replace", 1, True,
             )
         assert exc.value.code == "PATCH_TEXT_MISMATCH"
@@ -646,19 +648,27 @@ def test_exact_text_replace_rejects_missing_ambiguous_and_overlapping_anchor():
 
 
 def test_exact_text_replace_requires_current_blob_and_match_count_one():
-    service = ReadService(ReadRepo(b"old\n", blob="a" * 40))
+    head = "c" * 40
+    service = ReadService(ReadRepo(b"old\n", head=head, blob="a" * 40))
     with pytest.raises(mygithub10.MyGithub10Error) as exc:
         mygithub10.replace_text_once(
-            service, "owner/repo", "feature", "head-1", "x.txt", "b" * 40,
+            service, "owner/repo", "feature", head, "x.txt", "b" * 40,
             "old\n", "new\n", "replace", 1, True,
         )
     assert exc.value.code == "BLOB_CHANGED"
     with pytest.raises(mygithub10.MyGithub10Error) as exc:
         mygithub10.replace_text_once(
-            service, "owner/repo", "feature", "head-1", "x.txt", "a" * 40,
+            service, "owner/repo", "feature", head, "x.txt", "a" * 40,
             "old\n", "new\n", "replace", 2, True,
         )
     assert exc.value.code == "PATCH_INVALID_FORMAT"
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        mygithub10.replace_text_once(
+            service, "owner/repo", "feature", "", "x.txt", "a" * 40,
+            "old\n", "new\n", "replace", 1, True,
+        )
+    assert exc.value.code == "PATCH_INVALID_FORMAT"
+    assert "expected_head_sha" in str(exc.value)
 
 
 def test_idempotency_key_is_scoped_to_full_request(tmp_path, monkeypatch):

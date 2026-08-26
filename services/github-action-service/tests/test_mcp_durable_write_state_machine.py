@@ -89,6 +89,30 @@ async def test_09_edit_github_file_ranges_mcp_only_returns_after_success_verifie
 
 
 @pytest.mark.asyncio
+async def test_09b_replace_github_text_once_mcp_only_returns_after_success_verified(tmp_path, monkeypatch):
+    monkeypatch.setattr(mygithub10.settings, "IDEMPOTENCY_DB_PATH", str(tmp_path / "exact.db"))
+    monkeypatch.setattr(mygithub12, "workspace_write_preflight", lambda *args, **kwargs: None)
+
+    def fake_replace(*args, **kwargs):
+        result = verified_result()
+        return make_git_verified(
+            "replace_github_text_once", "exact-key",
+            {"tool_name": "replace_github_text_once", "repository": "owner/allowed-repo", "branch": "ai/test", "expected_head_sha": OLD},
+            result,
+        )
+
+    monkeypatch.setattr(mygithub10, "replace_text_once", fake_replace)
+    raw = await mcp_server.replace_github_text_once(
+        "owner/allowed-repo", "ai/test", OLD, "a.txt", BLOB,
+        "old\n", "new\n", "write", 1, False, "exact-key",
+    )
+    data = json.loads(raw)
+    assert data["write_verified"] is True
+    assert data["operation_id"]
+    assert mygithub10._idempotent_existing("exact-key")["status"] == "success_verified"
+
+
+@pytest.mark.asyncio
 async def test_11_commit_github_uploaded_files_mcp_only_returns_after_success_verified(tmp_path, monkeypatch):
     monkeypatch.setattr(mygithub10.settings, "IDEMPOTENCY_DB_PATH", str(tmp_path / "upload.db"))
     monkeypatch.setattr(mygithub12, "workspace_write_preflight", lambda *args, **kwargs: None)
