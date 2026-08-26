@@ -107,6 +107,10 @@ async def _finalize_durable_write(
         return result
     operation_id = str(result.pop("_operation_id", "") or "")
     cleanup_upload_id = str(result.pop("_cleanup_upload_id", "") or "")
+    raw_cleanup_upload_ids = result.pop("_cleanup_upload_ids", [])
+    cleanup_upload_ids = [str(item) for item in raw_cleanup_upload_ids if str(item)] if isinstance(raw_cleanup_upload_ids, list) else []
+    if cleanup_upload_id:
+        cleanup_upload_ids.insert(0, cleanup_upload_id)
     if result.get("write_verified") is not True:
         exc = mygithub10.MyGithub10Error(
             "WRITE_VERIFY_FAILED",
@@ -184,11 +188,11 @@ async def _finalize_durable_write(
                     "cause_type": type(exc).__name__,
                 },
             ) from exc
-    if cleanup_upload_id:
+    for cleanup_id in dict.fromkeys(cleanup_upload_ids):
         try:
-            await _github_call(mygithub10.abort_upload, cleanup_upload_id)
+            await _github_call(mygithub10.abort_upload, cleanup_id)
         except Exception:
-            logger.warning("verified upload cleanup failed upload_id=%s", cleanup_upload_id)
+            logger.warning("verified upload cleanup failed upload_id=%s", cleanup_id)
     return result
 
 

@@ -730,6 +730,45 @@ def test_upload_replay_survives_body_cleanup(tmp_path, monkeypatch):
     assert replay["replayed"] is True
 
 
+def test_multi_upload_commit_uses_one_atomic_commit_and_replays_after_cleanup(tmp_path, monkeypatch):
+    monkeypatch.setattr(mygithub10, "_UPLOAD_ROOT", tmp_path / "multi-uploads")
+    monkeypatch.setattr(mygithub10.settings, "IDEMPOTENCY_DB_PATH", str(tmp_path / "multi-upload-ops.db"))
+    uploaded_files = []
+    for name, data in (("a.txt", b"alpha\n"), ("b.txt", b"beta\n")):
+        upload = mygithub10.begin_upload()
+        sha = hashlib.sha256(data).hexdigest()
+        mygithub10.append_upload(upload["upload_id"], 0, data, sha)
+        mygithub10.finalize_upload(upload["upload_id"], len(data), sha)
+        uploaded_files.append({"path": name, "expected_blob_sha": "", "upload_id": upload["upload_id"]})
+
+    calls = []
+
+    def fake_commit_files(_service, repository, branch, expected_head_sha, changed, expected_blob_shas, message):
+        calls.append((repository, branch, expected_head_sha, changed, expected_blob_shas, message))
+        return {
+            "commit_sha": "multi-commit", "old_head_sha": "head-1", "new_head_sha": "multi-commit",
+            "tree_sha": "tree-1", "changed_files": [{"path": path, "size_bytes": len(data)} for path, data in changed.items()],
+            "write_verified": True, "repository": repository, "branch": branch,
+            "previous_head_sha": "head-1", "verified_branch_head_sha": "multi-commit",
+            "verified_commit_sha": "multi-commit", "verified_tree_sha": "tree-1",
+        }
+
+    monkeypatch.setattr(mygithub10, "_commit_files", fake_commit_files)
+    first = mygithub10.commit_uploads(ReadService(ReadRepo(b"")), "owner/repo", "feature", "head-1", uploaded_files, "multi", "multi-key")
+    assert len(calls) == 1
+    assert calls[0][3] == {"a.txt": b"alpha\n", "b.txt": b"beta\n"}
+    assert first["upload_ids"] == [item["upload_id"] for item in uploaded_files]
+    operation_id = first.pop("_operation_id")
+    cleanup_ids = first.pop("_cleanup_upload_ids")
+    mygithub10._idempotent_finish(operation_id, "success_verified", "multi-commit", result=first)
+    for upload_id in cleanup_ids:
+        mygithub10.abort_upload(upload_id)
+    replay = mygithub10.commit_uploads(ReadService(ReadRepo(b"")), "owner/repo", "feature", "head-1", uploaded_files, "multi", "multi-key")
+    assert replay["commit_sha"] == "multi-commit"
+    assert replay["replayed"] is True
+    assert len(calls) == 1
+
+
 def test_concurrent_same_idempotency_key_has_one_owner(tmp_path, monkeypatch):
     monkeypatch.setattr(mygithub10.settings, "IDEMPOTENCY_DB_PATH", str(tmp_path / "concurrent.db"))
     request = {"tool_name": "apply_github_patch", "repository": "a/r", "branch": "one", "expected_head_sha": "h1", "patch_sha256": "p1", "commit_message": "m"}

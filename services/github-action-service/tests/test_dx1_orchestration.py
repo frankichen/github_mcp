@@ -703,6 +703,35 @@ def test_change_set_v1_reuses_strict_modes_and_rejects_unknown_schema():
     assert exc.value.code == "PATCH_INVALID_FORMAT"
 
 
+def test_upload_change_set_supports_atomic_multiple_finalized_files(monkeypatch):
+    uploads = [
+        {"path": "a.txt", "expected_blob_sha": "a" * 40, "upload_id": "upload-a"},
+        {"path": "b.txt", "expected_blob_sha": "b" * 40, "upload_id": "upload-b"},
+    ]
+    parsed = dx.parse_change_set(json.dumps({"schema_version": 1, "mode": "upload", "uploaded_files": uploads}))
+    assert parsed["mode"] == "upload"
+    monkeypatch.setattr(dx.mygithub10, "_safe_path", lambda path: path)
+    monkeypatch.setattr(dx.mygithub10, "_load_upload", lambda upload_id: (None, None, {"finalized": True, "size": 10, "sha256": upload_id}))
+    dry = dx.execute_change_set(object(), {"repository": "owner/repo", "branch": "ai/task"}, {}, parsed, SHA_B, 3, "multi", True, "multi-key", {})
+    assert [item["path"] for item in dry["changed_files"]] == ["a.txt", "b.txt"]
+
+    calls = []
+    monkeypatch.setattr(dx.mygithub10, "commit_uploads", lambda *args: calls.append(args) or {"ok": True, "commit_sha": SHA_C})
+    result = dx.execute_change_set(object(), {"repository": "owner/repo", "branch": "ai/task"}, {}, parsed, SHA_B, 3, "multi", False, "multi-key", {})
+    assert result["commit_sha"] == SHA_C
+    assert len(calls) == 1
+    assert calls[0][4] == uploads
+
+
+def test_upload_change_set_rejects_duplicate_paths_and_upload_ids():
+    with pytest.raises(mygithub12.MyGithub12Error) as path_exc:
+        dx.parse_change_set(json.dumps({"schema_version": 1, "mode": "upload", "uploaded_files": [{"path": "same", "upload_id": "one"}, {"path": "same", "upload_id": "two"}]}))
+    assert path_exc.value.code == "PATCH_INVALID_FORMAT"
+    with pytest.raises(mygithub12.MyGithub12Error) as upload_exc:
+        dx.parse_change_set(json.dumps({"schema_version": 1, "mode": "upload", "uploaded_files": [{"path": "a", "upload_id": "same"}, {"path": "b", "upload_id": "same"}]}))
+    assert upload_exc.value.code == "PATCH_INVALID_FORMAT"
+
+
 def test_mygithub12_db_open_retries_cantopen_once(tmp_path, monkeypatch):
     target = tmp_path / "nested" / "mygithub12.db"
     monkeypatch.setenv("MYGITHUB12_DB_PATH", str(target))

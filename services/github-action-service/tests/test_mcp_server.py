@@ -92,6 +92,7 @@ class TestMCPTools:
         assert len(capabilities["tool_schema_sha256"]) == 64
         assert capabilities["schema_generation_id"].startswith("schema-v1:")
         assert capabilities["supports_exact_text_replace"] is True
+        assert capabilities["supports_atomic_multi_upload_change_set"] is True
         assert capabilities["supports_private_ci_applicability_planning"] is True
         assert capabilities["supports_development_task_orchestration"] is True
         assert capabilities["supports_development_sessions"] is True
