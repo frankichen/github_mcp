@@ -26,6 +26,7 @@ from app.config import settings
 from app.exceptions import ValidationError
 from app.version import SERVICE_VERSION
 from app.github_write_verify import WriteVerificationError, post_write_verify
+from app.github_policy import ensure_repository_allowed
 from app.observability import current_request_id
 
 MAX_INLINE_RESPONSE_BYTES = 65536
@@ -361,6 +362,69 @@ def _read_blob(repo, path: str, ref: str) -> tuple[bytes, str, str]:
         raise MyGithub10Error("GITHUB_READ_FAILED", f"GitHub failed while reading {path}", {"path": path, "ref": ref, "retryable": True}) from exc
 
 
+def resolve_patch_from_ref(client, patch_repository: str, patch_ref: str, patch_path: str,
+                           expected_patch_blob_sha: str, expected_patch_sha256: str,
+                           expected_patch_size_bytes: int) -> tuple[str, dict[str, Any]]:
+    """Resolve and attest a patch using the canonical GitHub blob reader."""
+    import re
+
+    def source_error(code: str, message: str, details: dict[str, Any] | None = None) -> MyGithub10Error:
+        return MyGithub10Error(code, message, details or {})
+
+    if not isinstance(patch_ref, str) or not patch_ref.strip():
+        raise source_error("PATCH_SOURCE_REF_NOT_FOUND", "patch_ref must be non-empty")
+    if not isinstance(expected_patch_blob_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", expected_patch_blob_sha):
+        raise source_error("PATCH_SOURCE_BLOB_CHANGED", "expected_patch_blob_sha must be lowercase 40-hex")
+    if not isinstance(expected_patch_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_patch_sha256):
+        raise source_error("PATCH_SOURCE_HASH_MISMATCH", "expected_patch_sha256 must be lowercase 64-hex")
+    if isinstance(expected_patch_size_bytes, bool) or not isinstance(expected_patch_size_bytes, int) or expected_patch_size_bytes < 0:
+        raise source_error("PATCH_SOURCE_SIZE_MISMATCH", "expected_patch_size_bytes must be a non-negative integer")
+    try:
+        ensure_repository_allowed(patch_repository)
+    except Exception as exc:
+        raise source_error("PATCH_SOURCE_REPOSITORY_NOT_ALLOWED", "patch source repository is not allowed", {"repository": patch_repository}) from exc
+    try:
+        _safe_path(patch_path)
+    except MyGithub10Error as exc:
+        raise source_error("PATCH_SOURCE_UNSAFE_PATH", exc.message, exc.details) from exc
+    try:
+        raw, actual_blob_sha, resolved_commit_sha = _read_blob(_repo(client, patch_repository), patch_path, patch_ref)
+    except MyGithub10Error as exc:
+        source_code = {
+            "REF_NOT_FOUND": "PATCH_SOURCE_REF_NOT_FOUND",
+            "FILE_NOT_FOUND": "PATCH_SOURCE_FILE_NOT_FOUND",
+            "GITHUB_READ_FAILED": "PATCH_SOURCE_READ_FAILED",
+            "PATCH_UNSAFE_PATH": "PATCH_SOURCE_UNSAFE_PATH",
+        }.get(exc.code)
+        if source_code:
+            raise source_error(source_code, exc.message, exc.details) from exc
+        raise
+    except Exception as exc:
+        raise source_error("PATCH_SOURCE_READ_FAILED", "GitHub failed while reading the patch blob", {"path": patch_path, "ref": patch_ref, "retryable": True}) from exc
+    actual_blob_from_bytes = _git_blob_sha(raw)
+    if actual_blob_from_bytes != actual_blob_sha:
+        raise source_error("PATCH_SOURCE_BLOB_CHANGED", "resolved patch blob bytes differ from GitHub blob identity", {"expected": actual_blob_sha, "actual": actual_blob_from_bytes})
+    if expected_patch_blob_sha != actual_blob_sha:
+        raise source_error("PATCH_SOURCE_BLOB_CHANGED", "patch blob SHA differs from expected", {"expected": expected_patch_blob_sha, "actual": actual_blob_sha})
+    actual_size = len(raw)
+    if expected_patch_size_bytes != actual_size:
+        raise source_error("PATCH_SOURCE_SIZE_MISMATCH", "patch blob size differs from expected", {"expected": expected_patch_size_bytes, "actual": actual_size})
+    actual_sha256 = _sha256(raw)
+    if expected_patch_sha256 != actual_sha256:
+        raise source_error("PATCH_SOURCE_HASH_MISMATCH", "patch blob SHA256 differs from expected", {"expected": expected_patch_sha256, "actual": actual_sha256})
+    try:
+        patch = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise source_error("PATCH_SOURCE_UTF8_INVALID", "patch blob is not valid UTF-8") from exc
+    identity = {
+        "patch_source_mode": "github_ref", "patch_repository": patch_repository,
+        "patch_ref": patch_ref, "resolved_patch_commit_sha": resolved_commit_sha,
+        "patch_path": patch_path, "patch_blob_sha": actual_blob_sha,
+        "patch_size_bytes": actual_size, "patch_sha256": actual_sha256,
+    }
+    return patch, identity
+
+
 def _text(data: bytes) -> str:
     try:
         return data.decode("utf-8")
@@ -534,6 +598,7 @@ def _canonical_patch_request(
     expected_blob_shas: dict[str, str],
     parsed: list[tuple[str, str, list[tuple[int, int, list[str], list[str]]]]],
     commit_message: str,
+    artifact_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     files = []
     for path, operation, hunks in parsed:
@@ -551,7 +616,7 @@ def _canonical_patch_request(
                 for old_start, new_start, old_lines, new_lines in hunks
             ],
         })
-    return {
+    request = {
         "tool_name": "apply_github_patch",
         "repository": repository,
         "branch": branch,
@@ -559,6 +624,9 @@ def _canonical_patch_request(
         "commit_message": commit_message,
         "files": sorted(files, key=lambda item: item["path"]),
     }
+    if artifact_identity:
+        request["patch_artifact"] = artifact_identity
+    return request
 
 
 def _patch_mismatch_details(
@@ -709,7 +777,7 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
     return {"commit_sha": commit.sha, "new_head_sha": commit.sha, "old_head_sha": actual_head, "tree_sha": tree.sha, "branch": branch, "repository": repository, "changed_files": file_results, **evidence}
 
 
-def apply_patch(client, repository: str, branch: str, expected_head_sha: str, expected_blob_shas_json: str, patch: str, commit_message: str, dry_run: bool, idempotency_key: str = "", audit_context: dict[str, Any] | None = None) -> dict[str, Any]:
+def apply_patch(client, repository: str, branch: str, expected_head_sha: str, expected_blob_shas_json: str, patch: str, commit_message: str, dry_run: bool, idempotency_key: str = "", audit_context: dict[str, Any] | None = None, artifact_identity: dict[str, Any] | None = None) -> dict[str, Any]:
     parsed, patch_metadata = _parse_patch_details(patch)
     try:
         expected = json.loads(expected_blob_shas_json or "{}")
@@ -724,7 +792,14 @@ def apply_patch(client, repository: str, branch: str, expected_head_sha: str, ex
         expected,
         parsed,
         commit_message,
+        artifact_identity,
     )
+    if artifact_identity:
+        request.update({
+            "dry_run": dry_run,
+            "workspace_id": str((audit_context or {}).get("workspace_id") or ""),
+            "expected_workspace_revision": int((audit_context or {}).get("workspace_revision") or 0),
+        })
     operation_id, replay = ("", None) if dry_run else _idempotent_start("apply_github_patch", idempotency_key, request, audit_context)
     if replay:
         return replay
@@ -790,6 +865,11 @@ def apply_patch(client, repository: str, branch: str, expected_head_sha: str, ex
               "expected_head_sha": expected_head_sha, "changed_files": previews,
               "diff_preview": diff_preview, "diff_truncated": diff_truncated,
               "operation_fingerprint": fingerprint, **patch_metadata}
+    if artifact_identity:
+        result.update(artifact_identity)
+        if audit_context and audit_context.get("workspace_id"):
+            result["workspace_id"] = str(audit_context["workspace_id"])
+            result["workspace_revision"] = int(audit_context.get("workspace_revision") or 0)
     if dry_run:
         return result
     try:
@@ -800,6 +880,21 @@ def apply_patch(client, repository: str, branch: str, expected_head_sha: str, ex
     except MyGithub10Error as exc:
         _idempotent_finish(operation_id, "failed", error_code=exc.code, result={"failed_stage": exc.details.get("failed_stage"), "error": {"code": exc.code, "details": exc.details}})
         raise
+
+
+def apply_patch_from_ref(client, repository: str, branch: str, expected_head_sha: str,
+                         expected_blob_shas_json: str, patch_repository: str, patch_ref: str,
+                         patch_path: str, expected_patch_blob_sha: str, expected_patch_sha256: str,
+                         expected_patch_size_bytes: int, commit_message: str, dry_run: bool = True,
+                         idempotency_key: str = "", audit_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    patch, identity = resolve_patch_from_ref(
+        client, patch_repository, patch_ref, patch_path,
+        expected_patch_blob_sha, expected_patch_sha256, expected_patch_size_bytes,
+    )
+    return apply_patch(
+        client, repository, branch, expected_head_sha, expected_blob_shas_json, patch,
+        commit_message, dry_run, idempotency_key, audit_context, identity,
+    )
 
 
 def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, operations_json: str, commit_message: str, dry_run: bool, idempotency_key: str = "", audit_context: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -975,7 +1070,7 @@ def capabilities(build_sha: str) -> dict[str, Any]:
     return {
         "name": "MyGithut12",
         "version": SERVICE_VERSION,
-        "tool_count": 159,
+        "tool_count": 161,
         "build_sha": build_sha,
         "build_sha_source": "environment" if new_build_env or legacy_build_env else "vcs_fallback",
         "runtime_mode": os.environ.get("MYGITHUB12_RUNTIME_MODE", os.environ.get("MYGITHUB10_RUNTIME_MODE", "development")),

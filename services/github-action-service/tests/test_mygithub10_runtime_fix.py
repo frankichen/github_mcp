@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from app import mygithub10
+from app import mygithub10_runtime_fix
 
 
 class FakeRef:
@@ -111,6 +112,24 @@ def _replace_line_two():
 def test_runtime_fix_is_installed_on_app_import():
     assert mygithub10._runtime_strict_write_fix_installed is True
     assert mygithub10.edit_ranges.__module__ == "app.mygithub10_runtime_fix"
+
+
+def test_runtime_fix_forwards_patch_artifact_identity(monkeypatch):
+    seen = {}
+
+    def original(*args):
+        seen["args"] = args
+        return {"ok": True}
+
+    monkeypatch.setattr(mygithub10_runtime_fix, "_ORIGINAL_APPLY_PATCH", original)
+    artifact_identity = {"patch_blob_sha": "blob-1"}
+    result = mygithub10.apply_patch(
+        object(), "owner/repo", "feature", "head-1", "{}", "patch", "change",
+        True, "", None, artifact_identity,
+    )
+
+    assert result == {"ok": True}
+    assert seen["args"][-1] == artifact_identity
 
 
 def test_formal_range_write_uses_direct_gitcommit_tree_and_non_forced_ref_update():

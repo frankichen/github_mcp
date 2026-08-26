@@ -1106,6 +1106,39 @@ async def apply_github_patch(repository: str, branch: str, expected_head_sha: st
         return _mygithub10_error(exc)
 
 
+@mcp.tool(
+    name="apply_github_patch_from_ref",
+    description="Apply a strict unified diff stored in an exact GitHub blob, with source identity verification, exact target HEAD/blob checks, optional workspace CAS, dry-run and idempotency.",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def apply_github_patch_from_ref(
+    repository: str, branch: str, expected_head_sha: str, expected_blob_shas_json: str,
+    patch_repository: str, patch_ref: str, patch_path: str, expected_patch_blob_sha: str,
+    expected_patch_sha256: str, expected_patch_size_bytes: int, commit_message: str,
+    dry_run: bool = True, idempotency_key: str = "", create_pull_request: bool = False,
+    pull_request_json: str = "{}", workspace_id: str = "", expected_workspace_revision: int = 0,
+) -> str:
+    try:
+        await _github_call(mygithub12.workspace_write_preflight, _service, repository, branch, expected_head_sha, workspace_id, expected_workspace_revision)
+        result = await _github_call(
+            mygithub10.apply_patch_from_ref, _service, repository, branch, expected_head_sha,
+            expected_blob_shas_json, patch_repository, patch_ref, patch_path,
+            expected_patch_blob_sha, expected_patch_sha256, expected_patch_size_bytes,
+            commit_message, dry_run, idempotency_key,
+            _write_audit_context(workspace_id, expected_workspace_revision),
+        )
+        if not dry_run:
+            result = await _finalize_durable_write(result, workspace_id, expected_workspace_revision)
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        return _mygithub10_error(exc)
+
+
 @mcp.tool(name="edit_github_file_ranges", description="Apply non-overlapping exact-text line range edits as one atomic commit. Each item uses expected_blob_sha and replacement_text; replace/delete must explicitly provide expected_old_text or compatibility field expected_old_text_sha256. start_line/end_line are 1-based inclusive. Supports optional workspace CAS. Dry-run and commit use identical computed UTF-8 bytes.")
 async def edit_github_file_ranges(
     repository: str,

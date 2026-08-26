@@ -7,7 +7,7 @@ import pytest
 from app.mcp_server import mcp
 
 
-EXPECTED_TOOL_COUNT = 159
+EXPECTED_TOOL_COUNT = 161
 DX1_TOOLS = [
     "prepare_development_task",
     "apply_development_change_set",
@@ -32,6 +32,7 @@ MYGITHUB12_BASE_TOOLS = {
     "get_repository_dependency_graph", "get_repository_agent_instructions",
     "build_repository_context_pack", "build_change_context_pack",
     "analyze_repository_change_impact", "analyze_repository_patch",
+    "analyze_repository_patch_from_ref",
     "get_affected_tests", "detect_repository_contract_changes",
     "read_mcp_response_resource",
 }
@@ -47,7 +48,7 @@ async def test_registered_tool_manifest_is_stable_and_unique():
     assert all(name and name.strip() == name for name in actual_names)
     tools = {tool.name: tool for tool in actual}
     assert MYGITHUB12_BASE_TOOLS <= set(actual_names)
-    assert len(MYGITHUB12_BASE_TOOLS) == 37
+    assert len(MYGITHUB12_BASE_TOOLS) == 38
     assert actual_names[-4:] == DX1_TOOLS
     for name in DX1_TOOLS:
         assert tools[name].annotations.readOnlyHint is False
@@ -55,11 +56,26 @@ async def test_registered_tool_manifest_is_stable_and_unique():
         assert tools[name].annotations.idempotentHint is False
     assert tools["build_github_patch"].annotations.readOnlyHint is True
     assert tools["search_repository_text"].annotations.readOnlyHint is True
+    assert tools["analyze_repository_patch_from_ref"].annotations.readOnlyHint is True
+    assert tools["analyze_repository_patch_from_ref"].inputSchema["required"][-3:] == [
+        "expected_patch_blob_sha", "expected_patch_sha256", "expected_patch_size_bytes"
+    ]
+    assert [tool.name for tool in actual].count("analyze_repository_patch_from_ref") == 1
+    assert [tool.name for tool in actual].count("apply_github_patch_from_ref") == 1
+    assert tools["apply_github_patch_from_ref"].annotations.readOnlyHint is False
+    assert tools["apply_github_patch_from_ref"].annotations.destructiveHint is True
+    assert tools["apply_github_patch_from_ref"].annotations.idempotentHint is False
+    reference_required = {
+        "patch_repository", "patch_ref", "patch_path", "expected_patch_blob_sha",
+        "expected_patch_sha256", "expected_patch_size_bytes",
+    }
+    assert reference_required <= set(tools["apply_github_patch_from_ref"].inputSchema["required"])
+    assert reference_required <= set(tools["analyze_repository_patch_from_ref"].inputSchema["required"])
     assert "result" not in (tools["get_private_ci_job"].outputSchema.get("properties") or {})
     assert tools["get_private_ci_job"].inputSchema["properties"]["detail_level"]["default"] == "summary"
     templates = await mcp.list_resource_templates()
     assert any(str(template.uriTemplate) == "mygithub12://response/{resource_id}" for template in templates)
-    for name in ("commit_github_files", "apply_github_patch", "edit_github_file_ranges", "commit_github_uploaded_files"):
+    for name in ("commit_github_files", "apply_github_patch", "apply_github_patch_from_ref", "edit_github_file_ranges", "commit_github_uploaded_files"):
         properties = tools[name].inputSchema["properties"]
         assert properties["workspace_id"]["default"] == ""
         assert properties["expected_workspace_revision"]["default"] == 0
@@ -69,9 +85,16 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.1.1"
-    assert manifest["legacy_tool_count"] == 118
-    assert manifest["new_tool_count"] == 41
+    assert manifest["service_version"] == "12.1.2"
+    assert manifest["legacy_tool_count"] == 119
+    assert manifest["new_tool_count"] == 42
     assert manifest["tool_count"] == EXPECTED_TOOL_COUNT
     assert manifest["new_tools"][-4:] == DX1_TOOLS
     assert set(manifest["new_tools"][:-4]) == MYGITHUB12_BASE_TOOLS
+    legacy = json.loads((root / "docs" / "MYGITHUB10_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
+    assert [tool["name"] for tool in legacy["tools"]].count("apply_github_patch_from_ref") == 1
+    apply_tool = next(tool for tool in legacy["tools"] if tool["name"] == "apply_github_patch_from_ref")
+    assert apply_tool["read_only"] is False
+    assert apply_tool["consequential"] is True
+    assert {"patch_repository", "patch_ref", "patch_path", "expected_patch_blob_sha", "expected_patch_sha256", "expected_patch_size_bytes"} <= set(apply_tool["input_schema"]["required"])
+    assert manifest["new_tools"].count("analyze_repository_patch_from_ref") == 1

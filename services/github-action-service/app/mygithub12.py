@@ -1477,6 +1477,23 @@ def analyze_patch(service: Any, repository: str, base_commit_sha: str, patch: st
     }
 
 
+def analyze_patch_from_ref(service: Any, repository: str, base_commit_sha: str,
+                           patch_repository: str, patch_ref: str, patch_path: str,
+                           expected_patch_blob_sha: str, expected_patch_sha256: str,
+                           expected_patch_size_bytes: int) -> dict[str, Any]:
+    from app import mygithub10
+    try:
+        patch, identity = mygithub10.resolve_patch_from_ref(
+            service, patch_repository, patch_ref, patch_path,
+            expected_patch_blob_sha, expected_patch_sha256, expected_patch_size_bytes,
+        )
+    except mygithub10.MyGithub10Error as exc:
+        raise MyGithub12Error(exc.code, exc.message, exc.details) from exc
+    result = analyze_patch(service, repository, base_commit_sha, patch)
+    result.update(identity)
+    return result
+
+
 
 
 from app.mygithub12_workspace import (

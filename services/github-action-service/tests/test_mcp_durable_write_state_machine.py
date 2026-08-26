@@ -161,3 +161,32 @@ async def test_06_workspace_finalize_failure_marks_operation_indeterminate(tmp_p
     row = mygithub10._idempotent_existing_by_operation(operation_id)
     assert row["status"] == "indeterminate"
     assert row["result_commit_sha"] == NEW
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workspace_error", [
+    "WORKSPACE_REVISION_MISMATCH",
+    "WORKSPACE_LEASE_REQUIRED",
+    "WORKSPACE_BRANCH_DRIFTED",
+])
+async def test_apply_patch_from_ref_workspace_preflight_blocks_core(workspace_error, monkeypatch):
+    called = False
+
+    def fail_preflight(*args, **kwargs):
+        raise mygithub12.MyGithub12Error(workspace_error, "workspace preflight failed")
+
+    def forbidden_apply(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("apply core must not run after workspace preflight failure")
+
+    monkeypatch.setattr(mygithub12, "workspace_write_preflight", fail_preflight)
+    monkeypatch.setattr(mygithub10, "apply_patch_from_ref", forbidden_apply)
+    raw = await mcp_server.apply_github_patch_from_ref(
+        "owner/allowed-repo", "ai/test", OLD, "{}", "owner/source", "main", "patch.diff",
+        "a" * 40, "b" * 64, 1, "write", False, "ref-key", workspace_id="ws-1", expected_workspace_revision=2,
+    )
+    data = json.loads(raw)
+    assert data["ok"] is False
+    assert data["error"]["code"] == workspace_error
+    assert called is False
