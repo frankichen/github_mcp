@@ -37,6 +37,7 @@ from app.version import runtime_build_sha
 from app.observability import current_request_id
 from app.mygithub12_mcp import register_mygithub12_tools
 from app.mygithub12_dx_mcp import register_dx_tools
+from app.infrastructure_deployment_mcp import register_infrastructure_deployment_tools
 from app.mcp_response import (
     MAX_RESPONSE_RESOURCE_CHUNK_BYTES,
     StructuredFastMCP,
@@ -1468,6 +1469,7 @@ mcp.tool(
 # Stable DX-1 high-level orchestration surface. Keep registration after the
 # pre-12.1 tool set so manifest ordering remains backward compatible.
 register_dx_tools(mcp, _github_call, _service, _finalize_durable_write)
+register_infrastructure_deployment_tools(mcp, _github_call)
 
 
 # ========================================================================
