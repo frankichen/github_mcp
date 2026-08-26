@@ -54,6 +54,8 @@ DX-1 已经完成了 Development Session、Development Workspace、Index、Fast/
 7. 新窗口接手 branch/PR 时，仍需要人工恢复 main、HEAD、Tree、Workspace、Session、Lease、Index、CI、PR 和 overlap；
 8. 真实 CI 性能尚未形成长期可比较的 performance capability 和回归门禁。
 
+9. 新文件 deterministic Patch Builder 与 strict apply 对 add 语义不一致，调用方需要人工修正 patch header，已在本轮真实复现。
+
 ## 4. DX-2 总目标
 
 ### 4.1 速度目标
@@ -89,6 +91,10 @@ DX-1 已经完成了 Development Session、Development Workspace、Index、Fast/
 Lease 到期的 Workspace 不再长期作为 active Writer 参与默认 overlap；保留审计、branch、历史和 Index evidence，不自动删 branch。
 
 ### P1：显著减少重复调用与诊断成本
+
+#### DX2-WRITE-01：新文件 Patch Builder / Strict Apply 一致性
+
+修复 `build_github_patch` 新文件输出不能直接被 strict apply 接受的问题，保证服务端 builder → dry-run → commit 的闭环无需人工改写 patch header。
 
 #### DX2-INFRA-01：Infrastructure Executor 独立 heartbeat
 
