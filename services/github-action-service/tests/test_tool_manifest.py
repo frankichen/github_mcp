@@ -7,13 +7,18 @@ import pytest
 from app.mcp_server import mcp
 
 
-EXPECTED_REGISTERED_TOOL_COUNT = 163
-EXPECTED_CANONICAL_TOOL_COUNT = 160
+EXPECTED_REGISTERED_TOOL_COUNT = 166
+EXPECTED_CANONICAL_TOOL_COUNT = 163
 DX1_TOOLS = [
     "prepare_development_task",
     "apply_development_change_set",
     "validate_development_task",
     "finalize_development_task",
+]
+INFRASTRUCTURE_DEPLOY_TOOLS = [
+    "plan_infrastructure_deployment",
+    "start_infrastructure_deployment",
+    "get_infrastructure_deployment",
 ]
 MYGITHUB12_BASE_TOOLS = {
     "get_repository_index_status", "request_repository_index_build",
