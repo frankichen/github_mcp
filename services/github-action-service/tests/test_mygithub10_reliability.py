@@ -783,3 +783,34 @@ def test_concurrent_same_idempotency_key_has_one_owner(tmp_path, monkeypatch):
         results = list(pool.map(lambda _: claim(), range(2)))
     assert sum(isinstance(value, str) and value not in {"IDEMPOTENCY_IN_PROGRESS", "IDEMPOTENCY_CONFLICT"} for value in results) == 1
     assert "IDEMPOTENCY_IN_PROGRESS" in results
+
+
+
+def test_transport_safe_chunk_contract_finalizes_92355_byte_upload(tmp_path, monkeypatch):
+    monkeypatch.setattr(mygithub10, "_UPLOAD_ROOT", tmp_path / "transport-safe-upload")
+    upload = mygithub10.begin_upload()
+    assert upload["max_chunk_bytes"] == mygithub10.MAX_UPLOAD_CHUNK_BYTES == 24576
+    assert upload["recommended_chunk_bytes"] == mygithub10.RECOMMENDED_UPLOAD_CHUNK_BYTES == 16384
+    assert upload["preferred_encoding"] == "text_for_utf8_base64_for_binary"
+    assert mygithub10.MAX_UPLOAD_CHUNK_BYTES < mygithub10.MAX_INLINE_RESPONSE_BYTES
+
+    payload = (b"diff --git a/a b/a\n+transport-safe\n" * 4000)[:92355]
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    offset = 0
+    chunk_count = 0
+    while offset < len(payload):
+        chunk = payload[offset:offset + mygithub10.RECOMMENDED_UPLOAD_CHUNK_BYTES]
+        result = mygithub10.append_upload(
+            upload["upload_id"],
+            offset,
+            chunk,
+            hashlib.sha256(chunk).hexdigest(),
+        )
+        offset = result["next_offset"]
+        chunk_count += 1
+
+    assert offset == 92355
+    assert chunk_count >= 6
+    finalized = mygithub10.finalize_upload(upload["upload_id"], len(payload), expected_sha256)
+    assert finalized["size_bytes"] == 92355
+    assert finalized["sha256"] == expected_sha256

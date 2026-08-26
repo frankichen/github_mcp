@@ -82,7 +82,10 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.2.0"
+        assert capabilities["version"] == "12.2.1"
+        assert capabilities["max_upload_chunk_bytes"] == 24576
+        assert capabilities["recommended_upload_chunk_bytes"] == 16384
+        assert capabilities["preferred_upload_encoding"] == "text_for_utf8_base64_for_binary"
         assert capabilities["tool_count"] == 163
         assert capabilities["tool_manifest_count"] == 163
         assert capabilities["compatibility_tool_count"] == 163
@@ -770,3 +773,52 @@ class TestMergeIndexBootstrap:
         assert result["post_merge_index"]["status"] == "bootstrap_failed"
         assert result["post_merge_index"]["error_code"] == "RuntimeError"
         assert result["warnings"] == ["POST_MERGE_INDEX_BOOTSTRAP_FAILED"]
+
+
+    @pytest.mark.asyncio
+    async def test_upload_chunk_invalid_base64_returns_stable_error(self):
+        import json
+        import app.mcp_server as mcp_server
+
+        raw = await mcp_server.append_github_file_upload_chunk(
+            "00000000-0000-0000-0000-000000000000",
+            40960,
+            content_base64="A" * 8621,
+            chunk_sha256="f" * 64,
+        )
+        result = json.loads(raw)
+        assert result["ok"] is False
+        assert result["error"]["code"] == "UPLOAD_CHUNK_BASE64_INVALID"
+        assert result["error"]["details"]["encoded_length"] == 8621
+
+    @pytest.mark.asyncio
+    async def test_upload_chunk_utf8_text_bypasses_base64(self, monkeypatch):
+        import hashlib
+        import json
+        import app.mcp_server as mcp_server
+
+        text = "diff --git a/a b/a\n+你好\n"
+        encoded = text.encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        observed = {}
+
+        async def fake_github_call(function, *args):
+            assert function is mcp_server.mygithub10.append_upload
+            observed["content"] = args[2]
+            return {
+                "upload_id": args[0],
+                "offset": args[1],
+                "next_offset": args[1] + len(args[2]),
+                "chunk_sha256": args[3],
+            }
+
+        monkeypatch.setattr(mcp_server, "_github_call", fake_github_call)
+        raw = await mcp_server.append_github_file_upload_chunk(
+            "00000000-0000-0000-0000-000000000000",
+            0,
+            text=text,
+            chunk_sha256=digest,
+        )
+        result = json.loads(raw)
+        assert result["next_offset"] == len(encoded)
+        assert observed["content"] == encoded
