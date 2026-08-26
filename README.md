@@ -54,9 +54,9 @@ private-deploy-agent（服务器端）
 
 ## GitHub Action Service
 
-MyGithut12 当前版本为 `12.0.5`。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。大文件仍使用 manifest、chunk read/upload 和 finalize/commit 流程，不退化为普通全文提交。
+MyGithut12 当前版本为 `12.1.3`。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。小范围唯一文本替换优先使用 `replace_github_text_once`，大文件仍使用 manifest、chunk read/upload 和 finalize/commit 流程，不退化为普通全文提交。
 
-Python 服务现有 155 个 MCP 工具。除既有 GitHub、CI、Workspace、Index 和上下文工具外，`read_mcp_response_resource` 用于按 UTF-8 byte offset 分块读取容量降级后的完整工具响应。所有写操作继续受原有授权、CAS、confirm 和 CI 门禁约束。
+Python 服务现有 162 个 MCP 工具。除既有 GitHub、CI、Workspace、Index 和上下文工具外，`replace_github_text_once` 用于无需行号的唯一 exact-text 替换，`read_mcp_response_resource` 用于按 UTF-8 byte offset 分块读取容量降级后的完整工具响应。所有写操作继续受原有授权、CAS、confirm 和 CI 门禁约束。
 
 MCP tool result 默认以真正的 `structuredContent` 对象返回；安全 inline budget 为 32 KiB，超过预算的完整 payload 会保存为短期 `mygithub12://response/...` Resource，并在小型 inline summary 的 `response_meta` 中返回 `inline_bytes`、`total_bytes`、`truncated`、`resource_uri`、`has_more` 和 SHA-256。`get_private_ci_job` 默认 `detail_level=summary`，只返回门禁所需状态；`detail_level=full` 保留 command、changed files、evidence 和 step offsets，但仍受统一 resource fallback 保护。
 
@@ -86,7 +86,7 @@ docker compose up -d --build
 
 ## MyGithut12 运行状态
 
-MyGithut12 已进入 `12.0.5` response-contract 版本：保留既有 154 个工具名称和业务门禁语义，并新增 1 个 response resource 分块读取工具。Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
+MyGithut12 已进入 `12.1.3` 版本，共 162 个工具；新增 `replace_github_text_once`，用于在准确 HEAD/Blob 下按唯一 exact-text anchor 替换，避免调用方手工行号定位。Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
 
 ## Private Deploy Agent
 

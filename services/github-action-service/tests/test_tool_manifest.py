@@ -7,7 +7,7 @@ import pytest
 from app.mcp_server import mcp
 
 
-EXPECTED_TOOL_COUNT = 161
+EXPECTED_TOOL_COUNT = 162
 DX1_TOOLS = [
     "prepare_development_task",
     "apply_development_change_set",
@@ -75,7 +75,7 @@ async def test_registered_tool_manifest_is_stable_and_unique():
     assert tools["get_private_ci_job"].inputSchema["properties"]["detail_level"]["default"] == "summary"
     templates = await mcp.list_resource_templates()
     assert any(str(template.uriTemplate) == "mygithub12://response/{resource_id}" for template in templates)
-    for name in ("commit_github_files", "apply_github_patch", "apply_github_patch_from_ref", "edit_github_file_ranges", "commit_github_uploaded_files"):
+    for name in ("commit_github_files", "apply_github_patch", "apply_github_patch_from_ref", "replace_github_text_once", "edit_github_file_ranges", "commit_github_uploaded_files"):
         properties = tools[name].inputSchema["properties"]
         assert properties["workspace_id"]["default"] == ""
         assert properties["expected_workspace_revision"]["default"] == 0
@@ -85,8 +85,8 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.1.2"
-    assert manifest["legacy_tool_count"] == 119
+    assert manifest["service_version"] == "12.1.3"
+    assert manifest["legacy_tool_count"] == 120
     assert manifest["new_tool_count"] == 42
     assert manifest["tool_count"] == EXPECTED_TOOL_COUNT
     assert manifest["new_tools"][-4:] == DX1_TOOLS

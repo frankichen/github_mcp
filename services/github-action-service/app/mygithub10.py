@@ -1042,6 +1042,109 @@ def edit_ranges(client, repository: str, branch: str, expected_head_sha: str, op
         raise
 
 
+def replace_text_once(client, repository: str, branch: str, expected_head_sha: str, path: str, expected_blob_sha: str, old_text: str, new_text: str, commit_message: str, expected_match_count: int = 1, dry_run: bool = True, idempotency_key: str = "", audit_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    _safe_path(path)
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_head_sha or ""):
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "expected_head_sha must be a full lowercase Git commit SHA")
+    if not isinstance(old_text, str) or not isinstance(new_text, str):
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "old_text and new_text must be strings")
+    if not old_text:
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "old_text must not be empty")
+    if old_text == new_text:
+        raise MyGithub10Error("PATCH_EMPTY", "old_text and new_text are identical")
+    if isinstance(expected_match_count, bool) or not isinstance(expected_match_count, int) or expected_match_count != 1:
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "expected_match_count must be exactly 1")
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_blob_sha or ""):
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "expected_blob_sha must be a full lowercase Git blob SHA")
+
+    request = {
+        "tool_name": "replace_github_text_once",
+        "repository": repository,
+        "branch": branch,
+        "expected_head_sha": expected_head_sha,
+        "path": path,
+        "expected_blob_sha": expected_blob_sha,
+        "old_text_sha256": _sha256(old_text.encode("utf-8")),
+        "new_text_sha256": _sha256(new_text.encode("utf-8")),
+        "old_text_size_bytes": len(old_text.encode("utf-8")),
+        "new_text_size_bytes": len(new_text.encode("utf-8")),
+        "expected_match_count": expected_match_count,
+        "commit_message": commit_message,
+    }
+    operation_id, replay = ("", None) if dry_run else _idempotent_start(
+        "replace_github_text_once", idempotency_key, request, audit_context
+    )
+    if replay:
+        return replay
+
+    try:
+        repo = _repo(client, repository)
+        actual_head, _ = _resolve_commit(repo, branch)
+        if expected_head_sha and actual_head != expected_head_sha:
+            raise MyGithub10Error(
+                "PATCH_HEAD_CHANGED",
+                f"branch HEAD changed before exact text replace for {repository}:{branch}",
+                {"expected": expected_head_sha, "actual": actual_head, "repository": repository, "branch": branch, "phase": "before_write", "error_code": "HEAD_CHANGED"},
+            )
+        data, blob_sha, _ = _read_blob(repo, path, actual_head)
+        if len(data) > MAX_TEXT_EDIT_FILE_BYTES:
+            raise MyGithub10Error("FILE_TOO_LARGE", f"text edit target exceeds the file limit: {path}", {"path": path, "limit_bytes": MAX_TEXT_EDIT_FILE_BYTES})
+        if blob_sha != expected_blob_sha:
+            raise MyGithub10Error("BLOB_CHANGED", f"file blob changed before exact text replace: {path}", {"path": path, "expected": expected_blob_sha, "actual": blob_sha})
+
+        text = _text(data)
+        match_offsets = []
+        search_from = 0
+        while True:
+            match_offset = text.find(old_text, search_from)
+            if match_offset < 0:
+                break
+            match_offsets.append(match_offset)
+            search_from = match_offset + 1
+        exact_match_count = len(match_offsets)
+        if exact_match_count != expected_match_count:
+            raise MyGithub10Error(
+                "PATCH_TEXT_MISMATCH",
+                f"exact text match count differs for {path}",
+                {"path": path, "expected_match_count": expected_match_count, "exact_match_count": exact_match_count, "old_text_sha256": _sha256(old_text.encode("utf-8"))},
+            )
+
+        match_offset = match_offsets[0]
+        match_start_line = text.count("\n", 0, match_offset) + 1
+        changed_text = text[:match_offset] + new_text + text[match_offset + len(old_text):]
+        changed = {path: changed_text.encode("utf-8")}
+        expected = {path: blob_sha}
+        patch, added_lines, deleted_lines = _minimal_unified_diff(path, text, changed_text)
+        diff_preview, diff_truncated = _truncate_utf8(patch)
+        fingerprint = _sha256(_json(request).encode())
+        result = {
+            "ok": True,
+            "dry_run": dry_run,
+            "repository": repository,
+            "branch": branch,
+            "expected_head_sha": expected_head_sha,
+            "resolved_head_sha": actual_head,
+            "path": path,
+            "expected_match_count": expected_match_count,
+            "exact_match_count": exact_match_count,
+            "match_start_line": match_start_line,
+            "changed_files": [{"path": path, "operation": "modify", "old_blob_sha": blob_sha, "new_blob_sha": _git_blob_sha(changed[path]), "content_sha256": _sha256(changed[path]), "size_bytes": len(changed[path]), "added_lines": added_lines, "deleted_lines": deleted_lines}],
+            "diff_preview": diff_preview,
+            "diff_truncated": diff_truncated,
+            "operation_fingerprint": fingerprint,
+        }
+        if dry_run:
+            return result
+        result.update(_commit_files(client, repository, branch, expected_head_sha, changed, expected, commit_message))
+        _idempotent_mark_git_verified(operation_id, result)
+        result["_operation_id"] = operation_id
+        return result
+    except MyGithub10Error as exc:
+        if operation_id:
+            _idempotent_finish(operation_id, "failed", error_code=exc.code, result={"error": {"code": exc.code, "details": exc.details}})
+        raise
+
+
 def build_patch(path: str, expected_blob_sha: str, original_text: str, replacement_text: str) -> dict[str, Any]:
     """Build a deterministic, local-only unified diff; never contacts GitHub."""
     _safe_path(path)
@@ -1070,7 +1173,7 @@ def capabilities(build_sha: str) -> dict[str, Any]:
     return {
         "name": "MyGithut12",
         "version": SERVICE_VERSION,
-        "tool_count": 161,
+        "tool_count": 162,
         "build_sha": build_sha,
         "build_sha_source": "environment" if new_build_env or legacy_build_env else "vcs_fallback",
         "runtime_mode": os.environ.get("MYGITHUB12_RUNTIME_MODE", os.environ.get("MYGITHUB10_RUNTIME_MODE", "development")),
@@ -1093,6 +1196,8 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_incremental_patch": True,
         "supports_range_edit": True,
         "range_edit_semantics": {"start_line": "1-based inclusive", "end_line": "1-based inclusive", "encoding": "UTF-8 text lines; original LF/CRLF and final-newline state are preserved"},
+        "supports_exact_text_replace": True,
+        "exact_text_replace_semantics": {"match": "exact UTF-8 substring", "required_match_count": 1, "normalization": "none", "line_numbers": "not used"},
         "supports_chunked_upload": True,
         "supports_dry_run": True,
         "supports_expected_head_sha": True,
@@ -1140,9 +1245,10 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_blue_green_runtime": True,
         "supports_runtime_generation_leader": True,
         "supports_cross_generation_resources": True,
-        "tool_manifest_count": 161,
+        "tool_manifest_count": 162,
+        "recommended_small_text_workflow": ["replace_github_text_once", "apply_github_patch", "edit_github_file_ranges"],
         "recommended_large_file_workflow": ["get_github_file_manifest", "read_github_file_chunk", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "commit_github_uploaded_files"],
-        "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_IN_PROGRESS", "WORKSPACE_LEASE_REQUIRED", "WORKSPACE_REVISION_MISMATCH", "WORKSPACE_BRANCH_DRIFTED", "DEVELOPMENT_SESSION_NOT_FOUND", "DEVELOPMENT_SESSION_CLOSED", "DEVELOPMENT_SESSION_STATE_INVALID", "DEVELOPMENT_SESSION_REVISION_MISMATCH", "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "MIRROR_UNAVAILABLE", "MIRROR_ORIGIN_MISMATCH", "MIRROR_FETCH_FAILED", "MIRROR_OBJECT_MISSING", "MIRROR_IDENTITY_MISMATCH", "FAST_CI_NOT_MERGE_ELIGIBLE", "CI_PROFILE_DISCOVERY_MISMATCH", "CI_ENV_CACHE_INVALID", "CI_ENV_CACHE_BUILD_FAILED", "AFFECTED_SELECTION_INCOMPLETE", "FAILURE_PACK_UNAVAILABLE", "RUNTIME_SCHEMA_INCOMPATIBLE", "RUNTIME_GENERATION_NOT_READY", "RUNTIME_LEADER_CONFLICT", "CROSS_GENERATION_RESOURCE_UNAVAILABLE", "CROSS_GENERATION_UPLOAD_UNAVAILABLE"],
+        "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "PATCH_TEXT_MISMATCH", "IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_IN_PROGRESS", "WORKSPACE_LEASE_REQUIRED", "WORKSPACE_REVISION_MISMATCH", "WORKSPACE_BRANCH_DRIFTED", "DEVELOPMENT_SESSION_NOT_FOUND", "DEVELOPMENT_SESSION_CLOSED", "DEVELOPMENT_SESSION_STATE_INVALID", "DEVELOPMENT_SESSION_REVISION_MISMATCH", "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "MIRROR_UNAVAILABLE", "MIRROR_ORIGIN_MISMATCH", "MIRROR_FETCH_FAILED", "MIRROR_OBJECT_MISSING", "MIRROR_IDENTITY_MISMATCH", "FAST_CI_NOT_MERGE_ELIGIBLE", "CI_PROFILE_DISCOVERY_MISMATCH", "CI_ENV_CACHE_INVALID", "CI_ENV_CACHE_BUILD_FAILED", "AFFECTED_SELECTION_INCOMPLETE", "FAILURE_PACK_UNAVAILABLE", "RUNTIME_SCHEMA_INCOMPATIBLE", "RUNTIME_GENERATION_NOT_READY", "RUNTIME_LEADER_CONFLICT", "CROSS_GENERATION_RESOURCE_UNAVAILABLE", "CROSS_GENERATION_UPLOAD_UNAVAILABLE"],
         "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}],
     }
 
