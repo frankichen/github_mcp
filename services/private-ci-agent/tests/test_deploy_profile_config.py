@@ -284,6 +284,11 @@ if name == "git":
 if name == "systemctl":
     sys.exit(0)
 
+if name == "systemd-run":
+    if args[-2:] == ["/usr/bin/id", "-u"]:
+        print("1500")
+    sys.exit(0)
+
 if name in {"touch", "mount", "rm", "install", "sleep", "runuser", "mkdir", "chown", "chmod"}:
     sys.exit(0)
 
@@ -330,7 +335,7 @@ def _run_apply_fixes(
     fake_tool.write_text(FAKE_TOOL_SOURCE, encoding="utf-8")
     commands = (
         "docker", "jq", "curl", "git", "systemctl", "touch", "mount", "rm",
-        "install", "sleep", "runuser", "mkdir", "chown", "chmod",
+        "install", "sleep", "runuser", "systemd-run", "mkdir", "chown", "chmod",
     )
     bash_env = tmp_path / "bash_env"
     functions = ['_fake_tool() { "$FAKE_PYTHON" "$FAKE_TOOL_SCRIPT" "$@"; }']
@@ -461,10 +466,33 @@ def test_apply_fixes_success_path_continues_in_fail_stop_mode(tmp_path):
     result, calls, state = _run_apply_fixes(tmp_path, failure_mode="fail-stop")
     assert result.returncode == 0, _output(result)
     assert "DONE. Worker restarted with local shared image and caches preheated." in _output(result)
-    preheat_calls = [call for call in calls if call.startswith("runuser ")]
+    broker_calls = [call for call in calls if call.startswith("systemd-run ")]
+    preheat_calls = [call for call in broker_calls if "prepare-" in call]
+    assert len(broker_calls) == 5
     assert len(preheat_calls) == 4
+    assert all("--property=User=ciworker" in call for call in broker_calls)
+    assert all("--property=Group=ciworker" in call for call in broker_calls)
+    assert all("--setenv=HOME=/home/ciworker" in call for call in broker_calls)
     assert any("prepare-python-ci" in call for call in preheat_calls)
+    assert not any(call.startswith("runuser ") for call in calls)
     assert "systemctl restart private-ci-agent.service" in calls
     assert "systemctl is-active --quiet private-ci-agent.service" in calls
     assert f"docker rename {ROLLBACK_CONTAINER} github-action-service" not in calls
     assert state == {ROLLBACK_CONTAINER, "github-action-service"}
+
+
+def test_apply_fixes_preserves_executor_no_new_privileges_hardening():
+    script = APPLY_FIXES_SCRIPT.read_text(encoding="utf-8")
+    unit = (
+        Path(__file__).parents[2]
+        / "private-ci-deploy-executor/systemd/mygithub12-infrastructure-deploy-executor.service.example"
+    ).read_text(encoding="utf-8")
+
+    assert "run_ciworker_preheat" in script
+    assert "--property=User=ciworker" in script
+    assert "--property=Group=ciworker" in script
+    assert "runuser -u ciworker" not in script
+    assert "NoNewPrivileges=true" in unit
+    assert "ProtectKernelTunables=true" in unit
+    assert "ProtectKernelModules=true" in unit
+    assert "ProtectControlGroups=true" in unit

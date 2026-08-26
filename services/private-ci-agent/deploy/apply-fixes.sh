@@ -55,6 +55,17 @@ handle_controller_failure() {
     die "${message}; automatic rollback disabled"
 }
 
+run_ciworker_preheat() {
+    systemd-run --quiet --wait --pipe --collect \
+        --property=User=ciworker \
+        --property=Group=ciworker \
+        --setenv=HOME=/home/ciworker \
+        --setenv=XDG_RUNTIME_DIR=/run/user/1500 \
+        --setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1500/bus \
+        --setenv=PYTHONPATH="${AGENT_DIR}" \
+        "$@"
+}
+
 # ── 1. 根文件系统需要可写（当前 ro）────────────────────────
 if ! touch "${AGENT_DIR}/.wtest" 2>/dev/null; then
     log "Remounting / read-write (was read-only)"
@@ -99,6 +110,14 @@ install -o nobody -g nogroup -m 644 \
 install -o nobody -g nogroup -m 644 \
     "${REPO_ROOT}/services/private-ci-agent/deploy/Dockerfile.python-ci" \
     "${AGENT_DIR}/deploy/Dockerfile.python-ci"
+
+# ── 3. 预检 ciworker 降权 broker ────────────────────────────
+# Infrastructure Executor 保持 NoNewPrivileges=true，不能在自身进程树里
+# 直接 setuid。预热命令通过 systemd 的固定 User/Group service broker 执行。
+command -v systemd-run >/dev/null 2>&1 || die "systemd-run is required for ciworker preheat broker"
+CIWORKER_BROKER_UID="$(run_ciworker_preheat /usr/bin/id -u)" || die "ciworker preheat broker probe failed"
+[ "${CIWORKER_BROKER_UID}" = "${CIWORKER_UID}" ] || die "ciworker preheat broker returned unexpected uid"
+log "ciworker preheat broker ready (uid=${CIWORKER_BROKER_UID})"
 
 # ── 4. 重建并重启 controller（github-action-service）────────
 # 容器内代码通过镜像打包（build: .），heartbeat lease_token 修复需重建。
@@ -182,34 +201,22 @@ sleep 5
 
 # ── 5. 预热本地共享 Python CI 镜像 ─────────────────────────
 log "Preheating shared Python CI image"
-runuser -u ciworker -- env HOME=/home/ciworker XDG_RUNTIME_DIR=/run/user/1500 \
-    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1500/bus \
-    PYTHONPATH="${AGENT_DIR}" \
-    "${AGENT_DIR}/deploy/prepare-python-ci" || die "Python CI image preheat failed"
+run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-python-ci" || die "Python CI image preheat failed"
 
 # ── 6. 预热本地共享 Node Chromium 镜像 ─────────────────────
 log "Preheating shared local Node Chromium image"
-runuser -u ciworker -- env HOME=/home/ciworker XDG_RUNTIME_DIR=/run/user/1500 \
-    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1500/bus \
-    PYTHONPATH="${AGENT_DIR}" \
-    "${AGENT_DIR}/deploy/prepare-node-chromium" || die "Node Chromium image preheat failed"
+run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-node-chromium" || die "Node Chromium image preheat failed"
 
 # ── 7. 预热共享 Go 缓存（goose 模块进 file:// 命中）────────
 log "Preheating shared Go module cache (goose)"
 mkdir -p /srv/private-ci/cache/go
 chown "${CIWORKER_UID}:${CIWORKER_UID}" /srv/private-ci/cache/go
 chmod 700 /srv/private-ci/cache/go
-runuser -u ciworker -- env HOME=/home/ciworker XDG_RUNTIME_DIR=/run/user/1500 \
-    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1500/bus \
-    PYTHONPATH="${AGENT_DIR}" \
-    "${AGENT_DIR}/deploy/prepare-go-cache" || die "go cache preheat failed"
+run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-go-cache" || die "go cache preheat failed"
 
 # ── 8. 预热共享 Playwright 浏览器缓存 ──────────────────────
 log "Preheating shared Playwright browser cache"
-runuser -u ciworker -- env HOME=/home/ciworker XDG_RUNTIME_DIR=/run/user/1500 \
-    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1500/bus \
-    PYTHONPATH="${AGENT_DIR}" \
-    "${AGENT_DIR}/deploy/prepare-playwright-cache" || die "Playwright cache preheat failed"
+run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-playwright-cache" || die "Playwright cache preheat failed"
 
 # ── 9. 重启 worker 加载新代码 ─────────────────────────────
 log "Restarting private-ci-agent.service"
