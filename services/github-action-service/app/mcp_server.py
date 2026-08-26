@@ -1122,7 +1122,7 @@ async def open_github_file_resource(repository: str, path: str, ref: str = "") -
         return _mygithub10_error(exc)
 
 
-@mcp.tool(name="read_github_file_resource", description="Read a bounded page from an opened MyGithub10 file resource.")
+@mcp.tool(name="read_github_file_resource", description="Read a bounded page from an opened MyGithut12 file resource.")
 async def read_github_file_resource(resource_uri: str, offset_bytes: int = 0, limit_bytes: int = mygithub10.MAX_FILE_CHUNK_BYTES) -> str:
     try:
         token = resource_uri.rsplit("/", 1)[-1]
@@ -1402,7 +1402,7 @@ async def revoke_release_artifact(artifact_id: str) -> str:
     return json.dumps({"ok": True, "artifact": item}, ensure_ascii=False)
 
 
-@mcp.tool(name="get_repository_operation_policy", description="Return the operation policy for a repository: what MyGithub10 operations are allowed (GitHub read/write, private CI, test deploy, self deploy).")
+@mcp.tool(name="get_repository_operation_policy", description="Return the operation policy for a repository: what MyGithut12 operations are allowed (GitHub read/write, private CI, test deploy, self deploy).")
 async def get_repository_operation_policy(repository: str) -> str:
     """Return allowed operations for a repository based on authoritative policy sources."""
     from app.ci_repository_config import (
