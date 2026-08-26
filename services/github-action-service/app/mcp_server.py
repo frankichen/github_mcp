@@ -779,12 +779,52 @@ async def plan_github_pull_request_merge(repository: str, pull_number: int, merg
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
 
-@mcp.tool(name="merge_github_pull_request", description="Safely merge a PR only after readiness gates, exact SHA, passed private CI, and explicit confirm=true. Never deploys.")
+@mcp.tool(name="merge_github_pull_request", description="Safely merge a PR only after readiness gates, exact SHA, passed private CI, and explicit confirm=true. Never deploys. A confirmed merge also queues exact-SHA repository index bootstrap for the new base head.")
 async def merge_github_pull_request(repository: str, pull_number: int, merge_method: str = "squash", expected_head_sha: str = "", required_private_ci_job_id: str = "", expected_base_branch: str = "main", commit_title: str = "", commit_message: str = "", delete_head_branch: bool = False, confirm: bool = False) -> str:
     try:
         if delete_head_branch:
             return json.dumps(github_utils._error_response("HEAD_BRANCH_DELETE_REQUIRES_SEPARATE_AUTHORIZATION", "Automatic head branch deletion is disabled; use delete_github_branch separately."))
-        return json.dumps(await _github_call(github_utils.merge_github_pull_request, repository, pull_number, merge_method, expected_head_sha, required_private_ci_job_id, expected_base_branch, commit_title, commit_message, delete_head_branch, confirm), ensure_ascii=False)
+        result = await _github_call(github_utils.merge_github_pull_request, repository, pull_number, merge_method, expected_head_sha, required_private_ci_job_id, expected_base_branch, commit_title, commit_message, delete_head_branch, confirm)
+        if result.get("ok") and result.get("merged"):
+            base_after = str(result.get("base_head_after") or "")
+            base_before = str(result.get("base_head_before") or "")
+            if re.fullmatch(r"[0-9a-f]{40}", base_after):
+                try:
+                    index_result = await _github_call(
+                        mygithub12.request_index_build,
+                        _service,
+                        repository,
+                        base_after,
+                        "auto",
+                        base_before if re.fullmatch(r"[0-9a-f]{40}", base_before) else "",
+                        "interactive",
+                        f"post-merge-index:{repository}:{base_after}",
+                        False,
+                    )
+                    result["post_merge_index"] = {
+                        key: index_result.get(key)
+                        for key in (
+                            "ok", "job_id", "commit_sha", "tree_sha", "version", "strategy",
+                            "base_commit_sha", "status", "step", "deduplicated",
+                        )
+                        if key in index_result
+                    }
+                except Exception as index_exc:
+                    error_code = getattr(index_exc, "code", type(index_exc).__name__)
+                    result["post_merge_index"] = {
+                        "ok": False,
+                        "status": "bootstrap_failed",
+                        "error_code": error_code,
+                    }
+                    result.setdefault("warnings", []).append("POST_MERGE_INDEX_BOOTSTRAP_FAILED")
+            else:
+                result["post_merge_index"] = {
+                    "ok": False,
+                    "status": "bootstrap_skipped",
+                    "error_code": "POST_MERGE_BASE_SHA_INVALID",
+                }
+                result.setdefault("warnings", []).append("POST_MERGE_INDEX_BOOTSTRAP_SKIPPED")
+        return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
