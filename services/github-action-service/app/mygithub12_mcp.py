@@ -95,6 +95,11 @@ def register_mygithub12_tools(mcp, github_call, service) -> None:
     async def list_repository_indexes(repository: str, limit: int = 50, offset: int = 0) -> str:
         return await _call(github_call, mygithub12.list_indexes, service, repository, limit, offset)
 
+    # A2. Private CI applicability planning (1)
+    @mcp.tool(name="plan_private_ci_job", description="Plan whether a private CI profile is applicable to one exact commit using repository policy, manifests and fixed profile entrypoints. Never queues CI.", annotations=_READ_ONLY)
+    async def plan_private_ci_job(repository: str, commit_sha: str, profile: str = "repo-auto-check") -> str:
+        return await _call(github_call, mygithub12.plan_private_ci_job, service, repository, commit_sha, profile)
+
     # B. Development workspaces (9)
     @mcp.tool(name="create_development_workspace", description="Create an isolated development workspace and unique ai/ branch or bind an existing ai/ branch.", annotations=_WORKSPACE_WRITE)
     async def create_development_workspace(repository: str, task_name: str, base_ref: str = "main", branch: str = "", owner: str = "chatgpt", create_branch: bool = True, lease_seconds: int = mygithub12.DEFAULT_LEASE_SECONDS) -> str:
