@@ -1,6 +1,6 @@
 # MyGithut12 基础设施自部署控制面合同
 
-版本：12.3.0 设计合同  
+版本：12.3.2 运行合同  
 目标仓库：`frankichen/github_mcp`  
 目标环境：`mygithub12-production`  
 目标范围：`control-plane`
@@ -68,6 +68,8 @@ Executor 固定：
 - executor id：`mygithub12-infrastructure-deploy-01`
 - deployment script：`services/private-ci-agent/deploy/apply-fixes.sh`
 - `MYGITHUB12_DEPLOY_FAILURE_MODE=fail-stop`
+
+Executor systemd unit 继续保持 `NoNewPrivileges=true`。需要以 `ciworker` 身份执行的固定缓存预热命令必须通过 systemd service manager 的固定 `User=ciworker` / `Group=ciworker` broker 启动，并在 Controller 切换前完成 UID 预检；不得通过关闭 `NoNewPrivileges` 绕过降权失败。
 
 Queue 不提供上述运行参数，Executor 代码自身固定它们。
 
