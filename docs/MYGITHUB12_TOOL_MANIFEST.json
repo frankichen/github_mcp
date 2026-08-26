@@ -1,11 +1,18 @@
 {
   "service_name": "MyGithut12",
-  "service_version": "12.1.3",
-  "manifest_format": "composed-v1",
+  "service_version": "12.2.0",
+  "manifest_format": "composed-v2",
   "legacy_manifest": "MYGITHUB10_TOOL_MANIFEST.json",
   "legacy_tool_count": 120,
-  "new_tool_count": 42,
-  "tool_count": 162,
+  "new_tool_count": 43,
+  "tool_count": 160,
+  "compatibility_tool_count": 163,
+  "hidden_deprecated_tools": [
+    "get_github_file",
+    "commit_github_files",
+    "get_test_deployment_logs"
+  ],
+  "schema_identity_algorithm": "sha256-canonical-mcp-tools-v1",
   "new_tools": [
     "get_repository_index_status",
     "request_repository_index_build",
@@ -13,6 +20,7 @@
     "wait_repository_index_job",
     "cancel_repository_index_job",
     "list_repository_indexes",
+    "plan_private_ci_job",
     "create_development_workspace",
     "get_development_workspace",
     "list_development_workspaces",

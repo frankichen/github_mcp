@@ -161,6 +161,9 @@ runtime_leader_leases
 规则：
 
 - 单次只允许一种 mode；
+- `mode=upload` 允许同一 ChangeSet 引用多个 finalized upload；目标 path 与 upload_id 均不得重复，所有文件通过同一次 `_commit_files` 形成一个 Git Tree/Commit；服务端按 capability 限制文件数量和聚合字节数，当前上限分别为 64 个文件和 64 MiB；
+- 单 upload 保持原 `commit_github_uploaded_files` 兼容语义，多 upload 由 `apply_development_change_set` 原子编排；
+- dry-run 必须验证全部 upload finalized 元数据且不得消费 upload body；durable verify、Workspace CAS 与幂等最终成功后再统一清理全部 upload；
 - 归一化为 `changed[path] = bytes | delete`；
 - dry-run 保存 canonical request hash；
 - commit 使用相同 canonical request；

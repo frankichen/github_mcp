@@ -5,6 +5,7 @@ import logging
 import base64
 import asyncio
 import os
+import re
 import subprocess
 import inspect
 import uuid
@@ -106,6 +107,10 @@ async def _finalize_durable_write(
         return result
     operation_id = str(result.pop("_operation_id", "") or "")
     cleanup_upload_id = str(result.pop("_cleanup_upload_id", "") or "")
+    raw_cleanup_upload_ids = result.pop("_cleanup_upload_ids", [])
+    cleanup_upload_ids = [str(item) for item in raw_cleanup_upload_ids if str(item)] if isinstance(raw_cleanup_upload_ids, list) else []
+    if cleanup_upload_id:
+        cleanup_upload_ids.insert(0, cleanup_upload_id)
     if result.get("write_verified") is not True:
         exc = mygithub10.MyGithub10Error(
             "WRITE_VERIFY_FAILED",
@@ -183,11 +188,11 @@ async def _finalize_durable_write(
                     "cause_type": type(exc).__name__,
                 },
             ) from exc
-    if cleanup_upload_id:
+    for cleanup_id in dict.fromkeys(cleanup_upload_ids):
         try:
-            await _github_call(mygithub10.abort_upload, cleanup_upload_id)
+            await _github_call(mygithub10.abort_upload, cleanup_id)
         except Exception:
-            logger.warning("verified upload cleanup failed upload_id=%s", cleanup_upload_id)
+            logger.warning("verified upload cleanup failed upload_id=%s", cleanup_id)
     return result
 
 
@@ -779,12 +784,52 @@ async def plan_github_pull_request_merge(repository: str, pull_number: int, merg
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
 
-@mcp.tool(name="merge_github_pull_request", description="Safely merge a PR only after readiness gates, exact SHA, passed private CI, and explicit confirm=true. Never deploys.")
+@mcp.tool(name="merge_github_pull_request", description="Safely merge a PR only after readiness gates, exact SHA, passed private CI, and explicit confirm=true. Never deploys. A confirmed merge also queues exact-SHA repository index bootstrap for the new base head.")
 async def merge_github_pull_request(repository: str, pull_number: int, merge_method: str = "squash", expected_head_sha: str = "", required_private_ci_job_id: str = "", expected_base_branch: str = "main", commit_title: str = "", commit_message: str = "", delete_head_branch: bool = False, confirm: bool = False) -> str:
     try:
         if delete_head_branch:
             return json.dumps(github_utils._error_response("HEAD_BRANCH_DELETE_REQUIRES_SEPARATE_AUTHORIZATION", "Automatic head branch deletion is disabled; use delete_github_branch separately."))
-        return json.dumps(await _github_call(github_utils.merge_github_pull_request, repository, pull_number, merge_method, expected_head_sha, required_private_ci_job_id, expected_base_branch, commit_title, commit_message, delete_head_branch, confirm), ensure_ascii=False)
+        result = await _github_call(github_utils.merge_github_pull_request, repository, pull_number, merge_method, expected_head_sha, required_private_ci_job_id, expected_base_branch, commit_title, commit_message, delete_head_branch, confirm)
+        if result.get("ok") and result.get("merged"):
+            base_after = str(result.get("base_head_after") or "")
+            base_before = str(result.get("base_head_before") or "")
+            if re.fullmatch(r"[0-9a-f]{40}", base_after):
+                try:
+                    index_result = await _github_call(
+                        mygithub12.request_index_build,
+                        _service,
+                        repository,
+                        base_after,
+                        "auto",
+                        base_before if re.fullmatch(r"[0-9a-f]{40}", base_before) else "",
+                        "interactive",
+                        f"post-merge-index:{repository}:{base_after}",
+                        False,
+                    )
+                    result["post_merge_index"] = {
+                        key: index_result.get(key)
+                        for key in (
+                            "ok", "job_id", "commit_sha", "tree_sha", "version", "strategy",
+                            "base_commit_sha", "status", "step", "deduplicated",
+                        )
+                        if key in index_result
+                    }
+                except Exception as index_exc:
+                    error_code = getattr(index_exc, "code", type(index_exc).__name__)
+                    result["post_merge_index"] = {
+                        "ok": False,
+                        "status": "bootstrap_failed",
+                        "error_code": error_code,
+                    }
+                    result.setdefault("warnings", []).append("POST_MERGE_INDEX_BOOTSTRAP_FAILED")
+            else:
+                result["post_merge_index"] = {
+                    "ok": False,
+                    "status": "bootstrap_skipped",
+                    "error_code": "POST_MERGE_BASE_SHA_INVALID",
+                }
+                result.setdefault("warnings", []).append("POST_MERGE_INDEX_BOOTSTRAP_SKIPPED")
+        return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
@@ -1048,9 +1093,12 @@ def _mygithub10_error(exc: Exception) -> str:
     return json.dumps({"ok": False, "error": {"code": "INTERNAL_ERROR", "message": "MyGithut operation failed", "details": {}, "trace_id": str(uuid.uuid4())}}, ensure_ascii=False)
 
 
-@mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithut12 capability and compatibility contract.")
+@mcp.tool(name="get_mygithub_capabilities", description="Return the explicit MyGithut12 capability and canonical connector schema identity.")
 async def get_mygithub_capabilities() -> str:
-    return json.dumps(mygithub10.capabilities(runtime_build_sha()), ensure_ascii=False)
+    capabilities = mygithub10.capabilities(runtime_build_sha())
+    visible_tools = await mcp.list_tools()
+    capabilities.update(await mcp.tool_schema_identity(visible_tools))
+    return json.dumps(capabilities, ensure_ascii=False)
 
 
 @mcp.tool(name="get_github_file_manifest", description="Return exact Git Blob metadata for a file without returning file content.")
@@ -1079,7 +1127,7 @@ async def open_github_file_resource(repository: str, path: str, ref: str = "") -
         return _mygithub10_error(exc)
 
 
-@mcp.tool(name="read_github_file_resource", description="Read a bounded page from an opened MyGithub10 file resource.")
+@mcp.tool(name="read_github_file_resource", description="Read a bounded page from an opened MyGithut12 file resource.")
 async def read_github_file_resource(resource_uri: str, offset_bytes: int = 0, limit_bytes: int = mygithub10.MAX_FILE_CHUNK_BYTES) -> str:
     try:
         token = resource_uri.rsplit("/", 1)[-1]
@@ -1359,7 +1407,7 @@ async def revoke_release_artifact(artifact_id: str) -> str:
     return json.dumps({"ok": True, "artifact": item}, ensure_ascii=False)
 
 
-@mcp.tool(name="get_repository_operation_policy", description="Return the operation policy for a repository: what MyGithub10 operations are allowed (GitHub read/write, private CI, test deploy, self deploy).")
+@mcp.tool(name="get_repository_operation_policy", description="Return the operation policy for a repository: what MyGithut12 operations are allowed (GitHub read/write, private CI, test deploy, self deploy).")
 async def get_repository_operation_policy(repository: str) -> str:
     """Return allowed operations for a repository based on authoritative policy sources."""
     from app.ci_repository_config import (

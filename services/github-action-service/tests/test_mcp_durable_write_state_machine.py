@@ -139,6 +139,16 @@ async def test_11_commit_github_uploaded_files_mcp_only_returns_after_success_ve
 
 
 @pytest.mark.asyncio
+async def test_finalize_durable_write_cleans_every_multi_upload_body(monkeypatch):
+    cleaned = []
+    monkeypatch.setattr(mygithub10, "abort_upload", lambda upload_id: cleaned.append(upload_id) or {"ok": True})
+    result = {**verified_result(), "_cleanup_upload_ids": ["upload-a", "upload-b", "upload-a"]}
+    finalized = await mcp_server._finalize_durable_write(result, "", 0)
+    assert finalized["write_verified"] is True
+    assert cleaned == ["upload-a", "upload-b"]
+
+
+@pytest.mark.asyncio
 async def test_10_commit_github_files_mcp_has_audit_and_success_verified(tmp_path, monkeypatch):
     monkeypatch.setattr(mygithub10.settings, "IDEMPOTENCY_DB_PATH", str(tmp_path / "files.db"))
     monkeypatch.setattr(mygithub12, "workspace_write_preflight", lambda *args, **kwargs: None)

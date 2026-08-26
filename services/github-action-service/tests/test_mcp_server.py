@@ -49,11 +49,12 @@ class TestMCPTools:
         assert middleware._validate_origin("https://evil.example") is False
 
     @pytest.mark.asyncio
-    async def test_mygithub10_schema_and_gofmt_contract(self):
+    async def test_mygithub10_schema_and_gofmt_contract(self, monkeypatch):
         from app.mcp_server import mcp
 
+        monkeypatch.setenv("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", "true")
         tools = {tool.name: tool for tool in await mcp.list_tools()}
-        for name in ("build_github_patch", "replace_github_text_once", "edit_github_file_ranges", "apply_github_patch", "get_mygithub_capabilities"):
+        for name in ("build_github_patch", "replace_github_text_once", "edit_github_file_ranges", "apply_github_patch", "get_mygithub_capabilities", "plan_private_ci_job"):
             assert name in tools
         assert "expected_blob_sha" in tools["edit_github_file_ranges"].description
         assert "expected_old_text" in tools["edit_github_file_ranges"].description
@@ -81,10 +82,20 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.1.3"
-        assert capabilities["tool_count"] == 162
-        assert capabilities["tool_manifest_count"] == 162
+        assert capabilities["version"] == "12.2.0"
+        assert capabilities["tool_count"] == 163
+        assert capabilities["tool_manifest_count"] == 163
+        assert capabilities["compatibility_tool_count"] == 163
+        assert capabilities["deprecated_tools_exposed"] is True
+        assert capabilities["hidden_deprecated_tool_count"] == 0
+        assert capabilities["hidden_deprecated_tools"] == []
+        assert len(capabilities["tool_schema_sha256"]) == 64
+        assert capabilities["schema_generation_id"].startswith("schema-v1:")
         assert capabilities["supports_exact_text_replace"] is True
+        assert capabilities["supports_atomic_multi_upload_change_set"] is True
+        assert capabilities["max_atomic_multi_upload_files"] == 64
+        assert capabilities["max_atomic_multi_upload_bytes"] == 64 * 1024 * 1024
+        assert capabilities["supports_private_ci_applicability_planning"] is True
         assert capabilities["supports_development_task_orchestration"] is True
         assert capabilities["supports_development_sessions"] is True
         assert capabilities["supports_local_git_mirror_reads"] is True
@@ -665,3 +676,97 @@ class TestOAuthWellKnown:
     def test_well_known_no_auth_required(self, client):
         response = client.get("/.well-known/oauth-protected-resource")
         assert response.status_code == 200
+
+
+class TestMergeIndexBootstrap:
+    @pytest.mark.asyncio
+    async def test_confirmed_merge_queues_exact_new_base_index(self, monkeypatch):
+        import json
+        import app.mcp_server as mcp_server
+
+        old_base = "b" * 40
+        new_base = "c" * 40
+        merged = {
+            "ok": True,
+            "merged": True,
+            "repository": "owner/allowed-repo",
+            "pull_number": 7,
+            "base_head_before": old_base,
+            "base_head_after": new_base,
+            "merge_commit_sha": new_base,
+        }
+        calls = []
+
+        async def fake_github_call(function, *args):
+            if function is mcp_server.github_utils.merge_github_pull_request:
+                return dict(merged)
+            if function is mcp_server.mygithub12.request_index_build:
+                calls.append(args)
+                return {
+                    "ok": True,
+                    "job_id": "index-job",
+                    "commit_sha": new_base,
+                    "tree_sha": "d" * 40,
+                    "version": "12.0.0-1",
+                    "strategy": "auto",
+                    "base_commit_sha": old_base,
+                    "status": "running",
+                    "step": "snapshot",
+                    "deduplicated": False,
+                }
+            raise AssertionError(function)
+
+        monkeypatch.setattr(mcp_server, "_github_call", fake_github_call)
+        raw = await mcp_server.merge_github_pull_request(
+            "owner/allowed-repo", 7, expected_head_sha="a" * 40, confirm=True
+        )
+        result = json.loads(raw)
+        assert result["ok"] is True
+        assert result["merged"] is True
+        assert result["post_merge_index"]["commit_sha"] == new_base
+        assert result["post_merge_index"]["base_commit_sha"] == old_base
+        assert calls == [(
+            mcp_server._service,
+            "owner/allowed-repo",
+            new_base,
+            "auto",
+            old_base,
+            "interactive",
+            f"post-merge-index:owner/allowed-repo:{new_base}",
+            False,
+        )]
+
+    @pytest.mark.asyncio
+    async def test_index_bootstrap_failure_never_reverses_confirmed_merge(self, monkeypatch):
+        import json
+        import app.mcp_server as mcp_server
+
+        new_base = "c" * 40
+        merged = {
+            "ok": True,
+            "merged": True,
+            "repository": "owner/allowed-repo",
+            "pull_number": 8,
+            "base_head_before": "b" * 40,
+            "base_head_after": new_base,
+            "merge_commit_sha": new_base,
+        }
+
+        async def fake_github_call(function, *args):
+            if function is mcp_server.github_utils.merge_github_pull_request:
+                return dict(merged)
+            if function is mcp_server.mygithub12.request_index_build:
+                raise RuntimeError("index backend unavailable")
+            raise AssertionError(function)
+
+        monkeypatch.setattr(mcp_server, "_github_call", fake_github_call)
+        raw = await mcp_server.merge_github_pull_request(
+            "owner/allowed-repo", 8, expected_head_sha="a" * 40, confirm=True
+        )
+        result = json.loads(raw)
+        assert result["ok"] is True
+        assert result["merged"] is True
+        assert result["post_merge_index"]["ok"] is False
+        assert result["post_merge_index"]["status"] == "bootstrap_failed"
+        assert result["post_merge_index"]["error_code"] == "RuntimeError"
+        assert result["warnings"] == ["POST_MERGE_INDEX_BOOTSTRAP_FAILED"]

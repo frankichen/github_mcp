@@ -1043,3 +1043,67 @@ def test_full_strategy_bypasses_same_tree_reuse(tmp_path, monkeypatch):
     assert manifest.get("tree_reuse_commit_sha") is None
     assert manifest["reused_file_count"] == 0
     assert manifest["reindexed_file_count"] == 1
+
+
+class _CIPlanEntry:
+    def __init__(self, path: str):
+        self.path = path
+        self.type = "blob"
+
+
+class _CIPlanService:
+    def __init__(self, makefile: str = ""):
+        self.makefile = makefile
+
+    def get_file(self, repository: str, path: str, ref: str):
+        assert path == "Makefile"
+        return {"content": self.makefile, "truncated": False}
+
+
+def _configure_ci_plan(monkeypatch, paths, allowed_profiles, repository_config=None):
+    from app import ci_repository_config
+
+    identity = {"repository": "o/r", "commit_sha": "a" * 40, "tree_sha": "b" * 40}
+    entries = [_CIPlanEntry(path) for path in paths]
+    monkeypatch.setattr(mygithub12, "_recursive_tree", lambda *args, **kwargs: (identity, entries))
+    monkeypatch.setattr(ci_repository_config, "get_allowed_profiles", lambda repository: list(allowed_profiles))
+    monkeypatch.setattr(ci_repository_config, "get_repository_config", lambda repository: repository_config or {})
+    monkeypatch.setattr(ci_repository_config, "get_repository_policy_source", lambda repository: "test")
+    monkeypatch.setattr(ci_repository_config, "is_private_ci_enabled", lambda repository: True)
+
+
+def test_private_ci_plan_auto_selects_only_detected_manifest_stacks(monkeypatch):
+    _configure_ci_plan(
+        monkeypatch,
+        ["go.mod", "h5/app/package.json", "h5/app/package-lock.json", "services/github-action-service/requirements.txt"],
+        ["repo-auto-check", "go-check", "node-check", "python-check"],
+    )
+    result = mygithub12.plan_private_ci_job(_CIPlanService(), "o/r", "a" * 40, "repo-auto-check")
+    assert result["applicable"] is True
+    assert result["detected_stacks"] == ["go", "node", "python"]
+    assert result["selected_profiles"] == ["go-check", "node-check", "python-check"]
+    assert result["workspaces"] == [
+        {"path": ".", "stack": "go"},
+        {"path": "h5/app", "stack": "node", "package_manager": "npm"},
+        {"path": "services/github-action-service", "stack": "python"},
+    ]
+
+
+def test_private_ci_plan_explicit_python_matches_worker_root_only_semantics(monkeypatch):
+    _configure_ci_plan(monkeypatch, ["services/github-action-service/requirements.txt"], ["python-check"])
+    result = mygithub12.plan_private_ci_job(_CIPlanService(), "o/r", "a" * 40, "python-check")
+    assert result["applicable"] is False
+    assert result["reason"] == "no_python_manifest"
+    assert result["detected_stacks"] == []
+    assert result["workspaces"] == []
+
+
+def test_private_ci_plan_fast_check_requires_real_make_entrypoint(monkeypatch):
+    _configure_ci_plan(monkeypatch, ["Makefile"], ["repo-fast-check"])
+    missing = mygithub12.plan_private_ci_job(_CIPlanService("test:\n\ttrue\n"), "o/r", "a" * 40, "repo-fast-check")
+    assert missing["applicable"] is False
+    assert missing["reason"] == "fast_check_entrypoint_missing"
+
+    applicable = mygithub12.plan_private_ci_job(_CIPlanService("ai-integrity-check:\n\ttrue\n"), "o/r", "a" * 40, "repo-fast-check")
+    assert applicable["applicable"] is True
+    assert applicable["selected_profiles"] == ["repo-fast-check"]

@@ -111,7 +111,8 @@ Session 只负责编排；Workspace lease/revision 和 GitHub identity 仍为写
 
 `apply_development_change_set` 必须：
 
-- 支持 patch、range edit 和 finalized upload 引用；
+- 支持 patch、range edit 和 finalized upload 引用；`mode=upload` 必须支持一个或多个 finalized upload；
+- 多 upload 必须一次性校验全部 path/upload/expected Blob，并通过同一个 Git Tree/Commit 原子写入；任一项失败不得形成部分 Commit；文件数量和聚合字节数必须有服务端硬上限并通过 capability 暴露；
 - 单次请求最终形成一个 Commit；
 - dry-run 和 commit 使用同一 canonical request；
 - 校验 Session CAS、Workspace CAS、lease、expected HEAD 和 expected Blob；

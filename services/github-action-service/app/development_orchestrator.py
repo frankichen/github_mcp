@@ -142,7 +142,16 @@ def parse_change_set(change_set_json: str) -> dict[str,Any]:
     if mode=="range" and not isinstance(change.get("range_operations"),list): raise MyGithub12Error("PATCH_INVALID_FORMAT","range mode requires range_operations")
     if mode=="upload":
         uploads=change.get("uploaded_files")
-        if not isinstance(uploads,list) or len(uploads)!=1 or not isinstance(uploads[0],dict): raise MyGithub12Error("PATCH_INVALID_FORMAT","upload mode requires exactly one finalized uploaded file")
+        if not isinstance(uploads,list) or not uploads or not all(isinstance(item,dict) for item in uploads): raise MyGithub12Error("PATCH_INVALID_FORMAT","upload mode requires one or more finalized uploaded files")
+        if len(uploads)>mygithub10.MAX_UPLOAD_CHANGE_SET_FILES: raise MyGithub12Error("PATCH_INVALID_FORMAT",f"upload mode exceeds file limit: {mygithub10.MAX_UPLOAD_CHANGE_SET_FILES}")
+        paths=[]; upload_ids=[]
+        for item in uploads:
+            path=item.get("path"); upload_id=item.get("upload_id")
+            if not isinstance(path,str) or not path: raise MyGithub12Error("PATCH_INVALID_FORMAT","upload item requires path")
+            if not isinstance(upload_id,str) or not upload_id: raise MyGithub12Error("PATCH_INVALID_FORMAT","upload item requires upload_id")
+            if path in paths: raise MyGithub12Error("PATCH_INVALID_FORMAT",f"duplicate upload target path: {path}")
+            if upload_id in upload_ids: raise MyGithub12Error("PATCH_INVALID_FORMAT",f"duplicate upload_id: {upload_id}")
+            paths.append(path); upload_ids.append(upload_id)
     canonical=json.dumps(change,ensure_ascii=False,sort_keys=True,separators=(",",":"))
     return {"change":change,"mode":mode,"canonical_hash":hashlib.sha256(canonical.encode()).hexdigest()}
 
@@ -156,16 +165,24 @@ def execute_change_set(service: Any, session: dict[str,Any], workspace: dict[str
     elif mode=="range":
         result=mygithub10.edit_ranges(service,session["repository"],session["branch"],expected_head_sha,json.dumps(change["range_operations"]),commit_message,dry_run,idempotency_key,audit_context)
     else:
-        item=change["uploaded_files"][0]
-        for key in ("path","upload_id"):
-            if not isinstance(item.get(key),str) or not item[key]: raise MyGithub12Error("PATCH_INVALID_FORMAT",f"upload item requires {key}")
+        items=change["uploaded_files"]
+        for item in items: mygithub10._safe_path(item["path"])
         if dry_run:
-            # Verify finalized upload metadata without consuming it.
-            _,_,meta=mygithub10._load_upload(item["upload_id"])
-            if not meta.get("finalized"): raise MyGithub12Error("UPLOAD_NOT_FINALIZED","finalize upload before change-set commit")
-            result={"ok":True,"dry_run":True,"repository":session["repository"],"branch":session["branch"],"expected_head_sha":expected_head_sha,"changed_files":[{"path":item["path"],"operation":"upsert","size_bytes":meta["size"],"content_sha256":meta["sha256"]}]}
-        else:
+            # Reuse the exact HEAD/blob CAS preflight used by the real commit, then verify every finalized upload without consuming any body.
+            mygithub10.preflight_upload_targets(service,session["repository"],session["branch"],expected_head_sha,items)
+            changed_files=[]; total_size=0
+            for item in items:
+                _,_,meta=mygithub10._load_upload(item["upload_id"])
+                if not meta.get("finalized"): raise MyGithub12Error("UPLOAD_NOT_FINALIZED",f"finalize upload before change-set commit: {item['upload_id']}")
+                total_size+=int(meta["size"])
+                if total_size>mygithub10.MAX_UPLOAD_CHANGE_SET_BYTES: raise MyGithub12Error("UPLOAD_SIZE_EXCEEDED",f"upload mode exceeds aggregate size limit: {mygithub10.MAX_UPLOAD_CHANGE_SET_BYTES}")
+                changed_files.append({"path":item["path"],"operation":"upsert","size_bytes":meta["size"],"content_sha256":meta["sha256"]})
+            result={"ok":True,"dry_run":True,"repository":session["repository"],"branch":session["branch"],"expected_head_sha":expected_head_sha,"changed_files":changed_files}
+        elif len(items)==1:
+            item=items[0]
             result=mygithub10.commit_upload(service,session["repository"],session["branch"],expected_head_sha,item["path"],str(item.get("expected_blob_sha") or ""),item["upload_id"],commit_message,idempotency_key,audit_context)
+        else:
+            result=mygithub10.commit_uploads(service,session["repository"],session["branch"],expected_head_sha,items,commit_message,idempotency_key,audit_context)
     result["change_set_canonical_hash"]=parsed["canonical_hash"]
     return result
 

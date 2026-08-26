@@ -35,6 +35,8 @@ MAX_PATCH_BYTES = 262144
 MAX_TEXT_EDIT_FILE_BYTES = 4 * 1024 * 1024
 MAX_UPLOAD_CHUNK_BYTES = 131072
 MAX_UPLOAD_BYTES = 1048576
+MAX_UPLOAD_CHANGE_SET_FILES = 64
+MAX_UPLOAD_CHANGE_SET_BYTES = 64 * MAX_UPLOAD_BYTES
 UPLOAD_TTL_SECONDS = 3600
 MAX_FILE_EDIT_OPERATIONS = 1000
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?(?:\r?\n)?$")
@@ -689,7 +691,7 @@ def _apply_file_patch(
     return "".join(output).encode("utf-8")
 
 
-def _commit_files(client, repository: str, branch: str, expected_head_sha: str, changed: dict[str, bytes | None], expected_blob_shas: dict[str, str], message: str) -> dict[str, Any]:
+def _preflight_file_write(client, repository: str, branch: str, expected_head_sha: str, paths: list[str], expected_blob_shas: dict[str, str]) -> tuple[Any, Any, Any, str, dict[str, str | None]]:
     service = client
     service._check_repository_allowed(repository)
     service._check_default_branch_write(repository, branch)
@@ -699,10 +701,8 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
     actual_head = ref.object.sha
     if expected_head_sha and actual_head != expected_head_sha:
         raise MyGithub10Error("PATCH_HEAD_CHANGED", f"branch HEAD changed before write for {repository}:{branch}", {"expected": expected_head_sha, "actual": actual_head, "repository": repository, "branch": branch, "phase": "before_write", "error_code": "HEAD_CHANGED"})
-    elements = []
-    old_shas = {}
-    new_shas = {}
-    for path, content in changed.items():
+    old_shas: dict[str, str | None] = {}
+    for path in paths:
         _safe_path(path)
         try:
             entry = repo.get_contents(path, ref=actual_head)
@@ -715,6 +715,21 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
         expected = expected_blob_shas.get(path, "")
         if expected and expected != (old_sha or ""):
             raise MyGithub10Error("BLOB_CHANGED", f"file blob changed before write: {path}", {"expected": expected, "actual": old_sha, "repository": repository, "branch": branch, "path": path})
+    return gh, repo, ref, actual_head, old_shas
+
+
+def preflight_upload_targets(client, repository: str, branch: str, expected_head_sha: str, uploaded_files: list[dict[str, Any]]) -> dict[str, Any]:
+    paths = [str(item["path"]) for item in uploaded_files]
+    expected_blob_shas = {str(item["path"]): str(item.get("expected_blob_sha") or "") for item in uploaded_files}
+    _, _, _, actual_head, old_shas = _preflight_file_write(client, repository, branch, expected_head_sha, paths, expected_blob_shas)
+    return {"head_sha": actual_head, "old_blob_shas": old_shas}
+
+
+def _commit_files(client, repository: str, branch: str, expected_head_sha: str, changed: dict[str, bytes | None], expected_blob_shas: dict[str, str], message: str) -> dict[str, Any]:
+    gh, repo, ref, actual_head, old_shas = _preflight_file_write(client, repository, branch, expected_head_sha, list(changed), expected_blob_shas)
+    elements = []
+    new_shas = {}
+    for path, content in changed.items():
         if content is None:
             elements.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
         else:
@@ -1173,7 +1188,7 @@ def capabilities(build_sha: str) -> dict[str, Any]:
     return {
         "name": "MyGithut12",
         "version": SERVICE_VERSION,
-        "tool_count": 162,
+        "tool_count": 163,
         "build_sha": build_sha,
         "build_sha_source": "environment" if new_build_env or legacy_build_env else "vcs_fallback",
         "runtime_mode": os.environ.get("MYGITHUB12_RUNTIME_MODE", os.environ.get("MYGITHUB10_RUNTIME_MODE", "development")),
@@ -1199,6 +1214,9 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_exact_text_replace": True,
         "exact_text_replace_semantics": {"match": "exact UTF-8 substring", "required_match_count": 1, "normalization": "none", "line_numbers": "not used"},
         "supports_chunked_upload": True,
+        "supports_atomic_multi_upload_change_set": True,
+        "max_atomic_multi_upload_files": MAX_UPLOAD_CHANGE_SET_FILES,
+        "max_atomic_multi_upload_bytes": MAX_UPLOAD_CHANGE_SET_BYTES,
         "supports_dry_run": True,
         "supports_expected_head_sha": True,
         "supports_expected_blob_sha": True,
@@ -1233,6 +1251,7 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_repository_change_impact": True,
         "supports_repository_patch_analysis": True,
         "supports_affected_test_selection": True,
+        "supports_private_ci_applicability_planning": True,
         "supports_repository_contract_change_detection": True,
         "supports_development_task_orchestration": True,
         "supports_development_sessions": True,
@@ -1245,9 +1264,10 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_blue_green_runtime": True,
         "supports_runtime_generation_leader": True,
         "supports_cross_generation_resources": True,
-        "tool_manifest_count": 162,
+        "tool_manifest_count": 163,
         "recommended_small_text_workflow": ["replace_github_text_once", "apply_github_patch", "edit_github_file_ranges"],
         "recommended_large_file_workflow": ["get_github_file_manifest", "read_github_file_chunk", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "commit_github_uploaded_files"],
+        "recommended_atomic_multi_upload_workflow": ["prepare_development_task", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "apply_development_change_set"],
         "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "PATCH_TEXT_MISMATCH", "IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_IN_PROGRESS", "WORKSPACE_LEASE_REQUIRED", "WORKSPACE_REVISION_MISMATCH", "WORKSPACE_BRANCH_DRIFTED", "DEVELOPMENT_SESSION_NOT_FOUND", "DEVELOPMENT_SESSION_CLOSED", "DEVELOPMENT_SESSION_STATE_INVALID", "DEVELOPMENT_SESSION_REVISION_MISMATCH", "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "MIRROR_UNAVAILABLE", "MIRROR_ORIGIN_MISMATCH", "MIRROR_FETCH_FAILED", "MIRROR_OBJECT_MISSING", "MIRROR_IDENTITY_MISMATCH", "FAST_CI_NOT_MERGE_ELIGIBLE", "CI_PROFILE_DISCOVERY_MISMATCH", "CI_ENV_CACHE_INVALID", "CI_ENV_CACHE_BUILD_FAILED", "AFFECTED_SELECTION_INCOMPLETE", "FAILURE_PACK_UNAVAILABLE", "RUNTIME_SCHEMA_INCOMPATIBLE", "RUNTIME_GENERATION_NOT_READY", "RUNTIME_LEADER_CONFLICT", "CROSS_GENERATION_RESOURCE_UNAVAILABLE", "CROSS_GENERATION_UPLOAD_UNAVAILABLE"],
         "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}],
     }
@@ -1397,6 +1417,86 @@ def commit_upload(client, repository: str, branch: str, expected_head_sha: str, 
         _idempotent_mark_git_verified(operation_id, result)
         result["_operation_id"] = operation_id
         result["_cleanup_upload_id"] = upload_id
+        return result
+    except MyGithub10Error as exc:
+        _idempotent_finish(operation_id, "failed", error_code=exc.code, result={"failed_stage": exc.details.get("failed_stage"), "error": {"code": exc.code, "details": exc.details}})
+        raise
+
+
+def commit_uploads(client, repository: str, branch: str, expected_head_sha: str, uploaded_files: list[dict[str, Any]], commit_message: str, idempotency_key: str = "", audit_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not isinstance(uploaded_files, list) or len(uploaded_files) < 2:
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "multi-upload commit requires at least two uploaded files")
+    if len(uploaded_files) > MAX_UPLOAD_CHANGE_SET_FILES:
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", f"multi-upload commit exceeds file limit: {MAX_UPLOAD_CHANGE_SET_FILES}")
+    items: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    seen_upload_ids: set[str] = set()
+    for item in uploaded_files:
+        if not isinstance(item, dict):
+            raise MyGithub10Error("PATCH_INVALID_FORMAT", "each uploaded file must be an object")
+        path = item.get("path")
+        upload_id = item.get("upload_id")
+        expected_blob_sha = item.get("expected_blob_sha", "")
+        if not isinstance(path, str) or not path:
+            raise MyGithub10Error("PATCH_INVALID_FORMAT", "upload item requires path")
+        if not isinstance(upload_id, str) or not upload_id:
+            raise MyGithub10Error("PATCH_INVALID_FORMAT", "upload item requires upload_id")
+        if not isinstance(expected_blob_sha, str):
+            raise MyGithub10Error("PATCH_INVALID_FORMAT", "upload item expected_blob_sha must be a string")
+        _safe_path(path)
+        if path in seen_paths:
+            raise MyGithub10Error("PATCH_INVALID_FORMAT", f"duplicate upload target path: {path}")
+        if upload_id in seen_upload_ids:
+            raise MyGithub10Error("PATCH_INVALID_FORMAT", f"duplicate upload_id: {upload_id}")
+        seen_paths.add(path)
+        seen_upload_ids.add(upload_id)
+        items.append({"path": path, "expected_blob_sha": expected_blob_sha, "upload_id": upload_id})
+
+    scope = {"repository": repository, "branch": branch, "expected_head_sha": expected_head_sha, "uploaded_files": items, "commit_message": commit_message}
+    existing = _idempotent_existing(idempotency_key)
+    if existing and existing.get("status") == "success_verified":
+        stored_request = json.loads(existing.get("request_json") or "{}")
+        stored_scope = {key: stored_request.get(key) for key in scope}
+        if stored_scope != scope:
+            raise MyGithub10Error("IDEMPOTENCY_CONFLICT", "idempotency key was used for a different multi-upload request")
+        if existing.get("result_json"):
+            replay = json.loads(existing["result_json"])
+            replay["replayed"] = True
+            replay["operation_id"] = existing["operation_id"]
+            return replay
+        raise MyGithub10Error("IDEMPOTENCY_RESULT_UNAVAILABLE", "the verified idempotent multi-upload result is unavailable")
+    if existing and existing.get("status") == "succeeded":
+        raise MyGithub10Error("IDEMPOTENCY_RESULT_UNVERIFIED", "legacy multi-upload success was not durably verified against GitHub", {"operation_id": existing["operation_id"], "recovery_required": True})
+
+    changed: dict[str, bytes] = {}
+    expected_blob_shas: dict[str, str] = {}
+    upload_evidence: list[dict[str, Any]] = []
+    upload_sources: list[tuple[dict[str, str], Path, dict[str, Any]]] = []
+    total_size = 0
+    for item in items:
+        data_path, _, meta = _load_upload(item["upload_id"])
+        if not meta.get("finalized"):
+            raise MyGithub10Error("UPLOAD_NOT_FINALIZED", f"finalize upload before change-set commit: {item['upload_id']}")
+        total_size += int(meta["size"])
+        if total_size > MAX_UPLOAD_CHANGE_SET_BYTES:
+            raise MyGithub10Error("UPLOAD_SIZE_EXCEEDED", f"multi-upload commit exceeds aggregate size limit: {MAX_UPLOAD_CHANGE_SET_BYTES}")
+        upload_sources.append((item, data_path, meta))
+    for item, data_path, meta in upload_sources:
+        changed[item["path"]] = data_path.read_bytes()
+        expected_blob_shas[item["path"]] = item["expected_blob_sha"]
+        upload_evidence.append({"upload_id": item["upload_id"], "sha256": meta["sha256"], "size": meta["size"]})
+
+    request = {"tool_name": "apply_development_change_set", **scope, "upload_evidence": upload_evidence}
+    operation_id, replay = _idempotent_start("apply_development_change_set", idempotency_key, request, audit_context)
+    if replay:
+        return replay
+    try:
+        result = _commit_files(client, repository, branch, expected_head_sha, changed, expected_blob_shas, commit_message)
+        upload_ids = [item["upload_id"] for item in items]
+        result = {"ok": True, **result, "upload_ids": upload_ids}
+        _idempotent_mark_git_verified(operation_id, result)
+        result["_operation_id"] = operation_id
+        result["_cleanup_upload_ids"] = upload_ids
         return result
     except MyGithub10Error as exc:
         _idempotent_finish(operation_id, "failed", error_code=exc.code, result={"failed_stage": exc.details.get("failed_stage"), "error": {"code": exc.code, "details": exc.details}})

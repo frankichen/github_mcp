@@ -242,3 +242,47 @@ async def test_structured_fastmcp_removes_json_string_in_json_envelope(tmp_path,
     assert structured["status"] == "passed"
     assert "result" not in structured
     assert structured["response_meta"]["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_structured_fastmcp_hides_deprecated_tools_in_production_but_keeps_call_compatibility(monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_RUNTIME_MODE", "production")
+    monkeypatch.delenv("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", raising=False)
+    mcp = StructuredFastMCP("canonical-schema-test")
+
+    @mcp.tool(name="get_github_file")
+    async def legacy_tool() -> str:
+        return json.dumps({"ok": True, "legacy": True})
+
+    @mcp.tool(name="current_tool")
+    async def current_tool() -> str:
+        return json.dumps({"ok": True, "current": True})
+
+    visible = await mcp.list_tools()
+    assert [tool.name for tool in visible] == ["current_tool"]
+    identity = await mcp.tool_schema_identity(visible)
+    assert identity["tool_count"] == 1
+    assert identity["tool_manifest_count"] == 1
+    assert identity["compatibility_tool_count"] == 2
+    assert identity["hidden_deprecated_tool_count"] == 1
+    assert identity["hidden_deprecated_tools"] == ["get_github_file"]
+    assert identity["deprecated_tools_exposed"] is False
+    assert len(identity["tool_schema_sha256"]) == 64
+    assert identity["schema_generation_id"].startswith("schema-v1:")
+
+    call_result = await mcp.call_tool("get_github_file", {})
+    if isinstance(call_result, tuple):
+        structured = call_result[1]
+    else:
+        structured = getattr(call_result, "structured_content", None)
+        if structured is None:
+            structured = getattr(call_result, "structuredContent", None)
+    assert structured["legacy"] is True
+
+    monkeypatch.setenv("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", "true")
+    compatibility = await mcp.list_tools()
+    assert [tool.name for tool in compatibility] == ["get_github_file", "current_tool"]
+    compatibility_identity = await mcp.tool_schema_identity(compatibility)
+    assert compatibility_identity["deprecated_tools_exposed"] is True
+    assert compatibility_identity["hidden_deprecated_tool_count"] == 0
+    assert compatibility_identity["compatibility_tool_count"] == 2

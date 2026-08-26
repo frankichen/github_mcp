@@ -1076,6 +1076,196 @@ def _recursive_tree(service: Any, repository: str, commit_sha: str):
     return identity,list(repo.get_git_tree(_tree_sha(commit),recursive=True).tree)
 
 
+def plan_private_ci_job(service: Any, repository: str, commit_sha: str, profile: str="repo-auto-check") -> dict[str,Any]:
+    """Plan private CI applicability from exact Git identity, policy and project manifests only."""
+    from app.ci_repository_config import (
+        get_allowed_profiles,
+        get_repository_config,
+        get_repository_policy_source,
+        is_private_ci_enabled,
+    )
+
+    identity, entries = _recursive_tree(service, repository, commit_sha)
+    requested_profile = (profile or "repo-auto-check").strip()
+    allowed_profiles = get_allowed_profiles(repository)
+    policy_source = get_repository_policy_source(repository)
+    repository_config = get_repository_config(repository)
+    paths = {
+        str(entry.path)
+        for entry in entries
+        if str(getattr(entry, "type", "")) == "blob"
+    }
+    lock_files = {"package-lock.json": "npm", "npm-shrinkwrap.json": "npm", "pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn", "bun.lock": "bun", "bun.lockb": "bun"}
+    python_manifests = {"pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg", "Pipfile"}
+    excluded_parts = {"node_modules", "vendor", ".git", ".venv", "dist", "build"}
+    profile_by_stack = {"go": "go-check", "python": "python-check", "node": "node-check", "rust": "rust-check", "maven": "maven-check", "gradle": "gradle-check", "dotnet": "dotnet-check"}
+    workspaces: list[dict[str,Any]] = []
+    seen: set[tuple[str,str]] = set()
+
+    def direct_files(rel: str) -> set[str]:
+        prefix = "" if rel == "." else rel.rstrip("/") + "/"
+        result = set()
+        for path in paths:
+            if prefix and not path.startswith(prefix):
+                continue
+            remainder = path[len(prefix):] if prefix else path
+            if "/" not in remainder:
+                result.add(remainder)
+        return result
+
+    def add_workspace(rel: str, stack: str, files: set[str], explicit: dict[str,Any]|None=None) -> None:
+        key = (rel, stack)
+        if key in seen:
+            return
+        seen.add(key)
+        workspace: dict[str,Any] = {"path": rel, "stack": stack}
+        if stack == "node":
+            configured_manager = str((explicit or {}).get("package_manager") or "").strip()
+            managers = sorted({manager for filename, manager in lock_files.items() if filename in files})
+            if configured_manager:
+                workspace["package_manager"] = configured_manager
+            elif len(managers) == 1:
+                workspace["package_manager"] = managers[0]
+            else:
+                workspace["package_manager"] = None
+                workspace["configuration_error"] = "supported_lock_file_missing" if not managers else "multiple_supported_lock_files"
+        workspaces.append(workspace)
+
+    def detect_directory(rel: str, files: set[str], kind: str="auto", explicit: dict[str,Any]|None=None) -> None:
+        if kind in {"auto", "go"} and "go.mod" in files:
+            add_workspace(rel, "go", files, explicit)
+        if kind in {"auto", "node"} and "package.json" in files:
+            root_go_without_lock = kind == "auto" and rel == "." and "go.mod" in files and not any(lock in files for lock in lock_files)
+            if not root_go_without_lock:
+                add_workspace(rel, "node", files, explicit)
+        if kind in {"auto", "python"} and files.intersection(python_manifests):
+            add_workspace(rel, "python", files, explicit)
+        if kind in {"auto", "rust"} and "Cargo.toml" in files:
+            add_workspace(rel, "rust", files, explicit)
+        if kind in {"auto", "maven"} and "pom.xml" in files:
+            add_workspace(rel, "maven", files, explicit)
+        if kind in {"auto", "gradle"} and ({"build.gradle", "build.gradle.kts"} & files):
+            add_workspace(rel, "gradle", files, explicit)
+        if kind in {"auto", "dotnet"} and any(name.endswith((".sln", ".csproj", ".fsproj")) for name in files):
+            add_workspace(rel, "dotnet", files, explicit)
+
+    configured = repository_config.get("workspaces") or []
+    if configured:
+        for item in configured:
+            if not isinstance(item, dict):
+                continue
+            rel = str(item.get("path") or ".").strip("/") or "."
+            detect_directory(rel, direct_files(rel), str(item.get("type") or "auto"), item)
+    else:
+        directories: dict[str,set[str]] = {}
+        for path in paths:
+            parts = path.split("/")
+            if any(part in excluded_parts for part in parts[:-1]):
+                continue
+            rel = "/".join(parts[:-1]) or "."
+            directories.setdefault(rel, set()).add(parts[-1])
+        for rel, files in directories.items():
+            detect_directory(rel, files)
+
+    workspaces.sort(key=lambda item: (str(item.get("path")), str(item.get("stack"))))
+    detected_stacks: list[str] = []
+    for workspace in workspaces:
+        stack = str(workspace["stack"])
+        if stack not in detected_stacks:
+            detected_stacks.append(stack)
+
+    base_result: dict[str,Any] = {
+        "ok": True,
+        **identity,
+        "requested_profile": requested_profile,
+        "policy_source": policy_source,
+        "allowed_profiles": allowed_profiles,
+        "detected_stacks": detected_stacks,
+        "workspaces": workspaces,
+        "selected_profiles": [],
+        "applicable": False,
+        "reason": "not_evaluated",
+    }
+    if not is_private_ci_enabled(repository):
+        return {**base_result, "reason": "private_ci_disabled"}
+    if requested_profile not in allowed_profiles:
+        return {**base_result, "reason": "profile_not_allowed"}
+
+    if requested_profile == "repo-auto-check":
+        if any(workspace.get("configuration_error") for workspace in workspaces):
+            return {**base_result, "reason": "workspace_configuration_error"}
+        selected_profiles: list[str] = []
+        unavailable: list[str] = []
+        for workspace in workspaces:
+            selected = profile_by_stack.get(str(workspace["stack"]))
+            if not selected or selected in selected_profiles:
+                continue
+            if selected not in allowed_profiles:
+                unavailable.append(selected)
+            else:
+                selected_profiles.append(selected)
+        if not workspaces:
+            return {**base_result, "reason": "no_supported_project_manifest"}
+        if unavailable:
+            return {**base_result, "reason": "detected_profile_not_allowed", "missing_profiles": unavailable}
+        return {**base_result, "applicable": True, "reason": "applicable", "selected_profiles": selected_profiles}
+
+    if requested_profile == "repo-fast-check":
+        if "Makefile" not in direct_files("."):
+            return {**base_result, "reason": "fast_check_makefile_missing"}
+        try:
+            makefile_result = service.get_file(repository, "Makefile", commit_sha)
+            makefile = makefile_result.get("content") or ""
+        except Exception:
+            return {**base_result, "reason": "fast_check_entrypoint_unverified"}
+        if not re.search(r"(?m)^ai-integrity-check\s*:", makefile):
+            if makefile_result.get("truncated"):
+                return {**base_result, "reason": "fast_check_entrypoint_unverified"}
+            return {**base_result, "reason": "fast_check_entrypoint_missing"}
+        return {**base_result, "applicable": True, "reason": "applicable", "selected_profiles": [requested_profile]}
+
+    if requested_profile == "openapi-check":
+        required_paths = ["scripts/validate-openapi.sh", ".redocly.yaml"]
+        missing_paths = [path for path in required_paths if path not in paths]
+        if missing_paths:
+            return {**base_result, "reason": "openapi_entrypoint_missing", "missing_paths": missing_paths}
+        return {**base_result, "applicable": True, "reason": "applicable", "selected_profiles": [requested_profile], "required_paths": required_paths}
+
+    requested_stack = requested_profile.removesuffix("-check")
+    if requested_profile == "node-check" and configured:
+        explicit_detected_stacks = detected_stacks
+        matching = [workspace for workspace in workspaces if workspace["stack"] == requested_stack]
+    else:
+        root_files = direct_files(".")
+        matching: list[dict[str,Any]] = []
+        if requested_stack == "go" and "go.mod" in root_files:
+            matching.append({"path": ".", "stack": "go"})
+        elif requested_stack == "node" and "package.json" in root_files:
+            managers = sorted({manager for filename, manager in lock_files.items() if filename in root_files})
+            workspace: dict[str,Any] = {"path": ".", "stack": "node", "package_manager": managers[0] if len(managers) == 1 else None}
+            if len(managers) != 1:
+                workspace["configuration_error"] = "supported_lock_file_missing" if not managers else "multiple_supported_lock_files"
+            matching.append(workspace)
+        elif requested_stack == "python" and root_files.intersection(python_manifests):
+            matching.append({"path": ".", "stack": "python"})
+        elif requested_stack == "rust" and "Cargo.toml" in root_files:
+            matching.append({"path": ".", "stack": "rust"})
+        elif requested_stack == "maven" and "pom.xml" in root_files:
+            matching.append({"path": ".", "stack": "maven"})
+        elif requested_stack == "gradle" and ({"build.gradle", "build.gradle.kts"} & root_files):
+            matching.append({"path": ".", "stack": "gradle"})
+        elif requested_stack == "dotnet" and any(name.endswith((".sln", ".csproj", ".fsproj")) for name in root_files):
+            matching.append({"path": ".", "stack": "dotnet"})
+        explicit_detected_stacks = [requested_stack] if matching else []
+
+    explicit_result = {**base_result, "detected_stacks": explicit_detected_stacks, "workspaces": matching}
+    if not matching:
+        return {**explicit_result, "reason": f"no_{requested_stack}_manifest"}
+    if any(workspace.get("configuration_error") for workspace in matching):
+        return {**explicit_result, "reason": "workspace_configuration_error"}
+    return {**explicit_result, "applicable": True, "reason": "applicable", "selected_profiles": [requested_profile]}
+
+
 def list_repository_tree(service: Any, repository: str, commit_sha: str, path: str="", max_depth: int=5, include_globs_json: str="[]", exclude_globs_json: str="[]", limit: int=500, cursor: str="") -> dict[str,Any]:
     path=_safe_path(path,True); includes=_parse(include_globs_json,list,"include_globs_json",[]); excludes=_parse(exclude_globs_json,list,"exclude_globs_json",[]); identity,entries=_recursive_tree(service,repository,commit_sha); prefix=path.rstrip("/")+("/" if path else ""); out=[]
     for e in entries:
