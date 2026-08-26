@@ -665,3 +665,97 @@ class TestOAuthWellKnown:
     def test_well_known_no_auth_required(self, client):
         response = client.get("/.well-known/oauth-protected-resource")
         assert response.status_code == 200
+
+
+class TestMergeIndexBootstrap:
+    @pytest.mark.asyncio
+    async def test_confirmed_merge_queues_exact_new_base_index(self, monkeypatch):
+        import json
+        import app.mcp_server as mcp_server
+
+        old_base = "b" * 40
+        new_base = "c" * 40
+        merged = {
+            "ok": True,
+            "merged": True,
+            "repository": "owner/allowed-repo",
+            "pull_number": 7,
+            "base_head_before": old_base,
+            "base_head_after": new_base,
+            "merge_commit_sha": new_base,
+        }
+        calls = []
+
+        async def fake_github_call(function, *args):
+            if function is mcp_server.github_utils.merge_github_pull_request:
+                return dict(merged)
+            if function is mcp_server.mygithub12.request_index_build:
+                calls.append(args)
+                return {
+                    "ok": True,
+                    "job_id": "index-job",
+                    "commit_sha": new_base,
+                    "tree_sha": "d" * 40,
+                    "version": "12.0.0-1",
+                    "strategy": "auto",
+                    "base_commit_sha": old_base,
+                    "status": "running",
+                    "step": "snapshot",
+                    "deduplicated": False,
+                }
+            raise AssertionError(function)
+
+        monkeypatch.setattr(mcp_server, "_github_call", fake_github_call)
+        raw = await mcp_server.merge_github_pull_request(
+            "owner/allowed-repo", 7, expected_head_sha="a" * 40, confirm=True
+        )
+        result = json.loads(raw)
+        assert result["ok"] is True
+        assert result["merged"] is True
+        assert result["post_merge_index"]["commit_sha"] == new_base
+        assert result["post_merge_index"]["base_commit_sha"] == old_base
+        assert calls == [(
+            mcp_server._service,
+            "owner/allowed-repo",
+            new_base,
+            "auto",
+            old_base,
+            "interactive",
+            f"post-merge-index:owner/allowed-repo:{new_base}",
+            False,
+        )]
+
+    @pytest.mark.asyncio
+    async def test_index_bootstrap_failure_never_reverses_confirmed_merge(self, monkeypatch):
+        import json
+        import app.mcp_server as mcp_server
+
+        new_base = "c" * 40
+        merged = {
+            "ok": True,
+            "merged": True,
+            "repository": "owner/allowed-repo",
+            "pull_number": 8,
+            "base_head_before": "b" * 40,
+            "base_head_after": new_base,
+            "merge_commit_sha": new_base,
+        }
+
+        async def fake_github_call(function, *args):
+            if function is mcp_server.github_utils.merge_github_pull_request:
+                return dict(merged)
+            if function is mcp_server.mygithub12.request_index_build:
+                raise RuntimeError("index backend unavailable")
+            raise AssertionError(function)
+
+        monkeypatch.setattr(mcp_server, "_github_call", fake_github_call)
+        raw = await mcp_server.merge_github_pull_request(
+            "owner/allowed-repo", 8, expected_head_sha="a" * 40, confirm=True
+        )
+        result = json.loads(raw)
+        assert result["ok"] is True
+        assert result["merged"] is True
+        assert result["post_merge_index"]["ok"] is False
+        assert result["post_merge_index"]["status"] == "bootstrap_failed"
+        assert result["post_merge_index"]["error_code"] == "RuntimeError"
+        assert result["warnings"] == ["POST_MERGE_INDEX_BOOTSTRAP_FAILED"]
