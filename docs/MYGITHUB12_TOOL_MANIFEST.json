@@ -1,12 +1,12 @@
 {
   "service_name": "MyGithut12",
-  "service_version": "12.2.1",
+  "service_version": "12.3.0",
   "manifest_format": "composed-v2",
   "legacy_manifest": "MYGITHUB10_TOOL_MANIFEST.json",
   "legacy_tool_count": 120,
-  "new_tool_count": 43,
-  "tool_count": 160,
-  "compatibility_tool_count": 163,
+  "new_tool_count": 46,
+  "tool_count": 163,
+  "compatibility_tool_count": 166,
   "hidden_deprecated_tools": [
     "get_github_file",
     "commit_github_files",
@@ -56,6 +56,9 @@
     "prepare_development_task",
     "apply_development_change_set",
     "validate_development_task",
-    "finalize_development_task"
+    "finalize_development_task",
+    "plan_infrastructure_deployment",
+    "start_infrastructure_deployment",
+    "get_infrastructure_deployment"
   ]
 }
