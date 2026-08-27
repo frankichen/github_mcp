@@ -82,7 +82,9 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert tools["start_infrastructure_deployment"].annotations.readOnlyHint is False
     assert tools["start_infrastructure_deployment"].annotations.destructiveHint is True
     assert tools["get_infrastructure_deployment"].annotations.readOnlyHint is True
-    infrastructure_get_schema = tools["get_infrastructure_deployment"].inputSchema["properties"]
+    infrastructure_get_input = tools["get_infrastructure_deployment"].inputSchema
+    assert infrastructure_get_input["required"] == ["deployment_id"]
+    infrastructure_get_schema = infrastructure_get_input["properties"]
     assert infrastructure_get_schema["wait_seconds"]["default"] == 0
     assert infrastructure_get_schema["last_known_revision"]["default"] == 0
     assert infrastructure_get_schema["last_known_status"]["default"] == ""

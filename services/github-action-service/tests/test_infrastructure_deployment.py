@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 
 import pytest
 
@@ -233,6 +235,93 @@ def test_get_legacy_shape_and_revision_aware_diagnostics(monkeypatch, isolated_s
     assert diagnostics["phase"] == "source_prepare"
     assert diagnostics["elapsed_seconds"] < 1
     assert "log_tail" not in diagnostics
+
+
+def test_wait_returns_when_progress_changes_after_blocking(monkeypatch, isolated_store):
+    _ready_plan(monkeypatch)
+    started = service.start_infrastructure_deployment(
+        service.REPOSITORY,
+        service.ENVIRONMENT,
+        SHA_B,
+        "job-1",
+        SHA_A,
+        confirm=True,
+    )
+    claimed = service.claim_infrastructure_deployment(service.DEFAULT_EXECUTOR_ID)["deployment"]
+    monkeypatch.setattr(service, "WAIT_POLL_SECONDS", 0.01)
+
+    writer_finished = threading.Event()
+
+    def update_progress():
+        time.sleep(0.05)
+        service.update_infrastructure_deployment_progress(
+            started["deployment_id"],
+            "health",
+            "health phase reached",
+        )
+        writer_finished.set()
+
+    writer = threading.Thread(target=update_progress, daemon=True)
+    writer.start()
+    wait_started = time.monotonic()
+    waited = service.get_infrastructure_deployment(
+        started["deployment_id"],
+        wait_seconds=2,
+        last_known_revision=claimed["log_revision"],
+        last_known_status=claimed["status"],
+        last_known_step=claimed["current_step"],
+    )
+    elapsed = time.monotonic() - wait_started
+    writer.join(timeout=1)
+
+    assert writer_finished.is_set() is True
+    assert writer.is_alive() is False
+    assert elapsed < 1
+    diagnostics = waited["diagnostics"]
+    assert diagnostics["changed"] is True
+    assert diagnostics["timed_out"] is False
+    assert diagnostics["terminal"] is False
+    assert diagnostics["revision"] > claimed["log_revision"]
+    assert diagnostics["status"] == "running"
+    assert diagnostics["current_step"] == "health"
+    assert diagnostics["phase"] == "health"
+
+
+def test_failed_terminal_returns_exit_and_error_code(monkeypatch, isolated_store):
+    _ready_plan(monkeypatch)
+    started = service.start_infrastructure_deployment(
+        service.REPOSITORY,
+        service.ENVIRONMENT,
+        SHA_B,
+        "job-1",
+        SHA_A,
+        confirm=True,
+    )
+    claimed = service.claim_infrastructure_deployment(service.DEFAULT_EXECUTOR_ID)["deployment"]
+    failed = service.fail_infrastructure_deployment(
+        started["deployment_id"],
+        17,
+        "DX2_TEST_FAILURE",
+        "fixed executor failure",
+    )
+    assert failed["deployment"]["status"] == "failed"
+
+    waited = service.get_infrastructure_deployment(
+        started["deployment_id"],
+        wait_seconds=55,
+        last_known_revision=claimed["log_revision"],
+        last_known_status=claimed["status"],
+        last_known_step=claimed["current_step"],
+    )
+    deployment = waited["deployment"]
+    diagnostics = waited["diagnostics"]
+    assert deployment["status"] == "failed"
+    assert deployment["exit_code"] == 17
+    assert deployment["error_code"] == "DX2_TEST_FAILURE"
+    assert diagnostics["changed"] is True
+    assert diagnostics["timed_out"] is False
+    assert diagnostics["terminal"] is True
+    assert diagnostics["phase"] == "failed"
 
 
 def test_get_wait_timeout_is_bounded_without_logs(monkeypatch, isolated_store):
