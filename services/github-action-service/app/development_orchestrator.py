@@ -124,6 +124,17 @@ def prepare_task(
         raise MyGithub12Error("DEVELOPMENT_TASK_PREPARE_FAILED","development task preparation failed",{**details,"cause_type":type(exc).__name__}) from exc
 
 
+def _append_recovery_event_best_effort(
+    session_id: str, expected_revision: int, event_type: str, data: dict[str,Any],
+) -> bool:
+    """Persist recovery audit evidence when possible without masking the primary fail-stop error."""
+    try:
+        sessions.append_recovery_event(session_id,expected_revision,event_type,data)
+        return True
+    except Exception:
+        return False
+
+
 def recover_stale_session(
     service: Any, session_id: str, expected_session_revision: int, expected_workspace_revision: int=0,
     expected_head_sha: str="", idempotency_key: str="",
@@ -146,7 +157,7 @@ def recover_stale_session(
             "workspace_head":ws["head_sha"], "workspace_tree":ws["tree_sha"],
             **details,
         }
-        sessions.append_recovery_event(session_id,current_revision,event_type,payload)
+        _append_recovery_event_best_effort(session_id,current_revision,event_type,payload)
         raise MyGithub12Error(code,message,details)
 
     if expected_workspace_revision and int(expected_workspace_revision) not in {int(session["workspace_revision"]),workspace_revision}:
@@ -241,11 +252,11 @@ def maybe_auto_renew_session_workspace(
         return {"renewed":False,"session":session,"workspace":ws,"remaining_seconds":remaining,"recovery":recovery}
     branch_state=service.client.get_branch(session["repository"],session["branch"]); actual_head=str(branch_state.commit.sha) if branch_state else ""
     if actual_head!=session["head_commit_sha"]:
-        sessions.append_recovery_event(session_id,current_revision,"external_drift_detected",{"reason_code":"WORKSPACE_BRANCH_DRIFTED","workspace_head":ws["head_sha"],"session_head":session["head_commit_sha"],"actual_head":actual_head})
+        _append_recovery_event_best_effort(session_id,current_revision,"external_drift_detected",{"reason_code":"WORKSPACE_BRANCH_DRIFTED","workspace_head":ws["head_sha"],"session_head":session["head_commit_sha"],"actual_head":actual_head})
         raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","GitHub branch HEAD changed before auto-renew",{"workspace_head":ws["head_sha"],"session_head":session["head_commit_sha"],"actual_head":actual_head})
     repo=mygithub12._service_repo(service,session["repository"]); actual_tree=mygithub12._tree_sha(repo.get_commit(actual_head))
     if actual_tree!=session["tree_sha"] or actual_tree!=ws["tree_sha"]:
-        sessions.append_recovery_event(session_id,current_revision,"external_drift_detected",{"reason_code":"WORKSPACE_BRANCH_DRIFTED","workspace_tree":ws["tree_sha"],"session_tree":session["tree_sha"],"actual_tree":actual_tree})
+        _append_recovery_event_best_effort(session_id,current_revision,"external_drift_detected",{"reason_code":"WORKSPACE_BRANCH_DRIFTED","workspace_tree":ws["tree_sha"],"session_tree":session["tree_sha"],"actual_tree":actual_tree})
         raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","GitHub branch Tree changed before auto-renew",{"workspace_tree":ws["tree_sha"],"session_tree":session["tree_sha"],"actual_tree":actual_tree})
     renewed=sessions.auto_renew_session_workspace_lease(
         session_id,current_revision,ws["workspace_id"],workspace_revision,
