@@ -80,7 +80,9 @@ Executor 必须：
 - 要求 checkout `branch=main` 且工作树干净；
 - 使用一次性工作目录；
 - 对进度日志执行 Secret 脱敏；
-- Controller 重启期间允许进度 callback 暂时失败，但 terminal callback 做有界长重试；
+- deployment 执行期间由独立 heartbeat thread 约每 5 秒持续报告同一 `current_deployment_id`，不得因同步部署脚本阻塞主循环而过期；
+- Controller 重启或蓝绿切换期间允许 progress/heartbeat callback 暂时失败，heartbeat 恢复后继续报告同一 deployment identity，terminal callback 仍做有界长重试；
+- deployment terminal 或 executor 异常退出路径必须 stop/join running heartbeat，再恢复 `idle/current_deployment_id=null`；
 - 脚本失败或超时只报告失败，不触发自动回滚。
 
 ## 5. 失败与回滚

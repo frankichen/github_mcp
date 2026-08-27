@@ -332,39 +332,60 @@ def _heartbeat(state: str, current_deployment_id: str = "") -> None:
             "current_deployment_id": current_deployment_id,
         },
         required=False,
-        attempts=2,
+        attempts=1,
     )
 
 
+def _running_heartbeat_loop(deployment_id: str, stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            _heartbeat("running", deployment_id)
+        except Exception:
+            # Heartbeat is best-effort while the fixed deployment keeps running.
+            # A short Controller switch or callback transport failure must not abort it.
+            pass
+        if stop_event.wait(HEARTBEAT_SECONDS):
+            return
+
+
+def _execute_with_heartbeat(row: dict) -> None:
+    deployment_id = str(row["deployment_id"])
+    stop_event = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_running_heartbeat_loop,
+        args=(deployment_id, stop_event),
+        name=f"infrastructure-deploy-heartbeat-{deployment_id}",
+        daemon=False,
+    )
+    heartbeat_thread.start()
+    try:
+        execute(row)
+    finally:
+        stop_event.set()
+        heartbeat_thread.join()
+        _heartbeat("idle")
+
+
 def main() -> None:
-    current_deployment_id = ""
     last_heartbeat = 0.0
     while True:
         now = time.monotonic()
         if now - last_heartbeat >= HEARTBEAT_SECONDS:
-            _heartbeat("running" if current_deployment_id else "idle", current_deployment_id)
+            _heartbeat("idle")
             last_heartbeat = now
-        if current_deployment_id:
+        response = _request(
+            "POST",
+            "/internal/infrastructure-deployments/claim",
+            {"executor_id": EXECUTOR_ID},
+            required=True,
+            attempts=5,
+        )
+        row = (response or {}).get("deployment")
+        if not row:
             time.sleep(POLL_SECONDS)
             continue
-        try:
-            response = _request(
-                "POST",
-                "/internal/infrastructure-deployments/claim",
-                {"executor_id": EXECUTOR_ID},
-                required=True,
-                attempts=5,
-            )
-            row = (response or {}).get("deployment")
-            if not row:
-                time.sleep(POLL_SECONDS)
-                continue
-            current_deployment_id = str(row["deployment_id"])
-            _heartbeat("running", current_deployment_id)
-            execute(row)
-        finally:
-            current_deployment_id = ""
-            _heartbeat("idle")
+        _execute_with_heartbeat(row)
+        last_heartbeat = time.monotonic()
         time.sleep(POLL_SECONDS)
 
 

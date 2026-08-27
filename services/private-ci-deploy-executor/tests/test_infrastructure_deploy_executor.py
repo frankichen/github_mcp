@@ -136,3 +136,84 @@ def test_callback_header_uses_dedicated_secret_file(monkeypatch, tmp_path):
     assert result == {"ok": True}
     assert seen["headers"]["X-Infrastructure-Deployment-Callback-Key"] == "dedicated-test-key"
     assert "X-Deployment-Callback-Key" not in seen["headers"]
+
+
+def test_running_heartbeat_keeps_same_deployment_identity_and_stops(monkeypatch):
+    calls = []
+    monkeypatch.setattr(executor, "HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        executor,
+        "_heartbeat",
+        lambda state, deployment_id="": calls.append((state, deployment_id)),
+    )
+
+    def fake_execute(row):
+        deadline = executor.time.monotonic() + 0.5
+        while sum(1 for state, _ in calls if state == "running") < 3:
+            if executor.time.monotonic() >= deadline:
+                raise AssertionError("running heartbeat did not repeat during deployment")
+            executor.time.sleep(0.005)
+
+    monkeypatch.setattr(executor, "execute", fake_execute)
+    executor._execute_with_heartbeat(_row())
+
+    running = [item for item in calls if item[0] == "running"]
+    assert len(running) >= 3
+    assert {deployment_id for _, deployment_id in running} == {"infra_dep_1"}
+    assert calls[-1] == ("idle", "")
+    final_count = len(calls)
+    executor.time.sleep(0.03)
+    assert len(calls) == final_count
+
+
+def test_running_heartbeat_recovers_after_temporary_callback_error(monkeypatch):
+    calls = []
+    completed = []
+    monkeypatch.setattr(executor, "HEARTBEAT_SECONDS", 0.01)
+
+    def flaky_heartbeat(state, deployment_id=""):
+        calls.append((state, deployment_id))
+        running_count = sum(1 for item_state, _ in calls if item_state == "running")
+        if state == "running" and running_count == 1:
+            raise RuntimeError("temporary controller 502")
+
+    def fake_execute(row):
+        deadline = executor.time.monotonic() + 0.5
+        while sum(1 for state, _ in calls if state == "running") < 3:
+            if executor.time.monotonic() >= deadline:
+                raise AssertionError("running heartbeat did not recover")
+            executor.time.sleep(0.005)
+        completed.append(row["deployment_id"])
+
+    monkeypatch.setattr(executor, "_heartbeat", flaky_heartbeat)
+    monkeypatch.setattr(executor, "execute", fake_execute)
+    executor._execute_with_heartbeat(_row())
+
+    assert completed == ["infra_dep_1"]
+    assert sum(1 for state, _ in calls if state == "running") >= 3
+    assert {deployment_id for state, deployment_id in calls if state == "running"} == {"infra_dep_1"}
+    assert calls[-1] == ("idle", "")
+
+
+def test_running_heartbeat_stops_and_reports_idle_when_execute_raises(monkeypatch):
+    calls = []
+    monkeypatch.setattr(executor, "HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        executor,
+        "_heartbeat",
+        lambda state, deployment_id="": calls.append((state, deployment_id)),
+    )
+    monkeypatch.setattr(executor, "execute", lambda row: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    try:
+        executor._execute_with_heartbeat(_row())
+    except RuntimeError as exc:
+        assert str(exc) == "boom"
+    else:
+        raise AssertionError("execute error must propagate after heartbeat cleanup")
+
+    assert calls[0] == ("running", "infra_dep_1")
+    assert calls[-1] == ("idle", "")
+    final_count = len(calls)
+    executor.time.sleep(0.03)
+    assert len(calls) == final_count
