@@ -14,7 +14,7 @@ from typing import Any
 
 from app import development_orchestrator as dx
 from app import development_session_store as sessions
-from app import github_utils, mygithub12
+from app import attestation_registry, github_utils, mygithub12
 from app.github_policy import repository_is_allowed
 from app.ci_repository_config import is_private_ci_enabled, is_test_deploy_enabled, is_self_deploy_enabled
 from app.ci_database import list_jobs as db_list_jobs
@@ -145,7 +145,16 @@ def _session_evidence(session: dict[str, Any] | None, current_head: str) -> dict
         "last_attestation_id": session.get("last_attestation_id"),
         "last_failure_resource_uri": session.get("last_failure_resource_uri"),
         "head_commit_sha": session.get("head_commit_sha"),
+        "validated_attestation": None,
     }
+    if exact and evidence["last_attestation_id"]:
+        try:
+            validation = attestation_registry.validate_attestation(str(evidence["last_attestation_id"]))
+            attestation = validation.get("attestation") if isinstance(validation, dict) else None
+            if validation.get("ok") is True and isinstance(attestation, dict) and attestation.get("tested_commit_sha") == current_head:
+                evidence["validated_attestation"] = validation
+        except Exception:
+            evidence["validated_attestation"] = None
     if exact:
         current = evidence
     elif any(evidence.values()):
@@ -218,6 +227,8 @@ def resume_task(
 
     # Policy is returned as evidence from the same allowlists used by the public policy tool.
     policy = _repository_policy(repository)
+    if not bool((policy.get("policy") or {}).get("github")):
+        raise MyGithub12Error("REPOSITORY_NOT_ALLOWED", "repository is not allowed for GitHub operations", {"repository": repository})
     pr = _resolve_pr(repository, int(pull_number or 0), branch)
     current_main = _current_main(service, repository)
     effective_branch = branch or (str(pr.get("head_branch")) if pr else "")
@@ -329,5 +340,14 @@ def resume_task(
         "blockers": blockers,
         "degraded": degraded,
     }
-    response["next_allowed_actions"] = _next_actions(blockers, workspace, session, index, pr)
+    next_actions = _next_actions(blockers, workspace, session, index, pr)
+    response["live_facts"] = {
+        "policy": policy, "current_main": current_main, "branch": branch_state, "pull_request": pr,
+        "workspace": workspace, "development_session": session, "index": index,
+        "private_ci_current_head": ci, "current_attestation": (session_evidence.get("current_head") or {}).get("validated_attestation"),
+        "pull_request_readiness": readiness, "overlap": overlap,
+    }
+    response["historical_evidence"] = {"session": session_evidence.get("historical")}
+    response["candidate_next_actions"] = next_actions
+    response["next_allowed_actions"] = next_actions
     return response

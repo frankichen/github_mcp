@@ -96,3 +96,118 @@ def test_resume_task_rejects_branch_pr_mismatch(monkeypatch):
     with pytest.raises(resume.MyGithub12Error) as exc:
         resume.resume_task(FakeService(), "owner/repo", branch="ai/resume", pull_number=12)
     assert exc.value.code == "DEVELOPMENT_RESUME_INPUT_MISMATCH"
+
+
+def _ready_session(*, head=SHA_A, tree=TREE_A, workspace_revision=2, lease=9999999999.0):
+    return {
+        "session_id": "dev_resume", "status": "active", "session_revision": 4,
+        "workspace_revision": workspace_revision, "head_commit_sha": head, "tree_sha": tree,
+        "lease_expires_at": lease, "pull_number": None, "last_fast_ci_job_id": None,
+        "last_full_ci_job_id": None, "last_attestation_id": None, "last_failure_resource_uri": None,
+    }
+
+
+def _stub_resume_context(monkeypatch, *, ws=None, session=None, pr=None, branch_head=SHA_A, branch_tree=TREE_A, readiness=None):
+    ws = ws or _workspace()
+    session = session or _ready_session(workspace_revision=ws["revision"], lease=ws["lease_expires_at"])
+    monkeypatch.setattr(resume, "_repository_policy", lambda repository: {"ok": True, "repository": repository, "policy": {"github": True, "private_ci": True}})
+    monkeypatch.setattr(resume, "_resolve_pr", lambda repository, pull_number, branch: pr)
+    monkeypatch.setattr(resume, "_current_main", lambda service, repository: {"branch": "main", "repository": repository, "commit_sha": SHA_B, "tree_sha": "2" * 40})
+    monkeypatch.setattr(resume, "_resolve_branch", lambda service, repository, branch, base_branch: {"ok": True, "repository": repository, "branch": branch, "base_branch": base_branch, "commit_sha": branch_head, "tree_sha": branch_tree})
+    monkeypatch.setattr(resume, "_select_workspace", lambda service, repository, branch: (ws, [ws]))
+    monkeypatch.setattr(resume, "find_sessions_for_workspace", lambda workspace_id, include_terminal=False, limit=20: [session] if session else [])
+    monkeypatch.setattr(resume.mygithub12, "get_index_status", lambda service, repository, commit_sha="", ref="": {"ok": True, "repository": repository, "commit_sha": commit_sha, "tree_sha": branch_tree, "status": "ready"})
+    monkeypatch.setattr(resume.mygithub12, "workspace_overlap", lambda service, workspace_id: {"ok": True, "workspace_id": workspace_id, "items": []})
+    monkeypatch.setattr(resume, "db_list_jobs", lambda **kwargs: [])
+    monkeypatch.setattr(resume.github_utils, "get_github_pull_request_merge_readiness", lambda *args, **kwargs: readiness or {"ok": True, "ready": False})
+
+
+def test_resume_task_rejects_repository_before_github_reads(monkeypatch):
+    monkeypatch.setattr(resume, "_repository_policy", lambda repository: {"ok": True, "repository": repository, "policy": {"github": False}})
+    monkeypatch.setattr(resume, "_resolve_pr", lambda *args, **kwargs: pytest.fail("GitHub read must not run for denied repository"))
+    with pytest.raises(resume.MyGithub12Error) as exc:
+        resume.resume_task(FakeService(), "owner/denied", branch="ai/resume")
+    assert exc.value.code == "REPOSITORY_NOT_ALLOWED"
+
+
+def test_resume_task_pr_only_resolves_same_branch_and_readiness(monkeypatch):
+    ws = _workspace()
+    session = _ready_session(workspace_revision=ws["revision"], lease=ws["lease_expires_at"])
+    pr = {"pull_number": 7, "head_branch": "ai/resume", "head_sha": SHA_A, "base_branch": "main", "state": "open", "draft": True}
+    readiness = {"ok": True, "pull_number": 7, "ready": False}
+    _stub_resume_context(monkeypatch, ws=ws, session=session, pr=pr, readiness=readiness)
+
+    result = resume.resume_task(FakeService(), "owner/repo", pull_number=7)
+
+    assert result["input"] == {"branch": "", "pull_number": 7}
+    assert result["branch"]["branch"] == "ai/resume"
+    assert result["pull_request_readiness"] == readiness
+    assert "readiness" in result["next_allowed_actions"]
+
+
+def test_resume_task_safely_recovers_stale_session(monkeypatch):
+    ws = _workspace(revision=3)
+    ws.update({"head_sha": SHA_B, "tree_sha": "2" * 40})
+    stale = _ready_session(head=SHA_A, tree=TREE_A, workspace_revision=2, lease=ws["lease_expires_at"])
+    recovered = {**stale, "head_commit_sha": SHA_B, "tree_sha": "2" * 40, "workspace_revision": 3, "session_revision": 5}
+    _stub_resume_context(monkeypatch, ws=ws, session=stale, branch_head=SHA_B, branch_tree="2" * 40)
+    captured = {}
+
+    def fake_recover(service, session_id, session_revision, workspace_revision, expected_head_sha, idempotency_key):
+        captured.update(session_id=session_id, session_revision=session_revision, workspace_revision=workspace_revision, expected_head_sha=expected_head_sha, idempotency_key=idempotency_key)
+        return {"session": recovered, "workspace": ws, "recovered": True}
+
+    monkeypatch.setattr(resume.dx, "recover_stale_session", fake_recover)
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume", idempotency_key="resume-idem")
+
+    assert captured == {"session_id": "dev_resume", "session_revision": 4, "workspace_revision": 3, "expected_head_sha": SHA_B, "idempotency_key": "resume-idem"}
+    assert result["development_session"]["head_commit_sha"] == SHA_B
+    assert result["recovery"]["session"]["recovered"] is True
+    assert "continue_write" in result["next_allowed_actions"]
+
+
+def test_resume_task_drifted_workspace_never_invokes_session_recovery(monkeypatch):
+    ws = _workspace(status="drifted", revision=3)
+    ws["drift_reason"] = "branch moved externally"
+    stale = _ready_session(workspace_revision=2, lease=ws["lease_expires_at"])
+    _stub_resume_context(monkeypatch, ws=ws, session=stale)
+    monkeypatch.setattr(resume.dx, "recover_stale_session", lambda *args, **kwargs: pytest.fail("drifted Workspace must not auto-recover"))
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert "WORKSPACE_DRIFTED" in result["blockers"]
+    assert result["next_allowed_actions"] == ["recovery_required"]
+
+
+def test_session_evidence_never_promotes_old_head_or_invalid_attestation(monkeypatch):
+    historical = {"head_commit_sha": SHA_A, "last_full_ci_job_id": "old-full", "last_attestation_id": "old-att", "last_fast_ci_job_id": None, "last_failure_resource_uri": None}
+    evidence = resume._session_evidence(historical, SHA_B)
+    assert evidence["current_head"] is None
+    assert evidence["historical"]["last_full_ci_job_id"] == "old-full"
+
+    current = {**historical, "head_commit_sha": SHA_B, "last_attestation_id": "current-att"}
+    monkeypatch.setattr(resume.attestation_registry, "validate_attestation", lambda attestation_id: {"ok": True, "reusable": True, "attestation": {"attestation_id": attestation_id, "tested_commit_sha": SHA_B}})
+    exact = resume._session_evidence(current, SHA_B)
+    assert exact["historical"] is None
+    assert exact["current_head"]["validated_attestation"]["ok"] is True
+
+
+def test_resume_task_expired_workspace_renew_requires_revision_cas(monkeypatch):
+    ws = _workspace(status="expired", revision=9)
+    _stub_resume_context(monkeypatch, ws=ws, session=None)
+    with pytest.raises(resume.MyGithub12Error) as exc:
+        resume.resume_task(FakeService(), "owner/repo", branch="ai/resume", renew_lease=True)
+    assert exc.value.code == "WORKSPACE_REVISION_MISMATCH"
+
+
+def test_resume_task_explicitly_groups_live_historical_and_candidate_actions(monkeypatch):
+    ws = _workspace()
+    session = _ready_session(workspace_revision=ws["revision"], lease=ws["lease_expires_at"])
+    _stub_resume_context(monkeypatch, ws=ws, session=session)
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["live_facts"]["branch"]["commit_sha"] == SHA_A
+    assert result["historical_evidence"] == {"session": None}
+    assert result["candidate_next_actions"] == result["next_allowed_actions"]
+    assert "continue_write" in result["candidate_next_actions"]
