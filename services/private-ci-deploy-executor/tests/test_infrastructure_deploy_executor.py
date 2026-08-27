@@ -291,3 +291,25 @@ def test_running_heartbeat_cleans_up_for_deployment_failure_and_timeout(monkeypa
     timeout = run_case("timeout", -15, True)
     assert timeout["exit_code"] == 124
     assert timeout["error_code"] == "INFRASTRUCTURE_DEPLOYMENT_TIMEOUT"
+
+
+
+def test_phase_markers_are_fixed_and_unknown_values_do_not_expand_contract():
+    assert executor._phase_from_output(
+        "[deploy] DX2_PHASE=controller_build", "validation"
+    ) == "controller_build"
+    assert executor._phase_from_output(
+        "[deploy] DX2_PHASE=controller_switch", "controller_build"
+    ) == "controller_switch"
+    assert executor._phase_from_output(
+        "[deploy] DX2_PHASE=arbitrary_shell", "health"
+    ) == "health"
+    assert executor._phase_from_output("ordinary deployment output", "preheat") == "preheat"
+
+
+def test_fixed_deploy_script_contains_dx2_phase_markers():
+    script = Path(__file__).resolve().parents[2] / "private-ci-agent" / "deploy" / "apply-fixes.sh"
+    content = script.read_text(encoding="utf-8")
+    for phase in ("controller_build", "controller_switch", "health", "preheat", "post_verify"):
+        assert content.count(f'DX2_PHASE={phase}') == 1
+    assert "MYGITHUB12_DEPLOY_FAILURE_MODE" in content

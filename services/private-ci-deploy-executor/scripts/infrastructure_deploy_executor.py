@@ -45,6 +45,10 @@ TIMEOUT_SECONDS = int(os.environ.get("INFRASTRUCTURE_DEPLOY_TIMEOUT_SECONDS", "3
 SECRET_RE = re.compile(
     r"(?i)(authorization|cookie|token|password|secret|database_url|private_key)\s*[=:]\s*\S+"
 )
+DEPLOYMENT_PHASES = frozenset(
+    {"controller_build", "controller_switch", "health", "preheat", "post_verify"}
+)
+PHASE_MARKER_RE = re.compile(r"^\[deploy\]\s+DX2_PHASE=([a-z_]+)\s*$")
 
 
 class InfrastructureDeploymentSourceError(RuntimeError):
@@ -200,6 +204,13 @@ def _progress(deployment_id: str, step: str, message: str) -> None:
     )
 
 
+def _phase_from_output(line: str, current_phase: str) -> str:
+    match = PHASE_MARKER_RE.fullmatch(line)
+    if match and match.group(1) in DEPLOYMENT_PHASES:
+        return match.group(1)
+    return current_phase
+
+
 def _fixed_health_evidence() -> tuple[bool, bool]:
     controller = requests.get(CONTROLLER_URL + "/health", timeout=5)
     controller_healthy = controller.status_code == 200 and controller.json().get("status") == "ok"
@@ -218,9 +229,10 @@ def execute(row: dict) -> None:
     process: subprocess.Popen[str] | None = None
     timed_out = False
     try:
+        _progress(deployment_id, "source_prepare", "preparing isolated exact-main source")
         workspace, source_lines = prepare_workspace(row)
         for line in source_lines:
-            _progress(deployment_id, "validating_main", line)
+            _progress(deployment_id, "validation", line)
 
         deploy_env = dict(os.environ)
         deploy_env["MYGITHUB12_DEPLOY_FAILURE_MODE"] = "fail-stop"
@@ -247,9 +259,11 @@ def execute(row: dict) -> None:
         timer.daemon = True
         timer.start()
         assert process.stdout is not None
+        current_phase = "validation"
         for raw in process.stdout:
             line = _redact(raw.rstrip())
-            _progress(deployment_id, "deploying_control_plane", line)
+            current_phase = _phase_from_output(line, current_phase)
+            _progress(deployment_id, current_phase, line)
         process.wait()
         timer.cancel()
 

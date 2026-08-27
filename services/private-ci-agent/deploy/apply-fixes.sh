@@ -148,6 +148,7 @@ log "Web AI candidate handoff directory ready"
 
 # ── 4. 重建并重启 controller（github-action-service）────────
 # 容器内代码通过镜像打包（build: .），heartbeat lease_token 修复需重建。
+log "DX2_PHASE=controller_build"
 log "Rebuilding github-action-service controller"
 cd "${REPO_ROOT}/services/github-action-service"
 BUILD_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
@@ -186,6 +187,7 @@ ROLLBACK_CONTAINER="github-action-service-rollback-${BUILD_SHA:0:12}"
 if ! docker inspect github-action-service >/dev/null 2>&1; then
     die "existing github-action-service container is missing"
 fi
+log "DX2_PHASE=controller_switch"
 docker stop --time 30 github-action-service || die "controller stop failed"
 docker rename github-action-service "${ROLLBACK_CONTAINER}" || die "controller rollback rename failed"
 docker update --restart=no "${ROLLBACK_CONTAINER}" >/dev/null || true
@@ -224,9 +226,11 @@ if [ "${controller_ready}" -ne 1 ]; then
     docker logs --tail 80 github-action-service >&2 || true
     handle_controller_failure "controller_health" "controller health failed"
 fi
+log "DX2_PHASE=health"
 sleep 5
 
 # ── 5. 预热本地共享 Python CI 镜像 ─────────────────────────
+log "DX2_PHASE=preheat"
 log "Preheating shared Python CI image"
 run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-python-ci" || die "Python CI image preheat failed"
 
@@ -246,6 +250,7 @@ log "Preheating shared Playwright browser cache"
 run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-playwright-cache" || die "Playwright cache preheat failed"
 
 # ── 9. 重启 worker 加载新代码 ─────────────────────────────
+log "DX2_PHASE=post_verify"
 log "Restarting private-ci-agent.service"
 systemctl restart private-ci-agent.service
 sleep 3

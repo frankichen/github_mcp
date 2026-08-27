@@ -79,8 +79,8 @@ DX2-WS-01 + DX2-RESUME-01
 | DX2-CI-01 | P0 | `NOT_STARTED` | 两个独立 Private CI Worker 真并行 | AC-CI-01～10 |
 | DX2-WS-01 | P0 | `DONE` | Lease 过期对象退出默认 active Writer + guarded auto-renew | AC-WS-01～13 |
 | DX2-SESSION-01 | P0 | `IN_PROGRESS` | 安全恢复 stale Session，不掩盖真实 drift | AC-SESSION-01～07 |
-| DX2-INFRA-01 | P1 | `IN_PROGRESS` | 长 self-deploy 持续 heartbeat | AC-INFRA-HB-01～05 |
-| DX2-INFRA-02 | P1 | `NOT_STARTED` | self-deploy long-poll 和紧凑诊断 | AC-INFRA-WAIT-01～05 |
+| DX2-INFRA-01 | P1 | `DONE` | 长 self-deploy 持续 heartbeat | AC-INFRA-HB-01～05 |
+| DX2-INFRA-02 | P1 | `IN_PROGRESS` | self-deploy long-poll 和紧凑诊断 | AC-INFRA-WAIT-01～05 |
 | DX2-RESUME-01 | P1 | `IN_PROGRESS` | 新窗口一次恢复 branch/PR 开发上下文 | AC-RESUME-01～07 |
 | DX2-CONVERGE-01 | P1 | `NOT_STARTED` | 一次调用编排 post-write 收敛 | AC-CONV-01～07 |
 | DX2-PERF-01 | P2 | `NOT_STARTED` | 真实 CI 性能统计和回归依据 | AC-PERF-01～05 |
@@ -339,7 +339,7 @@ DX2-WS-01 + DX2-RESUME-01
 
 ### 状态
 
-`IN_PROGRESS`
+`DONE`
 
 ### 预计修改模块
 
@@ -366,7 +366,7 @@ DX2-WS-01 + DX2-RESUME-01
 
 ### 状态
 
-`NOT_STARTED`
+`IN_PROGRESS`
 
 ### 预计修改模块
 
@@ -378,15 +378,15 @@ DX2-WS-01 + DX2-RESUME-01
 
 ### 实现清单
 
-- [ ] 评审“扩展现有 get”与“新增 wait tool”两种方案；
-- [ ] 优先兼容可选参数，减少 tool count；
-- [ ] long-poll revision/status/step change；
-- [ ] bounded wait <= MCP 安全窗口；
-- [ ] compact default response；
-- [ ] redacted log tail；
-- [ ] 结构化 step；
-- [ ] Controller blue/green 切换连续性；
-- [ ] 旧 schema 调用保持兼容。
+- [x] 评审“扩展现有 get”与“新增 wait tool”两种方案；选择扩展现有 `get_infrastructure_deployment`；
+- [x] 优先兼容可选参数，减少 tool count；
+- [x] long-poll revision/status/step change；
+- [x] bounded wait <= 55 秒 MCP 安全窗口；
+- [x] compact default response；
+- [x] redacted log tail；
+- [x] 结构化 step；
+- [ ] Controller blue/green 切换连续性真实 self-deploy 验收；
+- [x] 旧 schema 调用保持兼容。
 
 ### 验收
 

@@ -82,6 +82,13 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert tools["start_infrastructure_deployment"].annotations.readOnlyHint is False
     assert tools["start_infrastructure_deployment"].annotations.destructiveHint is True
     assert tools["get_infrastructure_deployment"].annotations.readOnlyHint is True
+    infrastructure_get_schema = tools["get_infrastructure_deployment"].inputSchema["properties"]
+    assert infrastructure_get_schema["wait_seconds"]["default"] == 0
+    assert infrastructure_get_schema["last_known_revision"]["default"] == 0
+    assert infrastructure_get_schema["last_known_status"]["default"] == ""
+    assert infrastructure_get_schema["last_known_step"]["default"] == ""
+    assert infrastructure_get_schema["include_log_tail"]["default"] is False
+    assert infrastructure_get_schema["log_tail_lines"]["default"] == 40
     assert tools["plan_private_ci_job"].annotations.readOnlyHint is True
     assert tools["build_github_patch"].annotations.readOnlyHint is True
     builder_schema = tools["build_github_patch"].inputSchema

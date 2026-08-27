@@ -194,3 +194,141 @@ def test_redaction_removes_secret_like_log_values(monkeypatch, isolated_store):
     assert "hunter2" not in raw
     assert "token=***" in raw
     assert "password=***" in raw
+
+
+
+def test_get_legacy_shape_and_revision_aware_diagnostics(monkeypatch, isolated_store):
+    _ready_plan(monkeypatch)
+    started = service.start_infrastructure_deployment(
+        service.REPOSITORY,
+        service.ENVIRONMENT,
+        SHA_B,
+        "job-1",
+        SHA_A,
+        confirm=True,
+    )
+    legacy = service.get_infrastructure_deployment(started["deployment_id"])
+    assert set(legacy) == {"ok", "deployment", "executor"}
+    assert legacy["deployment"]["status"] == "queued"
+    assert legacy["deployment"]["log_revision"] == 0
+
+    claimed = service.claim_infrastructure_deployment(service.DEFAULT_EXECUTOR_ID)
+    assert claimed["deployment"]["status"] == "claimed"
+    assert claimed["deployment"]["log_revision"] == 1
+
+    waited = service.get_infrastructure_deployment(
+        started["deployment_id"],
+        wait_seconds=55,
+        last_known_revision=0,
+        last_known_status="queued",
+        last_known_step="queued",
+    )
+    diagnostics = waited["diagnostics"]
+    assert diagnostics["changed"] is True
+    assert diagnostics["timed_out"] is False
+    assert diagnostics["terminal"] is False
+    assert diagnostics["revision"] == 1
+    assert diagnostics["status"] == "claimed"
+    assert diagnostics["current_step"] == "claimed"
+    assert diagnostics["phase"] == "source_prepare"
+    assert diagnostics["elapsed_seconds"] < 1
+    assert "log_tail" not in diagnostics
+
+
+def test_get_wait_timeout_is_bounded_without_logs(monkeypatch, isolated_store):
+    _ready_plan(monkeypatch)
+    started = service.start_infrastructure_deployment(
+        service.REPOSITORY,
+        service.ENVIRONMENT,
+        SHA_B,
+        "job-1",
+        SHA_A,
+        confirm=True,
+    )
+    clock = {"value": 0.0}
+
+    def fake_monotonic():
+        clock["value"] += 30.0
+        return clock["value"]
+
+    monkeypatch.setattr(service.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(service.time, "sleep", lambda seconds: None)
+    waited = service.get_infrastructure_deployment(
+        started["deployment_id"],
+        wait_seconds=999,
+        last_known_status="queued",
+        last_known_step="queued",
+    )
+    diagnostics = waited["diagnostics"]
+    assert diagnostics["changed"] is False
+    assert diagnostics["timed_out"] is True
+    assert diagnostics["terminal"] is False
+    assert diagnostics["max_wait_seconds"] == 55
+    assert diagnostics["phase"] == "validation"
+    assert "log_tail" not in diagnostics
+
+
+def test_terminal_diagnostics_and_redacted_log_tail(monkeypatch, isolated_store):
+    _ready_plan(monkeypatch)
+    started = service.start_infrastructure_deployment(
+        service.REPOSITORY,
+        service.ENVIRONMENT,
+        SHA_B,
+        "job-1",
+        SHA_A,
+        confirm=True,
+    )
+    service.claim_infrastructure_deployment(service.DEFAULT_EXECUTOR_ID)
+    auth_value = "opaque-auth-" + "example"
+    cookie_value = "opaque-cookie-" + "example"
+    db_value = "opaque-db-" + "example"
+    cache_value = "opaque-cache-" + "example"
+    token_value = "opaque-token-" + "example"
+    password_value = "opaque-password-" + "example"
+    message = (
+        "Authorization" + ": Bearer " + auth_value + "\n"
+        + "Cookie" + ": session=" + cookie_value + "\n"
+        + "DATABASE" + "_URL=" + "postgres" + "://user:" + db_value + "@db.example.invalid/app\n"
+        + "redis" + "://:" + cache_value + "@cache.example.invalid/0 "
+        + "token=" + token_value + " password=" + password_value + " safe=text"
+    )
+    service.update_infrastructure_deployment_progress(
+        started["deployment_id"],
+        "controller_build",
+        message,
+    )
+    monkeypatch.setattr(service, "runtime_build_sha", lambda: SHA_B)
+    service.complete_infrastructure_deployment(
+        started["deployment_id"],
+        0,
+        True,
+        True,
+        "post verify completed",
+    )
+
+    result = service.get_infrastructure_deployment(
+        started["deployment_id"],
+        wait_seconds=55,
+        last_known_revision=0,
+        include_log_tail=True,
+        log_tail_lines=20,
+    )
+    deployment = result["deployment"]
+    diagnostics = result["diagnostics"]
+    assert deployment["status"] == "passed"
+    assert deployment["exit_code"] == 0
+    assert deployment["error_code"] is None
+    assert diagnostics["terminal"] is True
+    assert diagnostics["phase"] == "completed"
+    tail = diagnostics["log_tail"]
+    for secret in (
+        auth_value, cookie_value, db_value, cache_value, token_value, password_value
+    ):
+        assert secret not in tail
+    assert "Authorization=***" in tail
+    assert "Cookie=***" in tail
+    assert "DATABASE_URL=***" in tail
+    assert "<redacted-connection-url>" in tail
+    assert "token=***" in tail
+    assert "password=***" in tail
+    assert "safe=text" in tail

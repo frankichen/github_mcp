@@ -9,9 +9,18 @@ import threading
 import time
 from datetime import datetime, timezone
 
-SECRET_RE = re.compile(
-    r"(?i)(authorization|cookie|token|password|secret|database_url|private_key)\s*[=:]\s*\S+"
+HEADER_SECRET_RE = re.compile(
+    r"(?im)\b(authorization|proxy-authorization|cookie|set-cookie)\s*[:=]\s*[^\r\n]*"
 )
+SECRET_RE = re.compile(
+    r"(?i)\b(api[_-]?key|token|password|passwd|secret|database_url|private_key)\b"
+    r"\s*[=:]\s*(?:bearer\s+)?(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"
+)
+CONNECTION_URL_RE = re.compile(
+    r"(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp|amqps)://[^\s'\"<>]+"
+)
+MAX_LOG_TAIL_LINES = 100
+MAX_LOG_TAIL_CHARS = 12000
 
 _local = threading.local()
 
@@ -83,9 +92,21 @@ def init_db() -> None:
     db.commit()
 
 
+def _redact_log(value: str) -> str:
+    text = str(value or "")
+    text = HEADER_SECRET_RE.sub(lambda match: match.group(1) + "=***", text)
+    text = SECRET_RE.sub(lambda match: match.group(1) + "=***", text)
+    return CONNECTION_URL_RE.sub("<redacted-connection-url>", text)
+
+
 def sanitize_log(value: str) -> str:
-    text = SECRET_RE.sub(lambda match: match.group(1) + "=***", str(value or ""))
-    return text[:4000]
+    return _redact_log(value)[:4000]
+
+
+def redacted_log_tail(row: sqlite3.Row, lines: int = 40) -> str:
+    count = min(max(int(lines or 1), 1), MAX_LOG_TAIL_LINES)
+    redacted = _redact_log(str(row["log_text"] or ""))
+    return "\n".join(redacted.splitlines()[-count:])[-MAX_LOG_TAIL_CHARS:]
 
 
 def public_deployment(row: sqlite3.Row | None) -> dict | None:
