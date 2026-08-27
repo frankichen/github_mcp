@@ -42,6 +42,7 @@ async def main() -> int:
             "put_github_file",
             "put_github_files",
             "put_github_file_from_local_candidate",
+            "resume_development_task",
             "get_mygithub_capabilities",
             "plan_private_ci_job",
         }

@@ -81,7 +81,7 @@ DX2-WS-01 + DX2-RESUME-01
 | DX2-SESSION-01 | P0 | `IN_PROGRESS` | 安全恢复 stale Session，不掩盖真实 drift | AC-SESSION-01～07 |
 | DX2-INFRA-01 | P1 | `NOT_STARTED` | 长 self-deploy 持续 heartbeat | AC-INFRA-HB-01～05 |
 | DX2-INFRA-02 | P1 | `NOT_STARTED` | self-deploy long-poll 和紧凑诊断 | AC-INFRA-WAIT-01～05 |
-| DX2-RESUME-01 | P1 | `NOT_STARTED` | 新窗口一次恢复 branch/PR 开发上下文 | AC-RESUME-01～07 |
+| DX2-RESUME-01 | P1 | `IN_PROGRESS` | 新窗口一次恢复 branch/PR 开发上下文 | AC-RESUME-01～07 |
 | DX2-CONVERGE-01 | P1 | `NOT_STARTED` | 一次调用编排 post-write 收敛 | AC-CONV-01～07 |
 | DX2-PERF-01 | P2 | `NOT_STARTED` | 真实 CI 性能统计和回归依据 | AC-PERF-01～05 |
 | DX2-HYGIENE-01 | P2 | `NOT_STARTED` | 历史 Workspace/PR 可见性治理 | AC-HYGIENE-01～03 |
@@ -396,7 +396,7 @@ DX2-WS-01 + DX2-RESUME-01
 
 ### 状态
 
-`NOT_STARTED`
+`IN_PROGRESS`
 
 ### 依赖
 
@@ -404,10 +404,10 @@ DX2-WS-01、DX2-SESSION-01。
 
 ### 预计修改模块
 
+- `services/github-action-service/app/development_resume.py`
 - `services/github-action-service/app/mygithub12_dx_mcp.py`
-- `services/github-action-service/app/development_orchestrator.py`
-- Development Session / Workspace store
-- PR/readiness/CI/index 聚合逻辑
+- PR/readiness/CI/index/attestation 聚合逻辑
+- `services/github-action-service/tests/test_dx2_resume.py`
 - Tool Manifest / version tests
 
 ### 输入契约候选
