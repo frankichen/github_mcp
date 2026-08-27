@@ -50,6 +50,16 @@ def _workspace(**overrides):
     return value
 
 
+def _no_renewal(session, workspace_revision=3):
+    return {
+        "renewed": False,
+        "session": {"session_revision": 1, "workspace_revision": workspace_revision, **session},
+        "workspace": {"workspace_id": session.get("workspace_id", "ws_test"), "revision": workspace_revision},
+        "remaining_seconds": 4000.0,
+        "audit": None,
+    }
+
+
 def test_development_session_cas_events_and_idempotency(tmp_path, monkeypatch):
     monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "mygithub12.db"))
     monkeypatch.setattr(sessions, "_now", lambda: 1000.0)
@@ -261,6 +271,7 @@ async def test_apply_change_set_keeps_verified_commit_evidence_when_session_fina
     session = {"repository": "owner/repo", "branch": "ai/task", "base_branch": "main"}
     workspace = {"workspace_id": "ws_test"}
     monkeypatch.setattr(dx, "require_session_workspace", lambda *args, **kwargs: (session, workspace))
+    monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: _no_renewal(session))
     monkeypatch.setattr(dx, "execute_change_set", lambda *args, **kwargs: {"write_verified": True})
     monkeypatch.setattr(
         dx, "after_verified_change",
@@ -302,6 +313,7 @@ async def test_apply_change_set_pr_failure_is_partial_success_after_verified_com
     session = {"repository": "owner/repo", "branch": "ai/task", "base_branch": "main"}
     workspace = {"workspace_id": "ws_test"}
     monkeypatch.setattr(dx, "require_session_workspace", lambda *args, **kwargs: (session, workspace))
+    monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: _no_renewal(session))
     monkeypatch.setattr(dx, "execute_change_set", lambda *args, **kwargs: {"write_verified": True})
     monkeypatch.setattr(
         dx, "after_verified_change",
@@ -383,6 +395,7 @@ async def test_validate_job_start_failure_rolls_session_back(monkeypatch):
     monkeypatch.setattr(mygithub12, "get_workspace", lambda *args: {"revision": 3})
     monkeypatch.setattr(mygithub12, "workspace_write_preflight", lambda *args: {"revision": 3})
     monkeypatch.setattr(dx, "validation_preflight", lambda *args, **kwargs: {"profile": "repo-fast-check"})
+    monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: _no_renewal(session))
     monkeypatch.setattr(
         dx, "start_validation_job",
         lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -424,6 +437,7 @@ async def test_finalize_merge_keeps_merge_evidence_when_session_finalize_fails(m
     }
     monkeypatch.setattr(sessions, "get_session", lambda *args: session)
     monkeypatch.setattr(sessions, "_require_revision", lambda *args, **kwargs: session)
+    monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: _no_renewal(session))
     monkeypatch.setattr(
         dx_mcp.github_utils, "merge_github_pull_request",
         lambda *args, **kwargs: {"ok": True, "merged": True, "merge_commit_sha": SHA_C},
