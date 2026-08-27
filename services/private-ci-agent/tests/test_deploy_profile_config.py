@@ -151,8 +151,12 @@ def test_apply_fixes_syncs_entire_runtime_package():
 
 def test_apply_fixes_candidate_handoff_avoids_sgid_write_under_hardened_executor():
     script = (DEPLOY_DIR / "apply-fixes.sh").read_text(encoding="utf-8")
+    executor_unit = (
+        Path(__file__).parents[3]
+        / "services/private-ci-deploy-executor/systemd/mygithub12-infrastructure-deploy-executor.service.example"
+    ).read_text(encoding="utf-8")
 
-    assert "RestrictSUIDSGID=yes" in script
+    assert "RestrictSUIDSGID=true" in executor_unit
     assert "stat -c '%u:%g:%a'" in script
     assert '"0:${DOCKER_GID}:2770"|"0:${DOCKER_GID}:770"' in script
     assert 'install -d -o root -g docker -m 0770 "${CANDIDATE_DIR}"' in script
