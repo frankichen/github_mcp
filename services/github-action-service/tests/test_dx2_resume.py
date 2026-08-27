@@ -57,6 +57,7 @@ def test_resume_task_branch_only_allows_continue_when_workspace_session_and_inde
     monkeypatch.setattr(resume, "_repository_policy", lambda repository: {"ok": True, "repository": repository, "policy": {"github": True}})
     monkeypatch.setattr(resume.github_utils, "get_github_branch", lambda repository, branch, base_branch="": {"ok": True, "repository": repository, "branch": branch, "commit_sha": SHA_A, "base_branch": base_branch, "ahead_by": 0, "behind_by": 0})
     monkeypatch.setattr(resume.mygithub12, "resolve_identity", lambda service, repository, commit_sha="", ref="": {"repository": repository, "commit_sha": commit_sha or SHA_A, "tree_sha": TREE_A})
+    monkeypatch.setattr(resume, "_discover_pr_by_branch", lambda repository, branch, base_branch: None)
     monkeypatch.setattr(resume.mygithub12, "list_workspaces", lambda service, repository="", status="", branch="", owner="", limit=50, offset=0: {"ok": True, "items": [ws]})
     monkeypatch.setattr(resume, "find_sessions_for_workspace", lambda workspace_id, include_terminal=False, limit=20: [session])
     monkeypatch.setattr(resume.mygithub12, "get_index_status", lambda service, repository, commit_sha="", ref="": {"ok": True, "repository": repository, "commit_sha": commit_sha, "tree_sha": TREE_A, "status": "ready"})
@@ -77,6 +78,7 @@ def test_resume_task_does_not_continue_for_expired_workspace(monkeypatch):
     monkeypatch.setattr(resume, "_repository_policy", lambda repository: {"ok": True, "repository": repository, "policy": {"github": True}})
     monkeypatch.setattr(resume.github_utils, "get_github_branch", lambda repository, branch, base_branch="": {"ok": True, "repository": repository, "branch": branch, "commit_sha": SHA_A})
     monkeypatch.setattr(resume.mygithub12, "resolve_identity", lambda service, repository, commit_sha="", ref="": {"repository": repository, "commit_sha": commit_sha or SHA_A, "tree_sha": TREE_A})
+    monkeypatch.setattr(resume, "_discover_pr_by_branch", lambda repository, branch, base_branch: None)
     monkeypatch.setattr(resume.mygithub12, "list_workspaces", lambda service, repository="", status="", branch="", owner="", limit=50, offset=0: {"ok": True, "items": [ws]})
     monkeypatch.setattr(resume, "find_sessions_for_workspace", lambda workspace_id, include_terminal=False, limit=20: [])
     monkeypatch.setattr(resume.mygithub12, "get_index_status", lambda service, repository, commit_sha="", ref="": {"ok": True, "status": "ready", "commit_sha": commit_sha, "tree_sha": TREE_A})
@@ -111,7 +113,8 @@ def _stub_resume_context(monkeypatch, *, ws=None, session=None, pr=None, branch_
     ws = ws or _workspace()
     session = session or _ready_session(workspace_revision=ws["revision"], lease=ws["lease_expires_at"])
     monkeypatch.setattr(resume, "_repository_policy", lambda repository: {"ok": True, "repository": repository, "policy": {"github": True, "private_ci": True}})
-    monkeypatch.setattr(resume, "_resolve_pr", lambda repository, pull_number, branch: pr)
+    monkeypatch.setattr(resume, "_resolve_pr", lambda repository, pull_number, branch: pr if pull_number else None)
+    monkeypatch.setattr(resume, "_discover_pr_by_branch", lambda repository, branch, base_branch: pr)
     monkeypatch.setattr(resume, "_current_main", lambda service, repository: {"branch": "main", "repository": repository, "commit_sha": SHA_B, "tree_sha": "2" * 40})
     monkeypatch.setattr(resume, "_resolve_branch", lambda service, repository, branch, base_branch: {"ok": True, "repository": repository, "branch": branch, "base_branch": base_branch, "commit_sha": branch_head, "tree_sha": branch_tree})
     monkeypatch.setattr(resume, "_select_workspace", lambda service, repository, branch: (ws, [ws]))
@@ -236,3 +239,34 @@ def test_session_evidence_does_not_promote_invalid_current_attestation(monkeypat
     assert evidence["historical"] is None
     assert evidence["current_head"]["last_attestation_id"] == "invalid-att"
     assert evidence["current_head"]["validated_attestation"] is None
+
+
+def test_discover_pr_by_branch_uses_exact_open_head_and_base(monkeypatch):
+    captured = {}
+
+    def fake_list(repository, state="open", head_branch="", base_branch="", sort="updated", direction="desc", limit=30, page=1):
+        captured.update(repository=repository, state=state, head_branch=head_branch, base_branch=base_branch, sort=sort, direction=direction, limit=limit, page=page)
+        return {"ok": True, "pull_requests": [{"pull_number": 7, "head_branch": "ai/resume", "base_branch": "main"}]}
+
+    monkeypatch.setattr(resume.github_utils, "list_github_pull_requests", fake_list)
+    monkeypatch.setattr(resume.github_utils, "get_github_pull_request", lambda repository, pull_number: {"ok": True, "pull_number": pull_number, "head_branch": "ai/resume", "head_sha": SHA_A, "base_branch": "main", "state": "open", "draft": True})
+
+    pr = resume._discover_pr_by_branch("owner/repo", "ai/resume", "main")
+
+    assert captured == {"repository": "owner/repo", "state": "open", "head_branch": "ai/resume", "base_branch": "main", "sort": "updated", "direction": "desc", "limit": 2, "page": 1}
+    assert pr["pull_number"] == 7
+
+
+def test_resume_task_branch_only_discovers_existing_pr_and_readiness(monkeypatch):
+    ws = _workspace()
+    session = _ready_session(workspace_revision=ws["revision"], lease=ws["lease_expires_at"])
+    pr = {"pull_number": 7, "head_branch": "ai/resume", "head_sha": SHA_A, "base_branch": "main", "state": "open", "draft": True}
+    readiness = {"ok": True, "pull_number": 7, "ready": False}
+    _stub_resume_context(monkeypatch, ws=ws, session=session, pr=pr, readiness=readiness)
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["pull_request"]["pull_number"] == 7
+    assert result["pull_request"]["draft"] is True
+    assert result["pull_request_readiness"] == readiness
+    assert "readiness" in result["candidate_next_actions"]

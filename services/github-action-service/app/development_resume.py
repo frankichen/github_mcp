@@ -98,6 +98,23 @@ def _resolve_pr(repository: str, pull_number: int, branch: str) -> dict[str, Any
     return pr
 
 
+def _discover_pr_by_branch(repository: str, branch: str, base_branch: str) -> dict[str, Any] | None:
+    listing = github_utils.list_github_pull_requests(
+        repository, state="open", head_branch=branch, base_branch=base_branch,
+        sort="updated", direction="desc", limit=2, page=1,
+    )
+    _raise_result_error(listing, "PULL_REQUEST_LOOKUP_FAILED", "pull request lookup failed")
+    matches = [
+        item for item in listing.get("pull_requests", [])
+        if item.get("head_branch") == branch and item.get("base_branch") == base_branch
+    ]
+    if not matches:
+        return None
+    pr = github_utils.get_github_pull_request(repository, int(matches[0]["pull_number"]))
+    _raise_result_error(pr, "PULL_REQUEST_NOT_FOUND", "pull request was not found")
+    return pr
+
+
 def _select_workspace(service: Any, repository: str, branch: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     listing = mygithub12.list_workspaces(service, repository=repository, branch=branch, limit=20)
     items = [item for item in listing.get("items", []) if item.get("branch") == branch]
@@ -232,9 +249,11 @@ def resume_task(
     policy = _repository_policy(repository)
     if not bool((policy.get("policy") or {}).get("github")):
         raise MyGithub12Error("REPOSITORY_NOT_ALLOWED", "repository is not allowed for GitHub operations", {"repository": repository})
-    pr = _resolve_pr(repository, int(pull_number or 0), branch)
     current_main = _current_main(service, repository)
+    pr = _resolve_pr(repository, int(pull_number or 0), branch)
     effective_branch = branch or (str(pr.get("head_branch")) if pr else "")
+    if pr is None and branch:
+        pr = _discover_pr_by_branch(repository, effective_branch, current_main["branch"])
     branch_state = _resolve_branch(service, repository, effective_branch, current_main["branch"])
     branch_head = str(branch_state["commit_sha"])
     branch_tree = str(branch_state["tree_sha"])
