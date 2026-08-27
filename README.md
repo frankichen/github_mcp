@@ -57,9 +57,11 @@ private-deploy-agent（服务器端）
 
 ## GitHub Action Service
 
-MyGithut12 源码当前版本为 `12.4.0`；生产运行版本必须以 `get_mygithub_capabilities` 的实时结果为准。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。小范围唯一文本替换优先使用 `replace_github_text_once`，大文件仍使用 manifest、chunk read/upload 和 finalize/commit 流程，不退化为普通全文提交。
+MyGithut12 源码当前版本为 `12.4.1`；生产运行版本必须以 `get_mygithub_capabilities` 的实时结果为准。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。小范围唯一文本替换优先使用 `replace_github_text_once`，大文件仍使用 manifest、chunk read/upload 和 finalize/commit 流程，不退化为普通全文提交。
 
 Workspace 写 Lease 默认 7200 秒（2 小时），最大仍为 14400 秒（4 小时）。DX2-WS-01 使用 activity-driven renew：仅受控 Development Session 动作在剩余 Lease 不超过 1800 秒时尝试自动续签，并在 fresh GitHub HEAD/Tree、Workspace/Session identity、revision CAS、drift 和有效 Lease 全部成立后，原子同步 Workspace 与 Session revision；闲置窗口不会后台无限续命。已经过期的 Workspace 不会被普通 renew 或自动续签复活，必须显式调用 `resume_development_workspace` 重新验证 branch/base/Tree 后恢复。
+
+DX2-SESSION-01 在 Development Session 活动作业入口增加受控 stale Session recovery：只有 fresh GitHub branch HEAD/Tree 与 Workspace 完全一致、且旧 Session HEAD 能证明是 Workspace HEAD 的祖先时，才允许用 Session revision CAS 前进；真实 external drift 或 identity 无法证明时保持 fail-stop。HEAD 发生恢复时旧 fast/full CI、attestation 和 failure evidence 不再复用，并重新确认或请求 recovered exact HEAD Index；仅 Workspace revision/Lease stale 且 HEAD/Tree 未变时保留仍然 exact-head 的 CI 证据。`session_recovered`、`external_drift_detected`、`recovery_refused` 进入 Development Session event audit，审计持久化异常不会遮蔽主 drift/refusal 错误。
 
 ChatGPT/MCP 分块上传使用 transport-safe 合同：`max_upload_chunk_bytes=24576`，推荐 `recommended_upload_chunk_bytes=16384`。UTF-8 Patch、源码和文档优先使用 `text` 字段，`content_base64` 仅用于必须按二进制传输的内容；非法 Base64、空 payload 或同时传两种编码会返回稳定错误码，不再降级成泛化 `INTERNAL_ERROR`。多文件 `finalize -> apply_development_change_set` 的原子 Commit 语义保持不变。
 
@@ -95,7 +97,7 @@ docker compose up -d --build
 
 ## MyGithut12 运行状态
 
-MyGithut12 `12.4.0` 源码的 compatibility registration 为 167 个工具，canonical production Schema 为 164 个可见工具；生产 Schema 身份必须以运行时 capability 为准。DX2-WS-01 增加 expired effective state、显式 Workspace resume 和受控 Session activity-driven auto-renew；Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
+MyGithut12 `12.4.1` 源码的 compatibility registration 为 167 个工具，canonical production Schema 仍为 164 个可见工具；生产 Schema 身份必须以运行时 capability 为准。DX2-WS-01 增加 expired effective state、显式 Workspace resume 和受控 Session activity-driven auto-renew；DX2-SESSION-01 增加内部 guarded Session recovery，但不新增公开 MCP tool。Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
 
 ## Private Deploy Agent
 
