@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 import uuid
 
 from app import infrastructure_deployment_store as store
@@ -24,7 +25,29 @@ SCOPE = "control-plane"
 PROFILE = "repo-auto-check"
 DEFAULT_EXECUTOR_ID = "mygithub12-infrastructure-deploy-01"
 DEFAULT_HEARTBEAT_TTL_SECONDS = 30
+MAX_WAIT_SECONDS = 55
+DEFAULT_LOG_TAIL_LINES = 40
+WAIT_POLL_SECONDS = 0.25
 TERMINAL_STATUSES = ("passed", "failed")
+STRUCTURED_PHASES = {
+    "source_prepare",
+    "validation",
+    "controller_build",
+    "controller_switch",
+    "health",
+    "preheat",
+    "post_verify",
+    "completed",
+    "failed",
+}
+LEGACY_PHASE_MAP = {
+    "queued": "validation",
+    "claimed": "source_prepare",
+    "preflight": "validation",
+    "validating_main": "validation",
+    "deploying_control_plane": "controller_build",
+    "running": "controller_build",
+}
 ERROR_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _lock = threading.Lock()
 
@@ -304,18 +327,95 @@ def start_infrastructure_deployment(
     }
 
 
-def get_infrastructure_deployment(deployment_id: str) -> dict:
-    row = store.get_deployment(deployment_id)
-    if not row:
-        return _error_response(
-            "INFRASTRUCTURE_DEPLOYMENT_NOT_FOUND",
-            "infrastructure deployment not found",
+def _deployment_phase(row) -> str:
+    status = str(row["status"] or "")
+    step = str(row["current_step"] or "")
+    if status == "passed":
+        return "completed"
+    if status == "failed":
+        return "failed"
+    if step in STRUCTURED_PHASES:
+        return step
+    return LEGACY_PHASE_MAP.get(step, "validation")
+
+
+def get_infrastructure_deployment(
+    deployment_id: str,
+    wait_seconds: int = 0,
+    last_known_revision: int = 0,
+    last_known_status: str = "",
+    last_known_step: str = "",
+    include_log_tail: bool = False,
+    log_tail_lines: int = DEFAULT_LOG_TAIL_LINES,
+) -> dict:
+    """Read deployment state, optionally long-polling the shared SQLite record.
+
+    The default one-argument call keeps the original compact response. Waiting
+    never holds a SQLite transaction, so Controller blue/green replacement can
+    keep updating the same durable deployment row.
+    """
+    timeout = min(max(int(wait_seconds or 0), 0), MAX_WAIT_SECONDS)
+    known_revision = max(int(last_known_revision or 0), 0)
+    known_status = str(last_known_status or "")
+    known_step = str(last_known_step or "")
+    started = time.monotonic()
+    changed = False
+    terminal = False
+    timed_out = False
+
+    while True:
+        row = store.get_deployment(deployment_id)
+        if not row:
+            return _error_response(
+                "INFRASTRUCTURE_DEPLOYMENT_NOT_FOUND",
+                "infrastructure deployment not found",
+            )
+        status = str(row["status"] or "")
+        step = str(row["current_step"] or "")
+        revision = int(row["log_revision"] or 0)
+        terminal = status in TERMINAL_STATUSES
+        changed = (
+            revision != known_revision
+            or bool(known_status and status != known_status)
+            or bool(known_step and step != known_step)
         )
-    return {
+        elapsed = time.monotonic() - started
+        if timeout <= 0 or changed or terminal:
+            break
+        if elapsed >= timeout:
+            timed_out = True
+            break
+        time.sleep(min(WAIT_POLL_SECONDS, max(0.01, timeout - elapsed)))
+
+    result = {
         "ok": True,
         "deployment": store.public_deployment(row),
         "executor": _executor(row["repository"]),
     }
+    diagnostics_requested = bool(
+        timeout
+        or known_revision
+        or known_status
+        or known_step
+        or include_log_tail
+        or int(log_tail_lines or DEFAULT_LOG_TAIL_LINES) != DEFAULT_LOG_TAIL_LINES
+    )
+    if diagnostics_requested:
+        diagnostics = {
+            "changed": changed,
+            "timed_out": timed_out,
+            "terminal": terminal,
+            "revision": int(row["log_revision"] or 0),
+            "status": str(row["status"] or ""),
+            "current_step": str(row["current_step"] or ""),
+            "phase": _deployment_phase(row),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "max_wait_seconds": MAX_WAIT_SECONDS,
+        }
+        if include_log_tail:
+            diagnostics["log_tail"] = store.redacted_log_tail(row, log_tail_lines)
+        result["diagnostics"] = diagnostics
+    return result
 
 
 def claim_infrastructure_deployment(executor_id: str) -> dict:
@@ -366,7 +466,8 @@ def claim_infrastructure_deployment(executor_id: str) -> dict:
             timestamp = store.now()
             db.execute(
                 "UPDATE infrastructure_deployments SET status='failed',current_step='preflight',exit_code=1,"
-                "error_code=?,error_message=?,finished_at=?,updated_at=? WHERE deployment_id=?",
+                "error_code=?,error_message=?,finished_at=?,updated_at=?,log_revision=log_revision+1 "
+                "WHERE deployment_id=?",
                 (stale_code, stale_message, timestamp, timestamp, row["deployment_id"]),
             )
             db.commit()
@@ -381,7 +482,8 @@ def claim_infrastructure_deployment(executor_id: str) -> dict:
         timestamp = store.now()
         db.execute(
             "UPDATE infrastructure_deployments SET status='claimed',current_step='claimed',"
-            "started_at=COALESCE(started_at,?),updated_at=? WHERE deployment_id=? AND status='queued'",
+            "started_at=COALESCE(started_at,?),updated_at=?,log_revision=log_revision+1 "
+            "WHERE deployment_id=? AND status='queued'",
             (timestamp, timestamp, row["deployment_id"]),
         )
         db.commit()

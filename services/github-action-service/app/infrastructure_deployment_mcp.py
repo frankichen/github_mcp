@@ -113,12 +113,30 @@ def register_infrastructure_deployment_tools(mcp, github_call) -> None:
 
     @mcp.tool(
         name="get_infrastructure_deployment",
-        description="Get one MyGithut12 infrastructure deployment and redacted fixed-executor status by deployment_id.",
+        description=(
+            "Get one MyGithut12 infrastructure deployment. The legacy deployment_id-only call stays compact; "
+            "optional wait fields long-poll durable status/step/revision for at most 55 seconds, and an explicit "
+            "include_log_tail opt-in returns only a bounded redacted tail."
+        ),
         annotations=_READ_ONLY,
     )
-    async def get_infrastructure_deployment(deployment_id: str) -> str:
+    async def get_infrastructure_deployment(
+        deployment_id: str,
+        wait_seconds: int = 0,
+        last_known_revision: int = 0,
+        last_known_status: str = "",
+        last_known_step: str = "",
+        include_log_tail: bool = False,
+        log_tail_lines: int = infrastructure.DEFAULT_LOG_TAIL_LINES,
+    ) -> str:
         return await _call(
             github_call,
             infrastructure.get_infrastructure_deployment,
             deployment_id,
+            wait_seconds,
+            last_known_revision,
+            last_known_status,
+            last_known_step,
+            include_log_tail,
+            log_tail_lines,
         )

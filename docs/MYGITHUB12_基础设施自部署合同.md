@@ -146,3 +146,23 @@ Controller 使用独立数据库文件（默认 `/data/infrastructure-deployment
 12.3.0 首次上线仍需要现有、已经授权的生产发布路径完成 bootstrap，并由运维配置独立 callback Secret、Executor venv/systemd unit 和权威 mirror。
 
 **本合同本身不授权 12.3.0 合并、生产发布、Secret 创建/修改、systemd 安装或首次自部署。**
+
+## 10. DX2-INFRA-02：等待与紧凑诊断扩展
+
+`get_infrastructure_deployment` 保持原工具名和原 `deployment_id` 单参数调用；默认调用仍立即返回紧凑的 deployment + executor 状态，不返回完整日志。DX2-INFRA-02 仅增加兼容可选参数：
+
+- `wait_seconds`：默认 `0`，服务端硬限制最大 `55` 秒；
+- `last_known_revision` / `last_known_status` / `last_known_step`：用于判断持久状态是否变化；
+- `include_log_tail`：默认 `false`；
+- `log_tail_lines`：仅显式请求 tail 时生效，服务端限制最大 100 行。
+
+long-poll 只轮询共享 SQLite 中的持久部署记录，不持有数据库事务，也不依赖 Controller 进程内 Condition，因此蓝绿切换后新 Controller 可以继续同一个 deployment identity。发生 revision/status/step 变化、进入 terminal，或等待超时即返回。
+
+新部署通过固定 Executor / 固定 `apply-fixes.sh` 的受控 marker 报告以下结构化阶段：
+
+```text
+source_prepare -> validation -> controller_build -> controller_switch
+-> health -> preheat -> post_verify -> completed|failed
+```
+
+marker 仅决定只读诊断中的阶段，不改变 shell、脚本、host、failure mode 或 rollback 合同。未知 marker 不扩展允许阶段。日志 tail 在返回前再次执行 Secret / Authorization / Cookie / Token / database connection URL 脱敏；本扩展不增加 cancel、rollback 或任意执行入口。
