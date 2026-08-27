@@ -124,35 +124,137 @@ def prepare_task(
         raise MyGithub12Error("DEVELOPMENT_TASK_PREPARE_FAILED","development task preparation failed",{**details,"cause_type":type(exc).__name__}) from exc
 
 
+def recover_stale_session(
+    service: Any, session_id: str, expected_session_revision: int, expected_workspace_revision: int=0,
+    expected_head_sha: str="", idempotency_key: str="",
+) -> dict[str,Any]:
+    """Recover only when fresh GitHub and Workspace identity prove that Session alone is stale."""
+    session=sessions.get_session(session_id)
+    ws=mygithub12.get_workspace(service,session["workspace_id"])
+    current_revision=int(session["session_revision"]); workspace_revision=int(ws["revision"])
+    last=(session.get("metadata") or {}).get("last_session_recovery")
+    replay_candidate=bool(
+        idempotency_key and isinstance(last,dict)
+        and last.get("idempotency_key")==idempotency_key
+        and int(((last.get("after") or {}).get("session_revision") or -1))==current_revision
+    )
+
+    def refuse(event_type: str, code: str, message: str, details: dict[str,Any]) -> None:
+        payload={
+            "idempotency_key":idempotency_key or None, "reason_code":code,
+            "session_head":session["head_commit_sha"], "session_tree":session["tree_sha"],
+            "workspace_head":ws["head_sha"], "workspace_tree":ws["tree_sha"],
+            **details,
+        }
+        sessions.append_recovery_event(session_id,current_revision,event_type,payload)
+        raise MyGithub12Error(code,message,details)
+
+    if expected_workspace_revision and int(expected_workspace_revision) not in {int(session["workspace_revision"]),workspace_revision}:
+        if not replay_candidate:
+            refuse("recovery_refused","WORKSPACE_REVISION_MISMATCH","workspace revision changed outside the recoverable Session-stale window",{"expected":expected_workspace_revision,"actual":workspace_revision})
+    if expected_head_sha and expected_head_sha not in {session["head_commit_sha"],ws["head_sha"]}:
+        if not replay_candidate:
+            refuse("recovery_refused","DEVELOPMENT_SESSION_RECOVERY_REQUIRED","expected HEAD is neither the Session nor Workspace identity",{"expected_head":expected_head_sha})
+    if ws["status"]=="drifted" or ws.get("drift_reason"):
+        refuse("external_drift_detected","WORKSPACE_BRANCH_DRIFTED","drifted Workspace cannot recover a Development Session",{"workspace_id":ws["workspace_id"],"drift_reason":ws.get("drift_reason")})
+    if ws["status"]=="expired" or not ws.get("lease_valid"):
+        refuse("recovery_refused","WORKSPACE_LEASE_REQUIRED","expired Workspace requires explicit resume before Session recovery",{"workspace_id":ws["workspace_id"],"requires_resume":True})
+    if ws["status"]!="active":
+        refuse("recovery_refused","WORKSPACE_CLOSED","Workspace is not active",{"workspace_id":ws["workspace_id"]})
+
+    branch_state=service.client.get_branch(session["repository"],session["branch"]); actual_head=str(branch_state.commit.sha) if branch_state else ""
+    repo=mygithub12._service_repo(service,session["repository"])
+    actual_tree=mygithub12._tree_sha(repo.get_commit(actual_head)) if actual_head else ""
+    if actual_head!=ws["head_sha"] or actual_tree!=ws["tree_sha"]:
+        refuse("external_drift_detected","WORKSPACE_BRANCH_DRIFTED","GitHub branch identity differs from Workspace during Session recovery",{"actual_head":actual_head,"actual_tree":actual_tree})
+
+    ancestry={"required":session["head_commit_sha"]!=ws["head_sha"],"verified":True}
+    if session["head_commit_sha"]!=ws["head_sha"]:
+        try:
+            old_commit=repo.get_commit(session["head_commit_sha"]); old_tree=mygithub12._tree_sha(old_commit)
+            comparison=repo.compare(session["head_commit_sha"],ws["head_sha"])
+            merge_base=str(comparison.merge_base_commit.sha) if getattr(comparison,"merge_base_commit",None) else ""
+            ahead_by=int(getattr(comparison,"ahead_by",0) or 0); behind_by=int(getattr(comparison,"behind_by",0) or 0)
+        except Exception as exc:
+            refuse("recovery_refused","DEVELOPMENT_SESSION_RECOVERY_REQUIRED","Session ancestry could not be verified",{"cause_type":type(exc).__name__})
+        ancestry={"required":True,"verified":old_tree==session["tree_sha"] and merge_base==session["head_commit_sha"] and ahead_by>0 and behind_by==0,"merge_base":merge_base,"ahead_by":ahead_by,"behind_by":behind_by,"session_commit_tree":old_tree}
+        if not ancestry["verified"]:
+            refuse("recovery_refused","DEVELOPMENT_SESSION_RECOVERY_REQUIRED","Session HEAD is not a provable ancestor of the Workspace HEAD",{"ancestry":ancestry})
+
+    index_status=None; index_request=None; index_error=None
+    index_commit_sha=ws["head_sha"] if session.get("index_commit_sha")==ws["head_sha"] and ws.get("index_commit_sha")==ws["head_sha"] else None
+    try:
+        index_status=mygithub12.get_index_status(service,session["repository"],ws["head_sha"])
+        if index_status.get("status")=="ready" and index_status.get("commit_sha")==ws["head_sha"] and index_status.get("tree_sha")==ws["tree_sha"]:
+            index_commit_sha=ws["head_sha"]
+        else:
+            index_request=mygithub12.request_index_build(service,session["repository"],ws["head_sha"],"auto",session["head_commit_sha"] if ancestry["required"] else session["base_commit_sha"],"interactive",f"session-recovery-index:{session_id}:{ws['head_sha']}",False)
+            if session["head_commit_sha"]!=ws["head_sha"]:
+                index_commit_sha=None
+    except Exception as exc:
+        index_error={"code":getattr(exc,"code","INDEX_BUILD_FAILED"),"message":getattr(exc,"message","exact recovered HEAD Index request failed")}
+        if session["head_commit_sha"]!=ws["head_sha"]:
+            index_commit_sha=None
+
+    evidence={"github_head_sha":actual_head,"github_tree_sha":actual_tree,"ancestry":ancestry,"index_status":index_status,"index_request":index_request,"index_error":index_error}
+    recovered=sessions.recover_stale_session_from_workspace(
+        session_id,expected_session_revision,ws,idempotency_key=idempotency_key,
+        index_commit_sha=index_commit_sha,recovery_evidence=evidence,
+    )
+    return {**recovered,"workspace":ws,"index":{"status":index_status,"request":index_request,"error":index_error}}
+
+
 def maybe_auto_renew_session_workspace(
     service: Any, session_id: str, expected_session_revision: int, expected_workspace_revision: int=0,
     expected_head_sha: str="", idempotency_key: str="",
 ) -> dict[str,Any]:
-    sessions._require_revision(session_id,expected_session_revision); session=sessions.get_session(session_id)
+    session=sessions.get_session(session_id); ws=mygithub12.get_workspace(service,session["workspace_id"])
+    current_revision=int(session["session_revision"]); workspace_revision=int(ws["revision"])
+    last=(session.get("metadata") or {}).get("last_session_recovery")
+    replay_candidate=bool(
+        idempotency_key and isinstance(last,dict) and last.get("idempotency_key")==idempotency_key
+        and int(((last.get("after") or {}).get("session_revision") or -1))==current_revision
+    )
+    if current_revision!=int(expected_session_revision) and not replay_candidate:
+        sessions._require_revision(session_id,expected_session_revision)
+    local_stale=(
+        int(session["workspace_revision"])!=workspace_revision
+        or session["head_commit_sha"]!=ws["head_sha"] or session["tree_sha"]!=ws["tree_sha"]
+        or abs(float(session["lease_expires_at"])-float(ws["lease_expires_at"]))>0.001
+        or session.get("index_commit_sha")!=ws.get("index_commit_sha")
+    )
+    recovery=None
+    if local_stale or replay_candidate:
+        recovery=recover_stale_session(service,session_id,expected_session_revision,expected_workspace_revision,expected_head_sha,idempotency_key)
+        session=recovery["session"]; ws=recovery["workspace"]; workspace_revision=int(ws["revision"]); current_revision=int(session["session_revision"])
+    else:
+        sessions._require_revision(session_id,expected_session_revision)
+        if expected_workspace_revision and workspace_revision!=int(expected_workspace_revision): raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH","workspace revision changed",{"expected":expected_workspace_revision,"actual":workspace_revision})
+        if expected_head_sha and session["head_commit_sha"]!=expected_head_sha: raise MyGithub12Error("DEVELOPMENT_SESSION_RECOVERY_REQUIRED","session HEAD identity differs from expected HEAD",{"session_head":session["head_commit_sha"],"expected_head":expected_head_sha})
     if session["status"] not in AUTO_RENEW_SESSION_STATES: raise MyGithub12Error("DEVELOPMENT_SESSION_STATE_INVALID","development session state does not permit workspace auto-renew",{"status":session["status"]})
-    ws=mygithub12.get_workspace(service,session["workspace_id"]); workspace_revision=int(ws["revision"])
-    if expected_workspace_revision and workspace_revision!=int(expected_workspace_revision): raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH","workspace revision changed",{"expected":expected_workspace_revision,"actual":workspace_revision})
     if int(session["workspace_revision"])!=workspace_revision: raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH","session does not reference the current workspace revision",{"session_workspace_revision":session["workspace_revision"],"workspace_revision":workspace_revision})
-    if expected_head_sha and session["head_commit_sha"]!=expected_head_sha: raise MyGithub12Error("DEVELOPMENT_SESSION_RECOVERY_REQUIRED","session HEAD identity differs from expected HEAD",{"session_head":session["head_commit_sha"],"expected_head":expected_head_sha})
     if ws["status"]=="drifted" or ws.get("drift_reason"): raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","drifted workspace cannot be auto-renewed",{"workspace_id":ws["workspace_id"],"drift_reason":ws.get("drift_reason")})
     if ws["status"]=="expired" or not ws.get("lease_valid") or not session.get("lease_valid"): raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED","expired workspace cannot be auto-renewed",{"workspace_id":ws["workspace_id"],"requires_resume":True})
     if ws["status"]!="active": raise MyGithub12Error("WORKSPACE_CLOSED","workspace is not active")
     if session["head_commit_sha"]!=ws["head_sha"] or session["tree_sha"]!=ws["tree_sha"]: raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH","session and workspace Git identities differ")
-    if abs(float(session["lease_expires_at"])-float(ws["lease_expires_at"]))>0.001: raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH","session and workspace lease identities differ")
     now=mygithub12._now(); remaining=min(float(session["lease_expires_at"]),float(ws["lease_expires_at"]))-now
     if remaining>AUTO_RENEW_THRESHOLD_SECONDS:
-        return {"renewed":False,"session":session,"workspace":ws,"remaining_seconds":remaining}
+        return {"renewed":False,"session":session,"workspace":ws,"remaining_seconds":remaining,"recovery":recovery}
     branch_state=service.client.get_branch(session["repository"],session["branch"]); actual_head=str(branch_state.commit.sha) if branch_state else ""
-    if actual_head!=session["head_commit_sha"]: raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","GitHub branch HEAD changed before auto-renew",{"workspace_head":ws["head_sha"],"session_head":session["head_commit_sha"],"actual_head":actual_head})
+    if actual_head!=session["head_commit_sha"]:
+        sessions.append_recovery_event(session_id,current_revision,"external_drift_detected",{"reason_code":"WORKSPACE_BRANCH_DRIFTED","workspace_head":ws["head_sha"],"session_head":session["head_commit_sha"],"actual_head":actual_head})
+        raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","GitHub branch HEAD changed before auto-renew",{"workspace_head":ws["head_sha"],"session_head":session["head_commit_sha"],"actual_head":actual_head})
     repo=mygithub12._service_repo(service,session["repository"]); actual_tree=mygithub12._tree_sha(repo.get_commit(actual_head))
-    if actual_tree!=session["tree_sha"] or actual_tree!=ws["tree_sha"]: raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","GitHub branch Tree changed before auto-renew",{"workspace_tree":ws["tree_sha"],"session_tree":session["tree_sha"],"actual_tree":actual_tree})
+    if actual_tree!=session["tree_sha"] or actual_tree!=ws["tree_sha"]:
+        sessions.append_recovery_event(session_id,current_revision,"external_drift_detected",{"reason_code":"WORKSPACE_BRANCH_DRIFTED","workspace_tree":ws["tree_sha"],"session_tree":session["tree_sha"],"actual_tree":actual_tree})
+        raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","GitHub branch Tree changed before auto-renew",{"workspace_tree":ws["tree_sha"],"session_tree":session["tree_sha"],"actual_tree":actual_tree})
     renewed=sessions.auto_renew_session_workspace_lease(
-        session_id,expected_session_revision,ws["workspace_id"],workspace_revision,
+        session_id,current_revision,ws["workspace_id"],workspace_revision,
         lease_seconds=mygithub12.DEFAULT_LEASE_SECONDS,
         event_data={"idempotency_key":idempotency_key or None,"remaining_seconds":remaining,"threshold_seconds":AUTO_RENEW_THRESHOLD_SECONDS,"github_head_sha":actual_head,"github_tree_sha":actual_tree},
     )
     renewed_ws=mygithub12.get_workspace(service,ws["workspace_id"])
-    return {"renewed":True,"session":renewed["session"],"workspace":renewed_ws,"remaining_seconds":remaining,"audit":renewed["audit"]}
+    return {"renewed":True,"session":renewed["session"],"workspace":renewed_ws,"remaining_seconds":remaining,"audit":renewed["audit"],"recovery":recovery}
 
 
 def require_session_workspace(service: Any, session_id: str, expected_session_revision: int, expected_workspace_revision: int, expected_head_sha: str) -> tuple[dict[str,Any],dict[str,Any]]:

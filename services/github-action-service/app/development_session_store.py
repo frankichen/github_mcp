@@ -219,6 +219,160 @@ def sync_from_workspace(
     return _public(updated)
 
 
+def append_recovery_event(
+    session_id: str, expected_revision: int, event_type: str, data: dict[str, Any],
+) -> dict[str, Any]:
+    """Append a recovery diagnostic without changing Session/Workspace identity."""
+    if event_type not in {"external_drift_detected", "recovery_refused"}:
+        raise MyGithub12Error("DEVELOPMENT_SESSION_STATE_INVALID", "unsupported recovery event type")
+    init_session_db()
+    with _LOCK, _db() as db:
+        row = db.execute("SELECT * FROM development_sessions WHERE session_id=?", (session_id,)).fetchone()
+        if not row:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_NOT_FOUND",
+                "development session was not found",
+                {"development_session_id": session_id},
+            )
+        if int(row["session_revision"]) != int(expected_revision):
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_REVISION_MISMATCH",
+                "development session revision changed",
+                {"expected": int(expected_revision), "actual": int(row["session_revision"])},
+            )
+        _append_event(
+            db, row, event_type, row["status"], row["status"], int(row["session_revision"]), data,
+        )
+    return get_session(session_id)
+
+
+def recover_stale_session_from_workspace(
+    session_id: str, expected_revision: int, workspace: dict[str, Any], *,
+    idempotency_key: str = "", index_commit_sha: str | None = None,
+    recovery_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """CAS-sync a provably stale Session from already-verified Workspace evidence."""
+    init_session_db()
+    with _LOCK, _db() as db:
+        row = db.execute("SELECT * FROM development_sessions WHERE session_id=?", (session_id,)).fetchone()
+        if not row:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_NOT_FOUND",
+                "development session was not found",
+                {"development_session_id": session_id},
+            )
+        metadata = json.loads(row["metadata_json"] or "{}")
+        last = metadata.get("last_session_recovery") if isinstance(metadata, dict) else None
+        if idempotency_key and isinstance(last, dict) and last.get("idempotency_key") == idempotency_key:
+            after = last.get("after") if isinstance(last.get("after"), dict) else {}
+            if int(row["session_revision"]) == int(after.get("session_revision", -1)):
+                return {
+                    "session": _public(row), "recovered": bool(last.get("recovered")),
+                    "replayed": True, "before": last.get("before"), "after": after,
+                    "audit": last.get("audit"),
+                }
+            raise MyGithub12Error(
+                "IDEMPOTENCY_CONFLICT",
+                "session recovery idempotency key belongs to an earlier Session revision",
+                {"development_session_id": session_id},
+            )
+        if int(row["session_revision"]) != int(expected_revision):
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_REVISION_MISMATCH",
+                "development session revision changed",
+                {"expected": int(expected_revision), "actual": int(row["session_revision"])},
+            )
+        if row["status"] in TERMINAL_STATES:
+            raise MyGithub12Error("DEVELOPMENT_SESSION_CLOSED", "development session is not active")
+        identity_fields = ("workspace_id", "repository", "branch", "base_branch", "base_commit_sha")
+        if any(row[field] != workspace.get(field) for field in identity_fields):
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH",
+                "session and workspace identities differ during recovery",
+            )
+        target_head = str(workspace["head_sha"])
+        target_tree = str(workspace["tree_sha"])
+        target_workspace_revision = int(workspace["revision"])
+        target_lease = float(workspace.get("lease_expires_at") or 0)
+        if index_commit_sha and index_commit_sha != target_head:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                "recovery index identity is not the recovered HEAD",
+                {"index_commit_sha": index_commit_sha, "head_commit_sha": target_head},
+            )
+        before = {
+            "head_commit_sha": row["head_commit_sha"], "tree_sha": row["tree_sha"],
+            "workspace_revision": int(row["workspace_revision"]),
+            "session_revision": int(row["session_revision"]),
+            "lease_expires_at": float(row["lease_expires_at"] or 0),
+            "index_commit_sha": row["index_commit_sha"],
+        }
+        head_changed = row["head_commit_sha"] != target_head or row["tree_sha"] != target_tree
+        needs_update = (
+            head_changed
+            or int(row["workspace_revision"]) != target_workspace_revision
+            or abs(float(row["lease_expires_at"] or 0) - target_lease) > 0.001
+            or row["index_commit_sha"] != index_commit_sha
+        )
+        if not needs_update:
+            after = {**before}
+            return {
+                "session": _public(row), "recovered": False, "replayed": False,
+                "before": before, "after": after, "audit": None,
+            }
+        next_revision = int(row["session_revision"]) + 1
+        after = {
+            "head_commit_sha": target_head, "tree_sha": target_tree,
+            "workspace_revision": target_workspace_revision, "session_revision": next_revision,
+            "lease_expires_at": target_lease, "index_commit_sha": index_commit_sha,
+        }
+        cleared = head_changed and any(
+            row[field]
+            for field in (
+                "last_fast_ci_job_id", "last_full_ci_job_id", "last_attestation_id",
+                "last_failure_resource_uri",
+            )
+        )
+        audit = {
+            "idempotency_key": idempotency_key or None, "before": before, "after": after,
+            "head_changed": head_changed, "stale_ci_evidence_cleared": bool(cleared),
+            "evidence": recovery_evidence or {},
+        }
+        if idempotency_key:
+            metadata["last_session_recovery"] = {
+                "idempotency_key": idempotency_key, "recovered": True,
+                "before": before, "after": after, "audit": audit,
+            }
+        cur = db.execute(
+            """UPDATE development_sessions SET head_commit_sha=?,tree_sha=?,workspace_revision=?,
+            lease_expires_at=?,index_commit_sha=?,last_fast_ci_job_id=?,last_full_ci_job_id=?,
+            last_attestation_id=?,last_failure_resource_uri=?,metadata_json=?,
+            session_revision=session_revision+1,updated_at=? WHERE session_id=? AND session_revision=?""",
+            (
+                target_head, target_tree, target_workspace_revision, target_lease, index_commit_sha,
+                None if head_changed else row["last_fast_ci_job_id"],
+                None if head_changed else row["last_full_ci_job_id"],
+                None if head_changed else row["last_attestation_id"],
+                None if head_changed else row["last_failure_resource_uri"],
+                json.dumps(metadata, ensure_ascii=False, separators=(",", ":")), _now(),
+                session_id, expected_revision,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_REVISION_MISMATCH", "development session changed while recovering"
+            )
+        updated = db.execute("SELECT * FROM development_sessions WHERE session_id=?", (session_id,)).fetchone()
+        _append_event(
+            db, updated, "session_recovered", row["status"], updated["status"],
+            int(updated["session_revision"]), audit,
+        )
+    return {
+        "session": _public(updated), "recovered": True, "replayed": False,
+        "before": before, "after": after, "audit": audit,
+    }
+
+
 def auto_renew_session_workspace_lease(
     session_id: str, expected_session_revision: int, workspace_id: str, expected_workspace_revision: int,
     *, lease_seconds: int, event_data: dict[str, Any] | None = None,

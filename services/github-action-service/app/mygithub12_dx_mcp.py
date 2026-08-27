@@ -58,7 +58,6 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
         pull_request_json: str="{}",
     ) -> str:
         try:
-            session,workspace=await github_call(dx.require_session_workspace,service,development_session_id,expected_session_revision,expected_workspace_revision,expected_head_sha)
             parsed=dx.parse_change_set(change_set_json)
             pr_cfg=None
             if create_pull_request:
@@ -73,10 +72,12 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
             maintenance=await github_call(dx.maybe_auto_renew_session_workspace,service,development_session_id,expected_session_revision,expected_workspace_revision,expected_head_sha,idempotency_key)
             session=maintenance["session"]; workspace=maintenance["workspace"]
             effective_session_revision=int(session["session_revision"]); effective_workspace_revision=int(workspace["revision"])
-            lease_maintenance={"renewed":bool(maintenance.get("renewed")),"remaining_seconds":maintenance.get("remaining_seconds"),"audit":maintenance.get("audit")}
-            session,workspace=await github_call(dx.require_session_workspace,service,development_session_id,effective_session_revision,effective_workspace_revision,expected_head_sha)
+            lease_maintenance={"renewed":bool(maintenance.get("renewed")),"remaining_seconds":maintenance.get("remaining_seconds"),"audit":maintenance.get("audit"),"recovery":maintenance.get("recovery")}
+            if expected_head_sha!=session["head_commit_sha"]:
+                raise mygithub12.MyGithub12Error("HEAD_CHANGED","expected HEAD differs from the recovered Development Session HEAD",{"expected":expected_head_sha,"actual":session["head_commit_sha"]})
+            session,workspace=await github_call(dx.require_session_workspace,service,development_session_id,effective_session_revision,effective_workspace_revision,session["head_commit_sha"])
             audit={"development_session_id":development_session_id,"session_revision":effective_session_revision,"workspace_id":workspace["workspace_id"],"workspace_revision":effective_workspace_revision}
-            result=await github_call(dx.execute_change_set,service,session,workspace,parsed,expected_head_sha,effective_workspace_revision,commit_message,dry_run,idempotency_key,audit)
+            result=await github_call(dx.execute_change_set,service,session,workspace,parsed,session["head_commit_sha"],effective_workspace_revision,commit_message,dry_run,idempotency_key,audit)
             if dry_run:
                 result["development_session_id"]=development_session_id; result["session_revision"]=effective_session_revision; result["workspace_revision"]=effective_workspace_revision; result["lease_maintenance"]=lease_maintenance
                 return json.dumps(result,ensure_ascii=False)
@@ -132,11 +133,15 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
     ) -> str:
         try:
             session=sessions.get_session(development_session_id)
-            sessions._require_revision(development_session_id,expected_session_revision)
+            preflight_head=session["head_commit_sha"]
             resolved_base=base_sha or session["base_commit_sha"]
             prepared=await github_call(dx.validation_preflight,service,session,mode,resolved_base)
             maintenance=await github_call(dx.maybe_auto_renew_session_workspace,service,development_session_id,expected_session_revision,int(session["workspace_revision"]),session["head_commit_sha"],idempotency_key)
-            session=maintenance["session"]; ws=maintenance["workspace"]; effective_session_revision=int(session["session_revision"]); lease_maintenance={"renewed":bool(maintenance.get("renewed")),"remaining_seconds":maintenance.get("remaining_seconds"),"audit":maintenance.get("audit")}
+            session=maintenance["session"]; ws=maintenance["workspace"]; effective_session_revision=int(session["session_revision"])
+            if session["head_commit_sha"]!=preflight_head:
+                resolved_base=base_sha or session["base_commit_sha"]
+                prepared=await github_call(dx.validation_preflight,service,session,mode,resolved_base)
+            lease_maintenance={"renewed":bool(maintenance.get("renewed")),"remaining_seconds":maintenance.get("remaining_seconds"),"audit":maintenance.get("audit"),"recovery":maintenance.get("recovery")}
             await github_call(mygithub12.workspace_write_preflight,service,session["repository"],session["branch"],session["head_commit_sha"],session["workspace_id"],ws["revision"])
             phase="validating_fast" if mode=="fast" else "validating_full"
             phase_session=await github_call(sessions.transition,development_session_id,effective_session_revision,phase,event_type="validation_started",allowed_from={"active","pr_ready","validating_fast","validating_full"})
