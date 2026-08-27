@@ -44,7 +44,7 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
     async def prepare_development_task(
         repository: str, task_name: str, base_ref: str="main", branch: str="", owner: str="chatgpt", create_branch: bool=True,
         seed_paths_json: str="[]", seed_symbols_json: str="[]", include_tests: bool=True, include_docs: bool=True,
-        lease_seconds: int=1800, context_budget_bytes: int=262144, idempotency_key: str="",
+        lease_seconds: int=mygithub12.DEFAULT_LEASE_SECONDS, context_budget_bytes: int=262144, idempotency_key: str="",
     ) -> str:
         try:
             result=await github_call(dx.prepare_task,service,repository,task_name,base_ref,branch,owner,create_branch,seed_paths_json,seed_symbols_json,include_tests,include_docs,lease_seconds,context_budget_bytes,idempotency_key)

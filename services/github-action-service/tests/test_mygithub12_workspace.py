@@ -224,6 +224,11 @@ def test_expired_workspace_write_is_rejected_then_renewal_restores_lease_and_pin
     assert renewed["pr_number"] == 42
 
 
+def test_default_workspace_lease_is_two_hours():
+    assert workspace.DEFAULT_LEASE_SECONDS == 7200
+    assert workspace.MAX_LEASE_SECONDS == 14400
+
+
 def test_workspace_branch_ownership_allows_parallel_branches_but_not_duplicates(
     tmp_path, monkeypatch
 ):

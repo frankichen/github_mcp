@@ -126,7 +126,13 @@ DX-2 所有功能均必须保持：
 7. expired Workspace 如需恢复，必须通过显式 resume/recovery 路径重新校验 branch、base、drift 和 Lease；
 8. 不能通过简单续 Lease 让已发生真实 drift 的 Workspace 恢复可写；
 9. 状态迁移需要兼容旧数据库记录；
-10. retention 只能清理可重建缓存或过期 pin，不得破坏 GitHub 事实对象。
+10. retention 只能清理可重建缓存或过期 pin，不得破坏 GitHub 事实对象；
+11. 在自动续签完成前，Workspace 创建、显式续签和 `prepare_development_task` 的临时默认 Lease 统一为 7200 秒（2 小时），`MAX_LEASE_SECONDS` 继续保持 14400 秒（4 小时）；
+12. 后续自动续签必须是 activity-driven，只能由受控 Development Session 编排动作触发；没有用户/AI 活动时不得后台无限续签；
+13. 自动续签前必须 fresh-read 并证明 GitHub branch HEAD == Workspace HEAD == Session HEAD、Workspace `drift_reason=null`、status=active、当前 Lease 尚有效；
+14. 自动续签必须使用 expected Workspace revision CAS；Workspace revision 推进后必须同步 Session 的 workspace revision/identity，禁止再次制造 `DEVELOPMENT_SESSION_WORKSPACE_MISMATCH`；
+15. expired、drifted、closed 或 identity 无法证明的 Workspace 不得自动复活，必须进入显式 resume/recovery；
+16. 自动续签必须幂等、可审计，记录 before/after expiry 与 revision；单次自动续签只恢复到当前默认 Lease 窗口，不能突破 `MAX_LEASE_SECONDS`。
 
 ### 5.3 验收标准
 
@@ -136,7 +142,13 @@ DX-2 所有功能均必须保持：
 - AC-WS-04：显式 resume 对 branch 未漂移的 expired Workspace 可安全恢复并获得新 revision/lease；
 - AC-WS-05：branch 已漂移的 expired Workspace resume 必须拒绝；
 - AC-WS-06：升级前已有 `active + lease_invalid` 数据能被兼容读取和收敛；
-- AC-WS-07：不会删除任何 branch 或 PR。
+- AC-WS-07：不会删除任何 branch 或 PR；
+- AC-WS-08：`create_development_workspace`、`renew_development_workspace_lease`、`prepare_development_task` 的 Schema 默认 `lease_seconds` 均为 7200，且显式更短/更长合法值仍按现有 60～14400 秒边界工作；
+- AC-WS-09：无调用活动时 Workspace 不会被后台自动续签，最终仍可自然过期；
+- AC-WS-10：活动 Session 在续签阈值内且三方 identity 一致时，可一次受控自动续到新的 2 小时窗口；
+- AC-WS-11：GitHub branch 外部漂移、Workspace drift 或 Session stale 无法安全恢复时，自动续签必须拒绝且不修改 expiry/revision；
+- AC-WS-12：已经 expired 的 Workspace 不得由自动续签直接复活，必须走显式 resume/recovery；
+- AC-WS-13：自动续签后 Workspace revision 与 Session workspace revision 同步，重复同一幂等请求不会无限延长 Lease。
 
 ## 6. FR-DX2-WRITE-01：新文件 Patch Builder / Strict Apply 一致性
 
