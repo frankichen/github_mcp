@@ -104,16 +104,39 @@ def _diff_line(prefix: str, line: str) -> list[str]:
     return [prefix + line + "\n", "\\ No newline at end of file\n"]
 
 
-def _minimal_unified_diff(path: str, old_text: str, new_text: str, context: int = 3) -> tuple[str, int, int]:
-    """Return a bounded-context unified diff that preserves exact line bytes."""
+def _minimal_unified_diff(
+    path: str,
+    old_text: str,
+    new_text: str,
+    context: int = 3,
+    operation: str = "modify",
+) -> tuple[str, int, int]:
+    """Return a bounded-context strict unified diff that preserves exact line bytes."""
     _safe_path(path)
+    if operation not in {"modify", "add", "delete"}:
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "operation must be modify, add, or delete")
     old_lines = old_text.splitlines(keepends=True)
     new_lines = new_text.splitlines(keepends=True)
     matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
     groups = list(matcher.get_grouped_opcodes(context))
+    if operation == "add":
+        output = [
+            f"diff --git a/{path} b/{path}\n",
+            "new file mode 100644\n",
+            "--- /dev/null\n",
+            f"+++ b/{path}\n",
+        ]
+    elif operation == "delete":
+        output = [
+            f"diff --git a/{path} b/{path}\n",
+            "deleted file mode 100644\n",
+            f"--- a/{path}\n",
+            "+++ /dev/null\n",
+        ]
+    else:
+        output = [f"--- a/{path}\n", f"+++ b/{path}\n"]
     if not groups:
-        return "", 0, 0
-    output = [f"--- a/{path}\n", f"+++ b/{path}\n"]
+        return ("".join(output), 0, 0) if operation in {"add", "delete"} else ("", 0, 0)
     added = 0
     deleted = 0
     for group in groups:
@@ -578,7 +601,7 @@ def _parse_patch_details(patch: str) -> tuple[list[tuple[str, str, list[tuple[in
                                      "normalized": normalized_header})
             hunks.append((old_start, new_start, old_lines, new_lines))
         if not hunks:
-            if operation != "delete":
+            if operation not in {"add", "delete"}:
                 raise MyGithub10Error("PATCH_INVALID_FORMAT", f"file patch for {path} has no hunks")
             result.append((path, operation, []))
             continue
@@ -1162,21 +1185,34 @@ def replace_text_once(client, repository: str, branch: str, expected_head_sha: s
         raise
 
 
-def build_patch(path: str, expected_blob_sha: str, original_text: str, replacement_text: str) -> dict[str, Any]:
-    """Build a deterministic, local-only unified diff; never contacts GitHub."""
+def build_patch(
+    path: str,
+    expected_blob_sha: str,
+    original_text: str,
+    replacement_text: str,
+    operation: str = "modify",
+) -> dict[str, Any]:
+    """Build a deterministic, local-only strict unified diff; never contacts GitHub."""
     _safe_path(path)
     if not isinstance(original_text, str) or not isinstance(replacement_text, str):
         raise MyGithub10Error("PATCH_INVALID_FORMAT", "original_text and replacement_text must be strings")
+    if operation not in {"modify", "add", "delete"}:
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "operation must be modify, add, or delete")
+    if operation == "add" and (expected_blob_sha or original_text):
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "add requires empty expected_blob_sha and empty original_text")
+    if operation == "delete" and (not expected_blob_sha or replacement_text):
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "delete requires expected_blob_sha and empty replacement_text")
     old_bytes = original_text.encode("utf-8")
-    if len(old_bytes) > MAX_FILE_CHUNK_BYTES * 16 or len(replacement_text.encode("utf-8")) > MAX_FILE_CHUNK_BYTES * 16:
+    new_bytes = replacement_text.encode("utf-8")
+    if len(old_bytes) > MAX_FILE_CHUNK_BYTES * 16 or len(new_bytes) > MAX_FILE_CHUNK_BYTES * 16:
         raise MyGithub10Error("PATCH_TOO_LARGE", "text exceeds the patch builder limit")
     if expected_blob_sha and expected_blob_sha != _git_blob_sha(old_bytes):
         raise MyGithub10Error("BLOB_CHANGED", "expected_blob_sha does not match original_text", {"expected": expected_blob_sha, "actual": _git_blob_sha(old_bytes), "path": path})
-    patch, added_lines, deleted_lines = _minimal_unified_diff(path, original_text, replacement_text)
+    patch, added_lines, deleted_lines = _minimal_unified_diff(path, original_text, replacement_text, operation=operation)
     diff_preview, diff_truncated = _truncate_utf8(patch)
-    fingerprint = _sha256(_json({"path": path, "expected_blob_sha": expected_blob_sha, "original_text": original_text, "replacement_text": replacement_text}).encode())
-    return {"ok": True, "dry_run": True, "path": path, "patch": patch, "diff_preview": diff_preview, "diff_truncated": diff_truncated,
-            "operation_fingerprint": fingerprint, "old_blob_sha": _git_blob_sha(old_bytes), "new_blob_sha": _git_blob_sha(replacement_text.encode()),
+    fingerprint = _sha256(_json({"path": path, "expected_blob_sha": expected_blob_sha, "original_text": original_text, "replacement_text": replacement_text, "operation": operation}).encode())
+    return {"ok": True, "dry_run": True, "path": path, "operation": operation, "patch": patch, "diff_preview": diff_preview, "diff_truncated": diff_truncated,
+            "operation_fingerprint": fingerprint, "old_blob_sha": None if operation == "add" else _git_blob_sha(old_bytes), "new_blob_sha": None if operation == "delete" else _git_blob_sha(new_bytes),
             "old_count": len(original_text.splitlines()), "new_count": len(replacement_text.splitlines()),
             "added_lines": added_lines, "deleted_lines": deleted_lines}
 

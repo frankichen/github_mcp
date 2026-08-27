@@ -75,7 +75,7 @@ DX2-WS-01 + DX2-RESUME-01
 | ID | 优先级 | 状态 | 核心目标 | 关键验收 |
 |---|---|---|---|---|
 | DX2-00 | P0 | `IN_PROGRESS` | 固化 DX-2 规划、需求、清单和入口 | 文档落库、README 可发现、Draft PR |
-| DX2-WRITE-01 | P1 | `NOT_STARTED` | 新文件 builder 输出可原样 strict apply | AC-WRITE-01～06 |
+| DX2-WRITE-01 | P1 | `IN_PROGRESS` | 新文件 builder 输出可原样 strict apply | AC-WRITE-01～06 |
 | DX2-CI-01 | P0 | `NOT_STARTED` | 两个独立 Private CI Worker 真并行 | AC-CI-01～10 |
 | DX2-WS-01 | P0 | `NOT_STARTED` | Lease 过期对象退出默认 active Writer | AC-WS-01～07 |
 | DX2-SESSION-01 | P0 | `NOT_STARTED` | 安全恢复 stale Session，不掩盖真实 drift | AC-SESSION-01～07 |
@@ -123,7 +123,7 @@ DX2-WS-01 + DX2-RESUME-01
 
 ### 状态
 
-`NOT_STARTED`
+`IN_PROGRESS`
 
 ### 真实来源
 

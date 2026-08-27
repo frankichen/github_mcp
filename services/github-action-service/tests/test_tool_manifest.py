@@ -72,6 +72,10 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert tools["get_infrastructure_deployment"].annotations.readOnlyHint is True
     assert tools["plan_private_ci_job"].annotations.readOnlyHint is True
     assert tools["build_github_patch"].annotations.readOnlyHint is True
+    builder_schema = tools["build_github_patch"].inputSchema
+    assert builder_schema["properties"]["operation"]["default"] == "modify"
+    assert builder_schema["properties"]["operation"]["enum"] == ["modify", "add", "delete"]
+    assert "operation" not in builder_schema["required"]
     assert tools["search_repository_text"].annotations.readOnlyHint is True
     assert tools["analyze_repository_patch_from_ref"].annotations.readOnlyHint is True
     assert tools["analyze_repository_patch_from_ref"].inputSchema["required"][-3:] == [
@@ -108,7 +112,7 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.3.2"
+    assert manifest["service_version"] == "12.3.3"
     assert manifest["manifest_format"] == "composed-v2"
     assert manifest["legacy_tool_count"] == 120
     assert manifest["new_tool_count"] == 46

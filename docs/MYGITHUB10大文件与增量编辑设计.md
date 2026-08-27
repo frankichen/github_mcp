@@ -16,7 +16,7 @@ MyGithub10 通过 Git Blob API 获取精确字节，不把大文件正文塞入�
 | `apply_github_patch` | 严格 unified diff，默认 dry-run，支持多文件原子 commit；新增文件使用 `--- /dev/null` 与 `@@ -0,0 +1,N @@` |
 | `edit_github_file_ranges` | 按 1-based inclusive 行号执行 blob + exact-text（或显式 SHA256 兼容字段）校验后的非重叠编辑；范围基于原始内容计算并按降序应用 |
 | `replace_github_text_once` | 不要求调用方提供行号；服务端在准确 Blob 中按 exact UTF-8 old_text 唯一命中（固定 `expected_match_count=1`）后替换，不做换行、空白或 Unicode normalization |
-| `build_github_patch` | 根据完整旧/新 UTF-8 文件文本纯计算最小 unified diff；不读取或写入 GitHub |
+| `build_github_patch` | 根据完整 UTF-8 文件文本纯计算 strict unified diff；兼容可选 `operation=modify|add|delete`，默认 `modify`，add/delete 使用 `/dev/null` 语义且不猜测目标是否存在；不读取或写入 GitHub |
 | `begin/append/finalize/commit/abort_github_file_upload` | 严格 offset、chunk SHA、总大小和总 SHA 的分块上传 |
 
 小范围、唯一文本块修改优先使用 `replace_github_text_once`；同文件多处修改优先严格 unified patch；大文件优先 chunked upload；已持久化 patch 优先 server-side `*_from_ref`。只有确实需要行区间语义时才使用 `edit_github_file_ranges`，禁止 AI 手工数行号作为唯一定位依据。
