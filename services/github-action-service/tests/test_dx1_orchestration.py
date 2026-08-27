@@ -180,6 +180,132 @@ def test_auto_renew_orchestrator_skips_long_lease_and_rejects_github_drift(monke
     assert called == []
 
 
+def test_session_recovery_cas_clears_stale_evidence_and_replays_idempotently(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "session-recovery.db"))
+    monkeypatch.setattr(sessions, "_now", lambda: 1000.0)
+    created=sessions.create_session(_workspace(head_sha=SHA_A,tree_sha=SHA_B,revision=2,index_commit_sha=SHA_A))
+    with mygithub12._db() as db:
+        db.execute("UPDATE development_sessions SET last_fast_ci_job_id='fast-old',last_full_ci_job_id='full-old',last_attestation_id='att-old',last_failure_resource_uri='resource-old' WHERE session_id=?",(created["session_id"],))
+    workspace=_workspace(head_sha=SHA_B,tree_sha=SHA_C,revision=3,index_commit_sha=SHA_B)
+    recovered=sessions.recover_stale_session_from_workspace(
+        created["session_id"],1,workspace,idempotency_key="recover-1",index_commit_sha=SHA_B,
+        recovery_evidence={"github_head_sha":SHA_B,"github_tree_sha":SHA_C},
+    )
+    current=recovered["session"]
+    assert recovered["recovered"] is True and recovered["replayed"] is False
+    assert current["session_revision"] == 2 and current["workspace_revision"] == 3
+    assert current["head_commit_sha"] == SHA_B and current["tree_sha"] == SHA_C
+    assert current["index_commit_sha"] == SHA_B
+    assert current["last_fast_ci_job_id"] is None and current["last_full_ci_job_id"] is None
+    assert current["last_attestation_id"] is None and current["last_failure_resource_uri"] is None
+    replay=sessions.recover_stale_session_from_workspace(
+        created["session_id"],1,workspace,idempotency_key="recover-1",index_commit_sha=SHA_B,
+        recovery_evidence={"github_head_sha":SHA_B,"github_tree_sha":SHA_C},
+    )
+    assert replay["replayed"] is True and replay["session"]["session_revision"] == 2
+    assert [event["event_type"] for event in sessions.list_events(created["session_id"])] == ["session_created","session_recovered"]
+    noop=sessions.recover_stale_session_from_workspace(created["session_id"],2,workspace,index_commit_sha=SHA_B)
+    assert noop["recovered"] is False and noop["session"]["session_revision"] == 2
+
+
+def test_session_recovery_preserves_exact_head_ci_when_only_workspace_revision_is_stale(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "session-revision-recovery.db"))
+    monkeypatch.setattr(sessions, "_now", lambda: 1000.0)
+    created=sessions.create_session(_workspace(revision=2,index_commit_sha=SHA_B))
+    with mygithub12._db() as db:
+        db.execute("UPDATE development_sessions SET last_full_ci_job_id='full-exact',last_attestation_id='att-exact' WHERE session_id=?",(created["session_id"],))
+    workspace=_workspace(revision=3,index_commit_sha=SHA_B)
+    recovered=sessions.recover_stale_session_from_workspace(created["session_id"],1,workspace,index_commit_sha=SHA_B)
+    assert recovered["session"]["workspace_revision"] == 3
+    assert recovered["session"]["last_full_ci_job_id"] == "full-exact"
+    assert recovered["session"]["last_attestation_id"] == "att-exact"
+    assert recovered["audit"]["head_changed"] is False
+
+
+def _recovery_service(actual_head=SHA_B, actual_tree=SHA_C, *, merge_base=SHA_A, ahead_by=1, behind_by=0):
+    class Repo:
+        def get_commit(self, sha):
+            tree=SHA_B if sha == SHA_A else actual_tree
+            return SimpleNamespace(sha=sha,commit=SimpleNamespace(tree=SimpleNamespace(sha=tree)))
+
+        def compare(self, base, head):
+            return SimpleNamespace(
+                merge_base_commit=SimpleNamespace(sha=merge_base),ahead_by=ahead_by,behind_by=behind_by,
+            )
+
+    return SimpleNamespace(
+        client=SimpleNamespace(get_branch=lambda *args: SimpleNamespace(commit=SimpleNamespace(sha=actual_head))),
+        repo=Repo(),
+    )
+
+
+def test_orchestrator_recovers_proven_session_stale_and_requests_exact_index(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "orchestrator-recovery.db"))
+    monkeypatch.setattr(sessions, "_now", lambda: 1000.0)
+    created=sessions.create_session(_workspace(head_sha=SHA_A,tree_sha=SHA_B,revision=2,index_commit_sha=SHA_A))
+    workspace={**_workspace(head_sha=SHA_B,tree_sha=SHA_C,revision=3,index_commit_sha=SHA_B),"lease_valid":True,"drift_reason":None}
+    service=_recovery_service()
+    monkeypatch.setattr(mygithub12, "get_workspace", lambda *args, **kwargs: workspace)
+    monkeypatch.setattr(mygithub12, "_service_repo", lambda *args, **kwargs: service.repo)
+    monkeypatch.setattr(mygithub12, "_tree_sha", lambda commit: commit.commit.tree.sha)
+    monkeypatch.setattr(mygithub12, "get_index_status", lambda *args, **kwargs: {"status":"missing","commit_sha":SHA_B,"tree_sha":SHA_C})
+    requests=[]
+    monkeypatch.setattr(mygithub12, "request_index_build", lambda *args, **kwargs: requests.append(args) or {"status":"queued","commit_sha":SHA_B})
+    result=dx.recover_stale_session(service,created["session_id"],1,2,SHA_A,"recover-safe")
+    assert result["recovered"] is True and result["session"]["head_commit_sha"] == SHA_B
+    assert result["session"]["index_commit_sha"] is None
+    assert result["index"]["request"]["commit_sha"] == SHA_B
+    assert requests and requests[0][2] == SHA_B
+    assert sessions.list_events(created["session_id"])[-1]["event_type"] == "session_recovered"
+
+
+def test_orchestrator_recovery_rejects_external_drift_without_mutating_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "orchestrator-drift.db"))
+    monkeypatch.setattr(sessions, "_now", lambda: 1000.0)
+    created=sessions.create_session(_workspace(revision=2))
+    workspace={**_workspace(revision=3),"lease_valid":True,"drift_reason":None}
+    service=_recovery_service(actual_head=SHA_C,actual_tree=SHA_A)
+    monkeypatch.setattr(mygithub12, "get_workspace", lambda *args, **kwargs: workspace)
+    monkeypatch.setattr(mygithub12, "_service_repo", lambda *args, **kwargs: service.repo)
+    monkeypatch.setattr(mygithub12, "_tree_sha", lambda commit: commit.commit.tree.sha)
+    with pytest.raises(mygithub12.MyGithub12Error) as exc:
+        dx.recover_stale_session(service,created["session_id"],1,2,SHA_B,"recover-drift")
+    assert exc.value.code == "WORKSPACE_BRANCH_DRIFTED"
+    current=sessions.get_session(created["session_id"])
+    assert current["session_revision"] == 1 and current["workspace_revision"] == 2
+    assert sessions.list_events(created["session_id"])[-1]["event_type"] == "external_drift_detected"
+
+
+def test_orchestrator_recovery_refuses_unproven_session_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "orchestrator-refused.db"))
+    monkeypatch.setattr(sessions, "_now", lambda: 1000.0)
+    created=sessions.create_session(_workspace(head_sha=SHA_A,tree_sha=SHA_B,revision=2,index_commit_sha=SHA_A))
+    workspace={**_workspace(head_sha=SHA_B,tree_sha=SHA_C,revision=3,index_commit_sha=SHA_B),"lease_valid":True,"drift_reason":None}
+    service=_recovery_service(merge_base=SHA_C,ahead_by=1,behind_by=1)
+    monkeypatch.setattr(mygithub12, "get_workspace", lambda *args, **kwargs: workspace)
+    monkeypatch.setattr(mygithub12, "_service_repo", lambda *args, **kwargs: service.repo)
+    monkeypatch.setattr(mygithub12, "_tree_sha", lambda commit: commit.commit.tree.sha)
+    with pytest.raises(mygithub12.MyGithub12Error) as exc:
+        dx.recover_stale_session(service,created["session_id"],1,2,SHA_A,"recover-refused")
+    assert exc.value.code == "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    assert sessions.get_session(created["session_id"])["session_revision"] == 1
+    assert sessions.list_events(created["session_id"])[-1]["event_type"] == "recovery_refused"
+
+
+def test_auto_renew_recovers_revision_only_stale_session_before_threshold_check(monkeypatch):
+    session={"session_id":"dev_test","workspace_id":"ws_test","workspace_revision":2,"session_revision":1,"repository":"owner/repo","branch":"ai/task","head_commit_sha":SHA_B,"tree_sha":SHA_C,"lease_expires_at":5000.0,"lease_valid":True,"index_commit_sha":SHA_B,"status":"active","metadata":{}}
+    workspace={**_workspace(revision=3,lease_expires_at=5000.0,index_commit_sha=SHA_B),"lease_valid":True,"drift_reason":None}
+    recovered_session={**session,"workspace_revision":3,"session_revision":2}
+    monkeypatch.setattr(sessions, "get_session", lambda *args, **kwargs: session)
+    monkeypatch.setattr(mygithub12, "get_workspace", lambda *args, **kwargs: workspace)
+    monkeypatch.setattr(mygithub12, "_now", lambda: 1000.0)
+    calls=[]
+    monkeypatch.setattr(dx, "recover_stale_session", lambda *args, **kwargs: calls.append(args) or {"session":recovered_session,"workspace":workspace,"recovered":True,"replayed":False})
+    result=dx.maybe_auto_renew_session_workspace(SimpleNamespace(),"dev_test",1,2,SHA_B,"recover-revision")
+    assert result["renewed"] is False and result["session"]["session_revision"] == 2
+    assert result["recovery"]["recovered"] is True and len(calls) == 1
+
+
 def test_prepare_task_success_transitions_preparing_session_to_active(tmp_path, monkeypatch):
     monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "prepare-success.db"))
     monkeypatch.setattr(sessions, "_now", lambda: 1000.0)
@@ -268,7 +394,7 @@ async def test_apply_change_set_rejects_invalid_pr_config_before_write(monkeypat
 async def test_apply_change_set_keeps_verified_commit_evidence_when_session_finalize_fails(monkeypatch):
     mcp = StructuredFastMCP("dx-session-finalize-failure")
     service = SimpleNamespace()
-    session = {"repository": "owner/repo", "branch": "ai/task", "base_branch": "main"}
+    session = {"repository": "owner/repo", "branch": "ai/task", "base_branch": "main", "head_commit_sha": SHA_B}
     workspace = {"workspace_id": "ws_test"}
     monkeypatch.setattr(dx, "require_session_workspace", lambda *args, **kwargs: (session, workspace))
     monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: _no_renewal(session))
@@ -310,7 +436,7 @@ async def test_apply_change_set_pr_failure_is_partial_success_after_verified_com
             raise mygithub12.MyGithub12Error("GITHUB_API_ERROR", "PR create failed", {"retryable": True})
 
     service = Service()
-    session = {"repository": "owner/repo", "branch": "ai/task", "base_branch": "main"}
+    session = {"repository": "owner/repo", "branch": "ai/task", "base_branch": "main", "head_commit_sha": SHA_B}
     workspace = {"workspace_id": "ws_test"}
     monkeypatch.setattr(dx, "require_session_workspace", lambda *args, **kwargs: (session, workspace))
     monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: _no_renewal(session))

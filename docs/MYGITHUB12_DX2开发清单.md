@@ -77,8 +77,8 @@ DX2-WS-01 + DX2-RESUME-01
 | DX2-00 | P0 | `IN_PROGRESS` | 固化 DX-2 规划、需求、清单和入口 | 文档落库、README 可发现、Draft PR |
 | DX2-WRITE-01 | P1 | `IN_PROGRESS` | 新文件 builder 输出可原样 strict apply | AC-WRITE-01～06 |
 | DX2-CI-01 | P0 | `NOT_STARTED` | 两个独立 Private CI Worker 真并行 | AC-CI-01～10 |
-| DX2-WS-01 | P0 | `IN_PROGRESS` | Lease 过期对象退出默认 active Writer + guarded auto-renew | AC-WS-01～13 |
-| DX2-SESSION-01 | P0 | `NOT_STARTED` | 安全恢复 stale Session，不掩盖真实 drift | AC-SESSION-01～07 |
+| DX2-WS-01 | P0 | `DONE` | Lease 过期对象退出默认 active Writer + guarded auto-renew | AC-WS-01～13 |
+| DX2-SESSION-01 | P0 | `IN_PROGRESS` | 安全恢复 stale Session，不掩盖真实 drift | AC-SESSION-01～07 |
 | DX2-INFRA-01 | P1 | `NOT_STARTED` | 长 self-deploy 持续 heartbeat | AC-INFRA-HB-01～05 |
 | DX2-INFRA-02 | P1 | `NOT_STARTED` | self-deploy long-poll 和紧凑诊断 | AC-INFRA-WAIT-01～05 |
 | DX2-RESUME-01 | P1 | `NOT_STARTED` | 新窗口一次恢复 branch/PR 开发上下文 | AC-RESUME-01～07 |
@@ -237,7 +237,7 @@ DX2-WS-01 + DX2-RESUME-01
 
 ### 状态
 
-`IN_PROGRESS`
+`DONE`
 
 ### 预计修改模块
 
@@ -266,7 +266,7 @@ DX2-WS-01 + DX2-RESUME-01
 - [x] expired/drifted/closed 不自动复活；expired 必须显式 `resume_development_workspace`；
 - [x] renewal idempotency + `development_session_events` audit before/after；
 - [x] 任一 identity/CAS 校验失败在写操作前 fail-stop；
-- [ ] 合并并发布后以 production `12.4.0` runtime 验证 auto-renew / resume Schema。
+- [x] PR #68 合并并发布后已以 production `12.4.0` runtime 验证 auto-renew / resume Schema。
 
 ### 实现清单
 
@@ -294,7 +294,7 @@ DX2-WS-01 + DX2-RESUME-01
 
 ### 状态
 
-`NOT_STARTED`
+`IN_PROGRESS`
 
 ### 依赖
 
@@ -310,16 +310,16 @@ DX2-WS-01 + DX2-RESUME-01
 
 ### 实现清单
 
-- [ ] 新增内部 recovery primitive；
-- [ ] fresh-read GitHub branch；
-- [ ] 比较 GitHub / Workspace / Session 三方 HEAD/Tree；
-- [ ] 仅允许 Session stale 场景前进；
-- [ ] 真实 external drift fail-stop；
-- [ ] Session revision CAS；
-- [ ] recovery event audit；
-- [ ] exact HEAD Index 重新绑定；
-- [ ] 旧 CI/attestation 仅 exact SHA 可复用；
-- [ ] 幂等重放。
+- [x] 新增内部 recovery primitive；
+- [x] fresh-read GitHub branch；
+- [x] 比较 GitHub / Workspace / Session 三方 HEAD/Tree；
+- [x] 仅允许 Session stale 场景前进；
+- [x] 真实 external drift fail-stop；
+- [x] Session revision CAS；
+- [x] recovery event audit；
+- [x] exact HEAD Index 重新绑定；
+- [x] 旧 CI/attestation 仅 exact SHA 可复用；
+- [x] 幂等重放。
 
 ### 必测矩阵
 
