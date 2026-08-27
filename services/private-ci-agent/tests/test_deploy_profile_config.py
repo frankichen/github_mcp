@@ -152,7 +152,7 @@ def test_apply_fixes_syncs_entire_runtime_package():
 def test_apply_fixes_candidate_handoff_avoids_sgid_write_under_hardened_executor():
     script = (DEPLOY_DIR / "apply-fixes.sh").read_text(encoding="utf-8")
     executor_unit = (
-        Path(__file__).parents[3]
+        Path(__file__).resolve().parents[3]
         / "services/private-ci-deploy-executor/systemd/mygithub12-infrastructure-deploy-executor.service.example"
     ).read_text(encoding="utf-8")
 
