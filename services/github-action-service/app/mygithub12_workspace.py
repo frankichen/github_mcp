@@ -20,16 +20,26 @@ get_index_status=core.get_index_status
 _compare=core._compare
 init_db=core.init_db
 
+def _effective_workspace_status(status: str, lease_expires_at: float | int | None, *, now: float | None = None) -> str:
+    current=_now() if now is None else float(now)
+    if status=="active" and float(lease_expires_at or 0)<=current:
+        return "expired"
+    return status
+
+
 def _workspace_public(row: sqlite3.Row | dict[str,Any]) -> dict[str,Any]:
     r=dict(row)
     r["scope"]=json.loads(r.pop("scope_json") or "{}")
-    now=_now()
-    r["lease_valid"]=r["lease_expires_at"]>now and r["status"]=="active"
+    now=_now(); persisted_status=str(r.get("status") or "")
+    effective_status=_effective_workspace_status(persisted_status,r.get("lease_expires_at"),now=now)
+    r["persisted_status"]=persisted_status
+    r["status"]=effective_status
+    r["lease_valid"]=r["lease_expires_at"]>now and effective_status=="active"
     r["index_pin_active"]=core._workspace_index_pin_active(
-        r["status"], r["lease_expires_at"], now=now
+        effective_status, r["lease_expires_at"], now=now
     )
     r["index_pin_grace_expires_at"]=core._workspace_index_pin_grace_expires_at(
-        r["status"], r["lease_expires_at"]
+        effective_status, r["lease_expires_at"]
     )
     return r
 
@@ -54,6 +64,14 @@ def _branch_create_error(exc: Exception, branch: str, base_ref: str) -> MyGithub
     return MyGithub12Error("WORKSPACE_BRANCH_CREATE_FAILED","workspace branch could not be created",details)
 
 
+def _converge_expired_branch_owner(repository: str, branch: str, *, now: float) -> None:
+    with _LOCK,_db() as db:
+        db.execute(
+            "UPDATE workspaces SET status='expired',revision=revision+1,updated_at=? WHERE repository=? AND branch=? AND status='active' AND lease_expires_at<=?",
+            (now,repository,branch,now),
+        )
+
+
 def create_workspace(service: Any, repository: str, task_name: str, base_ref: str="main", branch: str="", owner: str="chatgpt", create_branch: bool=True, lease_seconds: int=DEFAULT_LEASE_SECONDS) -> dict[str,Any]:
     identity=resolve_identity(service,repository,ref=base_ref); slug=re.sub(r"[^a-z0-9-]+","-",task_name.lower()).strip("-")[:40] or "task"; workspace_id="ws_"+uuid.uuid4().hex[:16]; branch=branch or f"ai/{slug}-{workspace_id[-8:]}"
     if not branch.startswith("ai/"): raise MyGithub12Error("WORKSPACE_SCOPE_CONFLICT","workspace branches must use ai/ prefix")
@@ -64,6 +82,7 @@ def create_workspace(service: Any, repository: str, task_name: str, base_ref: st
     branch_state=service.client.get_branch(repository,branch)
     if not branch_state: raise MyGithub12Error("WORKSPACE_NOT_FOUND","workspace branch does not exist")
     head=str(branch_state.commit.sha); tree=_tree_sha(_service_repo(service,repository).get_commit(head)); lease_seconds=max(60,min(lease_seconds,MAX_LEASE_SECONDS)); init_db(); now=_now()
+    _converge_expired_branch_owner(repository,branch,now=now)
     try:
         with _LOCK,_db() as db: db.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(workspace_id,repository,branch,base_ref,identity["commit_sha"],head,tree,"active",1,owner,now+lease_seconds,head,"{}",None,None,now,now))
     except sqlite3.IntegrityError as exc: raise MyGithub12Error("WORKSPACE_LEASE_CONFLICT","another active workspace already owns this branch",{"branch":branch}) from exc
@@ -79,9 +98,12 @@ def get_workspace(service: Any, workspace_id: str) -> dict[str,Any]:
 
 def list_workspaces(service: Any, repository: str="", status: str="", branch: str="", owner: str="", limit: int=50, offset: int=0) -> dict[str,Any]:
     if repository: _service_repo(service,repository)
-    clauses=[]; values=[]
-    for field,value in (("repository",repository),("status",status),("branch",branch),("owner",owner)):
+    clauses=[]; values=[]; now=_now()
+    for field,value in (("repository",repository),("branch",branch),("owner",owner)):
         if value: clauses.append(field+"=?"); values.append(value)
+    if status=="active": clauses.extend(["status='active'","lease_expires_at>?"]); values.append(now)
+    elif status=="expired": clauses.append("(status='expired' OR (status='active' AND lease_expires_at<=?))"); values.append(now)
+    elif status: clauses.append("status=?"); values.append(status)
     where=" WHERE "+" AND ".join(clauses) if clauses else ""; limit=max(1,min(limit,100)); offset=max(0,offset); init_db()
     with _db() as db:
         total=db.execute("SELECT COUNT(*) FROM workspaces"+where,values).fetchone()[0]; rows=db.execute("SELECT * FROM workspaces"+where+" ORDER BY updated_at DESC LIMIT ? OFFSET ?",(*values,limit,offset)).fetchall()
@@ -96,18 +118,52 @@ def _workspace_cas(workspace_id: str, expected: int) -> sqlite3.Row:
 
 
 def renew_workspace_lease(service: Any, workspace_id: str, expected_workspace_revision: int, lease_seconds: int=DEFAULT_LEASE_SECONDS) -> dict[str,Any]:
-    get_workspace(service,workspace_id); row=_workspace_cas(workspace_id,expected_workspace_revision)
-    if row["status"]!="active": raise MyGithub12Error("WORKSPACE_CLOSED","workspace is not active")
-    with _LOCK,_db() as db: db.execute("UPDATE workspaces SET lease_expires_at=?,revision=revision+1,updated_at=? WHERE workspace_id=? AND revision=?",(_now()+max(60,min(lease_seconds,MAX_LEASE_SECONDS)),_now(),workspace_id,expected_workspace_revision))
+    public=get_workspace(service,workspace_id); _workspace_cas(workspace_id,expected_workspace_revision)
+    if public["status"]=="drifted": raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","drifted workspace lease cannot be renewed")
+    if public["status"]=="expired": raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED","expired workspace requires explicit resume",{"workspace_id":workspace_id,"requires_resume":True})
+    if public["status"]!="active": raise MyGithub12Error("WORKSPACE_CLOSED","workspace is not active")
+    now=_now(); expires=now+max(60,min(lease_seconds,MAX_LEASE_SECONDS))
+    with _LOCK,_db() as db:
+        cur=db.execute("UPDATE workspaces SET lease_expires_at=?,revision=revision+1,updated_at=? WHERE workspace_id=? AND revision=?",(expires,now,workspace_id,expected_workspace_revision))
+        if cur.rowcount!=1: raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH","workspace changed while renewing lease")
     return {"ok":True,**get_workspace(service,workspace_id)}
 
 
+def resume_workspace(service: Any, workspace_id: str, expected_workspace_revision: int, lease_seconds: int=DEFAULT_LEASE_SECONDS) -> dict[str,Any]:
+    public=get_workspace(service,workspace_id); row=_workspace_cas(workspace_id,expected_workspace_revision)
+    if public["status"]=="drifted": raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","drifted workspace requires branch recovery before resume")
+    if public["status"]=="closed": raise MyGithub12Error("WORKSPACE_CLOSED","closed workspace cannot be resumed")
+    if public["status"]!="expired": raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED","workspace resume is only allowed after lease expiry",{"workspace_id":workspace_id,"requires_resume":False})
+    repo=_service_repo(service,row["repository"]); branch=service.client.get_branch(row["repository"],row["branch"])
+    if not branch: raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","workspace branch no longer exists",{"workspace_id":workspace_id,"reason":"branch_deleted"})
+    actual_head=str(branch.commit.sha); actual_tree=_tree_sha(repo.get_commit(actual_head))
+    if actual_head!=row["head_sha"] or actual_tree!=row["tree_sha"]:
+        raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","workspace branch identity changed while lease was expired",{"workspace_id":workspace_id,"stored_head":row["head_sha"],"actual_head":actual_head,"stored_tree":row["tree_sha"],"actual_tree":actual_tree})
+    base=service.client.get_branch(row["repository"],row["base_branch"])
+    if not base: raise MyGithub12Error("REF_NOT_FOUND","workspace base branch no longer exists",{"base_branch":row["base_branch"]})
+    current_base=str(base.commit.sha); now=_now(); expires=now+max(60,min(lease_seconds,MAX_LEASE_SECONDS))
+    try:
+        with _LOCK,_db() as db:
+            cur=db.execute("UPDATE workspaces SET status='active',lease_expires_at=?,drift_reason=NULL,revision=revision+1,updated_at=? WHERE workspace_id=? AND revision=?",(expires,now,workspace_id,expected_workspace_revision))
+            if cur.rowcount!=1: raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH","workspace changed while resuming")
+    except sqlite3.IntegrityError as exc: raise MyGithub12Error("WORKSPACE_LEASE_CONFLICT","another active workspace owns this branch",{"branch":row["branch"]}) from exc
+    resumed=get_workspace(service,workspace_id)
+    return {"ok":True,**resumed,"resumed":True,"resume_evidence":{"branch_head_sha":actual_head,"tree_sha":actual_tree,"workspace_base_commit_sha":row["base_commit_sha"],"current_base_commit_sha":current_base,"base_advanced":current_base!=row["base_commit_sha"]}}
+
+
 def refresh_workspace(service: Any, workspace_id: str, expected_workspace_revision: int) -> dict[str,Any]:
-    row=_workspace_cas(workspace_id,expected_workspace_revision); _service_repo(service,row["repository"]); branch=service.client.get_branch(row["repository"],row["branch"])
+    row=_workspace_cas(workspace_id,expected_workspace_revision); _service_repo(service,row["repository"])
+    if row["status"]=="closed": raise MyGithub12Error("WORKSPACE_CLOSED","closed workspace cannot be refreshed")
+    branch=service.client.get_branch(row["repository"],row["branch"]); now=_now()
     if not branch: status,reason,head,tree="drifted","branch_deleted",row["head_sha"],row["tree_sha"]
     else:
-        head=str(branch.commit.sha); tree=_tree_sha(_service_repo(service,row["repository"]).get_commit(head)); status="active" if head==row["head_sha"] else "drifted"; reason=None if status=="active" else "branch_moved_externally"
-    with _LOCK,_db() as db: db.execute("UPDATE workspaces SET head_sha=?,tree_sha=?,status=?,drift_reason=?,revision=revision+1,updated_at=? WHERE workspace_id=? AND revision=?",(head,tree,status,reason,_now(),workspace_id,expected_workspace_revision))
+        head=str(branch.commit.sha); tree=_tree_sha(_service_repo(service,row["repository"]).get_commit(head))
+        if head!=row["head_sha"]: status,reason="drifted","branch_moved_externally"
+        elif float(row["lease_expires_at"] or 0)<=now: status,reason="expired",None
+        else: status,reason="active",None
+    with _LOCK,_db() as db:
+        cur=db.execute("UPDATE workspaces SET head_sha=?,tree_sha=?,status=?,drift_reason=?,revision=revision+1,updated_at=? WHERE workspace_id=? AND revision=?",(head,tree,status,reason,now,workspace_id,expected_workspace_revision))
+        if cur.rowcount!=1: raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH","workspace changed while refreshing")
     return {"ok":True,**get_workspace(service,workspace_id)}
 
 
@@ -118,8 +174,14 @@ def close_workspace(service: Any, workspace_id: str, expected_workspace_revision
 
 
 def declare_workspace_scope(service: Any, workspace_id: str, expected_workspace_revision: int, paths_json: str="[]", symbols_json: str="[]", apis_json: str="[]", tables_json: str="[]", migrations_json: str="[]", configs_json: str="[]", exclusive: bool=False) -> dict[str,Any]:
-    get_workspace(service,workspace_id); _workspace_cas(workspace_id,expected_workspace_revision); scope={"paths":[_safe_path(str(x)) for x in _parse(paths_json,list,"paths_json",[])],"symbols":_parse(symbols_json,list,"symbols_json",[]),"apis":_parse(apis_json,list,"apis_json",[]),"tables":_parse(tables_json,list,"tables_json",[]),"migrations":_parse(migrations_json,list,"migrations_json",[]),"configs":_parse(configs_json,list,"configs_json",[]),"exclusive":exclusive}
-    with _LOCK,_db() as db: db.execute("UPDATE workspaces SET scope_json=?,revision=revision+1,updated_at=? WHERE workspace_id=? AND revision=?",(json.dumps(scope),_now(),workspace_id,expected_workspace_revision))
+    public=get_workspace(service,workspace_id); _workspace_cas(workspace_id,expected_workspace_revision)
+    if public["status"]=="drifted": raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","drifted workspace scope cannot be changed")
+    if public["status"]=="expired": raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED","expired workspace requires explicit resume",{"workspace_id":workspace_id,"requires_resume":True})
+    if public["status"]!="active": raise MyGithub12Error("WORKSPACE_CLOSED","workspace is not active")
+    scope={"paths":[_safe_path(str(x)) for x in _parse(paths_json,list,"paths_json",[])],"symbols":_parse(symbols_json,list,"symbols_json",[]),"apis":_parse(apis_json,list,"apis_json",[]),"tables":_parse(tables_json,list,"tables_json",[]),"migrations":_parse(migrations_json,list,"migrations_json",[]),"configs":_parse(configs_json,list,"configs_json",[]),"exclusive":exclusive}
+    with _LOCK,_db() as db:
+        cur=db.execute("UPDATE workspaces SET scope_json=?,revision=revision+1,updated_at=? WHERE workspace_id=? AND revision=?",(json.dumps(scope),_now(),workspace_id,expected_workspace_revision))
+        if cur.rowcount!=1: raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH","workspace changed while declaring scope")
     return {"ok":True,**get_workspace(service,workspace_id)}
 
 
@@ -155,8 +217,10 @@ def workspace_write_preflight(service: Any, repository: str, branch: str, expect
     if expected_workspace_revision<=0: raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH","expected_workspace_revision is required with workspace_id")
     ws=get_workspace(service,workspace_id)
     if ws["repository"]!=repository or ws["branch"]!=branch: raise MyGithub12Error("WORKSPACE_SCOPE_CONFLICT","workspace does not own the requested repository/branch")
-    if ws["status"]!="active": raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED" if ws["status"]=="drifted" else "WORKSPACE_CLOSED","workspace is not writable")
-    if not ws["lease_valid"]: raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED","workspace write lease expired")
+    if ws["status"]=="drifted": raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","workspace is not writable")
+    if ws["status"]=="expired": raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED","workspace write lease expired",{"workspace_id":workspace_id,"requires_resume":True})
+    if ws["status"]!="active": raise MyGithub12Error("WORKSPACE_CLOSED","workspace is not writable")
+    if not ws["lease_valid"]: raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED","workspace write lease expired",{"workspace_id":workspace_id,"requires_resume":True})
     if ws["revision"]!=expected_workspace_revision: raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH","workspace revision changed",{"expected":expected_workspace_revision,"actual":ws["revision"]})
     branch_state=service.client.get_branch(repository,branch); actual=str(branch_state.commit.sha) if branch_state else ""
     if actual!=ws["head_sha"] or (expected_head_sha and actual!=expected_head_sha): raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","branch HEAD differs from workspace",{"workspace_head":ws["head_sha"],"expected_head":expected_head_sha,"actual_head":actual})

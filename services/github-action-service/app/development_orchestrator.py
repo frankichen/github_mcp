@@ -18,6 +18,8 @@ from app.development_failure_pack import build_failure_pack
 from app.mcp_response import store_response_resource
 
 MyGithub12Error=mygithub12.MyGithub12Error
+AUTO_RENEW_THRESHOLD_SECONDS=1800
+AUTO_RENEW_SESSION_STATES=frozenset({"active","validating_fast","validating_full","pr_ready"})
 
 
 def _json(value: str, expected: type, name: str, default: Any):
@@ -120,6 +122,37 @@ def prepare_task(
             exc.details.update({k:v for k,v in details.items() if v is not None})
             raise
         raise MyGithub12Error("DEVELOPMENT_TASK_PREPARE_FAILED","development task preparation failed",{**details,"cause_type":type(exc).__name__}) from exc
+
+
+def maybe_auto_renew_session_workspace(
+    service: Any, session_id: str, expected_session_revision: int, expected_workspace_revision: int=0,
+    expected_head_sha: str="", idempotency_key: str="",
+) -> dict[str,Any]:
+    sessions._require_revision(session_id,expected_session_revision); session=sessions.get_session(session_id)
+    if session["status"] not in AUTO_RENEW_SESSION_STATES: raise MyGithub12Error("DEVELOPMENT_SESSION_STATE_INVALID","development session state does not permit workspace auto-renew",{"status":session["status"]})
+    ws=mygithub12.get_workspace(service,session["workspace_id"]); workspace_revision=int(ws["revision"])
+    if expected_workspace_revision and workspace_revision!=int(expected_workspace_revision): raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH","workspace revision changed",{"expected":expected_workspace_revision,"actual":workspace_revision})
+    if int(session["workspace_revision"])!=workspace_revision: raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH","session does not reference the current workspace revision",{"session_workspace_revision":session["workspace_revision"],"workspace_revision":workspace_revision})
+    if expected_head_sha and session["head_commit_sha"]!=expected_head_sha: raise MyGithub12Error("DEVELOPMENT_SESSION_RECOVERY_REQUIRED","session HEAD identity differs from expected HEAD",{"session_head":session["head_commit_sha"],"expected_head":expected_head_sha})
+    if ws["status"]=="drifted" or ws.get("drift_reason"): raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","drifted workspace cannot be auto-renewed",{"workspace_id":ws["workspace_id"],"drift_reason":ws.get("drift_reason")})
+    if ws["status"]=="expired" or not ws.get("lease_valid") or not session.get("lease_valid"): raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED","expired workspace cannot be auto-renewed",{"workspace_id":ws["workspace_id"],"requires_resume":True})
+    if ws["status"]!="active": raise MyGithub12Error("WORKSPACE_CLOSED","workspace is not active")
+    if session["head_commit_sha"]!=ws["head_sha"] or session["tree_sha"]!=ws["tree_sha"]: raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH","session and workspace Git identities differ")
+    if abs(float(session["lease_expires_at"])-float(ws["lease_expires_at"]))>0.001: raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH","session and workspace lease identities differ")
+    now=mygithub12._now(); remaining=min(float(session["lease_expires_at"]),float(ws["lease_expires_at"]))-now
+    if remaining>AUTO_RENEW_THRESHOLD_SECONDS:
+        return {"renewed":False,"session":session,"workspace":ws,"remaining_seconds":remaining}
+    branch_state=service.client.get_branch(session["repository"],session["branch"]); actual_head=str(branch_state.commit.sha) if branch_state else ""
+    if actual_head!=session["head_commit_sha"]: raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","GitHub branch HEAD changed before auto-renew",{"workspace_head":ws["head_sha"],"session_head":session["head_commit_sha"],"actual_head":actual_head})
+    repo=mygithub12._service_repo(service,session["repository"]); actual_tree=mygithub12._tree_sha(repo.get_commit(actual_head))
+    if actual_tree!=session["tree_sha"] or actual_tree!=ws["tree_sha"]: raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","GitHub branch Tree changed before auto-renew",{"workspace_tree":ws["tree_sha"],"session_tree":session["tree_sha"],"actual_tree":actual_tree})
+    renewed=sessions.auto_renew_session_workspace_lease(
+        session_id,expected_session_revision,ws["workspace_id"],workspace_revision,
+        lease_seconds=mygithub12.DEFAULT_LEASE_SECONDS,
+        event_data={"idempotency_key":idempotency_key or None,"remaining_seconds":remaining,"threshold_seconds":AUTO_RENEW_THRESHOLD_SECONDS,"github_head_sha":actual_head,"github_tree_sha":actual_tree},
+    )
+    renewed_ws=mygithub12.get_workspace(service,ws["workspace_id"])
+    return {"renewed":True,"session":renewed["session"],"workspace":renewed_ws,"remaining_seconds":remaining,"audit":renewed["audit"]}
 
 
 def require_session_workspace(service: Any, session_id: str, expected_session_revision: int, expected_workspace_revision: int, expected_head_sha: str) -> tuple[dict[str,Any],dict[str,Any]]:

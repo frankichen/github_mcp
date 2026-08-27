@@ -7,8 +7,8 @@ import pytest
 from app.mcp_server import mcp
 
 
-EXPECTED_REGISTERED_TOOL_COUNT = 166
-EXPECTED_CANONICAL_TOOL_COUNT = 163
+EXPECTED_REGISTERED_TOOL_COUNT = 167
+EXPECTED_CANONICAL_TOOL_COUNT = 164
 DX1_TOOLS = [
     "prepare_development_task",
     "apply_development_change_set",
@@ -27,6 +27,7 @@ MYGITHUB12_BASE_TOOLS = {
     "plan_private_ci_job",
     "create_development_workspace", "get_development_workspace",
     "list_development_workspaces", "renew_development_workspace_lease",
+    "resume_development_workspace",
     "refresh_development_workspace", "close_development_workspace",
     "declare_development_scope", "analyze_development_workspace_overlap",
     "plan_development_workspace_sync", "list_repository_tree",
@@ -59,7 +60,7 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert all(name and name.strip() == name for name in actual_names)
     tools = {tool.name: tool for tool in actual}
     assert MYGITHUB12_BASE_TOOLS <= set(actual_names)
-    assert len(MYGITHUB12_BASE_TOOLS) == 39
+    assert len(MYGITHUB12_BASE_TOOLS) == 40
     assert actual_names[-7:-3] == DX1_TOOLS
     assert actual_names[-3:] == INFRASTRUCTURE_DEPLOY_TOOLS
     for name in DX1_TOOLS:
@@ -76,9 +77,10 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert builder_schema["properties"]["operation"]["default"] == "modify"
     assert builder_schema["properties"]["operation"]["enum"] == ["modify", "add", "delete"]
     assert "operation" not in builder_schema["required"]
-    for lease_tool_name in ("create_development_workspace", "renew_development_workspace_lease", "prepare_development_task"):
+    for lease_tool_name in ("create_development_workspace", "renew_development_workspace_lease", "resume_development_workspace", "prepare_development_task"):
         lease_schema = tools[lease_tool_name].inputSchema["properties"]["lease_seconds"]
         assert lease_schema["default"] == 7200
+    assert tools["resume_development_workspace"].annotations.readOnlyHint is False
     assert tools["search_repository_text"].annotations.readOnlyHint is True
     assert tools["analyze_repository_patch_from_ref"].annotations.readOnlyHint is True
     assert tools["analyze_repository_patch_from_ref"].inputSchema["required"][-3:] == [
@@ -115,10 +117,10 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.3.4"
+    assert manifest["service_version"] == "12.4.0"
     assert manifest["manifest_format"] == "composed-v2"
     assert manifest["legacy_tool_count"] == 120
-    assert manifest["new_tool_count"] == 46
+    assert manifest["new_tool_count"] == 47
     assert manifest["tool_count"] == EXPECTED_CANONICAL_TOOL_COUNT
     assert manifest["compatibility_tool_count"] == EXPECTED_REGISTERED_TOOL_COUNT
     assert set(manifest["hidden_deprecated_tools"]) == HIDDEN_DEPRECATED_TOOLS
