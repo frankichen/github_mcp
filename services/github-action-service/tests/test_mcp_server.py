@@ -54,7 +54,7 @@ class TestMCPTools:
 
         monkeypatch.setenv("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", "true")
         tools = {tool.name: tool for tool in await mcp.list_tools()}
-        for name in ("build_github_patch", "replace_github_text_once", "edit_github_file_ranges", "apply_github_patch", "get_mygithub_capabilities", "plan_private_ci_job"):
+        for name in ("build_github_patch", "replace_github_text_once", "edit_github_file_ranges", "apply_github_patch", "put_github_file", "put_github_files", "put_github_file_from_local_candidate", "get_mygithub_capabilities", "plan_private_ci_job"):
             assert name in tools
         assert "expected_blob_sha" in tools["edit_github_file_ranges"].description
         assert "expected_old_text" in tools["edit_github_file_ranges"].description
@@ -63,6 +63,16 @@ class TestMCPTools:
         assert "start_line" not in exact_schema
         assert "end_line" not in exact_schema
         assert exact_schema["expected_match_count"]["default"] == 1
+        put_schema = tools["put_github_file"].inputSchema["properties"]
+        assert {"repository", "branch", "path", "content", "expected_head_sha", "expected_blob_sha", "commit_message"} <= set(put_schema)
+        assert {"upload_id", "offset", "chunk_sha256"}.isdisjoint(put_schema)
+        multi_schema = tools["put_github_files"].inputSchema["properties"]
+        assert multi_schema["files"]["type"] == "array"
+        assert "change_set_json" not in multi_schema
+        local_schema = tools["put_github_file_from_local_candidate"].inputSchema["properties"]
+        assert {"candidate_name", "expected_size_bytes", "expected_sha256"} <= set(local_schema)
+        assert "local_path" not in local_schema
+        assert "host_path" not in local_schema
         assert "without caller-supplied line numbers" in tools["replace_github_text_once"].description
         assert "start_line" not in tools["build_github_patch"].description
         builder_schema = tools["build_github_patch"].inputSchema
@@ -86,13 +96,13 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.4.1"
+        assert capabilities["version"] == "12.4.2"
         assert capabilities["max_upload_chunk_bytes"] == 24576
         assert capabilities["recommended_upload_chunk_bytes"] == 16384
         assert capabilities["preferred_upload_encoding"] == "text_for_utf8_base64_for_binary"
-        assert capabilities["tool_count"] == 167
-        assert capabilities["tool_manifest_count"] == 167
-        assert capabilities["compatibility_tool_count"] == 167
+        assert capabilities["tool_count"] == 170
+        assert capabilities["tool_manifest_count"] == 170
+        assert capabilities["compatibility_tool_count"] == 170
         assert capabilities["deprecated_tools_exposed"] is True
         assert capabilities["hidden_deprecated_tool_count"] == 0
         assert capabilities["hidden_deprecated_tools"] == []
@@ -102,6 +112,10 @@ class TestMCPTools:
         assert capabilities["supports_atomic_multi_upload_change_set"] is True
         assert capabilities["max_atomic_multi_upload_files"] == 64
         assert capabilities["max_atomic_multi_upload_bytes"] == 64 * 1024 * 1024
+        assert capabilities["supports_high_level_file_put"] is True
+        assert capabilities["high_level_inline_content_limit_bytes"] == 48 * 1024
+        assert capabilities["supports_local_candidate_file_put"] is True
+        assert capabilities["recommended_large_file_workflow"][0] == "put_github_file_from_local_candidate"
         assert capabilities["supports_private_ci_applicability_planning"] is True
         assert capabilities["supports_development_task_orchestration"] is True
         assert capabilities["supports_development_sessions"] is True

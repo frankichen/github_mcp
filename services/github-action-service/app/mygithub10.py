@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import tempfile
 import time
 import uuid
@@ -39,9 +40,13 @@ RECOMMENDED_UPLOAD_CHUNK_BYTES = 16384
 MAX_UPLOAD_BYTES = 1048576
 MAX_UPLOAD_CHANGE_SET_FILES = 64
 MAX_UPLOAD_CHANGE_SET_BYTES = 64 * MAX_UPLOAD_BYTES
+# Direct Web/MCP arguments must stay well below the 64 KiB transport ceiling.
+# Larger text is handed off by basename from the fixed local candidate root.
+MAX_HIGH_LEVEL_INLINE_CONTENT_BYTES = 48 * 1024
 UPLOAD_TTL_SECONDS = 3600
 MAX_FILE_EDIT_OPERATIONS = 1000
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?(?:\r?\n)?$")
+_LOCAL_CANDIDATE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 logger = logging.getLogger(__name__)
 
 
@@ -1226,7 +1231,7 @@ def capabilities(build_sha: str) -> dict[str, Any]:
     return {
         "name": "MyGithut12",
         "version": SERVICE_VERSION,
-        "tool_count": 163,
+        "tool_count": 166,
         "build_sha": build_sha,
         "build_sha_source": "environment" if new_build_env or legacy_build_env else "vcs_fallback",
         "runtime_mode": os.environ.get("MYGITHUB12_RUNTIME_MODE", os.environ.get("MYGITHUB10_RUNTIME_MODE", "development")),
@@ -1257,6 +1262,9 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_atomic_multi_upload_change_set": True,
         "max_atomic_multi_upload_files": MAX_UPLOAD_CHANGE_SET_FILES,
         "max_atomic_multi_upload_bytes": MAX_UPLOAD_CHANGE_SET_BYTES,
+        "supports_high_level_file_put": True,
+        "high_level_inline_content_limit_bytes": MAX_HIGH_LEVEL_INLINE_CONTENT_BYTES,
+        "supports_local_candidate_file_put": True,
         "supports_dry_run": True,
         "supports_expected_head_sha": True,
         "supports_expected_blob_sha": True,
@@ -1304,11 +1312,11 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_blue_green_runtime": True,
         "supports_runtime_generation_leader": True,
         "supports_cross_generation_resources": True,
-        "tool_manifest_count": 166,
-        "recommended_small_text_workflow": ["replace_github_text_once", "apply_github_patch", "edit_github_file_ranges"],
-        "recommended_large_file_workflow": ["get_github_file_manifest", "read_github_file_chunk", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "commit_github_uploaded_files"],
-        "recommended_atomic_multi_upload_workflow": ["prepare_development_task", "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload", "apply_development_change_set"],
-        "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "PATCH_TEXT_MISMATCH", "IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_IN_PROGRESS", "UPLOAD_CHUNK_BASE64_INVALID", "UPLOAD_CHUNK_ENCODING_AMBIGUOUS", "UPLOAD_CHUNK_EMPTY", "UPLOAD_CHUNK_LIMIT_EXCEEDED", "UPLOAD_CHUNK_SHA_MISMATCH", "UPLOAD_OFFSET_MISMATCH", "UPLOAD_SIZE_EXCEEDED", "UPLOAD_NOT_FINALIZED", "WORKSPACE_LEASE_REQUIRED", "WORKSPACE_REVISION_MISMATCH", "WORKSPACE_BRANCH_DRIFTED", "DEVELOPMENT_SESSION_NOT_FOUND", "DEVELOPMENT_SESSION_CLOSED", "DEVELOPMENT_SESSION_STATE_INVALID", "DEVELOPMENT_SESSION_REVISION_MISMATCH", "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "MIRROR_UNAVAILABLE", "MIRROR_ORIGIN_MISMATCH", "MIRROR_FETCH_FAILED", "MIRROR_OBJECT_MISSING", "MIRROR_IDENTITY_MISMATCH", "FAST_CI_NOT_MERGE_ELIGIBLE", "CI_PROFILE_DISCOVERY_MISMATCH", "CI_ENV_CACHE_INVALID", "CI_ENV_CACHE_BUILD_FAILED", "AFFECTED_SELECTION_INCOMPLETE", "FAILURE_PACK_UNAVAILABLE", "RUNTIME_SCHEMA_INCOMPATIBLE", "RUNTIME_GENERATION_NOT_READY", "RUNTIME_LEADER_CONFLICT", "CROSS_GENERATION_RESOURCE_UNAVAILABLE", "CROSS_GENERATION_UPLOAD_UNAVAILABLE"],
+        "tool_manifest_count": 169,
+        "recommended_small_text_workflow": ["put_github_file", "replace_github_text_once", "apply_github_patch", "edit_github_file_ranges"],
+        "recommended_large_file_workflow": ["put_github_file_from_local_candidate", "get_github_file_manifest", "read_github_file_chunk"],
+        "recommended_atomic_multi_upload_workflow": ["put_github_files", "prepare_development_task", "apply_development_change_set"],
+        "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "GITHUB_WRITE_FAILED", "STAGING_FAILED", "PAYLOAD_INVALID", "PAYLOAD_TOO_LARGE", "PAYLOAD_REQUIRES_LOCAL_CANDIDATE", "PAYLOAD_LOCAL_CANDIDATE_UNAVAILABLE", "PAYLOAD_LOCAL_CANDIDATE_NOT_FOUND", "PAYLOAD_SIZE_MISMATCH", "PAYLOAD_SHA_MISMATCH", "BINARY_FILE_UNSUPPORTED", "BLOB_EXPECTATION_REQUIRED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "PATCH_TEXT_MISMATCH", "IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_IN_PROGRESS", "UPLOAD_CHUNK_BASE64_INVALID", "UPLOAD_CHUNK_ENCODING_AMBIGUOUS", "UPLOAD_CHUNK_EMPTY", "UPLOAD_CHUNK_LIMIT_EXCEEDED", "UPLOAD_CHUNK_SHA_MISMATCH", "UPLOAD_OFFSET_MISMATCH", "UPLOAD_SIZE_EXCEEDED", "UPLOAD_NOT_FINALIZED", "WORKSPACE_LEASE_REQUIRED", "WORKSPACE_REVISION_MISMATCH", "WORKSPACE_BRANCH_DRIFTED", "DEVELOPMENT_SESSION_NOT_FOUND", "DEVELOPMENT_SESSION_CLOSED", "DEVELOPMENT_SESSION_STATE_INVALID", "DEVELOPMENT_SESSION_REVISION_MISMATCH", "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "MIRROR_UNAVAILABLE", "MIRROR_ORIGIN_MISMATCH", "MIRROR_FETCH_FAILED", "MIRROR_OBJECT_MISSING", "MIRROR_IDENTITY_MISMATCH", "FAST_CI_NOT_MERGE_ELIGIBLE", "CI_PROFILE_DISCOVERY_MISMATCH", "CI_ENV_CACHE_INVALID", "CI_ENV_CACHE_BUILD_FAILED", "AFFECTED_SELECTION_INCOMPLETE", "FAILURE_PACK_UNAVAILABLE", "RUNTIME_SCHEMA_INCOMPATIBLE", "RUNTIME_GENERATION_NOT_READY", "RUNTIME_LEADER_CONFLICT", "CROSS_GENERATION_RESOURCE_UNAVAILABLE", "CROSS_GENERATION_UPLOAD_UNAVAILABLE"],
         "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}],
     }
 
@@ -1390,6 +1398,26 @@ def append_upload(upload_id: str, offset: int, content: bytes, chunk_sha256: str
     lock = _upload_lock(upload_id)
     try:
         data_path, meta_path, meta = _load_upload(upload_id)
+        receipts = meta.get("append_idempotency")
+        if not isinstance(receipts, dict):
+            receipts = {}
+        if idempotency_key:
+            stored = receipts.get(idempotency_key)
+            current_request = {
+                "offset": offset,
+                "size_bytes": len(content),
+                "chunk_sha256": chunk_sha256,
+            }
+            if stored is not None:
+                if not isinstance(stored, dict) or any(stored.get(key) != value for key, value in current_request.items()):
+                    raise MyGithub10Error("IDEMPOTENCY_CONFLICT", "upload chunk idempotency key was used for different content")
+                return {
+                    "upload_id": upload_id,
+                    "offset": offset,
+                    "next_offset": int(stored["next_offset"]),
+                    "chunk_sha256": chunk_sha256,
+                    "replayed": True,
+                }
         if offset != meta["size"]:
             raise MyGithub10Error("UPLOAD_OFFSET_MISMATCH", "upload offset is not contiguous")
         if meta["size"] + len(content) > MAX_UPLOAD_BYTES:
@@ -1397,6 +1425,14 @@ def append_upload(upload_id: str, offset: int, content: bytes, chunk_sha256: str
         with data_path.open("ab") as handle:
             handle.write(content)
         meta["size"] += len(content)
+        if idempotency_key:
+            receipts[idempotency_key] = {
+                "offset": offset,
+                "size_bytes": len(content),
+                "chunk_sha256": chunk_sha256,
+                "next_offset": meta["size"],
+            }
+            meta["append_idempotency"] = receipts
         temporary_meta = meta_path.with_suffix(".json.tmp")
         temporary_meta.write_text(_json(meta), encoding="utf-8")
         os.chmod(temporary_meta, 0o600)
@@ -1404,7 +1440,7 @@ def append_upload(upload_id: str, offset: int, content: bytes, chunk_sha256: str
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         lock.close()
-    return {"upload_id": upload_id, "offset": offset, "next_offset": meta["size"], "chunk_sha256": chunk_sha256}
+    return {"upload_id": upload_id, "offset": offset, "next_offset": meta["size"], "chunk_sha256": chunk_sha256, "replayed": False}
 
 
 def finalize_upload(upload_id: str, expected_size_bytes: int, expected_sha256: str) -> dict[str, Any]:
@@ -1546,6 +1582,356 @@ def commit_uploads(client, repository: str, branch: str, expected_head_sha: str,
         return result
     except MyGithub10Error as exc:
         _idempotent_finish(operation_id, "failed", error_code=exc.code, result={"failed_stage": exc.details.get("failed_stage"), "error": {"code": exc.code, "details": exc.details}})
+        raise
+
+
+def _prepare_put_item(path: str, data: bytes, expected_blob_sha: str = "") -> dict[str, Any]:
+    _safe_path(path)
+    if not isinstance(expected_blob_sha, str):
+        raise MyGithub10Error("PAYLOAD_INVALID", "expected_blob_sha must be a string")
+    if expected_blob_sha and not re.fullmatch(r"[0-9a-f]{40}", expected_blob_sha):
+        raise MyGithub10Error("PAYLOAD_INVALID", "expected_blob_sha must be a full lowercase Git blob SHA")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise MyGithub10Error(
+            "PAYLOAD_TOO_LARGE",
+            "one file exceeds the high-level file write limit",
+            {"path": path, "size_bytes": len(data), "max_bytes": MAX_UPLOAD_BYTES, "error_category": "PAYLOAD"},
+        )
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MyGithub10Error(
+            "BINARY_FILE_UNSUPPORTED",
+            "high-level Web AI file write currently accepts UTF-8 text only",
+            {"path": path, "error_category": "PAYLOAD"},
+        ) from exc
+    return {
+        "path": path,
+        "expected_blob_sha": expected_blob_sha,
+        "data": data,
+        "content_sha256": _sha256(data),
+        "size_bytes": len(data),
+    }
+
+
+def prepare_inline_put_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not isinstance(files, list) or not files:
+        raise MyGithub10Error("PAYLOAD_INVALID", "files must contain at least one file")
+    if len(files) > MAX_UPLOAD_CHANGE_SET_FILES:
+        raise MyGithub10Error(
+            "PAYLOAD_TOO_LARGE",
+            "too many files for one atomic high-level write",
+            {"file_count": len(files), "max_files": MAX_UPLOAD_CHANGE_SET_FILES, "error_category": "PAYLOAD"},
+        )
+    prepared: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    total_size = 0
+    for item in files:
+        if not isinstance(item, dict):
+            raise MyGithub10Error("PAYLOAD_INVALID", "each file must be an object")
+        path = item.get("path")
+        content = item.get("content")
+        expected_blob_sha = item.get("expected_blob_sha", "")
+        if not isinstance(path, str) or not path:
+            raise MyGithub10Error("PAYLOAD_INVALID", "each file requires path")
+        if not isinstance(content, str):
+            raise MyGithub10Error("PAYLOAD_INVALID", "each file requires UTF-8 text content")
+        if path in seen_paths:
+            raise MyGithub10Error("PAYLOAD_INVALID", f"duplicate target path: {path}")
+        seen_paths.add(path)
+        prepared_item = _prepare_put_item(path, content.encode("utf-8"), expected_blob_sha)
+        total_size += int(prepared_item["size_bytes"])
+        prepared.append(prepared_item)
+    if total_size > MAX_HIGH_LEVEL_INLINE_CONTENT_BYTES:
+        raise MyGithub10Error(
+            "PAYLOAD_REQUIRES_LOCAL_CANDIDATE",
+            "inline Web AI file content exceeds the transport-safe high-level limit; use put_github_file_from_local_candidate",
+            {
+                "total_size_bytes": total_size,
+                "max_inline_content_bytes": MAX_HIGH_LEVEL_INLINE_CONTENT_BYTES,
+                "error_category": "TRANSPORT/PAYLOAD",
+                "recommended_tool": "put_github_file_from_local_candidate",
+            },
+        )
+    return prepared
+
+
+def prepare_local_candidate_file(
+    path: str,
+    expected_blob_sha: str,
+    candidate_name: str,
+    expected_size_bytes: int,
+    expected_sha256: str,
+) -> list[dict[str, Any]]:
+    if not _LOCAL_CANDIDATE_NAME_RE.fullmatch(candidate_name or ""):
+        raise MyGithub10Error(
+            "PAYLOAD_INVALID",
+            "candidate_name must be one safe basename under the controlled local candidate root",
+            {"error_category": "PAYLOAD"},
+        )
+    if expected_size_bytes < 0 or expected_size_bytes > MAX_UPLOAD_BYTES:
+        raise MyGithub10Error(
+            "PAYLOAD_TOO_LARGE",
+            "local candidate size is outside the supported range",
+            {"expected_size_bytes": expected_size_bytes, "max_bytes": MAX_UPLOAD_BYTES, "error_category": "PAYLOAD"},
+        )
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256 or ""):
+        raise MyGithub10Error("PAYLOAD_INVALID", "expected_sha256 must be a full lowercase SHA256", {"error_category": "PAYLOAD"})
+    root = Path(settings.MYGITHUB12_LOCAL_CANDIDATE_DIR)
+    if not root.is_dir():
+        raise MyGithub10Error(
+            "PAYLOAD_LOCAL_CANDIDATE_UNAVAILABLE",
+            "the controlled local candidate root is not available",
+            {"error_category": "TRANSPORT/PAYLOAD"},
+        )
+    candidate = root / candidate_name
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(candidate, flags)
+    except OSError as exc:
+        raise MyGithub10Error(
+            "PAYLOAD_LOCAL_CANDIDATE_NOT_FOUND",
+            "the selected local candidate is not readable",
+            {"candidate_name": candidate_name, "error_category": "PAYLOAD"},
+        ) from exc
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise MyGithub10Error("PAYLOAD_INVALID", "local candidate must be a regular file", {"error_category": "PAYLOAD"})
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            data = handle.read(MAX_UPLOAD_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise MyGithub10Error("PAYLOAD_TOO_LARGE", "local candidate exceeds the file limit", {"error_category": "PAYLOAD"})
+    if len(data) != expected_size_bytes:
+        raise MyGithub10Error(
+            "PAYLOAD_SIZE_MISMATCH",
+            "local candidate size differs from the caller attestation",
+            {"expected": expected_size_bytes, "actual": len(data), "error_category": "PAYLOAD"},
+        )
+    actual_sha256 = _sha256(data)
+    if actual_sha256 != expected_sha256:
+        raise MyGithub10Error(
+            "PAYLOAD_SHA_MISMATCH",
+            "local candidate SHA256 differs from the caller attestation",
+            {"expected": expected_sha256, "actual": actual_sha256, "error_category": "PAYLOAD"},
+        )
+    return [_prepare_put_item(path, data, expected_blob_sha)]
+
+
+def build_put_request(
+    tool_name: str,
+    repository: str,
+    branch: str,
+    expected_head_sha: str,
+    prepared: list[dict[str, Any]],
+    commit_message: str,
+    workspace_id: str = "",
+    expected_workspace_revision: int = 0,
+    source_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_head_sha or ""):
+        raise MyGithub10Error("PAYLOAD_INVALID", "expected_head_sha must be a full lowercase commit SHA")
+    if not isinstance(commit_message, str) or not commit_message.strip():
+        raise MyGithub10Error("PAYLOAD_INVALID", "commit_message is required")
+    files = [
+        {
+            "path": item["path"],
+            "expected_blob_sha": item["expected_blob_sha"],
+            "content_sha256": item["content_sha256"],
+            "size_bytes": item["size_bytes"],
+        }
+        for item in prepared
+    ]
+    request = {
+        "tool_name": tool_name,
+        "repository": repository,
+        "branch": branch,
+        "expected_head_sha": expected_head_sha,
+        "files": files,
+        "commit_message": commit_message,
+        "workspace_id": workspace_id or "",
+        "expected_workspace_revision": int(expected_workspace_revision or 0),
+    }
+    if source_identity:
+        request["source_identity"] = source_identity
+    return request
+
+
+def fail_put_operation(operation_id: str, exc: Exception, failed_stage: str) -> None:
+    if not operation_id or operation_id == "replay":
+        return
+    if isinstance(exc, MyGithub10Error):
+        code = exc.code
+        details = dict(exc.details or {})
+    else:
+        code = "INTERNAL_ERROR"
+        details = {"cause_type": type(exc).__name__}
+    details.setdefault("failed_stage", failed_stage)
+    _idempotent_finish(
+        operation_id,
+        "failed",
+        error_code=code,
+        result={"failed_stage": failed_stage, "error": {"code": code, "details": details}},
+    )
+
+
+def execute_put_files(
+    client,
+    repository: str,
+    branch: str,
+    expected_head_sha: str,
+    prepared: list[dict[str, Any]],
+    commit_message: str,
+    dry_run: bool,
+    operation_id: str = "",
+) -> dict[str, Any]:
+    paths = [item["path"] for item in prepared]
+    expected_blob_shas = {item["path"]: item["expected_blob_sha"] for item in prepared}
+    try:
+        _, _, _, actual_head, old_shas = _preflight_file_write(
+            client, repository, branch, expected_head_sha, paths, expected_blob_shas
+        )
+        for item in prepared:
+            old_sha = old_shas[item["path"]]
+            if old_sha and not item["expected_blob_sha"]:
+                raise MyGithub10Error(
+                    "BLOB_EXPECTATION_REQUIRED",
+                    f"expected_blob_sha is required when modifying an existing file: {item['path']}",
+                    {"path": item["path"], "actual": old_sha},
+                )
+        if dry_run:
+            return {
+                "ok": True,
+                "dry_run": True,
+                "repository": repository,
+                "branch": branch,
+                "head_sha": actual_head,
+                "staging_strategy": "server_internal_chunked_upload",
+                "changed_files": [
+                    {
+                        "path": item["path"],
+                        "operation": "modify" if old_shas[item["path"]] else "add",
+                        "old_blob_sha": old_shas[item["path"]],
+                        "new_blob_sha": _git_blob_sha(item["data"]),
+                        "content_sha256": item["content_sha256"],
+                        "size_bytes": item["size_bytes"],
+                    }
+                    for item in prepared
+                ],
+            }
+    except Exception as exc:
+        if operation_id:
+            fail_put_operation(operation_id, exc, "preflight")
+        raise
+
+    staged_ids: list[str] = []
+    staged: list[tuple[dict[str, Any], str]] = []
+    chunk_count = 0
+    try:
+        for index, item in enumerate(prepared):
+            upload = begin_upload()
+            upload_id = upload["upload_id"]
+            staged_ids.append(upload_id)
+            offset = 0
+            data = item["data"]
+            while offset < len(data):
+                chunk = data[offset:offset + RECOMMENDED_UPLOAD_CHUNK_BYTES]
+                chunk_sha256 = _sha256(chunk)
+                receipt_key = f"put:{operation_id or 'dry'}:{index}:{offset}:{chunk_sha256}"
+                appended = append_upload(upload_id, offset, chunk, chunk_sha256, receipt_key)
+                offset = int(appended["next_offset"])
+                chunk_count += 1
+            finalize_upload(upload_id, len(data), item["content_sha256"])
+            staged.append((item, upload_id))
+    except Exception as exc:
+        for upload_id in staged_ids:
+            abort_upload(upload_id)
+        if isinstance(exc, MyGithub10Error):
+            mapped = MyGithub10Error(
+                "STAGING_FAILED",
+                "server-side file staging failed",
+                {"cause_code": exc.code, "cause_details": exc.details, "failed_stage": "staging", "error_category": "UPLOAD/STAGING"},
+            )
+        else:
+            mapped = MyGithub10Error(
+                "STAGING_FAILED",
+                "server-side file staging failed",
+                {"cause_type": type(exc).__name__, "failed_stage": "staging", "error_category": "UPLOAD/STAGING"},
+            )
+        if operation_id:
+            fail_put_operation(operation_id, mapped, "staging")
+        raise mapped from exc
+
+    changed: dict[str, bytes] = {}
+    try:
+        for item, upload_id in staged:
+            data_path, _, meta = _load_upload(upload_id)
+            if not meta.get("finalized"):
+                raise MyGithub10Error("STAGING_FAILED", "internal upload was not finalized", {"failed_stage": "staging"})
+            staged_data = data_path.read_bytes()
+            if _sha256(staged_data) != item["content_sha256"] or len(staged_data) != item["size_bytes"]:
+                raise MyGithub10Error("STAGING_FAILED", "internal staged bytes failed verification", {"failed_stage": "staging"})
+            changed[item["path"]] = staged_data
+        try:
+            result = _commit_files(
+                client, repository, branch, expected_head_sha, changed, expected_blob_shas, commit_message
+            )
+        except MyGithub10Error:
+            raise
+        except Exception as exc:
+            raise MyGithub10Error(
+                "GITHUB_WRITE_FAILED",
+                "GitHub failed while committing the verified staged files",
+                {"cause_type": type(exc).__name__, "failed_stage": "github_write", "error_category": "GITHUB_WRITE"},
+            ) from exc
+        result = {
+            "ok": True,
+            **result,
+            "staging": {
+                "strategy": "server_internal_chunked_upload",
+                "file_count": len(prepared),
+                "total_size_bytes": sum(int(item["size_bytes"]) for item in prepared),
+                "chunk_count": chunk_count,
+            },
+        }
+        if operation_id:
+            try:
+                _idempotent_mark_git_verified(operation_id, result)
+            except Exception as exc:
+                raise MyGithub10Error(
+                    "IDEMPOTENCY_FINALIZE_FAILED",
+                    "GitHub write is verified but durable idempotency state could not be advanced",
+                    {
+                        "operation_id": operation_id,
+                        "repository": repository,
+                        "branch": branch,
+                        "new_commit_sha": result.get("commit_sha", ""),
+                        "observed_branch_head": result.get("verified_branch_head_sha", ""),
+                        "expected_tree_sha": result.get("tree_sha", ""),
+                        "observed_tree_sha": result.get("verified_tree_sha", ""),
+                        "failed_stage": "idempotency_git_verified",
+                        "github_write_verified": True,
+                        "recovery_required": True,
+                        "cause_type": type(exc).__name__,
+                    },
+                ) from exc
+            result["_operation_id"] = operation_id
+        result["_cleanup_upload_ids"] = staged_ids
+        return result
+    except Exception as exc:
+        if isinstance(exc, MyGithub10Error) and exc.code == "WRITE_VERIFY_FAILED":
+            exc.details.setdefault("error_category", "WRITE_VERIFY")
+        if isinstance(exc, MyGithub10Error) and exc.code == "IDEMPOTENCY_FINALIZE_FAILED":
+            # GitHub already contains the exact verified commit. Preserve the
+            # staging evidence and fail closed for explicit recovery instead
+            # of rewriting history or misclassifying this as a GitHub failure.
+            raise
+        if operation_id:
+            fail_put_operation(operation_id, exc, str(getattr(exc, "details", {}).get("failed_stage") or "github_write"))
+        for upload_id in staged_ids:
+            abort_upload(upload_id)
         raise
 
 
