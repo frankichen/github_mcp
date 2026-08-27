@@ -149,6 +149,15 @@ def test_apply_fixes_syncs_entire_runtime_package():
     assert "install -o root -g root -m 644" in script
 
 
+def test_apply_fixes_candidate_handoff_avoids_sgid_write_under_hardened_executor():
+    script = (DEPLOY_DIR / "apply-fixes.sh").read_text(encoding="utf-8")
+
+    assert "stat -c '%u:%g:%a'" in script
+    assert '"0:${DOCKER_GID}:2770"|"0:${DOCKER_GID}:770"' in script
+    assert 'install -d -o root -g docker -m 0770 "${CANDIDATE_DIR}"' in script
+    assert "install -d -o root -g docker -m 2770" not in script
+
+
 def test_playwright_cache_maintenance_is_pinned_and_not_a_job_step():
     script = (DEPLOY_DIR / "prepare-playwright-cache").read_text(encoding="utf-8")
 
