@@ -217,3 +217,77 @@ def test_running_heartbeat_stops_and_reports_idle_when_execute_raises(monkeypatc
     final_count = len(calls)
     executor.time.sleep(0.03)
     assert len(calls) == final_count
+
+
+def test_running_heartbeat_cleans_up_for_deployment_failure_and_timeout(monkeypatch, tmp_path):
+    heartbeat_calls = []
+    monkeypatch.setattr(executor, "HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        executor,
+        "_heartbeat",
+        lambda state, deployment_id="": heartbeat_calls.append((state, deployment_id)),
+    )
+    monkeypatch.setattr(executor, "_progress", lambda *args: None)
+    monkeypatch.setattr(executor.shutil, "rmtree", lambda *args, **kwargs: None)
+
+    def run_case(name, returncode, fire_timeout):
+        workspace = tmp_path / name
+        script = workspace / executor.DEPLOY_SCRIPT
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\n", encoding="utf-8")
+        callbacks = []
+        monkeypatch.setattr(executor, "prepare_workspace", lambda value: (str(workspace), []))
+
+        class FakeProcess:
+            stdout = []
+
+            def __init__(self):
+                self.returncode = None if fire_timeout else returncode
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+        process = FakeProcess()
+        monkeypatch.setattr(executor.subprocess, "Popen", lambda *args, **kwargs: process)
+
+        class FakeTimer:
+            def __init__(self, seconds, callback):
+                self.callback = callback
+                self.daemon = False
+
+            def start(self):
+                if fire_timeout:
+                    self.callback()
+
+            def cancel(self):
+                return None
+
+        monkeypatch.setattr(executor.threading, "Timer", FakeTimer)
+        monkeypatch.setattr(
+            executor,
+            "_request",
+            lambda method, path, payload=None, **kwargs: callbacks.append((path, payload)) or {"ok": True},
+        )
+
+        before = len(heartbeat_calls)
+        executor._execute_with_heartbeat(_row())
+        case_heartbeats = heartbeat_calls[before:]
+        assert case_heartbeats[0] == ("running", "infra_dep_1")
+        assert case_heartbeats[-1] == ("idle", "")
+        fail_callbacks = [(path, payload) for path, payload in callbacks if path.endswith("/fail")]
+        assert len(fail_callbacks) == 1
+        return fail_callbacks[0][1]
+
+    failure = run_case("failure", 17, False)
+    assert failure["exit_code"] == 17
+    assert failure["error_code"] == "INFRASTRUCTURE_DEPLOYMENT_FAILED"
+
+    timeout = run_case("timeout", -15, True)
+    assert timeout["exit_code"] == 124
+    assert timeout["error_code"] == "INFRASTRUCTURE_DEPLOYMENT_TIMEOUT"
