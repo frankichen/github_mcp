@@ -394,7 +394,7 @@ async def test_apply_change_set_rejects_invalid_pr_config_before_write(monkeypat
 async def test_apply_change_set_keeps_verified_commit_evidence_when_session_finalize_fails(monkeypatch):
     mcp = StructuredFastMCP("dx-session-finalize-failure")
     service = SimpleNamespace()
-    session = {"repository": "owner/repo", "branch": "ai/task", "base_branch": "main"}
+    session = {"repository": "owner/repo", "branch": "ai/task", "base_branch": "main", "head_commit_sha": SHA_B}
     workspace = {"workspace_id": "ws_test"}
     monkeypatch.setattr(dx, "require_session_workspace", lambda *args, **kwargs: (session, workspace))
     monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: _no_renewal(session))
@@ -436,7 +436,7 @@ async def test_apply_change_set_pr_failure_is_partial_success_after_verified_com
             raise mygithub12.MyGithub12Error("GITHUB_API_ERROR", "PR create failed", {"retryable": True})
 
     service = Service()
-    session = {"repository": "owner/repo", "branch": "ai/task", "base_branch": "main"}
+    session = {"repository": "owner/repo", "branch": "ai/task", "base_branch": "main", "head_commit_sha": SHA_B}
     workspace = {"workspace_id": "ws_test"}
     monkeypatch.setattr(dx, "require_session_workspace", lambda *args, **kwargs: (session, workspace))
     monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: _no_renewal(session))

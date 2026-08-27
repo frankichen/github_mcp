@@ -221,7 +221,6 @@ def maybe_auto_renew_session_workspace(
         int(session["workspace_revision"])!=workspace_revision
         or session["head_commit_sha"]!=ws["head_sha"] or session["tree_sha"]!=ws["tree_sha"]
         or abs(float(session["lease_expires_at"])-float(ws["lease_expires_at"]))>0.001
-        or session.get("index_commit_sha")!=ws.get("index_commit_sha")
     )
     recovery=None
     if local_stale or replay_candidate:
