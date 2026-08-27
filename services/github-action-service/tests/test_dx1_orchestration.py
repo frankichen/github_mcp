@@ -386,7 +386,7 @@ async def test_validate_job_start_failure_rolls_session_back(monkeypatch):
     session = {
         "session_id": "dev_test", "workspace_id": "ws_test", "repository": "owner/repo",
         "branch": "ai/task", "head_commit_sha": SHA_B, "base_commit_sha": SHA_A,
-        "status": "active", "session_revision": 1,
+        "status": "active", "session_revision": 1, "workspace_revision": 3,
     }
     phase_session = {**session, "status": "validating_fast", "session_revision": 2}
     rollback_session = {**session, "session_revision": 3}
@@ -433,7 +433,7 @@ async def test_finalize_merge_keeps_merge_evidence_when_session_finalize_fails(m
     session = {
         "session_id": "dev_test", "workspace_id": "ws_test", "repository": "owner/repo",
         "branch": "ai/task", "base_branch": "main", "head_commit_sha": SHA_B,
-        "status": "pr_ready", "session_revision": 4, "pull_number": 54, "metadata": {},
+        "status": "pr_ready", "session_revision": 4, "workspace_revision": 3, "pull_number": 54, "metadata": {},
     }
     monkeypatch.setattr(sessions, "get_session", lambda *args: session)
     monkeypatch.setattr(sessions, "_require_revision", lambda *args, **kwargs: session)
