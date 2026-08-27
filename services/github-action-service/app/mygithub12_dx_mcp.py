@@ -9,6 +9,7 @@ from typing import Any, Callable, Awaitable
 from mcp.types import ToolAnnotations
 
 from app import development_orchestrator as dx
+from app import development_resume as resume
 from app import development_session_store as sessions
 from app import github_utils, mygithub12
 
@@ -48,6 +49,20 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
     ) -> str:
         try:
             result=await github_call(dx.prepare_task,service,repository,task_name,base_ref,branch,owner,create_branch,seed_paths_json,seed_symbols_json,include_tests,include_docs,lease_seconds,context_budget_bytes,idempotency_key)
+            return json.dumps(result,ensure_ascii=False)
+        except Exception as exc: return _error(exc)
+
+    @mcp.tool(name="resume_development_task",description="Resume a branch or PR development context with fresh repository, Workspace, Session, Index, CI, PR and overlap evidence; safely recovers stale Sessions only under DX2 guards.",annotations=_ORCHESTRATION)
+    async def resume_development_task(
+        repository: str, branch: str="", pull_number: int=0, recover_stale_session: bool=True, renew_lease: bool=False,
+        expected_workspace_revision: int=0, expected_session_revision: int=0, lease_seconds: int=mygithub12.DEFAULT_LEASE_SECONDS,
+        idempotency_key: str="",
+    ) -> str:
+        try:
+            result=await github_call(
+                resume.resume_task,service,repository,branch,pull_number,recover_stale_session,renew_lease,
+                expected_workspace_revision,expected_session_revision,lease_seconds,idempotency_key,
+            )
             return json.dumps(result,ensure_ascii=False)
         except Exception as exc: return _error(exc)
 
