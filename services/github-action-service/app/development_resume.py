@@ -3,8 +3,8 @@
 This module is intentionally a high-level read/recovery aggregator.  It does
 not move branches, create PRs, merge, close, delete branches, or run CI.  The
 only mutating behavior is guarded Session/Workspace recovery through existing
-Workspace/Session CAS paths when the caller explicitly requests it and the
-already-implemented DX2-SESSION safety checks prove the state is stale rather
+Workspace/Session CAS paths when the configured safe-recovery path permits it
+and the existing DX2-SESSION guards prove the state is stale rather
 than drifted.
 """
 from __future__ import annotations
@@ -183,7 +183,7 @@ def _workspace_recovery_plan(workspace: dict[str, Any] | None) -> dict[str, Any]
     return None
 
 
-def _next_actions(blockers: list[str], workspace: dict[str, Any] | None, session: dict[str, Any] | None, index: dict[str, Any] | None, pr: dict[str, Any] | None) -> list[str]:
+def _next_actions(blockers: list[str], workspace: dict[str, Any] | None, session: dict[str, Any] | None, index: dict[str, Any] | None, pr: dict[str, Any] | None, policy: dict[str, Any]) -> list[str]:
     actions: list[str] = []
     if not workspace:
         return ["prepare_development_task"]
@@ -198,7 +198,10 @@ def _next_actions(blockers: list[str], workspace: dict[str, Any] | None, session
     if index and index.get("status") != "ready":
         actions.append("request_index")
     if not blockers and workspace.get("lease_valid") and session.get("status") in ACTIVE_SESSION_STATUSES and index and index.get("status") == "ready":
-        actions.extend(["continue_write", "run_fast_ci", "run_full_ci", "prepare_pr"])
+        actions.append("continue_write")
+        if bool((policy.get("policy") or {}).get("private_ci")):
+            actions.extend(["run_fast_ci", "run_full_ci"])
+        actions.append("prepare_pr")
         if pr or session.get("pull_number"):
             actions.append("readiness")
     if not actions:
@@ -340,7 +343,7 @@ def resume_task(
         "blockers": blockers,
         "degraded": degraded,
     }
-    next_actions = _next_actions(blockers, workspace, session, index, pr)
+    next_actions = _next_actions(blockers, workspace, session, index, pr, policy)
     response["live_facts"] = {
         "policy": policy, "current_main": current_main, "branch": branch_state, "pull_request": pr,
         "workspace": workspace, "development_session": session, "index": index,

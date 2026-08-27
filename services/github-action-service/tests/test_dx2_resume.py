@@ -211,3 +211,28 @@ def test_resume_task_explicitly_groups_live_historical_and_candidate_actions(mon
     assert result["historical_evidence"] == {"session": None}
     assert result["candidate_next_actions"] == result["next_allowed_actions"]
     assert "continue_write" in result["candidate_next_actions"]
+
+
+def test_resume_task_candidate_actions_respect_private_ci_policy(monkeypatch):
+    ws = _workspace()
+    session = _ready_session(workspace_revision=ws["revision"], lease=ws["lease_expires_at"])
+    _stub_resume_context(monkeypatch, ws=ws, session=session)
+    monkeypatch.setattr(resume, "_repository_policy", lambda repository: {"ok": True, "repository": repository, "policy": {"github": True, "private_ci": False}})
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert "continue_write" in result["candidate_next_actions"]
+    assert "prepare_pr" in result["candidate_next_actions"]
+    assert "run_fast_ci" not in result["candidate_next_actions"]
+    assert "run_full_ci" not in result["candidate_next_actions"]
+
+
+def test_session_evidence_does_not_promote_invalid_current_attestation(monkeypatch):
+    current = {"head_commit_sha": SHA_B, "last_full_ci_job_id": "full", "last_attestation_id": "invalid-att", "last_fast_ci_job_id": None, "last_failure_resource_uri": None}
+    monkeypatch.setattr(resume.attestation_registry, "validate_attestation", lambda attestation_id: {"ok": False, "reusable": False, "error_code": "ATTESTATION_EXPIRED"})
+
+    evidence = resume._session_evidence(current, SHA_B)
+
+    assert evidence["historical"] is None
+    assert evidence["current_head"]["last_attestation_id"] == "invalid-att"
+    assert evidence["current_head"]["validated_attestation"] is None
