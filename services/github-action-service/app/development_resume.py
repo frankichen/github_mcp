@@ -249,8 +249,8 @@ def resume_task(
     policy = _repository_policy(repository)
     if not bool((policy.get("policy") or {}).get("github")):
         raise MyGithub12Error("REPOSITORY_NOT_ALLOWED", "repository is not allowed for GitHub operations", {"repository": repository})
-    current_main = _current_main(service, repository)
     pr = _resolve_pr(repository, int(pull_number or 0), branch)
+    current_main = _current_main(service, repository)
     effective_branch = branch or (str(pr.get("head_branch")) if pr else "")
     if pr is None and branch:
         pr = _discover_pr_by_branch(repository, effective_branch, current_main["branch"])
