@@ -124,10 +124,25 @@ log "ciworker preheat broker ready (uid=${CIWORKER_BROKER_UID})"
 # 复用 Controller 已有的 /var/lib/private-ci -> /data/private-ci 挂载，不新增
 # 服务、Secret 或 Docker mount。有 docker 组时授予本地 AI 候选文件投递权限；
 # 没有该组时使用 root-only 目录，不得因此阻断既有 Controller 发布路径。
+CANDIDATE_DIR="/var/lib/private-ci/web-ai-candidates"
 if getent group docker >/dev/null 2>&1; then
-    install -d -o root -g docker -m 2770 /var/lib/private-ci/web-ai-candidates
+    DOCKER_GID="$(getent group docker | cut -d: -f3)"
+    CANDIDATE_STATE=""
+    if [ -d "${CANDIDATE_DIR}" ]; then
+        CANDIDATE_STATE="$(stat -c '%u:%g:%a' "${CANDIDATE_DIR}" 2>/dev/null || true)"
+    fi
+    case "${CANDIDATE_STATE}" in
+        "0:${DOCKER_GID}:2770"|"0:${DOCKER_GID}:770")
+            log "Web AI candidate handoff directory permissions already compatible"
+            ;;
+        *)
+            # Infrastructure Executor 使用 RestrictSUIDSGID=yes；在该沙箱内
+            # 新建/纠正目录时不得尝试设置 SGID 位，否则 chmod 会返回 EPERM。
+            install -d -o root -g docker -m 0770 "${CANDIDATE_DIR}"
+            ;;
+    esac
 else
-    install -d -o root -g root -m 0750 /var/lib/private-ci/web-ai-candidates
+    install -d -o root -g root -m 0750 "${CANDIDATE_DIR}"
 fi
 log "Web AI candidate handoff directory ready"
 
