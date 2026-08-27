@@ -54,7 +54,7 @@ class TestMCPTools:
 
         monkeypatch.setenv("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", "true")
         tools = {tool.name: tool for tool in await mcp.list_tools()}
-        for name in ("build_github_patch", "replace_github_text_once", "edit_github_file_ranges", "apply_github_patch", "get_mygithub_capabilities", "plan_private_ci_job"):
+        for name in ("build_github_patch", "replace_github_text_once", "edit_github_file_ranges", "apply_github_patch", "get_mygithub_capabilities", "plan_private_ci_job", "resume_development_task"):
             assert name in tools
         assert "expected_blob_sha" in tools["edit_github_file_ranges"].description
         assert "expected_old_text" in tools["edit_github_file_ranges"].description
@@ -86,13 +86,13 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.4.1"
+        assert capabilities["version"] == "12.5.0"
         assert capabilities["max_upload_chunk_bytes"] == 24576
         assert capabilities["recommended_upload_chunk_bytes"] == 16384
         assert capabilities["preferred_upload_encoding"] == "text_for_utf8_base64_for_binary"
-        assert capabilities["tool_count"] == 167
-        assert capabilities["tool_manifest_count"] == 167
-        assert capabilities["compatibility_tool_count"] == 167
+        assert capabilities["tool_count"] == 168
+        assert capabilities["tool_manifest_count"] == 168
+        assert capabilities["compatibility_tool_count"] == 168
         assert capabilities["deprecated_tools_exposed"] is True
         assert capabilities["hidden_deprecated_tool_count"] == 0
         assert capabilities["hidden_deprecated_tools"] == []
