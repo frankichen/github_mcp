@@ -1281,6 +1281,257 @@ async def build_github_patch(
         return _mygithub10_error(exc)
 
 
+async def _claim_high_level_put(
+    tool_name: str,
+    request: dict,
+    dry_run: bool,
+    idempotency_key: str,
+    workspace_id: str,
+    expected_workspace_revision: int,
+) -> tuple[str, dict | None]:
+    if dry_run:
+        return "", None
+    return await _github_call(
+        mygithub10._idempotent_start,
+        tool_name,
+        idempotency_key,
+        request,
+        _write_audit_context(workspace_id, expected_workspace_revision),
+    )
+
+
+async def _run_high_level_put(
+    repository: str,
+    branch: str,
+    expected_head_sha: str,
+    prepared: list[dict],
+    commit_message: str,
+    dry_run: bool,
+    operation_id: str,
+    workspace_id: str,
+    expected_workspace_revision: int,
+) -> dict:
+    try:
+        await _github_call(
+            mygithub12.workspace_write_preflight,
+            _service,
+            repository,
+            branch,
+            expected_head_sha,
+            workspace_id,
+            expected_workspace_revision,
+        )
+    except Exception as exc:
+        if operation_id:
+            await _github_call(mygithub10.fail_put_operation, operation_id, exc, "workspace_preflight")
+        raise
+    result = await _github_call(
+        mygithub10.execute_put_files,
+        _service,
+        repository,
+        branch,
+        expected_head_sha,
+        prepared,
+        commit_message,
+        dry_run,
+        operation_id,
+    )
+    if not dry_run:
+        result = await _finalize_durable_write(result, workspace_id, expected_workspace_revision)
+    return result
+
+
+PUT_GITHUB_FILE_DESCRIPTION = "High-level Web AI UTF-8 file write. Provide repository/branch/path/content plus exact HEAD/blob CAS; MyGithut12 internally chunks, stages, verifies, commits and reads back. Callers never manage upload ids, offsets or chunk hashes. Direct content is bounded to a transport-safe size; larger content uses put_github_file_from_local_candidate."
+
+
+async def put_github_file(
+    repository: str,
+    branch: str,
+    path: str,
+    content: str,
+    expected_head_sha: str,
+    expected_blob_sha: str,
+    commit_message: str,
+    dry_run: bool = True,
+    idempotency_key: str = "",
+    workspace_id: str = "",
+    expected_workspace_revision: int = 0,
+) -> str:
+    try:
+        prepared = mygithub10.prepare_inline_put_files([
+            {"path": path, "content": content, "expected_blob_sha": expected_blob_sha}
+        ])
+        request = mygithub10.build_put_request(
+            "put_github_file",
+            repository,
+            branch,
+            expected_head_sha,
+            prepared,
+            commit_message,
+            workspace_id,
+            expected_workspace_revision,
+        )
+        operation_id, replay = await _claim_high_level_put(
+            "put_github_file",
+            request,
+            dry_run,
+            idempotency_key,
+            workspace_id,
+            expected_workspace_revision,
+        )
+        if replay:
+            return json.dumps(replay, ensure_ascii=False)
+        result = await _run_high_level_put(
+            repository,
+            branch,
+            expected_head_sha,
+            prepared,
+            commit_message,
+            dry_run,
+            operation_id,
+            workspace_id,
+            expected_workspace_revision,
+        )
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        return _mygithub10_error(exc)
+
+
+PUT_GITHUB_FILES_DESCRIPTION = "High-level atomic multi-file Web AI UTF-8 write. Pass files as a structured array of {path, content, expected_blob_sha}; MyGithut12 internally chunks/stages every file and creates one Git commit with exact HEAD/blob CAS, idempotency and durable read-back. No nested change_set JSON or upload lifecycle is exposed."
+
+
+async def put_github_files(
+    repository: str,
+    branch: str,
+    expected_head_sha: str,
+    files: list[dict[str, str]],
+    commit_message: str,
+    dry_run: bool = True,
+    idempotency_key: str = "",
+    workspace_id: str = "",
+    expected_workspace_revision: int = 0,
+) -> str:
+    try:
+        prepared = mygithub10.prepare_inline_put_files(files)
+        request = mygithub10.build_put_request(
+            "put_github_files",
+            repository,
+            branch,
+            expected_head_sha,
+            prepared,
+            commit_message,
+            workspace_id,
+            expected_workspace_revision,
+        )
+        operation_id, replay = await _claim_high_level_put(
+            "put_github_files",
+            request,
+            dry_run,
+            idempotency_key,
+            workspace_id,
+            expected_workspace_revision,
+        )
+        if replay:
+            return json.dumps(replay, ensure_ascii=False)
+        result = await _run_high_level_put(
+            repository,
+            branch,
+            expected_head_sha,
+            prepared,
+            commit_message,
+            dry_run,
+            operation_id,
+            workspace_id,
+            expected_workspace_revision,
+        )
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        return _mygithub10_error(exc)
+
+
+PUT_GITHUB_FILE_FROM_LOCAL_CANDIDATE_DESCRIPTION = "High-level large UTF-8 file write for Web AI transport limits. The caller supplies only a safe candidate basename from the fixed server-controlled candidate root plus exact size/SHA256 and Git HEAD/blob CAS; arbitrary host paths are never accepted. MyGithut12 verifies the candidate, internally chunks/stages it, commits, and performs durable read-back."
+
+
+async def put_github_file_from_local_candidate(
+    repository: str,
+    branch: str,
+    path: str,
+    candidate_name: str,
+    expected_size_bytes: int,
+    expected_sha256: str,
+    expected_head_sha: str,
+    expected_blob_sha: str,
+    commit_message: str,
+    dry_run: bool = True,
+    idempotency_key: str = "",
+    workspace_id: str = "",
+    expected_workspace_revision: int = 0,
+) -> str:
+    operation_id = ""
+    try:
+        # Build the idempotency identity from caller-attested metadata before
+        # touching the candidate. A verified replay therefore does not depend
+        # on the temporary candidate still being present.
+        descriptor = [{
+            "path": path,
+            "expected_blob_sha": expected_blob_sha,
+            "content_sha256": expected_sha256,
+            "size_bytes": expected_size_bytes,
+        }]
+        request = mygithub10.build_put_request(
+            "put_github_file_from_local_candidate",
+            repository,
+            branch,
+            expected_head_sha,
+            descriptor,
+            commit_message,
+            workspace_id,
+            expected_workspace_revision,
+            source_identity={
+                "candidate_name": candidate_name,
+                "expected_size_bytes": expected_size_bytes,
+                "expected_sha256": expected_sha256,
+            },
+        )
+        operation_id, replay = await _claim_high_level_put(
+            "put_github_file_from_local_candidate",
+            request,
+            dry_run,
+            idempotency_key,
+            workspace_id,
+            expected_workspace_revision,
+        )
+        if replay:
+            return json.dumps(replay, ensure_ascii=False)
+        try:
+            prepared = await _github_call(
+                mygithub10.prepare_local_candidate_file,
+                path,
+                expected_blob_sha,
+                candidate_name,
+                expected_size_bytes,
+                expected_sha256,
+            )
+        except Exception as exc:
+            if operation_id:
+                await _github_call(mygithub10.fail_put_operation, operation_id, exc, "payload_load")
+            raise
+        result = await _run_high_level_put(
+            repository,
+            branch,
+            expected_head_sha,
+            prepared,
+            commit_message,
+            dry_run,
+            operation_id,
+            workspace_id,
+            expected_workspace_revision,
+        )
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        return _mygithub10_error(exc)
+
+
 @mcp.tool(name="begin_github_file_upload", description="Begin a bounded, permission-0600 chunked file upload.")
 async def begin_github_file_upload() -> str:
     try: return json.dumps(await _github_call(mygithub10.begin_upload), ensure_ascii=False)
@@ -1474,6 +1725,15 @@ mcp.tool(
     name="read_mcp_response_resource",
     description="Read one bounded UTF-8 chunk from an oversized MCP response resource with SHA and continuation metadata.",
 )(read_mcp_response_resource)
+
+# MyGithut12 high-level Web AI write surface. Register these after the frozen
+# MyGithub10 compatibility manifest so old tool ordering/schema remains stable.
+mcp.tool(name="put_github_file", description=PUT_GITHUB_FILE_DESCRIPTION)(put_github_file)
+mcp.tool(name="put_github_files", description=PUT_GITHUB_FILES_DESCRIPTION)(put_github_files)
+mcp.tool(
+    name="put_github_file_from_local_candidate",
+    description=PUT_GITHUB_FILE_FROM_LOCAL_CANDIDATE_DESCRIPTION,
+)(put_github_file_from_local_candidate)
 
 # Stable DX-1 high-level orchestration surface. Keep registration after the
 # pre-12.1 tool set so manifest ordering remains backward compatible.

@@ -39,6 +39,9 @@ async def main() -> int:
             "edit_github_file_ranges",
             "replace_github_text_once",
             "build_github_patch",
+            "put_github_file",
+            "put_github_files",
+            "put_github_file_from_local_candidate",
             "get_mygithub_capabilities",
             "plan_private_ci_job",
         }

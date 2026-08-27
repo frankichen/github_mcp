@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     IDEMPOTENCY_DB_PATH: str = "/data/idempotency.db"
     IDEMPOTENCY_TTL_HOURS: int = 24
+    # Web AI large-file handoff uses one fixed host-mounted candidate root.
+    # MCP callers provide only a basename plus exact size/SHA; arbitrary host
+    # paths are never accepted.
+    MYGITHUB12_LOCAL_CANDIDATE_DIR: str = "/data/private-ci/web-ai-candidates"
     SERVICE_URL: str = "https://github.555044.xyz"
     DEPLOY_CALLBACK_API_KEY: SecretStr = SecretStr("")
     DEPLOY_CALLBACK_API_KEY_FILE: Optional[str] = None

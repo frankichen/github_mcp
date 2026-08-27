@@ -119,6 +119,14 @@ CIWORKER_BROKER_UID="$(run_ciworker_preheat /usr/bin/id -u)" || die "ciworker pr
 [ "${CIWORKER_BROKER_UID}" = "${CIWORKER_UID}" ] || die "ciworker preheat broker returned unexpected uid"
 log "ciworker preheat broker ready (uid=${CIWORKER_BROKER_UID})"
 
+# Web AI 超过单次 MCP 参数安全上限时，只允许把候选文件放进这个固定目录，
+# 高层 put 工具只接受 basename + size/SHA256，不接受调用方提供任意宿主机路径。
+# 复用 Controller 已有的 /var/lib/private-ci -> /data/private-ci 挂载，不新增
+# 服务、Secret 或 Docker mount。docker 组只获得该候选目录的写权限。
+getent group docker >/dev/null 2>&1 || die "docker group is required for Web AI candidate handoff"
+install -d -o root -g docker -m 2770 /var/lib/private-ci/web-ai-candidates
+log "Web AI candidate handoff directory ready"
+
 # ── 4. 重建并重启 controller（github-action-service）────────
 # 容器内代码通过镜像打包（build: .），heartbeat lease_token 修复需重建。
 log "Rebuilding github-action-service controller"
