@@ -337,19 +337,23 @@ def _heartbeat(state: str, current_deployment_id: str = "") -> None:
 
 
 def _running_heartbeat_loop(deployment_id: str, stop_event: threading.Event) -> None:
-    while not stop_event.is_set():
+    while not stop_event.wait(HEARTBEAT_SECONDS):
         try:
             _heartbeat("running", deployment_id)
         except Exception:
             # Heartbeat is best-effort while the fixed deployment keeps running.
             # A short Controller switch or callback transport failure must not abort it.
             pass
-        if stop_event.wait(HEARTBEAT_SECONDS):
-            return
 
 
 def _execute_with_heartbeat(row: dict) -> None:
     deployment_id = str(row["deployment_id"])
+    try:
+        _heartbeat("running", deployment_id)
+    except Exception:
+        # Establish the running identity before execute starts, but keep a short
+        # Controller switch non-fatal just like background heartbeat failures.
+        pass
     stop_event = threading.Event()
     heartbeat_thread = threading.Thread(
         target=_running_heartbeat_loop,
