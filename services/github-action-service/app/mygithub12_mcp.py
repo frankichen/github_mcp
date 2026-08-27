@@ -117,6 +117,10 @@ def register_mygithub12_tools(mcp, github_call, service) -> None:
     async def renew_development_workspace_lease(workspace_id: str, expected_workspace_revision: int, lease_seconds: int = mygithub12.DEFAULT_LEASE_SECONDS) -> str:
         return await _call(github_call, mygithub12.renew_workspace_lease, service, workspace_id, expected_workspace_revision, lease_seconds)
 
+    @mcp.tool(name="resume_development_workspace", description="Explicitly resume an expired workspace only after fresh branch/base identity checks and workspace revision CAS.", annotations=_WORKSPACE_WRITE)
+    async def resume_development_workspace(workspace_id: str, expected_workspace_revision: int, lease_seconds: int = mygithub12.DEFAULT_LEASE_SECONDS) -> str:
+        return await _call(github_call, mygithub12.resume_workspace, service, workspace_id, expected_workspace_revision, lease_seconds)
+
     @mcp.tool(name="refresh_development_workspace", description="Read the GitHub branch again and mark the workspace drifted if its branch moved externally.", annotations=_WORKSPACE_WRITE)
     async def refresh_development_workspace(workspace_id: str, expected_workspace_revision: int) -> str:
         return await _call(github_call, mygithub12.refresh_workspace, service, workspace_id, expected_workspace_revision)

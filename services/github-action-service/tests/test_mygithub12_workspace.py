@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from app import mygithub12 as core
@@ -180,48 +182,100 @@ def test_workspace_public_separates_write_lease_from_index_pin_grace(monkeypatch
     assert drifted["index_pin_active"] is True
 
 
-def test_expired_workspace_write_is_rejected_then_renewal_restores_lease_and_pin(
+def _resume_service(branch_sha: str = "b" * 40, base_sha: str = "a" * 40):
+    repo = SimpleNamespace(get_commit=lambda sha: SimpleNamespace(tree=SimpleNamespace(sha="c" * 40)))
+
+    def get_branch(repository, branch):
+        sha = base_sha if branch == "main" else branch_sha
+        return SimpleNamespace(commit=SimpleNamespace(sha=sha))
+
+    return SimpleNamespace(client=SimpleNamespace(get_branch=get_branch)), repo
+
+
+def test_legacy_active_expired_is_effectively_expired_and_absent_from_active_overlap(
     tmp_path, monkeypatch
 ):
-    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "renew-expired.db"))
-    monkeypatch.setenv("MYGITHUB12_EXPIRED_WORKSPACE_PIN_GRACE_SECONDS", "0")
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "effective-expired.db"))
     monkeypatch.setattr(workspace, "_now", lambda: 1000.0)
     monkeypatch.setattr(workspace, "_service_repo", lambda *args, **kwargs: object())
     workspace.init_db()
     with workspace._db() as db:
-        _seed_workspace(
-            db,
-            workspace_id="ws-expired",
-            branch="ai/expired",
-            lease_expires_at=900.0,
-        )
+        _seed_workspace(db, workspace_id="ws-expired", branch="ai/expired", lease_expires_at=900.0)
+        _seed_workspace(db, workspace_id="ws-live", branch="ai/live", lease_expires_at=1300.0)
+
+    expired = workspace.get_workspace(object(), "ws-expired")
+    assert expired["status"] == "expired"
+    assert expired["persisted_status"] == "active"
+    assert expired["scope"] == {"paths": ["app/**"]}
+    assert expired["pr_number"] == 42
+    assert [item["workspace_id"] for item in workspace.list_workspaces(object(), "owner/repo", "active")["items"]] == ["ws-live"]
+    assert [item["workspace_id"] for item in workspace.list_workspaces(object(), "owner/repo", "expired")["items"]] == ["ws-expired"]
+    assert workspace.workspace_overlap(object(), "ws-live", "[]")["items"] == []
+
+
+def test_expired_workspace_requires_explicit_resume_and_preserves_identity(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "resume-expired.db"))
+    monkeypatch.setattr(workspace, "_now", lambda: 1000.0)
+    service, repo = _resume_service()
+    monkeypatch.setattr(workspace, "_service_repo", lambda *args, **kwargs: repo)
+    workspace.init_db()
+    with workspace._db() as db:
+        _seed_workspace(db, workspace_id="ws-expired", branch="ai/expired", lease_expires_at=900.0)
 
     with pytest.raises(workspace.MyGithub12Error) as exc:
-        workspace.workspace_write_preflight(
-            object(),
-            "owner/repo",
-            "ai/expired",
-            "b" * 40,
-            workspace_id="ws-expired",
-            expected_workspace_revision=1,
-        )
+        workspace.renew_workspace_lease(service, "ws-expired", 1, lease_seconds=300)
     assert exc.value.code == "WORKSPACE_LEASE_REQUIRED"
+    assert exc.value.details["requires_resume"] is True
 
-    renewed = workspace.renew_workspace_lease(
-        object(), "ws-expired", 1, lease_seconds=300
-    )
+    resumed = workspace.resume_workspace(service, "ws-expired", 1, lease_seconds=300)
+    assert resumed["revision"] == 2
+    assert resumed["status"] == "active"
+    assert resumed["persisted_status"] == "active"
+    assert resumed["lease_expires_at"] == 1300.0
+    assert resumed["lease_valid"] is True
+    assert resumed["base_commit_sha"] == "a" * 40
+    assert resumed["head_sha"] == "b" * 40
+    assert resumed["tree_sha"] == "c" * 40
+    assert resumed["scope"] == {"paths": ["app/**"]}
+    assert resumed["pr_number"] == 42
+    assert resumed["resume_evidence"]["base_advanced"] is False
 
-    assert renewed["revision"] == 2
-    assert renewed["lease_expires_at"] == 1300.0
-    assert renewed["lease_valid"] is True
-    assert renewed["index_pin_active"] is True
-    assert renewed["repository"] == "owner/repo"
-    assert renewed["branch"] == "ai/expired"
-    assert renewed["base_commit_sha"] == "a" * 40
-    assert renewed["head_sha"] == "b" * 40
-    assert renewed["tree_sha"] == "c" * 40
-    assert renewed["scope"] == {"paths": ["app/**"]}
-    assert renewed["pr_number"] == 42
+
+def test_expired_workspace_resume_rejects_branch_drift_without_mutation(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "resume-drift.db"))
+    monkeypatch.setattr(workspace, "_now", lambda: 1000.0)
+    service, repo = _resume_service(branch_sha="d" * 40)
+    monkeypatch.setattr(workspace, "_service_repo", lambda *args, **kwargs: repo)
+    workspace.init_db()
+    with workspace._db() as db:
+        _seed_workspace(db, workspace_id="ws-expired", branch="ai/expired", lease_expires_at=900.0)
+
+    with pytest.raises(workspace.MyGithub12Error) as exc:
+        workspace.resume_workspace(service, "ws-expired", 1, lease_seconds=300)
+    assert exc.value.code == "WORKSPACE_BRANCH_DRIFTED"
+    with workspace._db() as db:
+        row = db.execute("SELECT status,revision,lease_expires_at FROM workspaces WHERE workspace_id='ws-expired'").fetchone()
+    assert tuple(row) == ("active", 1, 900.0)
+
+
+def test_new_workspace_converges_legacy_expired_branch_owner(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "branch-owner.db"))
+    monkeypatch.setattr(workspace, "_now", lambda: 1000.0)
+    monkeypatch.setattr(workspace, "resolve_identity", _resolve_identity)
+    service, repo = _resume_service()
+    monkeypatch.setattr(workspace, "_service_repo", lambda *args, **kwargs: repo)
+    monkeypatch.setattr(workspace, "get_index_status", lambda *args, **kwargs: {"status": "ready"})
+    workspace.init_db()
+    with workspace._db() as db:
+        _seed_workspace(db, workspace_id="ws-old", branch="ai/shared", lease_expires_at=900.0)
+
+    created = workspace.create_workspace(service, "owner/repo", "replacement", branch="ai/shared", create_branch=False, lease_seconds=300)
+    assert created["status"] == "active"
+    with workspace._db() as db:
+        old = db.execute("SELECT status,revision FROM workspaces WHERE workspace_id='ws-old'").fetchone()
+    assert tuple(old) == ("expired", 2)
 
 
 def test_default_workspace_lease_is_two_hours():

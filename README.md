@@ -57,13 +57,13 @@ private-deploy-agent（服务器端）
 
 ## GitHub Action Service
 
-MyGithut12 源码当前版本为 `12.3.4`；生产运行版本必须以 `get_mygithub_capabilities` 的实时结果为准。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。小范围唯一文本替换优先使用 `replace_github_text_once`，大文件仍使用 manifest、chunk read/upload 和 finalize/commit 流程，不退化为普通全文提交。
+MyGithut12 源码当前版本为 `12.4.0`；生产运行版本必须以 `get_mygithub_capabilities` 的实时结果为准。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。小范围唯一文本替换优先使用 `replace_github_text_once`，大文件仍使用 manifest、chunk read/upload 和 finalize/commit 流程，不退化为普通全文提交。
 
-Workspace 写 Lease 当前临时默认 7200 秒（2 小时），最大仍为 14400 秒（4 小时）。自动续签尚未启用；后续 DX2-WS-01 采用 activity-driven renew，只有 Session/Workspace/GitHub identity、revision CAS 和 drift 检查全部成立时才允许续签，闲置窗口不会被后台无限续命。
+Workspace 写 Lease 默认 7200 秒（2 小时），最大仍为 14400 秒（4 小时）。DX2-WS-01 使用 activity-driven renew：仅受控 Development Session 动作在剩余 Lease 不超过 1800 秒时尝试自动续签，并在 fresh GitHub HEAD/Tree、Workspace/Session identity、revision CAS、drift 和有效 Lease 全部成立后，原子同步 Workspace 与 Session revision；闲置窗口不会后台无限续命。已经过期的 Workspace 不会被普通 renew 或自动续签复活，必须显式调用 `resume_development_workspace` 重新验证 branch/base/Tree 后恢复。
 
 ChatGPT/MCP 分块上传使用 transport-safe 合同：`max_upload_chunk_bytes=24576`，推荐 `recommended_upload_chunk_bytes=16384`。UTF-8 Patch、源码和文档优先使用 `text` 字段，`content_base64` 仅用于必须按二进制传输的内容；非法 Base64、空 payload 或同时传两种编码会返回稳定错误码，不再降级成泛化 `INTERNAL_ERROR`。多文件 `finalize -> apply_development_change_set` 的原子 Commit 语义保持不变。
 
-MyGithut12 现在区分 canonical production Schema 与 compatibility registration：兼容层注册 166 个工具，生产默认 Schema 向 AI 暴露 163 个工具，并隐藏 `get_github_file`、`commit_github_files`、`get_test_deployment_logs` 三个 deprecated 工具；旧 handler 保留兼容调用能力。`get_mygithub_capabilities` 会基于当前实际可见 Schema 返回 `tool_schema_sha256`、`schema_generation_id`、可见工具数和兼容工具数，从而可以直接识别 Connector Schema 是否同步。新增只读 `plan_private_ci_job` 会在启动 CI 前按准确 Commit、仓库固定 policy、Manifest/workspace 和固定入口判断 `applicable/reason/detected_stacks/selected_profiles/workspaces`，但不会排队执行 CI。新增基础设施自部署工具只接受固定仓库、固定环境、固定 scope、exact main、repo-auto-check 和 current-build CAS，不接受 host、shell、script、rollback 或 failure-mode 参数。
+MyGithut12 现在区分 canonical production Schema 与 compatibility registration：兼容层注册 167 个工具，生产默认 Schema 向 AI 暴露 164 个工具，并隐藏 `get_github_file`、`commit_github_files`、`get_test_deployment_logs` 三个 deprecated 工具；旧 handler 保留兼容调用能力。`get_mygithub_capabilities` 会基于当前实际可见 Schema 返回 `tool_schema_sha256`、`schema_generation_id`、可见工具数和兼容工具数，从而可以直接识别 Connector Schema 是否同步。新增 `resume_development_workspace` 是 expired Workspace 的唯一显式恢复入口；只读 `plan_private_ci_job` 会在启动 CI 前按准确 Commit、仓库固定 policy、Manifest/workspace 和固定入口判断 `applicable/reason/detected_stacks/selected_profiles/workspaces`，但不会排队执行 CI。基础设施自部署工具只接受固定仓库、固定环境、固定 scope、exact main、repo-auto-check 和 current-build CAS，不接受 host、shell、script、rollback 或 failure-mode 参数。
 
 基础设施自部署的 `ciworker` 缓存预热通过 systemd 固定 User/Group broker 执行；Infrastructure Executor 本身继续保持 `NoNewPrivileges=true`，并在切换 Controller 前先验证 broker 能精确降权到 UID 1500，避免再次出现 Controller 已切换后才因 `runuser` 失败而把 deployment 标记失败。
 
@@ -95,7 +95,7 @@ docker compose up -d --build
 
 ## MyGithut12 运行状态
 
-MyGithut12 `12.3.4` 源码的 compatibility registration 仍为 166 个工具，canonical production Schema 仍为 163 个可见工具；生产 Schema 身份必须以运行时 capability 为准。除 Schema 降噪、CI Profile 预检和基础设施自部署控制面外，MyGithut12 自身成功合并 PR 后还会立即为新的 base/main exact SHA 请求 Repository Index identity；现有 same-tree cache 可以在 Tree 未变化时 100% 复用索引数据，同时仍保留新 Commit 独立合法的 index identity。Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
+MyGithut12 `12.4.0` 源码的 compatibility registration 为 167 个工具，canonical production Schema 为 164 个可见工具；生产 Schema 身份必须以运行时 capability 为准。DX2-WS-01 增加 expired effective state、显式 Workspace resume 和受控 Session activity-driven auto-renew；Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
 
 ## Private Deploy Agent
 

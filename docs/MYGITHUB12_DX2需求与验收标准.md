@@ -123,12 +123,12 @@ DX-2 所有功能均必须保持：
 4. overlap 默认只把真正活动 Writer 作为冲突候选；
 5. expired Workspace 必须继续保留 branch、head/tree、scope、owner、created/updated、审计和历史 Index identity；
 6. 过期不能自动删除 branch、PR、Commit、Index history 或审计；
-7. expired Workspace 如需恢复，必须通过显式 resume/recovery 路径重新校验 branch、base、drift 和 Lease；
+7. expired Workspace 如需恢复，必须通过显式 `resume_development_workspace` / recovery 路径重新校验 branch、base、HEAD/Tree、drift 和 Lease；
 8. 不能通过简单续 Lease 让已发生真实 drift 的 Workspace 恢复可写；
 9. 状态迁移需要兼容旧数据库记录；
 10. retention 只能清理可重建缓存或过期 pin，不得破坏 GitHub 事实对象；
 11. 在自动续签完成前，Workspace 创建、显式续签和 `prepare_development_task` 的临时默认 Lease 统一为 7200 秒（2 小时），`MAX_LEASE_SECONDS` 继续保持 14400 秒（4 小时）；
-12. 后续自动续签必须是 activity-driven，只能由受控 Development Session 编排动作触发；没有用户/AI 活动时不得后台无限续签；
+12. 后续自动续签必须是 activity-driven，只能由受控 Development Session 编排动作触发；默认仅在剩余 Lease 不超过 1800 秒时触发，续签窗口为 7200 秒；没有用户/AI 活动时不得后台无限续签；
 13. 自动续签前必须 fresh-read 并证明 GitHub branch HEAD == Workspace HEAD == Session HEAD、Workspace `drift_reason=null`、status=active、当前 Lease 尚有效；
 14. 自动续签必须使用 expected Workspace revision CAS；Workspace revision 推进后必须同步 Session 的 workspace revision/identity，禁止再次制造 `DEVELOPMENT_SESSION_WORKSPACE_MISMATCH`；
 15. expired、drifted、closed 或 identity 无法证明的 Workspace 不得自动复活，必须进入显式 resume/recovery；

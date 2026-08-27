@@ -70,14 +70,19 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
                     ) from exc
                 if not isinstance(pr_cfg,dict):
                     raise mygithub12.MyGithub12Error("SEARCH_QUERY_INVALID","pull_request_json must be an object")
-            audit={"development_session_id":development_session_id,"session_revision":expected_session_revision,"workspace_id":workspace["workspace_id"],"workspace_revision":expected_workspace_revision}
-            result=await github_call(dx.execute_change_set,service,session,workspace,parsed,expected_head_sha,expected_workspace_revision,commit_message,dry_run,idempotency_key,audit)
+            maintenance=await github_call(dx.maybe_auto_renew_session_workspace,service,development_session_id,expected_session_revision,expected_workspace_revision,expected_head_sha,idempotency_key)
+            session=maintenance["session"]; workspace=maintenance["workspace"]
+            effective_session_revision=int(session["session_revision"]); effective_workspace_revision=int(workspace["revision"])
+            lease_maintenance={"renewed":bool(maintenance.get("renewed")),"remaining_seconds":maintenance.get("remaining_seconds"),"audit":maintenance.get("audit")}
+            session,workspace=await github_call(dx.require_session_workspace,service,development_session_id,effective_session_revision,effective_workspace_revision,expected_head_sha)
+            audit={"development_session_id":development_session_id,"session_revision":effective_session_revision,"workspace_id":workspace["workspace_id"],"workspace_revision":effective_workspace_revision}
+            result=await github_call(dx.execute_change_set,service,session,workspace,parsed,expected_head_sha,effective_workspace_revision,commit_message,dry_run,idempotency_key,audit)
             if dry_run:
-                result["development_session_id"]=development_session_id; result["session_revision"]=expected_session_revision; result["workspace_revision"]=expected_workspace_revision
+                result["development_session_id"]=development_session_id; result["session_revision"]=effective_session_revision; result["workspace_revision"]=effective_workspace_revision; result["lease_maintenance"]=lease_maintenance
                 return json.dumps(result,ensure_ascii=False)
-            finalized=await finalize_write(result,workspace["workspace_id"],expected_workspace_revision)
+            finalized=await finalize_write(result,workspace["workspace_id"],effective_workspace_revision)
             try:
-                state=await github_call(dx.after_verified_change,service,development_session_id,expected_session_revision,finalized)
+                state=await github_call(dx.after_verified_change,service,development_session_id,effective_session_revision,finalized)
             except Exception as state_exc:
                 state_error=_error_payload(state_exc)
                 return json.dumps({
@@ -113,7 +118,7 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
                             "commit_already_verified":True,
                             "session_recovery_required":True,
                         }
-            response={"ok":True,**finalized,"development_session":state["session"],"index":state["index"],"index_error":state["index_error"],"pull_request":pr}
+            response={"ok":True,**finalized,"development_session":state["session"],"index":state["index"],"index_error":state["index_error"],"pull_request":pr,"lease_maintenance":lease_maintenance}
             if pr_error:
                 response["pull_request_error"]=pr_error["error"]
                 response["partial_success"]=True
@@ -125,16 +130,16 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
         development_session_id: str, expected_session_revision: int, mode: str="fast", base_sha: str="", force_rerun: bool=False,
         supersede_previous: bool=True, wait_seconds: int=55, include_failure_pack: bool=True, idempotency_key: str="",
     ) -> str:
-        del idempotency_key
         try:
             session=sessions.get_session(development_session_id)
             sessions._require_revision(development_session_id,expected_session_revision)
-            ws=await github_call(mygithub12.get_workspace,service,session["workspace_id"])
-            await github_call(mygithub12.workspace_write_preflight,service,session["repository"],session["branch"],session["head_commit_sha"],session["workspace_id"],ws["revision"])
             resolved_base=base_sha or session["base_commit_sha"]
             prepared=await github_call(dx.validation_preflight,service,session,mode,resolved_base)
+            maintenance=await github_call(dx.maybe_auto_renew_session_workspace,service,development_session_id,expected_session_revision,int(session["workspace_revision"]),session["head_commit_sha"],idempotency_key)
+            session=maintenance["session"]; ws=maintenance["workspace"]; effective_session_revision=int(session["session_revision"]); lease_maintenance={"renewed":bool(maintenance.get("renewed")),"remaining_seconds":maintenance.get("remaining_seconds"),"audit":maintenance.get("audit")}
+            await github_call(mygithub12.workspace_write_preflight,service,session["repository"],session["branch"],session["head_commit_sha"],session["workspace_id"],ws["revision"])
             phase="validating_fast" if mode=="fast" else "validating_full"
-            phase_session=await github_call(sessions.transition,development_session_id,expected_session_revision,phase,event_type="validation_started",allowed_from={"active","pr_ready","validating_fast","validating_full"})
+            phase_session=await github_call(sessions.transition,development_session_id,effective_session_revision,phase,event_type="validation_started",allowed_from={"active","pr_ready","validating_fast","validating_full"})
             try:
                 job,selection=await github_call(dx.start_validation_job,service,phase_session,mode,resolved_base,force_rerun,supersede_previous,prepared)
             except Exception as start_exc:
@@ -175,7 +180,7 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
                     "validation_result":result,"failed_stage":"validation_observe",
                     "orchestration_error":observe_error["error"],
                 },ensure_ascii=False)
-            return json.dumps({"ok":True,"development_session":final_session,"mode":mode,**result},ensure_ascii=False)
+            return json.dumps({"ok":True,"development_session":final_session,"mode":mode,"lease_maintenance":lease_maintenance,**result},ensure_ascii=False)
         except Exception as exc: return _error(exc)
 
     @mcp.tool(name="finalize_development_task",description="Prepare/update Draft PR, read readiness, safely merge with explicit confirmation, or close a development session/workspace.",annotations=_ORCHESTRATION)
@@ -184,10 +189,10 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
         merge_method: str="squash", required_private_ci_job_id: str="", confirm: bool=False, delete_head_branch: bool=False,
         idempotency_key: str="",
     ) -> str:
-        del idempotency_key
         try:
             session=sessions.get_session(development_session_id); sessions._require_revision(development_session_id,expected_session_revision,writable=action!="readiness")
             if action not in {"prepare_pr","readiness","merge","close"}: raise mygithub12.MyGithub12Error("DEVELOPMENT_SESSION_STATE_INVALID","unsupported finalize action",{"action":action})
+            cfg=None
             if action=="prepare_pr":
                 try:
                     cfg=json.loads(pull_request_json or "{}")
@@ -196,6 +201,14 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
                         "SEARCH_QUERY_INVALID","pull_request_json must be valid JSON",{"position":exc.pos}
                     ) from exc
                 if not isinstance(cfg,dict): raise mygithub12.MyGithub12Error("SEARCH_QUERY_INVALID","pull_request_json must be an object")
+            if action=="merge":
+                if not confirm: raise mygithub12.MyGithub12Error("CONFIRM_REQUIRED","confirm must be true")
+                if not session.get("pull_number"): raise mygithub12.MyGithub12Error("DEVELOPMENT_SESSION_STATE_INVALID","pull request is required before merge")
+            effective_session_revision=expected_session_revision; lease_maintenance={"renewed":False,"remaining_seconds":None,"audit":None}
+            if action!="close" and session["status"] in dx.AUTO_RENEW_SESSION_STATES:
+                maintenance=await github_call(dx.maybe_auto_renew_session_workspace,service,development_session_id,expected_session_revision,int(session["workspace_revision"]),session["head_commit_sha"],idempotency_key)
+                session=maintenance["session"]; effective_session_revision=int(session["session_revision"]); lease_maintenance={"renewed":bool(maintenance.get("renewed")),"remaining_seconds":maintenance.get("remaining_seconds"),"audit":maintenance.get("audit")}
+            if action=="prepare_pr":
                 if session.get("pull_number"):
                     pr=await github_call(github_utils.update_github_pull_request,session["repository"],int(session["pull_number"]),cfg.get("title"),cfg.get("body"),None,cfg.get("base_branch"),session["head_commit_sha"])
                     _require_ok_result(pr,"PULL_REQUEST_UPDATE_FAILED","pull request update failed")
@@ -206,7 +219,7 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
                     number=int(((pr or {}).get("pull_request") or {}).get("number") or 0)
                 if not number: raise mygithub12.MyGithub12Error("DEVELOPMENT_SESSION_RECOVERY_REQUIRED","pull request creation/update was not confirmed")
                 try:
-                    updated=await github_call(sessions.transition,development_session_id,expected_session_revision,"pr_ready",event_type="pull_request_prepared",allowed_from={"active","pr_ready"},fields={"pull_number":number})
+                    updated=await github_call(sessions.transition,development_session_id,effective_session_revision,"pr_ready",event_type="pull_request_prepared",allowed_from={"active","pr_ready"},fields={"pull_number":number})
                 except Exception as state_exc:
                     state_error=_error_payload(state_exc)
                     state_error["error"]["details"]={
@@ -219,18 +232,16 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
                         "failed_stage":"development_session_pr_finalize",
                         "orchestration_error":state_error["error"],
                     },ensure_ascii=False)
-                return json.dumps({"ok":True,"development_session":updated,"pull_request":pr},ensure_ascii=False)
+                return json.dumps({"ok":True,"development_session":updated,"pull_request":pr,"lease_maintenance":lease_maintenance},ensure_ascii=False)
             if action=="readiness":
-                if not session.get("pull_number"): return json.dumps({"ok":True,"ready":False,"blocking_reasons":["PULL_REQUEST_REQUIRED"],"development_session":session},ensure_ascii=False)
+                if not session.get("pull_number"): return json.dumps({"ok":True,"ready":False,"blocking_reasons":["PULL_REQUEST_REQUIRED"],"development_session":session,"lease_maintenance":lease_maintenance},ensure_ascii=False)
                 ready=await github_call(github_utils.get_github_pull_request_merge_readiness,session["repository"],int(session["pull_number"]),session["head_commit_sha"],required_private_ci_job_id,session["base_branch"])
-                return json.dumps({"ok":True,"development_session":session,"readiness":ready},ensure_ascii=False)
+                return json.dumps({"ok":True,"development_session":session,"readiness":ready,"lease_maintenance":lease_maintenance},ensure_ascii=False)
             if action=="merge":
-                if not confirm: raise mygithub12.MyGithub12Error("CONFIRM_REQUIRED","confirm must be true")
-                if not session.get("pull_number"): raise mygithub12.MyGithub12Error("DEVELOPMENT_SESSION_STATE_INVALID","pull request is required before merge")
                 merged=await github_call(github_utils.merge_github_pull_request,session["repository"],int(session["pull_number"]),merge_method,session["head_commit_sha"],required_private_ci_job_id,session["base_branch"],"","",delete_head_branch,True)
                 if not merged.get("ok") or not merged.get("merged"): return json.dumps({"ok":False,"development_session":session,"merge":merged},ensure_ascii=False)
                 try:
-                    updated=await github_call(sessions.transition,development_session_id,expected_session_revision,"merged",event_type="pull_request_merged",allowed_from={"active","pr_ready"})
+                    updated=await github_call(sessions.transition,development_session_id,effective_session_revision,"merged",event_type="pull_request_merged",allowed_from={"active","pr_ready"})
                 except Exception as state_exc:
                     state_error=_error_payload(state_exc)
                     return json.dumps({
@@ -239,9 +250,9 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
                         "failed_stage":"development_session_merge_finalize",
                         "orchestration_error":state_error["error"],
                     },ensure_ascii=False)
-                return json.dumps({"ok":True,"development_session":updated,"merge":merged},ensure_ascii=False)
+                return json.dumps({"ok":True,"development_session":updated,"merge":merged,"lease_maintenance":lease_maintenance},ensure_ascii=False)
             # close
-            closing=await github_call(sessions.transition,development_session_id,expected_session_revision,"closing",event_type="session_closing",allowed_from={"active","pr_ready","drifted","blocked","validating_fast","validating_full"})
+            closing=await github_call(sessions.transition,development_session_id,effective_session_revision,"closing",event_type="session_closing",allowed_from={"active","pr_ready","drifted","blocked","validating_fast","validating_full"})
             try:
                 ws=await github_call(mygithub12.get_workspace,service,closing["workspace_id"])
                 closed_ws=await github_call(mygithub12.close_workspace,service,closing["workspace_id"],ws["revision"])
@@ -262,5 +273,5 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
                     "failed_stage":"development_session_close_finalize",
                     "orchestration_error":state_error["error"],
                 },ensure_ascii=False)
-            return json.dumps({"ok":True,"development_session":closed,"workspace":closed_ws},ensure_ascii=False)
+            return json.dumps({"ok":True,"development_session":closed,"workspace":closed_ws,"lease_maintenance":lease_maintenance},ensure_ascii=False)
         except Exception as exc: return _error(exc)

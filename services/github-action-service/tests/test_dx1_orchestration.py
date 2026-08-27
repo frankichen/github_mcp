@@ -50,6 +50,16 @@ def _workspace(**overrides):
     return value
 
 
+def _no_renewal(session, workspace_revision=3):
+    return {
+        "renewed": False,
+        "session": {"session_revision": 1, "workspace_revision": workspace_revision, **session},
+        "workspace": {"workspace_id": session.get("workspace_id", "ws_test"), "revision": workspace_revision},
+        "remaining_seconds": 4000.0,
+        "audit": None,
+    }
+
+
 def test_development_session_cas_events_and_idempotency(tmp_path, monkeypatch):
     monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "mygithub12.db"))
     monkeypatch.setattr(sessions, "_now", lambda: 1000.0)
@@ -111,6 +121,63 @@ def test_development_session_idempotency_conflict_and_restart_recovery(tmp_path,
     assert current["status"] == "blocked"
     assert current["workspace_revision"] == 7
     assert current["head_commit_sha"] == SHA_C
+
+
+def test_atomic_session_workspace_auto_renew_syncs_revisions_and_audit(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "auto-renew.db"))
+    monkeypatch.setattr(sessions, "_now", lambda: 1000.0)
+    mygithub12.init_db()
+    with mygithub12._db() as db:
+        db.execute(
+            "INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("ws_test","owner/repo","ai/task","main",SHA_A,SHA_B,SHA_C,"active",3,"test",1100.0,SHA_B,"{}",None,None,10.0,20.0),
+        )
+    created=sessions.create_session(_workspace(lease_expires_at=1100.0))
+    renewed=sessions.auto_renew_session_workspace_lease(
+        created["session_id"],1,"ws_test",3,lease_seconds=7200,event_data={"idempotency_key":"renew-1"},
+    )
+    assert renewed["session"]["session_revision"] == 2
+    assert renewed["session"]["workspace_revision"] == 4
+    assert renewed["session"]["lease_expires_at"] == 8200.0
+    with mygithub12._db() as db:
+        row=db.execute("SELECT revision,lease_expires_at FROM workspaces WHERE workspace_id='ws_test'").fetchone()
+    assert tuple(row) == (4,8200.0)
+    event=sessions.list_events(created["session_id"])[-1]
+    assert event["event_type"] == "workspace_lease_auto_renewed"
+    assert event["data"]["idempotency_key"] == "renew-1"
+    assert event["data"]["before_workspace_revision"] == 3
+    assert event["data"]["after_workspace_revision"] == 4
+    with pytest.raises(mygithub12.MyGithub12Error) as exc:
+        sessions.auto_renew_session_workspace_lease(created["session_id"],1,"ws_test",3,lease_seconds=7200,event_data={"idempotency_key":"renew-1"})
+    assert exc.value.code == "DEVELOPMENT_SESSION_REVISION_MISMATCH"
+    with mygithub12._db() as db:
+        unchanged=db.execute("SELECT revision,lease_expires_at FROM workspaces WHERE workspace_id='ws_test'").fetchone()
+    assert tuple(unchanged) == (4,8200.0)
+
+
+def test_auto_renew_orchestrator_skips_long_lease_and_rejects_github_drift(monkeypatch):
+    session={"session_id":"dev_test","workspace_id":"ws_test","workspace_revision":3,"session_revision":1,"repository":"owner/repo","branch":"ai/task","head_commit_sha":SHA_B,"tree_sha":SHA_C,"lease_expires_at":5000.0,"lease_valid":True,"status":"active"}
+    workspace={**_workspace(lease_expires_at=5000.0),"lease_valid":True,"drift_reason":None}
+    monkeypatch.setattr(sessions, "_require_revision", lambda *args, **kwargs: session)
+    monkeypatch.setattr(sessions, "get_session", lambda *args, **kwargs: session)
+    monkeypatch.setattr(mygithub12, "get_workspace", lambda *args, **kwargs: workspace)
+    monkeypatch.setattr(mygithub12, "_now", lambda: 1000.0)
+    service=SimpleNamespace(client=SimpleNamespace(get_branch=lambda *args: (_ for _ in ()).throw(AssertionError("fresh GitHub read should not run outside renewal threshold"))))
+    skipped=dx.maybe_auto_renew_session_workspace(service,"dev_test",1,3,SHA_B,"renew-skip")
+    assert skipped["renewed"] is False
+    assert skipped["remaining_seconds"] == 4000.0
+
+    near_session={**session,"lease_expires_at":1100.0}
+    near_workspace={**workspace,"lease_expires_at":1100.0}
+    monkeypatch.setattr(sessions, "get_session", lambda *args, **kwargs: near_session)
+    monkeypatch.setattr(mygithub12, "get_workspace", lambda *args, **kwargs: near_workspace)
+    called=[]
+    monkeypatch.setattr(sessions, "auto_renew_session_workspace_lease", lambda *args, **kwargs: called.append(True))
+    drift_service=SimpleNamespace(client=SimpleNamespace(get_branch=lambda *args: SimpleNamespace(commit=SimpleNamespace(sha="d" * 40))))
+    with pytest.raises(mygithub12.MyGithub12Error) as exc:
+        dx.maybe_auto_renew_session_workspace(drift_service,"dev_test",1,3,SHA_B,"renew-drift")
+    assert exc.value.code == "WORKSPACE_BRANCH_DRIFTED"
+    assert called == []
 
 
 def test_prepare_task_success_transitions_preparing_session_to_active(tmp_path, monkeypatch):
@@ -204,6 +271,7 @@ async def test_apply_change_set_keeps_verified_commit_evidence_when_session_fina
     session = {"repository": "owner/repo", "branch": "ai/task", "base_branch": "main"}
     workspace = {"workspace_id": "ws_test"}
     monkeypatch.setattr(dx, "require_session_workspace", lambda *args, **kwargs: (session, workspace))
+    monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: _no_renewal(session))
     monkeypatch.setattr(dx, "execute_change_set", lambda *args, **kwargs: {"write_verified": True})
     monkeypatch.setattr(
         dx, "after_verified_change",
@@ -245,6 +313,7 @@ async def test_apply_change_set_pr_failure_is_partial_success_after_verified_com
     session = {"repository": "owner/repo", "branch": "ai/task", "base_branch": "main"}
     workspace = {"workspace_id": "ws_test"}
     monkeypatch.setattr(dx, "require_session_workspace", lambda *args, **kwargs: (session, workspace))
+    monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: _no_renewal(session))
     monkeypatch.setattr(dx, "execute_change_set", lambda *args, **kwargs: {"write_verified": True})
     monkeypatch.setattr(
         dx, "after_verified_change",
@@ -317,7 +386,7 @@ async def test_validate_job_start_failure_rolls_session_back(monkeypatch):
     session = {
         "session_id": "dev_test", "workspace_id": "ws_test", "repository": "owner/repo",
         "branch": "ai/task", "head_commit_sha": SHA_B, "base_commit_sha": SHA_A,
-        "status": "active", "session_revision": 1,
+        "status": "active", "session_revision": 1, "workspace_revision": 3,
     }
     phase_session = {**session, "status": "validating_fast", "session_revision": 2}
     rollback_session = {**session, "session_revision": 3}
@@ -326,6 +395,7 @@ async def test_validate_job_start_failure_rolls_session_back(monkeypatch):
     monkeypatch.setattr(mygithub12, "get_workspace", lambda *args: {"revision": 3})
     monkeypatch.setattr(mygithub12, "workspace_write_preflight", lambda *args: {"revision": 3})
     monkeypatch.setattr(dx, "validation_preflight", lambda *args, **kwargs: {"profile": "repo-fast-check"})
+    monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: _no_renewal(session))
     monkeypatch.setattr(
         dx, "start_validation_job",
         lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -363,10 +433,11 @@ async def test_finalize_merge_keeps_merge_evidence_when_session_finalize_fails(m
     session = {
         "session_id": "dev_test", "workspace_id": "ws_test", "repository": "owner/repo",
         "branch": "ai/task", "base_branch": "main", "head_commit_sha": SHA_B,
-        "status": "pr_ready", "session_revision": 4, "pull_number": 54, "metadata": {},
+        "status": "pr_ready", "session_revision": 4, "workspace_revision": 3, "pull_number": 54, "metadata": {},
     }
     monkeypatch.setattr(sessions, "get_session", lambda *args: session)
     monkeypatch.setattr(sessions, "_require_revision", lambda *args, **kwargs: session)
+    monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: _no_renewal(session))
     monkeypatch.setattr(
         dx_mcp.github_utils, "merge_github_pull_request",
         lambda *args, **kwargs: {"ok": True, "merged": True, "merge_commit_sha": SHA_C},

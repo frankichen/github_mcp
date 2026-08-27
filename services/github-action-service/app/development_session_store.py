@@ -219,6 +219,37 @@ def sync_from_workspace(
     return _public(updated)
 
 
+def auto_renew_session_workspace_lease(
+    session_id: str, expected_session_revision: int, workspace_id: str, expected_workspace_revision: int,
+    *, lease_seconds: int, event_data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Atomically advance an active Workspace lease and its Session revision."""
+    init_session_db(); now=_now(); bounded_lease=max(60,min(int(lease_seconds),core.MAX_LEASE_SECONDS))
+    with _LOCK,_db() as db:
+        session_row=db.execute("SELECT * FROM development_sessions WHERE session_id=?",(session_id,)).fetchone()
+        if not session_row: raise MyGithub12Error("DEVELOPMENT_SESSION_NOT_FOUND","development session was not found",{"development_session_id":session_id})
+        workspace_row=db.execute("SELECT * FROM workspaces WHERE workspace_id=?",(workspace_id,)).fetchone()
+        if not workspace_row: raise MyGithub12Error("WORKSPACE_NOT_FOUND","workspace was not found",{"workspace_id":workspace_id})
+        if int(session_row["session_revision"])!=int(expected_session_revision): raise MyGithub12Error("DEVELOPMENT_SESSION_REVISION_MISMATCH","development session revision changed",{"expected":expected_session_revision,"actual":session_row["session_revision"],"development_session_id":session_id})
+        if session_row["status"] in TERMINAL_STATES: raise MyGithub12Error("DEVELOPMENT_SESSION_CLOSED","development session is not active",{"status":session_row["status"]})
+        if session_row["workspace_id"]!=workspace_id: raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH","session and workspace identities differ")
+        if int(workspace_row["revision"])!=int(expected_workspace_revision): raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH","workspace revision changed",{"expected":expected_workspace_revision,"actual":workspace_row["revision"]})
+        if int(session_row["workspace_revision"])!=int(expected_workspace_revision): raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH","session does not reference the current workspace revision",{"session_workspace_revision":session_row["workspace_revision"],"workspace_revision":expected_workspace_revision})
+        if workspace_row["status"]=="drifted": raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","drifted workspace cannot be auto-renewed")
+        if workspace_row["status"]!="active" or float(workspace_row["lease_expires_at"] or 0)<=now or float(session_row["lease_expires_at"] or 0)<=now: raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED","expired workspace cannot be auto-renewed",{"workspace_id":workspace_id,"requires_resume":True})
+        if session_row["head_commit_sha"]!=workspace_row["head_sha"] or session_row["tree_sha"]!=workspace_row["tree_sha"]: raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH","session and workspace Git identities differ")
+        if abs(float(session_row["lease_expires_at"])-float(workspace_row["lease_expires_at"]))>0.001: raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH","session and workspace lease identities differ")
+        before_expiry=float(workspace_row["lease_expires_at"]); new_expiry=now+bounded_lease; new_workspace_revision=int(expected_workspace_revision)+1
+        cur=db.execute("UPDATE workspaces SET lease_expires_at=?,revision=revision+1,updated_at=? WHERE workspace_id=? AND revision=? AND status='active' AND lease_expires_at>?",(new_expiry,now,workspace_id,expected_workspace_revision,now))
+        if cur.rowcount!=1: raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH","workspace changed while auto-renewing lease")
+        cur=db.execute("UPDATE development_sessions SET workspace_revision=?,lease_expires_at=?,session_revision=session_revision+1,updated_at=? WHERE session_id=? AND session_revision=?",(new_workspace_revision,new_expiry,now,session_id,expected_session_revision))
+        if cur.rowcount!=1: raise MyGithub12Error("DEVELOPMENT_SESSION_REVISION_MISMATCH","development session changed while auto-renewing lease")
+        updated=db.execute("SELECT * FROM development_sessions WHERE session_id=?",(session_id,)).fetchone()
+        audit={**(event_data or {}),"before_expiry":before_expiry,"after_expiry":new_expiry,"before_workspace_revision":int(expected_workspace_revision),"after_workspace_revision":new_workspace_revision}
+        _append_event(db,updated,"workspace_lease_auto_renewed",session_row["status"],updated["status"],int(updated["session_revision"]),audit)
+    return {"session":_public(updated),"workspace_revision":new_workspace_revision,"lease_expires_at":new_expiry,"audit":audit}
+
+
 def transition(
     session_id: str, expected_revision: int, to_status: str, *, event_type: str = "state_changed", allowed_from: set[str] | None = None, fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:

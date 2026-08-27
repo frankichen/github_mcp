@@ -420,7 +420,7 @@ def _workspace_index_pin_active(
     *,
     now: float | None = None,
 ) -> bool:
-    if status not in {"active", "drifted"} or lease_expires_at is None:
+    if status not in {"active", "drifted", "expired"} or lease_expires_at is None:
         return False
     current = _now() if now is None else float(now)
     return float(lease_expires_at) + _expired_workspace_pin_grace_seconds() > current
@@ -429,7 +429,7 @@ def _workspace_index_pin_active(
 def _workspace_index_pin_grace_expires_at(
     status: str, lease_expires_at: float | int | None
 ) -> float | None:
-    if status not in {"active", "drifted"} or lease_expires_at is None:
+    if status not in {"active", "drifted", "expired"} or lease_expires_at is None:
         return None
     return float(lease_expires_at) + _expired_workspace_pin_grace_seconds()
 
@@ -444,7 +444,7 @@ def _workspace_protected_index_commits(
         """SELECT index_commit_sha, base_commit_sha, head_sha
            FROM workspaces
            WHERE repository=?
-             AND status IN ('active','drifted')
+             AND status IN ('active','drifted','expired')
              AND lease_expires_at>?""",
         (repository, cutoff),
     ):
@@ -1687,7 +1687,7 @@ def analyze_patch_from_ref(service: Any, repository: str, base_commit_sha: str,
 
 
 from app.mygithub12_workspace import (
-    create_workspace, get_workspace, list_workspaces, renew_workspace_lease,
+    create_workspace, get_workspace, list_workspaces, renew_workspace_lease, resume_workspace,
     refresh_workspace, close_workspace, declare_workspace_scope, workspace_overlap,
     workspace_sync_plan, workspace_write_preflight, workspace_write_complete,
 )

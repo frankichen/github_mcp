@@ -253,30 +253,31 @@ DX2-WS-01 + DX2-RESUME-01
 - [x] `create_development_workspace`、`renew_development_workspace_lease`、`prepare_development_task` 的默认值统一；
 - [x] `MAX_LEASE_SECONDS=14400` 保持不变；
 - [x] Schema/单测明确校验 7200 默认值；
-- [ ] 合并并发布后以 production Schema/capability 复验。
+- [x] 2 小时默认 Lease 已在 production `12.3.4` 通过 Schema/capability 复验。
 
 ### 后续自动续签
 
-- [ ] 采用 activity-driven renew，不启后台无限续签线程；
-- [ ] 续签阈值和窗口使用受控常量；
-- [ ] fresh-read GitHub / Workspace / Session 三方 HEAD/Tree；
-- [ ] `drift_reason=null`、status active、Lease 尚有效；
-- [ ] expected Workspace revision CAS；
-- [ ] 续签成功后同步 Session workspace revision；
-- [ ] expired/drifted/closed 不自动复活；
-- [ ] renewal idempotency + audit before/after；
-- [ ] 任一 identity/CAS 校验失败在写操作前 fail-stop。
+- [x] 采用 activity-driven renew，不启后台无限续签线程；
+- [x] 续签阈值固定为受控常量 `AUTO_RENEW_THRESHOLD_SECONDS=1800`，续签窗口使用 `DEFAULT_LEASE_SECONDS=7200`；
+- [x] fresh-read GitHub / Workspace / Session 三方 HEAD/Tree；
+- [x] `drift_reason=null`、status active、Lease 尚有效；
+- [x] expected Workspace revision CAS；
+- [x] 续签成功后在同一 SQLite 事务内同步 Session workspace revision；
+- [x] expired/drifted/closed 不自动复活；expired 必须显式 `resume_development_workspace`；
+- [x] renewal idempotency + `development_session_events` audit before/after；
+- [x] 任一 identity/CAS 校验失败在写操作前 fail-stop；
+- [ ] 合并并发布后以 production `12.4.0` runtime 验证 auto-renew / resume Schema。
 
 ### 实现清单
 
-- [ ] 定义 `expired` effective/persisted state 契约；
-- [ ] 兼容历史 `status=active + lease_valid=false`；
-- [ ] 默认 active 查询过滤 expired；
-- [ ] overlap 默认忽略 expired Writer；
-- [ ] 审计查询仍可看到 expired；
-- [ ] Index pin 生命周期与状态对齐；
-- [ ] resume 前重新验 branch HEAD/Tree/drift；
-- [ ] 绝不自动删 branch/PR。
+- [x] 定义 `expired` effective/persisted state 契约，并保留 `persisted_status` 证据；
+- [x] 兼容历史 `status=active + lease_valid=false`；
+- [x] 默认 active 查询过滤 expired，expired 查询兼容历史记录；
+- [x] overlap 默认忽略 expired Writer；
+- [x] 历史 identity/scope/PR/Session event audit 仍可查询；
+- [x] Index pin grace 生命周期与 `expired` 状态对齐；
+- [x] `resume_development_workspace` 前重新验 branch HEAD/Tree/base，并以 Workspace revision CAS 恢复；
+- [x] 普通 renew 不复活 expired，绝不自动删 branch/PR。
 
 ### 数据迁移要求
 
