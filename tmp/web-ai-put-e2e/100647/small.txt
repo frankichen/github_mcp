@@ -1,0 +1,2 @@
+small file via production MCP high-level put
+中文/quotes/JSON: {ok: true, n: 1}
