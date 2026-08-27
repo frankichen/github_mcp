@@ -77,7 +77,7 @@ DX2-WS-01 + DX2-RESUME-01
 | DX2-00 | P0 | `IN_PROGRESS` | 固化 DX-2 规划、需求、清单和入口 | 文档落库、README 可发现、Draft PR |
 | DX2-WRITE-01 | P1 | `IN_PROGRESS` | 新文件 builder 输出可原样 strict apply | AC-WRITE-01～06 |
 | DX2-CI-01 | P0 | `NOT_STARTED` | 两个独立 Private CI Worker 真并行 | AC-CI-01～10 |
-| DX2-WS-01 | P0 | `NOT_STARTED` | Lease 过期对象退出默认 active Writer | AC-WS-01～07 |
+| DX2-WS-01 | P0 | `IN_PROGRESS` | Lease 过期对象退出默认 active Writer + guarded auto-renew | AC-WS-01～13 |
 | DX2-SESSION-01 | P0 | `NOT_STARTED` | 安全恢复 stale Session，不掩盖真实 drift | AC-SESSION-01～07 |
 | DX2-INFRA-01 | P1 | `NOT_STARTED` | 长 self-deploy 持续 heartbeat | AC-INFRA-HB-01～05 |
 | DX2-INFRA-02 | P1 | `NOT_STARTED` | self-deploy long-poll 和紧凑诊断 | AC-INFRA-WAIT-01～05 |
@@ -237,7 +237,7 @@ DX2-WS-01 + DX2-RESUME-01
 
 ### 状态
 
-`NOT_STARTED`
+`IN_PROGRESS`
 
 ### 预计修改模块
 
@@ -246,6 +246,26 @@ DX2-WS-01 + DX2-RESUME-01
 - overlap analysis
 - Workspace MCP 列表/读取工具
 - Workspace 测试
+
+### 临时缓解：2 小时默认 Lease
+
+- [x] `DEFAULT_LEASE_SECONDS` 从 1800 调整为 7200；
+- [x] `create_development_workspace`、`renew_development_workspace_lease`、`prepare_development_task` 的默认值统一；
+- [x] `MAX_LEASE_SECONDS=14400` 保持不变；
+- [x] Schema/单测明确校验 7200 默认值；
+- [ ] 合并并发布后以 production Schema/capability 复验。
+
+### 后续自动续签
+
+- [ ] 采用 activity-driven renew，不启后台无限续签线程；
+- [ ] 续签阈值和窗口使用受控常量；
+- [ ] fresh-read GitHub / Workspace / Session 三方 HEAD/Tree；
+- [ ] `drift_reason=null`、status active、Lease 尚有效；
+- [ ] expected Workspace revision CAS；
+- [ ] 续签成功后同步 Session workspace revision；
+- [ ] expired/drifted/closed 不自动复活；
+- [ ] renewal idempotency + audit before/after；
+- [ ] 任一 identity/CAS 校验失败在写操作前 fail-stop。
 
 ### 实现清单
 
@@ -267,7 +287,7 @@ DX2-WS-01 + DX2-RESUME-01
 
 ### 验收
 
-对应 `AC-WS-01`～`AC-WS-07`。
+对应 `AC-WS-01`～`AC-WS-13`。
 
 ## 8. DX2-SESSION-01：Session / Workspace 安全恢复
 

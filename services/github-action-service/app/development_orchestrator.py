@@ -60,7 +60,7 @@ def context_pack_v2(
 def prepare_task(
     service: Any, repository: str, task_name: str, base_ref: str="main", branch: str="", owner: str="chatgpt",
     create_branch: bool=True, seed_paths_json: str="[]", seed_symbols_json: str="[]", include_tests: bool=True,
-    include_docs: bool=True, lease_seconds: int=1800, context_budget_bytes: int=262144, idempotency_key: str="",
+    include_docs: bool=True, lease_seconds: int=mygithub12.DEFAULT_LEASE_SECONDS, context_budget_bytes: int=262144, idempotency_key: str="",
 ) -> dict[str, Any]:
     policy=operation_policy(service,repository)
     existing=sessions.find_session_by_idempotency(repository,idempotency_key)
