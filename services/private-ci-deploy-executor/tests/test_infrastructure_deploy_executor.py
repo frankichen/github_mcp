@@ -136,3 +136,158 @@ def test_callback_header_uses_dedicated_secret_file(monkeypatch, tmp_path):
     assert result == {"ok": True}
     assert seen["headers"]["X-Infrastructure-Deployment-Callback-Key"] == "dedicated-test-key"
     assert "X-Deployment-Callback-Key" not in seen["headers"]
+
+
+def test_running_heartbeat_keeps_same_deployment_identity_and_stops(monkeypatch):
+    calls = []
+    monkeypatch.setattr(executor, "HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        executor,
+        "_heartbeat",
+        lambda state, deployment_id="": calls.append((state, deployment_id)),
+    )
+
+    def fake_execute(row):
+        deadline = executor.time.monotonic() + 0.5
+        while sum(1 for state, _ in calls if state == "running") < 3:
+            if executor.time.monotonic() >= deadline:
+                raise AssertionError("running heartbeat did not repeat during deployment")
+            executor.time.sleep(0.005)
+
+    monkeypatch.setattr(executor, "execute", fake_execute)
+    executor._execute_with_heartbeat(_row())
+
+    running = [item for item in calls if item[0] == "running"]
+    assert len(running) >= 3
+    assert {deployment_id for _, deployment_id in running} == {"infra_dep_1"}
+    assert calls[-1] == ("idle", "")
+    final_count = len(calls)
+    executor.time.sleep(0.03)
+    assert len(calls) == final_count
+
+
+def test_running_heartbeat_recovers_after_temporary_callback_error(monkeypatch):
+    calls = []
+    completed = []
+    monkeypatch.setattr(executor, "HEARTBEAT_SECONDS", 0.01)
+
+    def flaky_heartbeat(state, deployment_id=""):
+        calls.append((state, deployment_id))
+        running_count = sum(1 for item_state, _ in calls if item_state == "running")
+        if state == "running" and running_count == 1:
+            raise RuntimeError("temporary controller 502")
+
+    def fake_execute(row):
+        deadline = executor.time.monotonic() + 0.5
+        while sum(1 for state, _ in calls if state == "running") < 3:
+            if executor.time.monotonic() >= deadline:
+                raise AssertionError("running heartbeat did not recover")
+            executor.time.sleep(0.005)
+        completed.append(row["deployment_id"])
+
+    monkeypatch.setattr(executor, "_heartbeat", flaky_heartbeat)
+    monkeypatch.setattr(executor, "execute", fake_execute)
+    executor._execute_with_heartbeat(_row())
+
+    assert completed == ["infra_dep_1"]
+    assert sum(1 for state, _ in calls if state == "running") >= 3
+    assert {deployment_id for state, deployment_id in calls if state == "running"} == {"infra_dep_1"}
+    assert calls[-1] == ("idle", "")
+
+
+def test_running_heartbeat_stops_and_reports_idle_when_execute_raises(monkeypatch):
+    calls = []
+    monkeypatch.setattr(executor, "HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        executor,
+        "_heartbeat",
+        lambda state, deployment_id="": calls.append((state, deployment_id)),
+    )
+    monkeypatch.setattr(executor, "execute", lambda row: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    try:
+        executor._execute_with_heartbeat(_row())
+    except RuntimeError as exc:
+        assert str(exc) == "boom"
+    else:
+        raise AssertionError("execute error must propagate after heartbeat cleanup")
+
+    assert calls[0] == ("running", "infra_dep_1")
+    assert calls[-1] == ("idle", "")
+    final_count = len(calls)
+    executor.time.sleep(0.03)
+    assert len(calls) == final_count
+
+
+def test_running_heartbeat_cleans_up_for_deployment_failure_and_timeout(monkeypatch, tmp_path):
+    heartbeat_calls = []
+    monkeypatch.setattr(executor, "HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        executor,
+        "_heartbeat",
+        lambda state, deployment_id="": heartbeat_calls.append((state, deployment_id)),
+    )
+    monkeypatch.setattr(executor, "_progress", lambda *args: None)
+    monkeypatch.setattr(executor.shutil, "rmtree", lambda *args, **kwargs: None)
+
+    def run_case(name, returncode, fire_timeout):
+        workspace = tmp_path / name
+        script = workspace / executor.DEPLOY_SCRIPT
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\n", encoding="utf-8")
+        callbacks = []
+        monkeypatch.setattr(executor, "prepare_workspace", lambda value: (str(workspace), []))
+
+        class FakeProcess:
+            stdout = []
+
+            def __init__(self):
+                self.returncode = None if fire_timeout else returncode
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+        process = FakeProcess()
+        monkeypatch.setattr(executor.subprocess, "Popen", lambda *args, **kwargs: process)
+
+        class FakeTimer:
+            def __init__(self, seconds, callback):
+                self.callback = callback
+                self.daemon = False
+
+            def start(self):
+                if fire_timeout:
+                    self.callback()
+
+            def cancel(self):
+                return None
+
+        monkeypatch.setattr(executor.threading, "Timer", FakeTimer)
+        monkeypatch.setattr(
+            executor,
+            "_request",
+            lambda method, path, payload=None, **kwargs: callbacks.append((path, payload)) or {"ok": True},
+        )
+
+        before = len(heartbeat_calls)
+        executor._execute_with_heartbeat(_row())
+        case_heartbeats = heartbeat_calls[before:]
+        assert case_heartbeats[0] == ("running", "infra_dep_1")
+        assert case_heartbeats[-1] == ("idle", "")
+        fail_callbacks = [(path, payload) for path, payload in callbacks if path.endswith("/fail")]
+        assert len(fail_callbacks) == 1
+        return fail_callbacks[0][1]
+
+    failure = run_case("failure", 17, False)
+    assert failure["exit_code"] == 17
+    assert failure["error_code"] == "INFRASTRUCTURE_DEPLOYMENT_FAILED"
+
+    timeout = run_case("timeout", -15, True)
+    assert timeout["exit_code"] == 124
+    assert timeout["error_code"] == "INFRASTRUCTURE_DEPLOYMENT_TIMEOUT"
