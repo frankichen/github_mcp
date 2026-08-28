@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from private_ci_agent.executor import JobExecutor
+from private_ci_agent.executor import CACHE_MAP, JobExecutor
 from private_ci_agent.models import Job
 from private_ci_agent.podman import PodmanRunner
 from private_ci_agent.profiles import python_commands_for_workspace
@@ -149,6 +149,7 @@ class SuccessPodman:
 
 def _executor(podman):
     executor = object.__new__(JobExecutor)
+    executor.cache_map = CACHE_MAP
     executor.podman = podman
     executor.log_manager = FakeLogManager()
     executor.client = FakeClient()
