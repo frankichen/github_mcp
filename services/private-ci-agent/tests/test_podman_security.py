@@ -198,6 +198,7 @@ def test_playwright_cache_mount_and_environment_are_explicit(monkeypatch, tmp_pa
 
     monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
     cache = tmp_path / "ms-playwright"
+    cache.mkdir()
     result = PodmanRunner("podman").run_command(
         "docker.io/library/node:22", "job-123", str(tmp_path / "source"),
         {"npm": str(tmp_path / "npm"), "playwright": str(cache)},
@@ -206,7 +207,7 @@ def test_playwright_cache_mount_and_environment_are_explicit(monkeypatch, tmp_pa
 
     assert result["exit_code"] == 0
     command = captured[0]
-    assert f"{cache}:/ci-cache/ms-playwright:rw,z" in command
+    assert f"{cache}:/ci-cache/ms-playwright:ro,z" in command
     assert "PLAYWRIGHT_BROWSERS_PATH=/ci-cache/ms-playwright" in command
     assert not any("node_modules" in item for item in command)
     assert "--http-proxy=false" in command
@@ -225,11 +226,12 @@ def test_shared_browser_cache_uses_nonexclusive_relabel(monkeypatch, tmp_path):
     first.mkdir()
     second.mkdir()
     cache = tmp_path / "ms-playwright"
+    cache.mkdir()
     runner = PodmanRunner("podman")
     runner.run_command("docker.io/library/node:22", "job-a", str(first), {"playwright": str(cache)}, "true", 30, network=False)
     runner.run_command("docker.io/library/node:22", "job-b", str(second), {"playwright": str(cache)}, "true", 30, network=False)
 
-    assert all(f"{cache}:/ci-cache/ms-playwright:rw,z" in command for command in captured)
+    assert all(f"{cache}:/ci-cache/ms-playwright:ro,z" in command for command in captured)
     assert all(":Z" not in item for command in captured for item in command if "ms-playwright" in item)
 
 
@@ -433,13 +435,18 @@ def test_run_command_with_cancel_event_stops_container_and_reports_cancelled(mon
 
     assert result["cancelled"] is True
     assert result["exit_code"] == -1
-    assert any("ci-job-123" in str(cmd) for cmd in killed)
+    assert any("ci-wsl-ci-01-job-123" in str(cmd) for cmd in killed)
 
 
-def test_kill_job_stops_every_container_with_job_prefix(monkeypatch):
+def test_kill_job_stops_only_current_worker_job_containers(monkeypatch):
     import private_ci_agent.podman as podman_module
 
-    ps_output = "ci-job-123-abc123\nci-job-123-def456\nci-job-999-other\nci-svc-job_123\n"
+    ps_output = (
+        "ci-wsl-ci-01-job-123-abc123\n"
+        "ci-wsl-ci-01-job-123-def456\n"
+        "ci-wsl-ci-01-job-999-other\n"
+        "ci-wsl-ci-02-job-123-other\n"
+    )
     stopped = []
 
     def fake_run(cmd, **_kwargs):
@@ -449,19 +456,24 @@ def test_kill_job_stops_every_container_with_job_prefix(monkeypatch):
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(podman_module.subprocess, "run", fake_run)
-    runner = PodmanRunner("podman")
+    runner = PodmanRunner("podman", "wsl-ci-01")
     count = runner.kill_job("job-123")
 
     assert count == 2
-    assert any("ci-job-123-abc123" in cmd and cmd[1] == "stop" for cmd in stopped)
-    assert any("ci-job-123-def456" in cmd and cmd[1] == "stop" for cmd in stopped)
-    assert not any("ci-job-999" in cmd or "ci-svc-job_123" in cmd for cmd in stopped)
+    assert any("ci-wsl-ci-01-job-123-abc123" in cmd and cmd[1] == "stop" for cmd in stopped)
+    assert any("ci-wsl-ci-01-job-123-def456" in cmd and cmd[1] == "stop" for cmd in stopped)
+    assert not any("ci-wsl-ci-02" in item for cmd in stopped for item in cmd)
+    assert not any("ci-wsl-ci-01-job-999" in item for cmd in stopped for item in cmd)
 
 
-def test_cleanup_stale_keeps_active_job_containers(monkeypatch):
+def test_cleanup_stale_keeps_active_job_and_other_worker_containers(monkeypatch):
     import private_ci_agent.podman as podman_module
 
-    ps_output = "ci-job-123-abc123\nci-job-456-stale\n"
+    ps_output = (
+        "ci-wsl-ci-01-job-123-abc123\n"
+        "ci-wsl-ci-01-job-456-stale\n"
+        "ci-wsl-ci-02-job-456-running\n"
+    )
     removed = []
 
     def fake_run(cmd, **_kwargs):
@@ -472,9 +484,9 @@ def test_cleanup_stale_keeps_active_job_containers(monkeypatch):
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(podman_module.subprocess, "run", fake_run)
-    PodmanRunner("podman").cleanup_stale(["job-123"])
+    PodmanRunner("podman", "wsl-ci-01").cleanup_stale(["job-123"])
 
-    assert removed == [["podman", "rm", "-f", "ci-job-456-stale"]]
+    assert removed == [["podman", "rm", "-f", "ci-wsl-ci-01-job-456-stale"]]
 
 
 def test_image_digest_prefers_registry_repo_digest(monkeypatch):
