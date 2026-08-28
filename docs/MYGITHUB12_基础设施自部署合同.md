@@ -165,4 +165,8 @@ source_prepare -> validation -> controller_build -> controller_switch
 -> health -> preheat -> post_verify -> completed|failed
 ```
 
+DX2-CI-B 的双 Worker rollout 固定在同一 `apply-fixes.sh` 合同内：部署先安装受审的 `private-ci-agent@.service` 模板与 legacy w1 `ReadWritePaths` drop-in，创建两个 Worker 的私有 writable root；legacy w1 必须在 `controller_switch` 前加载新 Agent 代码，已启用的 w2 同样先刷新代码；首次 `wsl-ci-02` 的 enable/start 只能发生在 Controller 已切换且共享只读资产预热完成之后。最终 `post_verify` 同时要求 w1/w2 active。该顺序不允许调用方指定额外 service、host、shell 或 failure mode。
+
+Worker 隔离合同：`workspace/log/run/可写语言 cache` 按 Worker 分目录；job/service Podman 名称包含 Worker identity；共享内容仅限 sealed dependency environment cache、只读 Playwright browser cache，以及使用同仓库互斥锁的 bare Git mirror。每个 job 保留固定 Podman CPU/memory/swap/pids/tmpfs 限额，systemd 实例另有固定 Memory/CPU/Tasks 上限。
+
 marker 仅决定只读诊断中的阶段，不改变 shell、脚本、host、failure mode 或 rollback 合同。未知 marker 不扩展允许阶段。日志 tail 在返回前再次执行 Secret / Authorization / Cookie / Token / database connection URL 脱敏；本扩展不增加 cancel、rollback 或任意执行入口。
