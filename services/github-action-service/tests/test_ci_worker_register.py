@@ -227,23 +227,19 @@ def test_heartbeat_renews_current_job_lease_for_authenticated_worker(client, mon
     assert response.json()["cancel_requested"] is False
 
 
-def test_heartbeat_falls_back_to_auth_when_lease_token_missing(client, monkeypatch):
-    """Legacy workers that do not send lease_token keep the old fallback."""
-    from app.routers import ci_worker
-
+def test_heartbeat_without_job_lease_token_fails_closed(client, monkeypatch):
     renewed_with = []
 
     async def accept(_request):
         return "wsl-ci-test"
 
-    def fake_renew_lease(job_id, lease_token):
-        renewed_with.append((job_id, lease_token))
+    def fake_renew_lease(*args):
+        renewed_with.append(args)
         return True
 
     monkeypatch.setattr(ci_worker, "verify_ci_worker", accept)
     monkeypatch.setattr(ci_worker, "update_worker_heartbeat", lambda _worker_id: None)
     monkeypatch.setattr(ci_worker, "renew_lease", fake_renew_lease)
-    monkeypatch.setattr(ci_worker, "need_heartbeat", lambda _job_id: False)
 
     response = client.post(
         "/internal/ci/workers/heartbeat",
@@ -252,7 +248,10 @@ def test_heartbeat_falls_back_to_auth_when_lease_token_missing(client, monkeypat
     )
 
     assert response.status_code == 200
-    assert renewed_with == [("job-lease-2", "worker-token")]
+    assert renewed_with == []
+    assert response.json()["lease_renewed"] is False
+    assert response.json()["lease_lost"] is True
+    assert response.json()["cancel_requested"] is True
 
 
 
