@@ -530,8 +530,10 @@ def test_worker_runtime_roots_are_fixed_and_writable_state_is_isolated(monkeypat
 def test_second_worker_systemd_template_and_resource_limits_are_fixed():
     unit = (DEPLOY_DIR / "private-ci-agent@.service").read_text(encoding="utf-8")
     dropin = (DEPLOY_DIR / "private-ci-agent.service.d" / "dx2-worker-roots.conf").read_text(encoding="utf-8")
+    launcher = (DEPLOY_DIR.parent / "run-agent-with-proxy.sh").read_text(encoding="utf-8")
 
     assert "Environment=PRIVATE_CI_WORKER_ID=%i" in unit
+    assert 'export PRIVATE_CI_CONTAINER_PROXY_HOST="${PRIVATE_CI_CONTAINER_PROXY_HOST:-10.0.2.2}"' in launcher
     assert "ReadWritePaths=/srv/private-ci/workers /srv/private-ci/cache" in unit
     assert "MemoryMax=3G" in unit
     assert "CPUQuota=250%" in unit

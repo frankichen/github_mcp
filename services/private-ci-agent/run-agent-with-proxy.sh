@@ -12,6 +12,9 @@ case "${WORKER_ID}" in
     *) echo "[proxy-launcher] ERROR: CI_WORKER_ID_INVALID" >&2; exit 2 ;;
 esac
 export PRIVATE_CI_WORKER_ID="${WORKER_ID}"
+# Rootless Podman reaches the Worker host proxy through the WSL slirp gateway.
+# Keep an explicit operator override, but give every Worker the same safe default.
+export PRIVATE_CI_CONTAINER_PROXY_HOST="${PRIVATE_CI_CONTAINER_PROXY_HOST:-10.0.2.2}"
 WORKER_ROOT="/srv/private-ci/workers/${WORKER_ID}"
 # proxy.conf is a static, root-owned input. Runtime values are worker-scoped
 # so both Agent processes can run concurrently under ProtectSystem=strict.
