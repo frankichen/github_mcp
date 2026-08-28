@@ -7,8 +7,8 @@ import pytest
 from app.mcp_server import mcp
 
 
-EXPECTED_REGISTERED_TOOL_COUNT = 171
-EXPECTED_CANONICAL_TOOL_COUNT = 168
+EXPECTED_REGISTERED_TOOL_COUNT = 172
+EXPECTED_CANONICAL_TOOL_COUNT = 169
 DX1_TOOLS = [
     "prepare_development_task",
     "resume_development_task",
@@ -22,6 +22,7 @@ INFRASTRUCTURE_DEPLOY_TOOLS = [
     "get_infrastructure_deployment",
 ]
 HIGH_LEVEL_PUT_TOOLS = [
+    "put_generated_files",
     "put_github_file",
     "put_github_files",
     "put_github_file_from_local_candidate",
@@ -67,7 +68,7 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     tools = {tool.name: tool for tool in actual}
     assert MYGITHUB12_BASE_TOOLS <= set(actual_names)
     assert len(MYGITHUB12_BASE_TOOLS) == 40
-    assert actual_names[-11:-8] == HIGH_LEVEL_PUT_TOOLS
+    assert actual_names[-12:-8] == HIGH_LEVEL_PUT_TOOLS
     assert actual_names[-8:-3] == DX1_TOOLS
     assert actual_names[-3:] == INFRASTRUCTURE_DEPLOY_TOOLS
     for name in DX1_TOOLS:
@@ -121,7 +122,7 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert tools["get_private_ci_job"].inputSchema["properties"]["detail_level"]["default"] == "summary"
     templates = await mcp.list_resource_templates()
     assert any(str(template.uriTemplate) == "mygithub12://response/{resource_id}" for template in templates)
-    for name in ("commit_github_files", "apply_github_patch", "apply_github_patch_from_ref", "replace_github_text_once", "edit_github_file_ranges", "commit_github_uploaded_files", *HIGH_LEVEL_PUT_TOOLS):
+    for name in ("commit_github_files", "apply_github_patch", "apply_github_patch_from_ref", "replace_github_text_once", "edit_github_file_ranges", "commit_github_uploaded_files", *HIGH_LEVEL_PUT_TOOLS[1:]):
         properties = tools[name].inputSchema["properties"]
         assert properties["workspace_id"]["default"] == ""
         assert properties["expected_workspace_revision"]["default"] == 0
@@ -137,18 +138,18 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.5.0"
+    assert manifest["service_version"] == "12.6.0"
     assert manifest["manifest_format"] == "composed-v2"
     assert manifest["legacy_tool_count"] == 120
-    assert manifest["new_tool_count"] == 51
+    assert manifest["new_tool_count"] == 52
     assert manifest["tool_count"] == EXPECTED_CANONICAL_TOOL_COUNT
     assert manifest["compatibility_tool_count"] == EXPECTED_REGISTERED_TOOL_COUNT
     assert set(manifest["hidden_deprecated_tools"]) == HIDDEN_DEPRECATED_TOOLS
     assert manifest["schema_identity_algorithm"] == "sha256-canonical-mcp-tools-v1"
-    assert manifest["new_tools"][-11:-8] == HIGH_LEVEL_PUT_TOOLS
+    assert manifest["new_tools"][-12:-8] == HIGH_LEVEL_PUT_TOOLS
     assert manifest["new_tools"][-8:-3] == DX1_TOOLS
     assert manifest["new_tools"][-3:] == INFRASTRUCTURE_DEPLOY_TOOLS
-    assert set(manifest["new_tools"][:-11]) == MYGITHUB12_BASE_TOOLS
+    assert set(manifest["new_tools"][:-12]) == MYGITHUB12_BASE_TOOLS
     legacy = json.loads((root / "docs" / "MYGITHUB10_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert [tool["name"] for tool in legacy["tools"]].count("apply_github_patch_from_ref") == 1
     apply_tool = next(tool for tool in legacy["tools"] if tool["name"] == "apply_github_patch_from_ref")

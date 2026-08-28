@@ -12,6 +12,7 @@ import inspect
 import uuid
 from pathlib import Path
 from typing import Annotated, Literal, Optional
+from typing_extensions import TypedDict
 
 import httpx
 from pydantic import Field
@@ -46,6 +47,12 @@ from app.mcp_response import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class GeneratedTextFile(TypedDict):
+    path: str
+    content: str
+
 
 _client = GitHubClient()
 _service = GitHubService(_client)
@@ -1310,6 +1317,8 @@ async def _run_high_level_put(
     operation_id: str,
     workspace_id: str,
     expected_workspace_revision: int,
+    infer_expected_blob_shas: bool = False,
+    canonical_payload_hash: str = "",
 ) -> dict:
     try:
         await _github_call(
@@ -1335,13 +1344,67 @@ async def _run_high_level_put(
         commit_message,
         dry_run,
         operation_id,
+        infer_expected_blob_shas,
+        canonical_payload_hash,
     )
     if not dry_run:
         result = await _finalize_durable_write(result, workspace_id, expected_workspace_revision)
     return result
 
 
-PUT_GITHUB_FILE_DESCRIPTION = "High-level Web AI UTF-8 file write. Provide repository/branch/path/content plus exact HEAD/blob CAS; MyGithut12 internally chunks, stages, verifies, commits and reads back. Callers never manage upload ids, offsets or chunk hashes. Direct content is bounded to a transport-safe size; larger content uses put_github_file_from_local_candidate."
+PUT_GENERATED_FILES_DESCRIPTION = "The only recommended entry point for routine AI-generated UTF-8 text files. Provide repository, branch, exact expected_head_sha, structured files[{path,content}], commit_message, dry_run, and optional idempotency_key. MyGithut12 discovers existing blobs and internally performs path validation, hashing, chunked staging, atomic CAS commit, and durable read-back. V1 rejects oversized payloads, binary content, and deletion; callers must not manage upload IDs, chunks, offsets, hashes, staging paths, or expected_blob_sha."
+
+
+async def put_generated_files(
+    repository: str,
+    branch: str,
+    expected_head_sha: str,
+    files: list[GeneratedTextFile],
+    commit_message: str,
+    dry_run: bool = True,
+    idempotency_key: str = "",
+) -> str:
+    operation_id = ""
+    try:
+        prepared = mygithub10.prepare_generated_files(files)
+        request, canonical_payload_hash = mygithub10.build_generated_files_request(
+            repository,
+            branch,
+            expected_head_sha,
+            prepared,
+            commit_message,
+            idempotency_key,
+        )
+        effective_idempotency_key = idempotency_key or f"put-generated-files:{canonical_payload_hash}"
+        operation_id, replay = await _claim_high_level_put(
+            "put_generated_files",
+            request,
+            dry_run,
+            effective_idempotency_key,
+            "",
+            0,
+        )
+        if replay:
+            return json.dumps(replay, ensure_ascii=False)
+        result = await _run_high_level_put(
+            repository,
+            branch,
+            expected_head_sha,
+            prepared,
+            commit_message,
+            dry_run,
+            operation_id,
+            "",
+            0,
+            True,
+            canonical_payload_hash,
+        )
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        return _mygithub10_error(exc)
+
+
+PUT_GITHUB_FILE_DESCRIPTION = "Compatibility-only high-level UTF-8 file write requiring caller-supplied blob CAS. Routine AI-generated text files must use put_generated_files instead."
 
 
 async def put_github_file(
@@ -1397,7 +1460,7 @@ async def put_github_file(
         return _mygithub10_error(exc)
 
 
-PUT_GITHUB_FILES_DESCRIPTION = "High-level atomic multi-file Web AI UTF-8 write. Pass files as a structured array of {path, content, expected_blob_sha}; MyGithut12 internally chunks/stages every file and creates one Git commit with exact HEAD/blob CAS, idempotency and durable read-back. No nested change_set JSON or upload lifecycle is exposed."
+PUT_GITHUB_FILES_DESCRIPTION = "Compatibility-only atomic multi-file write requiring caller-supplied blob CAS. Routine AI-generated text files must use put_generated_files instead."
 
 
 async def put_github_files(
@@ -1449,7 +1512,7 @@ async def put_github_files(
         return _mygithub10_error(exc)
 
 
-PUT_GITHUB_FILE_FROM_LOCAL_CANDIDATE_DESCRIPTION = "High-level large UTF-8 file write for Web AI transport limits. The caller supplies only a safe candidate basename from the fixed server-controlled candidate root plus exact size/SHA256 and Git HEAD/blob CAS; arbitrary host paths are never accepted. MyGithut12 verifies the candidate, internally chunks/stages it, commits, and performs durable read-back."
+PUT_GITHUB_FILE_FROM_LOCAL_CANDIDATE_DESCRIPTION = "Compatibility-only local-candidate file write. Routine AI-generated text files must use put_generated_files; V1 returns PAYLOAD_TOO_LARGE instead of asking callers to manage alternate upload routes."
 
 
 async def put_github_file_from_local_candidate(
@@ -1532,13 +1595,13 @@ async def put_github_file_from_local_candidate(
         return _mygithub10_error(exc)
 
 
-@mcp.tool(name="begin_github_file_upload", description="Begin a bounded, permission-0600 chunked file upload.")
+@mcp.tool(name="begin_github_file_upload", description="Compatibility-only upload primitive. AI-generated text files must use put_generated_files and must not begin uploads directly.")
 async def begin_github_file_upload() -> str:
     try: return json.dumps(await _github_call(mygithub10.begin_upload), ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
 
 
-@mcp.tool(name="append_github_file_upload_chunk", description="Append one contiguous SHA-checked upload chunk. Use text for UTF-8 text and content_base64 only for binary; keep chunks within the transport-safe limits returned by begin_github_file_upload.")
+@mcp.tool(name="append_github_file_upload_chunk", description="Compatibility-only upload primitive. AI-generated text files must use put_generated_files and must not append chunks directly.")
 async def append_github_file_upload_chunk(upload_id: str, offset: int, content_base64: str = "", text: str = "", chunk_sha256: str = "", idempotency_key: str = "") -> str:
     try:
         if bool(content_base64) == bool(text):
@@ -1560,13 +1623,13 @@ async def append_github_file_upload_chunk(upload_id: str, offset: int, content_b
     except Exception as exc: return _mygithub10_error(exc)
 
 
-@mcp.tool(name="finalize_github_file_upload", description="Finalize an upload only after exact size and SHA256 validation.")
+@mcp.tool(name="finalize_github_file_upload", description="Compatibility-only upload primitive. AI-generated text files must use put_generated_files and must not finalize uploads directly.")
 async def finalize_github_file_upload(upload_id: str, expected_size_bytes: int, expected_sha256: str) -> str:
     try: return json.dumps(await _github_call(mygithub10.finalize_upload, upload_id, expected_size_bytes, expected_sha256), ensure_ascii=False)
     except Exception as exc: return _mygithub10_error(exc)
 
 
-@mcp.tool(name="commit_github_uploaded_files", description="Commit one finalized upload to a branch with exact HEAD/blob checks and optional workspace CAS.")
+@mcp.tool(name="commit_github_uploaded_files", description="Compatibility-only finalized-upload commit. AI-generated text files must use put_generated_files instead.")
 async def commit_github_uploaded_files(repository: str, branch: str, expected_head_sha: str, path: str, expected_blob_sha: str, upload_id: str, commit_message: str, idempotency_key: str = "", workspace_id: str = "", expected_workspace_revision: int = 0) -> str:
     try:
         await _github_call(mygithub12.workspace_write_preflight, _service, repository, branch, expected_head_sha, workspace_id, expected_workspace_revision)
@@ -1728,6 +1791,16 @@ mcp.tool(
 
 # MyGithut12 high-level Web AI write surface. Register these after the frozen
 # MyGithub10 compatibility manifest so old tool ordering/schema remains stable.
+mcp.tool(
+    name="put_generated_files",
+    description=PUT_GENERATED_FILES_DESCRIPTION,
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)(put_generated_files)
 mcp.tool(name="put_github_file", description=PUT_GITHUB_FILE_DESCRIPTION)(put_github_file)
 mcp.tool(name="put_github_files", description=PUT_GITHUB_FILES_DESCRIPTION)(put_github_files)
 mcp.tool(
