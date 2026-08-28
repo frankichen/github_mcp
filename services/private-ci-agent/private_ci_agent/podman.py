@@ -9,6 +9,8 @@ import threading
 import time
 from urllib.parse import urlsplit, urlunsplit
 
+from private_ci_agent.config import resolve_worker_id
+
 logger = logging.getLogger(__name__)
 
 PROXY_ENV_NAMES = {
@@ -29,8 +31,10 @@ GO_CACHE_SUBDIRECTORIES = (
 
 
 class PodmanRunner:
-    def __init__(self, podman_binary: str = "/usr/bin/podman"):
+    def __init__(self, podman_binary: str = "/usr/bin/podman", worker_id: str | None = None):
         self.podman = podman_binary
+        self.worker_id = resolve_worker_id(worker_id)
+        self.container_namespace = f"ci-{self.worker_id}"
         self._validated_proxy_contexts: set[tuple[str, str, str]] = set()
 
     @staticmethod
@@ -219,10 +223,13 @@ class PodmanRunner:
 
     def resource_summary(self) -> dict:
         return {
-            "mode": "shared_worker",
+            "mode": "worker_isolated",
+            "worker_id": self.worker_id,
             "pids_limit": 256,
             "cpus": 2,
             "memory": "2g",
+            "memory_swap": "3g",
+            "tmpfs_bytes": 335544320,
         }
 
     def image_digest(self, image: str) -> str | None:
@@ -287,10 +294,10 @@ class PodmanRunner:
                     mounts.extend(["-v", f"{cache_path}:/ci-cache/npm:rw,z"])
             elif cache_name == "playwright":
                 needs_cache_parent = True
-                if PodmanRunner._ensure_cache_dir(cache_path):
-                    # Browser binaries are a shared, immutable maintenance cache.
-                    # Use shared SELinux relabeling (:z), never the exclusive :Z.
-                    mounts.extend(["-v", f"{cache_path}:/ci-cache/ms-playwright:rw,z"])
+                if os.path.isdir(cache_path):
+                    # Browser binaries are preheated maintenance content. Jobs
+                    # share it read-only; a CI attempt must never mutate it.
+                    mounts.extend(["-v", f"{cache_path}:/ci-cache/ms-playwright:ro,z"])
             elif cache_name in {"cargo", "maven", "gradle", "nuget"}:
                 needs_cache_parent = True
                 if PodmanRunner._ensure_cache_dir(cache_path):
@@ -616,15 +623,13 @@ class PodmanRunner:
 
         return self._run_process(cmd, container_name, timeout_seconds, cancel_event)
 
-    @staticmethod
-    def _container_name(job_id: str, source_dir: str = "") -> str:
+    def _container_name(self, job_id: str, source_dir: str = "") -> str:
         suffix = hashlib.sha1(str(source_dir).encode()).hexdigest()[:6] if source_dir else "main"
-        return f"ci-{job_id[:12]}-{suffix}"
+        return f"{self.container_namespace}-{job_id[:12]}-{suffix}"
 
-    @staticmethod
-    def _job_container_prefix(job_id: str) -> str:
-        """Prefix shared by every container owned by a job (main + per-workspace)."""
-        return f"ci-{job_id[:12]}"
+    def _job_container_prefix(self, job_id: str) -> str:
+        """Prefix shared only by this Worker's containers for one job."""
+        return f"{self.container_namespace}-{job_id[:12]}"
 
     def kill_job(self, job_id: str) -> int:
         """Force-stop and remove every container owned by the job."""
@@ -687,15 +692,17 @@ class PodmanRunner:
                 pass
 
     def cleanup_stale(self, job_id_prefixes: list):
-        """Remove stale containers not matching current jobs."""
+        """Remove only stale containers owned by this Worker namespace."""
         try:
             result = subprocess.run(
                 [self.podman, "ps", "-a", "--format", "{{.Names}}"],
                 capture_output=True, text=True, timeout=10,
             )
+            active_prefixes = [self._job_container_prefix(job_id) for job_id in job_id_prefixes]
+            namespace_prefix = self.container_namespace + "-"
             for name in result.stdout.strip().split("\n"):
-                if name.startswith("ci-") and not any(name.startswith(f"ci-{prefix[:12]}") for prefix in job_id_prefixes):
-                    logger.info("Removing stale container: %s", name)
+                if name.startswith(namespace_prefix) and not any(name.startswith(prefix) for prefix in active_prefixes):
+                    logger.info("Removing stale container for %s: %s", self.worker_id, name)
                     try:
                         subprocess.run([self.podman, "rm", "-f", name],
                                        capture_output=True, timeout=10)
