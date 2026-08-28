@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 import private_ci_agent.executor as executor_module
-from private_ci_agent.executor import JobExecutor
+from private_ci_agent.executor import CACHE_MAP, JobExecutor
 from private_ci_agent.environment_cache import DependencyEnvironmentCache
 from private_ci_agent.models import Job
 from private_ci_agent.podman import PodmanRunner
@@ -67,6 +67,7 @@ class FakePodman:
 
 def make_executor(podman):
     executor = object.__new__(JobExecutor)
+    executor.cache_map = CACHE_MAP
     executor.podman = podman
     executor.services = SimpleNamespace(
         prepare=lambda _job_id, _workspace, _services=None: SimpleNamespace(
@@ -602,6 +603,7 @@ def make_fast_check_executor(exit_code=0):
             }
 
     e = object.__new__(JobExecutor)
+    e.cache_map = CACHE_MAP
     e.podman = FastCheckPodman()
     e.services = SimpleNamespace(
         prepare=lambda _jid, _ws: None,

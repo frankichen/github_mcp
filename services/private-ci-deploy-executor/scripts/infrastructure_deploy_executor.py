@@ -214,13 +214,20 @@ def _phase_from_output(line: str, current_phase: str) -> str:
 def _fixed_health_evidence() -> tuple[bool, bool]:
     controller = requests.get(CONTROLLER_URL + "/health", timeout=5)
     controller_healthy = controller.status_code == 200 and controller.json().get("status") == "ok"
-    agent = subprocess.run(
-        ["systemctl", "is-active", "--quiet", "private-ci-agent.service"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
+    worker_services = (
+        "private-ci-agent.service",
+        "private-ci-agent@wsl-ci-02.service",
     )
-    return controller_healthy, agent.returncode == 0
+    workers_healthy = True
+    for service in worker_services:
+        state = subprocess.run(
+            ["systemctl", "is-active", "--quiet", service],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        workers_healthy = workers_healthy and state.returncode == 0
+    return controller_healthy, workers_healthy
 
 
 def execute(row: dict) -> None:

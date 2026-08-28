@@ -35,16 +35,20 @@ from private_ci_agent.services import ServiceManager, ServiceSetupError
 
 logger = logging.getLogger(__name__)
 
-CACHE_MAP = {
-    "go": "/srv/private-ci/cache/go",
-    "pip": "/srv/private-ci/cache/pip",
-    "npm": "/srv/private-ci/cache/npm",
-    "playwright": "/srv/private-ci/cache/ms-playwright",
-    "cargo": "/srv/private-ci/cache/cargo",
-    "maven": "/srv/private-ci/cache/maven",
-    "gradle": "/srv/private-ci/cache/gradle",
-    "nuget": "/srv/private-ci/cache/nuget",
-}
+WRITABLE_CACHE_NAMES = ("go", "pip", "npm", "cargo", "maven", "gradle", "nuget")
+
+
+def build_cache_map(config: dict) -> dict:
+    writable_root = config.get("writable_cache_root", config.get("cache_root", "/srv/private-ci/cache"))
+    shared_root = config.get("shared_cache_root", "/srv/private-ci/cache")
+    result = {name: os.path.join(writable_root, name) for name in WRITABLE_CACHE_NAMES}
+    result["playwright"] = config.get("shared_playwright_cache", os.path.join(shared_root, "ms-playwright"))
+    return result
+
+
+# Backward-compatible module-level defaults for tests/importers. Runtime jobs
+# always use the instance map derived from the fixed Worker configuration.
+CACHE_MAP = build_cache_map({})
 PROFILE_BY_STACK = {
     "go": "go-check",
     "python": "python-check",
@@ -61,11 +65,14 @@ class JobExecutor:
         self.client = controller_client
         self.config = config
         self.cancel_event = cancel_event
-        self.podman = PodmanRunner(config.get("podman_binary", "/usr/bin/podman"))
+        self.cache_map = build_cache_map(config)
+        self.podman = PodmanRunner(
+            config.get("podman_binary", "/usr/bin/podman"), config.get("worker_id")
+        )
         self.log_manager = LogManager(controller_client, config.get("max_log_bytes", 10485760))
         self.services = ServiceManager(config.get("podman_binary", "/usr/bin/podman"), config)
         self.environment_cache = DependencyEnvironmentCache(
-            os.path.join(config.get("cache_root", "/srv/private-ci/cache"), "environments")
+            config.get("environment_cache_root", "/srv/private-ci/cache/environments")
         )
 
     def _cancelled(self) -> bool:
@@ -631,9 +638,9 @@ class JobExecutor:
                 "steps": [{"step_name": label, "status": "configuration_error", "exit_code": 2, "message": message}],
             }
         if workspace["stack"] == "go":
-            # Go 模块缓存跨 job 共享（CACHE_MAP["go"]），避免每个 job 冷下载
-            # 全部依赖；缓存目录在源码目录之外，不会进入 gofmt 的扫描范围。
-            cache_root = CACHE_MAP["go"]
+            # Go 下载缓存只在当前 Worker 内共享；跨 Worker 仅共享 sealed/只读资产。
+            # 缓存目录在源码目录之外，不会进入 gofmt 的扫描范围。
+            cache_root = self.cache_map["go"]
             if not os.path.isdir(cache_root):
                 os.makedirs(cache_root, mode=0o700)
             caches = {"go": cache_root}
@@ -650,10 +657,10 @@ class JobExecutor:
             caches = {"python_venv": cache_root}
             # Also include pip cache if configured
             for cache_name in commands.get("cache_dirs", {}):
-                if cache_name == "pip" and cache_name in CACHE_MAP:
-                    caches[cache_name] = CACHE_MAP[cache_name]
+                if cache_name == "pip" and cache_name in self.cache_map:
+                    caches[cache_name] = self.cache_map[cache_name]
         else:
-            caches = {name: CACHE_MAP[name] for name in commands.get("cache_dirs", {}) if name in CACHE_MAP}
+            caches = {name: self.cache_map[name] for name in commands.get("cache_dirs", {}) if name in self.cache_map}
         steps = []
         for preflight in commands.get("preflight", []):
             step = self._run_check(
@@ -994,7 +1001,7 @@ class JobExecutor:
             }
 
         spec = commands["setup"][0]
-        caches = {name: CACHE_MAP[name] for name in commands.get("cache_dirs", {}) if name in CACHE_MAP}
+        caches = {name: self.cache_map[name] for name in commands.get("cache_dirs", {}) if name in self.cache_map}
         step = self._run_setup(
             job, "openapi:.", image, job.source_dir, caches,
             spec["name"], spec["command"], pass_proxy=True,

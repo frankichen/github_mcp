@@ -1,0 +1,28 @@
+[Unit]
+Description=Private CI Agent %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ciworker
+Group=ciworker
+WorkingDirectory=/srv/private-ci/agent
+Environment=HOME=/home/ciworker
+Environment=XDG_RUNTIME_DIR=/run/user/1500
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1500/bus
+Environment=PRIVATE_CI_WORKER_ID=%i
+ExecStart=/srv/private-ci/agent/run-agent-with-proxy.sh
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/srv/private-ci/workers /srv/private-ci/cache /srv/private-ci/podman-storage /run/user/1500
+MemoryMax=3G
+CPUQuota=250%
+TasksMax=1024
+
+[Install]
+WantedBy=multi-user.target

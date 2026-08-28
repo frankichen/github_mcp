@@ -6,14 +6,23 @@ set -u
 
 AGENT_DIR="/srv/private-ci/agent"
 VENV_PYTHON="${AGENT_DIR}/venv/bin/python"
-# proxy.conf is a static, root-owned input. Runtime values belong in the
-# persistent worker run directory so ProtectSystem=strict remains effective.
+WORKER_ID="${PRIVATE_CI_WORKER_ID:-wsl-ci-01}"
+case "${WORKER_ID}" in
+    wsl-ci-01|wsl-ci-02) ;;
+    *) echo "[proxy-launcher] ERROR: CI_WORKER_ID_INVALID" >&2; exit 2 ;;
+esac
+export PRIVATE_CI_WORKER_ID="${WORKER_ID}"
+WORKER_ROOT="/srv/private-ci/workers/${WORKER_ID}"
+# proxy.conf is a static, root-owned input. Runtime values are worker-scoped
+# so both Agent processes can run concurrently under ProtectSystem=strict.
 PROXY_CONF="/etc/private-ci/proxy.conf"
-RUNTIME_PROXY_CONF="/srv/private-ci/run/proxy.runtime.conf"
-LOG_DIR="/srv/private-ci/logs"
-LOCKFILE="/srv/private-ci/run/private-ci-agent.lock"
-PODMAN_TMPDIR="/srv/private-ci/run/tmp"
+RUNTIME_PROXY_CONF="${WORKER_ROOT}/run/proxy.runtime.conf"
+LOG_DIR="${WORKER_ROOT}/logs"
+LOCKFILE="${WORKER_ROOT}/run/private-ci-agent.lock"
+PODMAN_TMPDIR="${WORKER_ROOT}/run/tmp"
 CONTROLLER_HOST="${PRIVATE_CI_CONTROLLER_HOST:-100.127.108.20}"
+mkdir -p "${WORKER_ROOT}/run" "${LOG_DIR}" "${PODMAN_TMPDIR}"
+chmod 700 "${WORKER_ROOT}" "${WORKER_ROOT}/run" "${LOG_DIR}" "${PODMAN_TMPDIR}"
 
 log() {
     local level="$1"; shift
