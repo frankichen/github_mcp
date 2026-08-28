@@ -111,13 +111,39 @@ install -o nobody -g nogroup -m 644 \
     "${REPO_ROOT}/services/private-ci-agent/deploy/Dockerfile.python-ci" \
     "${AGENT_DIR}/deploy/Dockerfile.python-ci"
 
-# Controller/Agent 的 attempt-lease 协议必须先升级 Agent，再切换 Controller。
+# DX2-CI-B：legacy wsl-ci-01 保留原 unit，仅补充新状态目录写权限；
+# wsl-ci-02 使用受审的实例模板。两个 Worker 的所有可写运行目录互相隔离。
+install -D -o root -g root -m 644 \
+    "${REPO_ROOT}/services/private-ci-agent/deploy/private-ci-agent.service.d/dx2-worker-roots.conf" \
+    /etc/systemd/system/private-ci-agent.service.d/dx2-worker-roots.conf
+install -o root -g root -m 644 \
+    "${REPO_ROOT}/services/private-ci-agent/deploy/private-ci-agent@.service" \
+    /etc/systemd/system/private-ci-agent@.service
+for worker_id in wsl-ci-01 wsl-ci-02; do
+    worker_root="/srv/private-ci/workers/${worker_id}"
+    install -d -o ciworker -g ciworker -m 0700 \
+        "${worker_root}" "${worker_root}/workspaces" "${worker_root}/cache" \
+        "${worker_root}/logs" "${worker_root}/run" "${worker_root}/run/tmp"
+done
+systemctl daemon-reload
+
+# Controller/Agent 的 attempt-lease 协议必须先升级现有 Agent，再切换 Controller。
 # 新 Agent 给旧 Controller 多发送受控 header 是向后兼容的；反向顺序会让
 # 旧 Agent 在 Controller 切换到严格 fencing 后无法提交 log/step/finish。
 log "Restarting private-ci-agent.service before controller protocol switch"
 systemctl restart private-ci-agent.service
 sleep 3
 systemctl is-active --quiet private-ci-agent.service || die "worker did not restart with updated protocol"
+
+# 已经启用过的第二 Worker 也必须在 Controller 切换前加载本次 Agent 代码。
+# 首次启用仍延后到 Controller 切换和共享只读资产预热之后。
+SECOND_WORKER_SERVICE="private-ci-agent@wsl-ci-02.service"
+if systemctl is-enabled --quiet "${SECOND_WORKER_SERVICE}"; then
+    log "Restarting ${SECOND_WORKER_SERVICE} before controller protocol switch"
+    systemctl restart "${SECOND_WORKER_SERVICE}"
+    sleep 3
+    systemctl is-active --quiet "${SECOND_WORKER_SERVICE}" || die "second worker did not restart with updated protocol"
+fi
 
 # ── 3. 预检 ciworker 降权 broker ────────────────────────────
 # Infrastructure Executor 保持 NoNewPrivileges=true，不能在自身进程树里
