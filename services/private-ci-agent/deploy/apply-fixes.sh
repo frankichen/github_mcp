@@ -118,6 +118,7 @@ log "Restarting private-ci-agent.service before controller protocol switch"
 systemctl restart private-ci-agent.service
 sleep 3
 systemctl is-active --quiet private-ci-agent.service || die "worker did not restart with updated protocol"
+
 # ── 3. 预检 ciworker 降权 broker ────────────────────────────
 # Infrastructure Executor 保持 NoNewPrivileges=true，不能在自身进程树里
 # 直接 setuid。预热命令通过 systemd 的固定 User/Group service broker 执行。
