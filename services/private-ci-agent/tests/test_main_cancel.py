@@ -49,7 +49,7 @@ def test_request_cancel_is_noop_without_active_job(monkeypatch):
 def test_kill_current_job_reclaims_all_job_containers_by_prefix(monkeypatch):
     stopped = []
     removed = []
-    ps_output = "ci-job-abc123-aaa111\nci-job-abc123-bbb222\n"
+    ps_output = "ci-wsl-ci-01-job-abc123-aaa111\nci-wsl-ci-01-job-abc123-bbb222\n"
 
     def fake_run(cmd, **_kwargs):
         if cmd[:2] == ["podman", "ps"]:
@@ -67,10 +67,10 @@ def test_kill_current_job_reclaims_all_job_containers_by_prefix(monkeypatch):
 
     main_module._kill_current_job()
 
-    assert any("ci-job-abc123-aaa111" in cmd and cmd[1] == "stop" for cmd in stopped)
-    assert any("ci-job-abc123-bbb222" in cmd and cmd[1] == "stop" for cmd in stopped)
-    assert any("ci-job-abc123-aaa111" in cmd and cmd[1] == "rm" for cmd in removed)
-    assert any("ci-job-abc123-bbb222" in cmd and cmd[1] == "rm" for cmd in removed)
+    assert any("ci-wsl-ci-01-job-abc123-aaa111" in cmd and cmd[1] == "stop" for cmd in stopped)
+    assert any("ci-wsl-ci-01-job-abc123-bbb222" in cmd and cmd[1] == "stop" for cmd in stopped)
+    assert any("ci-wsl-ci-01-job-abc123-aaa111" in cmd and cmd[1] == "rm" for cmd in removed)
+    assert any("ci-wsl-ci-01-job-abc123-bbb222" in cmd and cmd[1] == "rm" for cmd in removed)
 
 
 def test_controller_client_sends_attempt_lease_on_job_callbacks(monkeypatch):
