@@ -208,13 +208,15 @@ CI-A 仅完成 Controller/现有 Agent 的安全调度基础与自动化测试�
 
 任务：
 
-- [ ] 定义 `wsl-ci-02` 固定身份；
-- [ ] 独立 work root；
-- [ ] 独立容器命名与临时目录；
-- [ ] cache 只共享 immutable 内容，可写状态隔离；
-- [ ] CPU/RAM/disk 限额；
-- [ ] 两个 Worker 均能注册和 heartbeat；
-- [ ] 单 Worker 故障不拖垮另一个。
+- [x] 定义 `wsl-ci-02` 固定身份，并拒绝任意 Worker ID；
+- [x] `wsl-ci-01` / `wsl-ci-02` 使用独立 work/log/run root；
+- [x] Podman job/service 名称和临时目录按 Worker 隔离，startup/shutdown 只清理自身 namespace；
+- [x] 可写语言缓存按 Worker 隔离，仅共享 sealed environment cache、只读 Playwright cache 和带锁 bare mirror；
+- [x] 固定 systemd CPU/RAM/Tasks 上限，并保留 Podman memory/swap/pids/tmpfs 上限；
+- [ ] production self-deploy 后确认两个 Worker 均完成注册和 heartbeat；
+- [ ] CI-C 通过真实并发/故障样本确认单 Worker 故障不拖垮另一个。
+
+CI-B 代码与自动化测试已完成，但本窗口未获得 production self-deploy 授权，因此 `wsl-ci-02` 尚未声称在线。正式 rollout 保持 fail-stop：先升级 legacy w1 和已存在的 w2 Agent 代码，再切 Controller；首次 w2 enable/start 仅发生在 Controller 切换与共享只读资产预热之后，最终 deployment health 同时要求 w1/w2 active。
 
 #### Batch CI-C：真实并发验收
 
