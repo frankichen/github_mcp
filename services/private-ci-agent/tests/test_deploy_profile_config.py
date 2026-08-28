@@ -167,6 +167,7 @@ def test_playwright_cache_maintenance_is_pinned_and_not_a_job_step():
     assert "/ci-cache/ms-playwright" in script
     assert "playwright@1.62.0 install chromium --no-shell" in script
     assert "pass_proxy=True" in script
+    assert "playwright_cache_writable=True" in script
     assert "run as ciworker" in script
 
 

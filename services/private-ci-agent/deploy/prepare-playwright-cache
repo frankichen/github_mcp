@@ -54,6 +54,8 @@ result = PodmanRunner("/usr/bin/podman").run_command(
     # If a worker proxy is configured, PodmanRunner injects only its cleaned
     # and validated container endpoint.  With no proxy, this is direct egress.
     pass_proxy=True,
+    # Only this fixed maintenance path may refresh the shared browser cache.
+    playwright_cache_writable=True,
 )
 if result.get("exit_code") != 0:
     print(

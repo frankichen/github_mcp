@@ -265,7 +265,7 @@ class PodmanRunner:
             return None
 
     @staticmethod
-    def _cache_mounts(cache_dirs: dict) -> tuple[list[str], str | None]:
+    def _cache_mounts(cache_dirs: dict, *, playwright_cache_writable: bool = False) -> tuple[list[str], str | None]:
         mounts: list[str] = []
         go_cache = None
         needs_cache_parent = False
@@ -296,8 +296,10 @@ class PodmanRunner:
                 needs_cache_parent = True
                 if os.path.isdir(cache_path):
                     # Browser binaries are preheated maintenance content. Jobs
-                    # share it read-only; a CI attempt must never mutate it.
-                    mounts.extend(["-v", f"{cache_path}:/ci-cache/ms-playwright:ro,z"])
+                    # share it read-only; only the fixed maintenance script may
+                    # opt in to a writable mount while refreshing the cache.
+                    mode = "rw,z" if playwright_cache_writable else "ro,z"
+                    mounts.extend(["-v", f"{cache_path}:/ci-cache/ms-playwright:{mode}"])
             elif cache_name in {"cargo", "maven", "gradle", "nuget"}:
                 needs_cache_parent = True
                 if PodmanRunner._ensure_cache_dir(cache_path):
@@ -543,10 +545,13 @@ class PodmanRunner:
         extra_mounts: list[str] | None = None,
         cancel_event: threading.Event | None = None,
         source_read_only: bool = False,
+        playwright_cache_writable: bool = False,
     ) -> dict:
         """Run one command with explicit network and proxy boundaries."""
         container_name = self._container_name(job_id, source_dir)
-        cache_mounts, go_cache = self._cache_mounts(cache_dirs)
+        cache_mounts, go_cache = self._cache_mounts(
+            cache_dirs, playwright_cache_writable=playwright_cache_writable
+        )
         project_root = os.path.abspath(os.path.join(source_dir, os.pardir, os.pardir))
         net_arg = self._network_args(network, network_name)
         userns_arg = [] if network_name else ["--userns=keep-id"]
