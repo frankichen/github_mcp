@@ -15,8 +15,12 @@ class ControllerClient:
         self.base_url = base_url.rstrip("/")
         self.worker_id = worker_id
         self.worker_token = worker_token
+        self._job_leases: dict[str, str] = {}
 
-    def _request(self, method: str, path: str, body: Optional[dict] = None, timeout: int = 30) -> dict:
+    def _request(
+        self, method: str, path: str, body: Optional[dict] = None, timeout: int = 30,
+        job_id: Optional[str] = None,
+    ) -> dict:
         url = f"{self.base_url}{path}"
         data = json.dumps(body).encode() if body is not None else None
 
@@ -25,6 +29,10 @@ class ControllerClient:
         req.add_header("X-Worker-ID", self.worker_id)
         req.add_header("Content-Type", "application/json")
         req.add_header("X-Request-ID", f"{self.worker_id}-{int(time.time())}")
+        if job_id:
+            lease_token = self._job_leases.get(job_id)
+            if lease_token:
+                req.add_header("X-CI-Lease-Token", lease_token)
 
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -58,7 +66,11 @@ class ControllerClient:
     def lease_job(self) -> Optional[dict]:
         try:
             result = self._request("POST", "/internal/ci/jobs/lease", {})
-            if result.get("job_id"):
+            job_id = result.get("job_id")
+            lease_token = result.get("lease_token")
+            if job_id:
+                if lease_token:
+                    self._job_leases[job_id] = lease_token
                 return result
             return None
         except Exception:
@@ -66,14 +78,14 @@ class ControllerClient:
 
     def upload_log(self, job_id: str, content: str) -> bool:
         try:
-            self._request("POST", f"/internal/ci/jobs/{job_id}/logs", {"content": content})
+            self._request("POST", f"/internal/ci/jobs/{job_id}/logs", {"content": content}, job_id=job_id)
             return True
         except Exception:
             return False
 
     def upload_log_batch(self, job_id: str, batch_id: str, content: str) -> bool:
         try:
-            self._request("POST", f"/internal/ci/jobs/{job_id}/logs/batch", {"batch_id": batch_id, "content": content})
+            self._request("POST", f"/internal/ci/jobs/{job_id}/logs/batch", {"batch_id": batch_id, "content": content}, job_id=job_id)
             return True
         except Exception as e:
             logger.warning("Failed to upload log batch: %s", e)
@@ -84,7 +96,7 @@ class ControllerClient:
             result = self._request("POST", f"/internal/ci/jobs/{job_id}/steps", {
                 "step_name": step_name,
                 "action": "start",
-            })
+            }, job_id=job_id)
             return result.get("step_id")
         except Exception:
             return None
@@ -98,7 +110,7 @@ class ControllerClient:
                 "status": status,
                 "exit_code": exit_code,
                 "log_end_offset": log_end_offset,
-            })
+            }, job_id=job_id)
         except Exception as e:
             logger.warning("Failed to finish step: %s", e)
 
@@ -108,7 +120,7 @@ class ControllerClient:
                 "action": "update_status",
                 "job_status": status,
                 "step_name": "",
-            })
+            }, job_id=job_id)
         except Exception as e:
             logger.warning("Failed to update job status: %s", e)
 
@@ -120,12 +132,14 @@ class ControllerClient:
                 "summary": summary,
                 "error_code": error_code,
                 "error_message": error_message,
-            })
+            }, job_id=job_id)
+            self._job_leases.pop(job_id, None)
         except Exception as e:
             logger.error("Failed to finish job: %s", e)
 
     def release_job(self, job_id: str):
         try:
-            self._request("POST", f"/internal/ci/jobs/{job_id}/release", {})
+            self._request("POST", f"/internal/ci/jobs/{job_id}/release", {}, job_id=job_id)
+            self._job_leases.pop(job_id, None)
         except Exception as e:
             logger.warning("Failed to release job: %s", e)
