@@ -278,6 +278,39 @@ def require_session_workspace(service: Any, session_id: str, expected_session_re
     return public,ws
 
 
+def resolve_generated_write_context(service: Any, repository: str, branch: str, expected_head_sha: str) -> dict[str,Any]:
+    """Bind the friendly generated-file facade to the branch's collaboration lock."""
+    listed=mygithub12.list_workspaces(service,repository=repository,branch=branch,limit=100)
+    items=list(listed.get("items") or [])
+    active=[item for item in items if item.get("status")=="active" and item.get("lease_valid")]
+    if len(active)>1:
+        raise MyGithub12Error("WORKSPACE_LEASE_CONFLICT","multiple active workspaces own the requested branch",{"repository":repository,"branch":branch})
+    if not active:
+        drifted=next((item for item in items if item.get("status")=="drifted"),None)
+        if drifted:
+            raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","branch is owned by a drifted workspace",{"workspace_id":drifted["workspace_id"],"repository":repository,"branch":branch})
+        expired=next((item for item in items if item.get("status")=="expired"),None)
+        if expired:
+            raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED","branch workspace lease expired",{"workspace_id":expired["workspace_id"],"repository":repository,"branch":branch,"requires_resume":True})
+        return {"managed":False,"workspace":None,"session":None}
+
+    workspace=active[0]
+    session=sessions.find_active_session_for_workspace(workspace["workspace_id"])
+    if session is None:
+        checked=mygithub12.workspace_write_preflight(
+            service,repository,branch,expected_head_sha,workspace["workspace_id"],int(workspace["revision"])
+        )
+        return {"managed":True,"workspace":checked,"session":None}
+    if session["status"] not in AUTO_RENEW_SESSION_STATES:
+        raise MyGithub12Error("DEVELOPMENT_SESSION_STATE_INVALID","development session state does not permit generated-file writes",{"development_session_id":session["session_id"],"status":session["status"]})
+    if not session.get("lease_valid"):
+        raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED","development session lease expired",{"development_session_id":session["session_id"],"workspace_id":workspace["workspace_id"],"requires_resume":True})
+    checked_session,checked_workspace=require_session_workspace(
+        service,session["session_id"],int(session["session_revision"]),int(workspace["revision"]),expected_head_sha
+    )
+    return {"managed":True,"workspace":checked_workspace,"session":checked_session}
+
+
 def parse_change_set(change_set_json: str) -> dict[str,Any]:
     change=_json(change_set_json,dict,"change_set_json",{})
     if change.get("schema_version")!=1: raise MyGithub12Error("PATCH_INVALID_FORMAT","change_set_json schema_version must be 1")
@@ -332,10 +365,10 @@ def execute_change_set(service: Any, session: dict[str,Any], workspace: dict[str
     return result
 
 
-def after_verified_change(service: Any, session_id: str, expected_session_revision: int, finalized_write: dict[str,Any]) -> dict[str,Any]:
+def after_verified_change(service: Any, session_id: str, expected_session_revision: int, finalized_write: dict[str,Any], event_type: str="change_set_committed") -> dict[str,Any]:
     ws=finalized_write.get("workspace")
     if not isinstance(ws,dict): raise MyGithub12Error("DEVELOPMENT_SESSION_RECOVERY_REQUIRED","verified write did not return finalized workspace evidence")
-    session=sessions.sync_from_workspace(session_id,expected_session_revision,ws,event_type="change_set_committed",status="active",metadata_patch={"last_commit_operation_id":finalized_write.get("operation_id","")})
+    session=sessions.sync_from_workspace(session_id,expected_session_revision,ws,event_type=event_type,status="active",metadata_patch={"last_commit_operation_id":finalized_write.get("operation_id","")})
     try:
         index=mygithub12.request_index_build(service,session["repository"],session["head_commit_sha"],"auto",finalized_write.get("old_head_sha",session["base_commit_sha"]),"interactive",f"session-index:{session_id}:{session['head_commit_sha']}",False)
         index_error=None

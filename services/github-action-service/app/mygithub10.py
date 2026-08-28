@@ -334,6 +334,24 @@ def _idempotent_mark_git_verified(operation_id: str, result: dict[str, Any]) -> 
     _idempotent_finish(operation_id, "git_verified", result.get("commit_sha"), result=result)
 
 
+def bind_operation_workspace(operation_id: str, workspace_id: str, workspace_revision: int) -> None:
+    """Attach server-resolved collaboration identity without changing request identity."""
+    if not operation_id or operation_id == "replay" or not workspace_id:
+        return
+    db = _db()
+    cur = db.execute(
+        "UPDATE mygithub10_operations SET workspace_id=?,workspace_revision=? WHERE operation_id=? AND status='in_progress'",
+        (workspace_id, int(workspace_revision), operation_id),
+    )
+    db.commit()
+    if cur.rowcount != 1:
+        raise MyGithub10Error(
+            "IDEMPOTENCY_INDETERMINATE",
+            "generated-file operation could not bind its workspace audit identity",
+            {"operation_id": operation_id, "workspace_id": workspace_id, "recovery_required": True},
+        )
+
+
 def _idempotent_existing(key: str) -> dict[str, Any] | None:
     """Read an existing caller idempotency operation without remote state."""
     if not key:
@@ -1267,7 +1285,7 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "generated_files_put_semantics": {
             "recommended_for": "routine AI-generated UTF-8 text add/modify writes",
             "caller_supplies": ["repository", "branch", "expected_head_sha", "files", "commit_message", "dry_run", "idempotency_key"],
-            "server_manages": ["existing_blob_lookup", "path_validation", "hashing", "chunking", "staging", "atomic_commit", "read_back_verification"],
+            "server_manages": ["workspace_session_resolution", "workspace_session_revision_cas", "existing_blob_lookup", "path_validation", "hashing", "chunking", "staging", "atomic_commit", "read_back_verification"],
             "unsupported": ["binary", "delete", "bundle"],
         },
         "high_level_inline_content_limit_bytes": MAX_HIGH_LEVEL_INLINE_CONTENT_BYTES,

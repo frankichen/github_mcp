@@ -109,6 +109,24 @@ def get_session(session_id: str) -> dict[str, Any]:
     return _public(row)
 
 
+def find_active_session_for_workspace(workspace_id: str) -> dict[str, Any] | None:
+    """Return the unique non-terminal Session that owns a Workspace."""
+    init_session_db()
+    placeholders = ",".join("?" for _ in ACTIVE_STATES)
+    with _db() as db:
+        rows = db.execute(
+            f"SELECT * FROM development_sessions WHERE workspace_id=? AND status IN ({placeholders}) ORDER BY updated_at DESC LIMIT 2",
+            (workspace_id, *sorted(ACTIVE_STATES)),
+        ).fetchall()
+    if len(rows) > 1:
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH",
+            "workspace has more than one active development session",
+            {"workspace_id": workspace_id},
+        )
+    return _public(rows[0]) if rows else None
+
+
 def _require_revision(session_id: str, expected_revision: int, *, writable: bool = True) -> sqlite3.Row:
     init_session_db()
     with _db() as db:
