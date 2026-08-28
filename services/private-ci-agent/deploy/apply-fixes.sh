@@ -111,6 +111,14 @@ install -o nobody -g nogroup -m 644 \
     "${REPO_ROOT}/services/private-ci-agent/deploy/Dockerfile.python-ci" \
     "${AGENT_DIR}/deploy/Dockerfile.python-ci"
 
+# Controller/Agent 的 attempt-lease 协议必须先升级 Agent，再切换 Controller。
+# 新 Agent 给旧 Controller 多发送受控 header 是向后兼容的；反向顺序会让
+# 旧 Agent 在 Controller 切换到严格 fencing 后无法提交 log/step/finish。
+log "Restarting private-ci-agent.service before controller protocol switch"
+systemctl restart private-ci-agent.service
+sleep 3
+systemctl is-active --quiet private-ci-agent.service || die "worker did not restart with updated protocol"
+
 # ── 3. 预检 ciworker 降权 broker ────────────────────────────
 # Infrastructure Executor 保持 NoNewPrivileges=true，不能在自身进程树里
 # 直接 setuid。预热命令通过 systemd 的固定 User/Group service broker 执行。
@@ -249,12 +257,9 @@ run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-go-cache" || die "go cache pre
 log "Preheating shared Playwright browser cache"
 run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-playwright-cache" || die "Playwright cache preheat failed"
 
-# ── 9. 重启 worker 加载新代码 ─────────────────────────────
+# ── 9. 最终验证 Agent / Controller 协议切换后的运行状态 ─────
 log "DX2_PHASE=post_verify"
-log "Restarting private-ci-agent.service"
-systemctl restart private-ci-agent.service
-sleep 3
-systemctl is-active --quiet private-ci-agent.service || die "worker did not restart"
+systemctl is-active --quiet private-ci-agent.service || die "worker is not active after controller switch"
 
 log "DONE. Worker restarted with local shared image and caches preheated."
 log "Verify: journalctl -u private-ci-agent.service -n 20"

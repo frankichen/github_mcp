@@ -76,7 +76,7 @@ DX2-WS-01 + DX2-RESUME-01
 |---|---|---|---|---|
 | DX2-00 | P0 | `IN_PROGRESS` | 固化 DX-2 规划、需求、清单和入口 | 文档落库、README 可发现、Draft PR |
 | DX2-WRITE-01 | P1 | `IN_PROGRESS` | 新文件 builder 输出可原样 strict apply | AC-WRITE-01～06 |
-| DX2-CI-01 | P0 | `NOT_STARTED` | 两个独立 Private CI Worker 真并行 | AC-CI-01～10 |
+| DX2-CI-01 | P0 | `IN_PROGRESS` | 两个独立 Private CI Worker 真并行 | AC-CI-01～10 |
 | DX2-WS-01 | P0 | `DONE` | Lease 过期对象退出默认 active Writer + guarded auto-renew | AC-WS-01～13 |
 | DX2-SESSION-01 | P0 | `IN_PROGRESS` | 安全恢复 stale Session，不掩盖真实 drift | AC-SESSION-01～07 |
 | DX2-INFRA-01 | P1 | `DONE` | 长 self-deploy 持续 heartbeat | AC-INFRA-HB-01～05 |
@@ -173,7 +173,7 @@ DX2-WS-01 + DX2-RESUME-01
 
 ### 状态
 
-`NOT_STARTED`
+`IN_PROGRESS`
 
 ### 建议拆分
 
@@ -187,13 +187,15 @@ DX2-WS-01 + DX2-RESUME-01
 
 任务：
 
-- [ ] 复核 worker registration / heartbeat / claim / lease / attempt 数据模型；
-- [ ] scheduler 支持多个 eligible Worker；
-- [ ] 同 job lease fencing 不变；
-- [ ] stale callback 拒绝；
-- [ ] queue priority + fairness；
-- [ ] queue evidence 可观察；
-- [ ] worker loss 后安全重新调度规则明确。
+- [x] 复核 worker registration / heartbeat / claim / lease / attempt 数据模型；
+- [x] scheduler 支持多个 eligible Worker；
+- [x] 同 job 使用 per-attempt lease fencing，过期 lease 不可续活；
+- [x] stale callback 以稳定 `stale_job_lease` 拒绝；
+- [x] queue priority + repository round-robin + repo FIFO 保持；
+- [x] queue evidence 可观察：eligible Worker / 不可调度原因；
+- [x] worker loss / restart 后按 attempts 安全重排，queue counter 成对恢复。
+
+CI-A 仅完成 Controller/现有 Agent 的安全调度基础与自动化测试；CI-B 第二 Worker 运行时隔离、CI-C 真实双 Worker 并发验收仍未完成。正式 self-deploy 的协议切换顺序固定为 Agent 先加载新 callback header，再切换严格 fencing Controller。
 
 #### Batch CI-B：第二 Worker 运行时隔离
 

@@ -59,6 +59,7 @@ def _error_response(code: str, message: str, retryable: bool = False, details: d
 _PRIVATE_CI_SUMMARY_FIELDS = (
     "job_id", "repository", "branch", "commit_sha", "base_sha", "profile",
     "status", "exit_code", "priority", "worker_id", "queue_position",
+    "eligible_workers", "unschedulable_reason",
     "created_at", "started_at", "finished_at", "duration_seconds",
     "cancel_requested", "superseded_by_job_id",
 )
@@ -130,7 +131,10 @@ def build_private_ci_job_list_item(job: dict) -> dict:
         (step.get("step_name") for step in logical_steps if step.get("status") == "running"),
         None,
     )
-    for optional_key in ("worker_id", "queue_position", "superseded_by_job_id"):
+    for optional_key in (
+        "worker_id", "queue_position", "eligible_workers",
+        "unschedulable_reason", "superseded_by_job_id",
+    ):
         if result.get(optional_key) is None:
             result.pop(optional_key, None)
     if current_step is not None:
@@ -184,6 +188,12 @@ def build_private_ci_job_response(job: dict, persisted_steps: list[dict], detail
         return result
 
     result = {key: job.get(key) for key in _PRIVATE_CI_SUMMARY_FIELDS}
+    for optional_key in (
+        "worker_id", "queue_position", "eligible_workers",
+        "unschedulable_reason", "superseded_by_job_id",
+    ):
+        if result.get(optional_key) is None:
+            result.pop(optional_key, None)
     result["current_step"] = current_step
     result["git_tree_sha"] = job_summary.get("git_tree_sha")
     result["detected_stacks"] = list(job.get("detected_stacks") or job_summary.get("detected_stacks") or [])

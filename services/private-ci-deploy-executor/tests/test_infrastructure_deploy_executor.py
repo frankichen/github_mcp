@@ -313,3 +313,5 @@ def test_fixed_deploy_script_contains_dx2_phase_markers():
     for phase in ("controller_build", "controller_switch", "health", "preheat", "post_verify"):
         assert content.count(f'DX2_PHASE={phase}') == 1
     assert "MYGITHUB12_DEPLOY_FAILURE_MODE" in content
+    assert content.count("systemctl restart private-ci-agent.service") == 1
+    assert content.index("systemctl restart private-ci-agent.service") < content.index("DX2_PHASE=controller_switch")

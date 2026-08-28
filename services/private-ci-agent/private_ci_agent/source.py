@@ -141,10 +141,12 @@ def _is_proxy_error(error: Exception) -> bool:
 def download_source_archive(controller_url: str, worker_id: str, worker_token: str,
                             job_id: str, dest_file: str, max_bytes: int,
                             connect_timeout: int = DOWNLOAD_CONNECT_TIMEOUT,
-                            total_timeout: int = DOWNLOAD_TOTAL_TIMEOUT) -> tuple:
+                            total_timeout: int = DOWNLOAD_TOTAL_TIMEOUT,
+                            lease_token: str = "", log_callback=None) -> tuple:
     """Download source tarball from the CI controller and return (sha256, file_size).
 
-    Implements connect timeout, total timeout, and retry with backoff.
+    Implements connect timeout, total timeout, and retry with backoff. The
+    optional per-job lease token fences this source request to one attempt.
     Raises SourceDownloadTimeout or ProxyUnavailableError for specific failure modes.
     """
     url = f"{controller_url}/internal/ci/jobs/{job_id}/source/download"
@@ -152,10 +154,12 @@ def download_source_archive(controller_url: str, worker_id: str, worker_token: s
     last_error = None
 
     for attempt in range(DOWNLOAD_MAX_RETRIES + 1):
+        if log_callback:
+            log_callback(f"[download] attempt={attempt + 1}/{DOWNLOAD_MAX_RETRIES + 1}\n")
         try:
             return _attempt_download(url, worker_id, worker_token, dest_file,
                                      max_bytes, connect_timeout, total_timeout,
-                                     attempt)
+                                     attempt, lease_token=lease_token)
         except DownloadError:
             raise
         except Exception as e:
@@ -164,6 +168,8 @@ def download_source_archive(controller_url: str, worker_id: str, worker_token: s
                 delay = DOWNLOAD_RETRY_BACKOFF[min(attempt, len(DOWNLOAD_RETRY_BACKOFF) - 1)]
                 logger.warning("Download attempt %d/%d failed: %s - retrying in %ds",
                                attempt + 1, DOWNLOAD_MAX_RETRIES + 1, e, delay)
+                if log_callback:
+                    log_callback(f"[download] retry_in_seconds={delay}\n")
                 time.sleep(delay)
             else:
                 break
@@ -185,12 +191,14 @@ def download_source_archive(controller_url: str, worker_id: str, worker_token: s
 
 def _attempt_download(url: str, worker_id: str, worker_token: str, dest_file: str,
                       max_bytes: int, connect_timeout: int, total_timeout: int,
-                      attempt: int) -> tuple:
+                      attempt: int, lease_token: str = "") -> tuple:
     logger.info("Download attempt %d: %s", attempt + 1, url)
 
     req = urllib.request.Request(url)
     req.add_header("Authorization", f"Bearer {worker_token}")
     req.add_header("X-Worker-ID", worker_id)
+    if lease_token:
+        req.add_header("X-CI-Lease-Token", lease_token)
     req.add_header("User-Agent", "private-ci-agent/1.0")
 
     try:

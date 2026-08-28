@@ -200,18 +200,14 @@ def test_list_workers_preserves_history_and_null_job(client, monkeypatch):
     assert response.json()["workers"][0]["current_job"] is None
 
 
-def test_heartbeat_renews_lease_with_body_lease_token_not_worker_auth(client, monkeypatch):
-    """The heartbeat must renew the job lease with the per-job lease token,
-    never with the worker registration token from the Authorization header."""
-    from app.routers import ci_worker
-
+def test_heartbeat_renews_current_job_lease_for_authenticated_worker(client, monkeypatch):
     renewed_with = []
 
     async def accept(_request):
         return "wsl-ci-test"
 
-    def fake_renew_lease(job_id, lease_token):
-        renewed_with.append((job_id, lease_token))
+    def fake_renew_lease(job_id, lease_token, worker_id):
+        renewed_with.append((job_id, lease_token, worker_id))
         return True
 
     monkeypatch.setattr(ci_worker, "verify_ci_worker", accept)
@@ -226,26 +222,24 @@ def test_heartbeat_renews_lease_with_body_lease_token_not_worker_auth(client, mo
     )
 
     assert response.status_code == 200
-    assert renewed_with == [("job-lease-1", "job-lease-secret")]
+    assert renewed_with == [("job-lease-1", "job-lease-secret", "wsl-ci-test")]
+    assert response.json()["lease_lost"] is False
+    assert response.json()["cancel_requested"] is False
 
 
-def test_heartbeat_falls_back_to_auth_when_lease_token_missing(client, monkeypatch):
-    """Legacy workers that do not send lease_token keep the old fallback."""
-    from app.routers import ci_worker
-
+def test_heartbeat_without_job_lease_token_fails_closed(client, monkeypatch):
     renewed_with = []
 
     async def accept(_request):
         return "wsl-ci-test"
 
-    def fake_renew_lease(job_id, lease_token):
-        renewed_with.append((job_id, lease_token))
+    def fake_renew_lease(*args):
+        renewed_with.append(args)
         return True
 
     monkeypatch.setattr(ci_worker, "verify_ci_worker", accept)
     monkeypatch.setattr(ci_worker, "update_worker_heartbeat", lambda _worker_id: None)
     monkeypatch.setattr(ci_worker, "renew_lease", fake_renew_lease)
-    monkeypatch.setattr(ci_worker, "need_heartbeat", lambda _job_id: False)
 
     response = client.post(
         "/internal/ci/workers/heartbeat",
@@ -254,7 +248,10 @@ def test_heartbeat_falls_back_to_auth_when_lease_token_missing(client, monkeypat
     )
 
     assert response.status_code == 200
-    assert renewed_with == [("job-lease-2", "worker-token")]
+    assert renewed_with == []
+    assert response.json()["lease_renewed"] is False
+    assert response.json()["lease_lost"] is True
+    assert response.json()["cancel_requested"] is True
 
 
 
@@ -343,3 +340,67 @@ def test_reconcile_worker_startup_clears_stale_pointer(tmp_path, monkeypatch):
         if database._local.db is not None:
             database._local.db.close()
             database._local.db = None
+
+
+def test_job_log_callback_rejects_stale_attempt(client, monkeypatch):
+    async def accept(_request):
+        return "wsl-ci-test"
+
+    def stale_write(*_args):
+        raise ci_worker.StaleJobLeaseError("job-stale")
+
+    monkeypatch.setattr(ci_worker, "verify_ci_worker", accept)
+    monkeypatch.setattr(ci_worker, "append_log_chunk", stale_write)
+    response = client.post(
+        "/internal/ci/jobs/job-stale/logs",
+        json={"content": "old attempt\n"},
+        headers={
+            "Authorization": "Bearer worker-token",
+            "X-Worker-ID": "wsl-ci-test",
+            "X-CI-Lease-Token": "old-lease",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"] == "stale_job_lease"
+
+
+def test_job_log_callback_passes_worker_and_attempt_lease(client, monkeypatch):
+    calls = []
+
+    async def accept(_request):
+        return "wsl-ci-test"
+
+    def current_write(job_id, content, worker_id, lease_token):
+        calls.append((job_id, content, worker_id, lease_token))
+        return len(content)
+
+    monkeypatch.setattr(ci_worker, "verify_ci_worker", accept)
+    monkeypatch.setattr(ci_worker, "append_log_chunk", current_write)
+    response = client.post(
+        "/internal/ci/jobs/job-current/logs",
+        json={"content": "current\n"},
+        headers={
+            "Authorization": "Bearer worker-token",
+            "X-Worker-ID": "wsl-ci-test",
+            "X-CI-Lease-Token": "current-lease",
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == [("job-current", "current\n", "wsl-ci-test", "current-lease")]
+
+
+def test_job_callback_without_attempt_lease_is_rejected(client, monkeypatch):
+    async def accept(_request):
+        return "wsl-ci-test"
+
+    monkeypatch.setattr(ci_worker, "verify_ci_worker", accept)
+    response = client.post(
+        "/internal/ci/jobs/job-current/logs",
+        json={"content": "current\n"},
+        headers={"Authorization": "Bearer worker-token", "X-Worker-ID": "wsl-ci-test"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"] == "stale_job_lease"

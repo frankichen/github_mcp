@@ -71,3 +71,43 @@ def test_kill_current_job_reclaims_all_job_containers_by_prefix(monkeypatch):
     assert any("ci-job-abc123-bbb222" in cmd and cmd[1] == "stop" for cmd in stopped)
     assert any("ci-job-abc123-aaa111" in cmd and cmd[1] == "rm" for cmd in removed)
     assert any("ci-job-abc123-bbb222" in cmd and cmd[1] == "rm" for cmd in removed)
+
+
+def test_controller_client_sends_attempt_lease_on_job_callbacks(monkeypatch):
+    import private_ci_agent.controller_client as client_module
+
+    requests = []
+    payloads = [
+        b'{"job_id":"job-lease","lease_token":"attempt-secret"}',
+        b'{}',
+        b'{}',
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return self.payload
+
+    def fake_urlopen(request, timeout=30):
+        requests.append(request)
+        return FakeResponse(payloads.pop(0))
+
+    monkeypatch.setattr(client_module.urllib.request, "urlopen", fake_urlopen)
+    client = client_module.ControllerClient("http://controller", "worker-a", "worker-token")
+
+    leased = client.lease_job()
+    assert leased["lease_token"] == "attempt-secret"
+    assert client.upload_log("job-lease", "hello\n") is True
+    callback_headers = {key.lower(): value for key, value in requests[1].header_items()}
+    assert callback_headers["x-ci-lease-token"] == "attempt-secret"
+
+    client.finish_job("job-lease", 0, "passed")
+    assert "job-lease" not in client._job_leases
