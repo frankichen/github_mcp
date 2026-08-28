@@ -3,8 +3,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
+import private_ci_agent.config as agent_config
 from private_ci_agent.config import DEFAULT_CONFIG
 from private_ci_agent.profiles import PROFILE_COMMANDS, get_repository_overrides
 
@@ -500,3 +502,56 @@ def test_apply_fixes_uses_fixed_ciworker_systemd_broker():
     assert "command -v systemd-run" in script
     assert 'CIWORKER_BROKER_UID="$(run_ciworker_preheat /usr/bin/id -u)"' in script
     assert "runuser -u ciworker" not in script
+
+
+def test_worker_runtime_roots_are_fixed_and_writable_state_is_isolated(monkeypatch):
+    primary = agent_config.worker_runtime_config("wsl-ci-01")
+    secondary = agent_config.worker_runtime_config("wsl-ci-02")
+
+    assert primary["workspace_root"] != secondary["workspace_root"]
+    assert primary["writable_cache_root"] != secondary["writable_cache_root"]
+    assert primary["log_root"] != secondary["log_root"]
+    assert primary["run_root"] != secondary["run_root"]
+    assert primary["environment_cache_root"] == secondary["environment_cache_root"]
+    assert primary["shared_playwright_cache"] == secondary["shared_playwright_cache"]
+    assert primary["source_mirror_root"] == secondary["source_mirror_root"]
+
+    monkeypatch.setenv("PRIVATE_CI_WORKER_ID", "wsl-ci-02")
+    monkeypatch.setattr(agent_config.os.path, "exists", lambda _path: False)
+    loaded = agent_config.load_config()
+    assert loaded["worker_id"] == "wsl-ci-02"
+    assert loaded["max_concurrent_jobs"] == 1
+    assert loaded["workspace_root"].endswith("/workers/wsl-ci-02/workspaces")
+    with pytest.raises(RuntimeError, match="CI_WORKER_ID_INVALID"):
+        agent_config.resolve_worker_id("arbitrary-worker")
+
+
+def test_second_worker_systemd_template_and_resource_limits_are_fixed():
+    unit = (DEPLOY_DIR / "private-ci-agent@.service").read_text(encoding="utf-8")
+    dropin = (DEPLOY_DIR / "private-ci-agent.service.d" / "dx2-worker-roots.conf").read_text(encoding="utf-8")
+
+    assert "Environment=PRIVATE_CI_WORKER_ID=%i" in unit
+    assert "ReadWritePaths=/srv/private-ci/workers /srv/private-ci/cache" in unit
+    assert "MemoryMax=3G" in unit
+    assert "CPUQuota=250%" in unit
+    assert "TasksMax=1024" in unit
+    assert "ReadWritePaths=/srv/private-ci/workers" in dropin
+
+    from private_ci_agent.podman import PodmanRunner
+    summary = PodmanRunner("podman", "wsl-ci-02").resource_summary()
+    assert summary == {
+        "mode": "worker_isolated", "worker_id": "wsl-ci-02",
+        "pids_limit": 256, "cpus": 2, "memory": "2g",
+        "memory_swap": "3g", "tmpfs_bytes": 335544320,
+    }
+
+
+def test_second_worker_first_enable_happens_after_controller_switch():
+    script = APPLY_FIXES_SCRIPT.read_text(encoding="utf-8")
+    controller_switch = script.index("DX2_PHASE=controller_switch")
+    second_enable = script.index('systemctl enable --now "${SECOND_WORKER_SERVICE}"')
+
+    assert script.index("systemctl restart private-ci-agent.service") < controller_switch
+    assert second_enable > controller_switch
+    assert "private-ci-agent@wsl-ci-02.service" in script
+    assert 'systemctl is-active --quiet "${SECOND_WORKER_SERVICE}"' in script

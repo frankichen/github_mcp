@@ -315,3 +315,29 @@ def test_fixed_deploy_script_contains_dx2_phase_markers():
     assert "MYGITHUB12_DEPLOY_FAILURE_MODE" in content
     assert content.count("systemctl restart private-ci-agent.service") == 1
     assert content.index("systemctl restart private-ci-agent.service") < content.index("DX2_PHASE=controller_switch")
+    assert content.index('systemctl enable --now "${SECOND_WORKER_SERVICE}"') > content.index("DX2_PHASE=controller_switch")
+    assert "private-ci-agent@wsl-ci-02.service" in content
+
+
+def test_fixed_health_evidence_requires_both_private_ci_workers(monkeypatch):
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"status": "ok"}
+
+    states = {
+        "private-ci-agent.service": 0,
+        "private-ci-agent@wsl-ci-02.service": 0,
+    }
+
+    def fake_run(command, **_kwargs):
+        return SimpleNamespace(returncode=states[command[-1]])
+
+    monkeypatch.setattr(executor.requests, "get", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(executor.subprocess, "run", fake_run)
+    assert executor._fixed_health_evidence() == (True, True)
+
+    states["private-ci-agent@wsl-ci-02.service"] = 3
+    assert executor._fixed_health_evidence() == (True, False)

@@ -96,3 +96,24 @@ def test_source_download_request_carries_attempt_lease(monkeypatch, tmp_path):
     assert size == len(payload)
     assert captured["x-ci-lease-token"] == "attempt-lease"
     assert logs == ["[download] attempt=1/3\n"]
+
+
+def test_remove_source_worktree_does_not_mutate_shared_mirror_without_lock(monkeypatch, tmp_path):
+    mirror_root = tmp_path / "mirrors"
+    mirror = mirror_root / "frankichen-example.git"
+    mirror.mkdir(parents=True)
+    dest = tmp_path / "source"
+    dest.mkdir()
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        if command[-2:] == ["rev-parse", "--git-common-dir"]:
+            return type("Result", (), {"returncode": 0, "stdout": str(mirror) + "\n", "stderr": ""})()
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(source.subprocess, "run", fake_run)
+    monkeypatch.setattr(source, "_acquire_mirror_lock", lambda *_args, **_kwargs: False)
+    source.remove_source_worktree(str(dest), str(mirror_root))
+
+    assert not any("worktree" in command and "remove" in command for command in commands)
