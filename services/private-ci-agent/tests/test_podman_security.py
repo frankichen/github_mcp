@@ -213,6 +213,29 @@ def test_playwright_cache_mount_and_environment_are_explicit(monkeypatch, tmp_pa
     assert "--http-proxy=false" in command
 
 
+def test_playwright_maintenance_cache_write_requires_explicit_opt_in(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_run(command, **_kwargs):
+        captured.append(command)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    cache = tmp_path / "ms-playwright"
+    cache.mkdir()
+    result = PodmanRunner("podman").run_command(
+        "docker.io/library/node:22", "maintenance-123", str(tmp_path / "source"),
+        {"playwright": str(cache)}, "true", 30, network=True,
+        playwright_cache_writable=True,
+    )
+
+    assert result["exit_code"] == 0
+    command = captured[0]
+    assert f"{cache}:/ci-cache/ms-playwright:rw,z" in command
+    assert f"{cache}:/ci-cache/ms-playwright:ro,z" not in command
+    assert "PLAYWRIGHT_BROWSERS_PATH=/ci-cache/ms-playwright" in command
+
+
 def test_shared_browser_cache_uses_nonexclusive_relabel(monkeypatch, tmp_path):
     captured = []
 
