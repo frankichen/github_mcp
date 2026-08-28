@@ -261,5 +261,5 @@ run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-playwright-cache" || die "Play
 log "DX2_PHASE=post_verify"
 systemctl is-active --quiet private-ci-agent.service || die "worker is not active after controller switch"
 
-log "DONE. Worker protocol loaded before controller switch and caches preheated."
+log "DONE. Worker restarted with local shared image and caches preheated."
 log "Verify: journalctl -u private-ci-agent.service -n 20"
