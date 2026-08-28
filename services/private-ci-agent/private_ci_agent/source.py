@@ -24,6 +24,19 @@ DOWNLOAD_TOTAL_TIMEOUT = 300
 DOWNLOAD_MAX_RETRIES = 2
 DOWNLOAD_RETRY_BACKOFF = [5, 15]
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+MIRROR_LOCK_TIMEOUT_SECONDS = 60
+
+
+def _acquire_mirror_lock(lock, timeout_seconds: int = MIRROR_LOCK_TIMEOUT_SECONDS) -> bool:
+    deadline = time.monotonic() + max(0, timeout_seconds)
+    while True:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.2)
 
 
 def _authoritative_repository_url(repository: str) -> str | None:
@@ -59,9 +72,7 @@ def prepare_source_from_mirror(repository: str, commit_sha: str, dest_dir: str, 
     lock_path = mirror + ".lock"
     try:
         with open(lock_path, "a+") as lock:
-            try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+            if not _acquire_mirror_lock(lock):
                 return {"ok": False, "error_code": "SOURCE_MIRROR_LOCK_TIMEOUT"}
             if not os.path.isdir(os.path.join(mirror, "objects")):
                 result = subprocess.run(["git", "clone", "--mirror", authoritative_url, mirror], capture_output=True, text=True, timeout=180)
@@ -114,7 +125,14 @@ def remove_source_worktree(dest_dir: str, mirror_root: str):
     mirror = os.path.join(mirror_root, repository + ".git")
     if not os.path.isdir(mirror):
         return
-    subprocess.run(["git", "-C", mirror, "worktree", "remove", "--force", dest_dir], capture_output=True, text=True, timeout=30)
+    try:
+        with open(mirror + ".lock", "a+") as lock:
+            if not _acquire_mirror_lock(lock, 30):
+                logger.warning("Mirror worktree cleanup lock timed out for %s", repository)
+                return
+            subprocess.run(["git", "-C", mirror, "worktree", "remove", "--force", dest_dir], capture_output=True, text=True, timeout=30)
+    except OSError:
+        return
 
 
 class DownloadError(Exception):
