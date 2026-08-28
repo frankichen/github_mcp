@@ -1263,6 +1263,13 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "max_atomic_multi_upload_files": MAX_UPLOAD_CHANGE_SET_FILES,
         "max_atomic_multi_upload_bytes": MAX_UPLOAD_CHANGE_SET_BYTES,
         "supports_high_level_file_put": True,
+        "supports_generated_files_put_v1": True,
+        "generated_files_put_semantics": {
+            "recommended_for": "routine AI-generated UTF-8 text add/modify writes",
+            "caller_supplies": ["repository", "branch", "expected_head_sha", "files", "commit_message", "dry_run", "idempotency_key"],
+            "server_manages": ["existing_blob_lookup", "path_validation", "hashing", "chunking", "staging", "atomic_commit", "read_back_verification"],
+            "unsupported": ["binary", "delete", "bundle"],
+        },
         "high_level_inline_content_limit_bytes": MAX_HIGH_LEVEL_INLINE_CONTENT_BYTES,
         "supports_local_candidate_file_put": True,
         "supports_dry_run": True,
@@ -1313,10 +1320,12 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_runtime_generation_leader": True,
         "supports_cross_generation_resources": True,
         "tool_manifest_count": 169,
-        "recommended_small_text_workflow": ["put_github_file", "replace_github_text_once", "apply_github_patch", "edit_github_file_ranges"],
-        "recommended_large_file_workflow": ["put_github_file_from_local_candidate", "get_github_file_manifest", "read_github_file_chunk"],
-        "recommended_atomic_multi_upload_workflow": ["put_github_files", "prepare_development_task", "apply_development_change_set"],
-        "stable_write_error_codes": ["HEAD_CHANGED", "BLOB_CHANGED", "WRITE_VERIFY_FAILED", "GITHUB_WRITE_FAILED", "STAGING_FAILED", "PAYLOAD_INVALID", "PAYLOAD_TOO_LARGE", "PAYLOAD_REQUIRES_LOCAL_CANDIDATE", "PAYLOAD_LOCAL_CANDIDATE_UNAVAILABLE", "PAYLOAD_LOCAL_CANDIDATE_NOT_FOUND", "PAYLOAD_SIZE_MISMATCH", "PAYLOAD_SHA_MISMATCH", "BINARY_FILE_UNSUPPORTED", "BLOB_EXPECTATION_REQUIRED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "PATCH_TEXT_MISMATCH", "IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_IN_PROGRESS", "UPLOAD_CHUNK_BASE64_INVALID", "UPLOAD_CHUNK_ENCODING_AMBIGUOUS", "UPLOAD_CHUNK_EMPTY", "UPLOAD_CHUNK_LIMIT_EXCEEDED", "UPLOAD_CHUNK_SHA_MISMATCH", "UPLOAD_OFFSET_MISMATCH", "UPLOAD_SIZE_EXCEEDED", "UPLOAD_NOT_FINALIZED", "WORKSPACE_LEASE_REQUIRED", "WORKSPACE_REVISION_MISMATCH", "WORKSPACE_BRANCH_DRIFTED", "DEVELOPMENT_SESSION_NOT_FOUND", "DEVELOPMENT_SESSION_CLOSED", "DEVELOPMENT_SESSION_STATE_INVALID", "DEVELOPMENT_SESSION_REVISION_MISMATCH", "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "MIRROR_UNAVAILABLE", "MIRROR_ORIGIN_MISMATCH", "MIRROR_FETCH_FAILED", "MIRROR_OBJECT_MISSING", "MIRROR_IDENTITY_MISMATCH", "FAST_CI_NOT_MERGE_ELIGIBLE", "CI_PROFILE_DISCOVERY_MISMATCH", "CI_ENV_CACHE_INVALID", "CI_ENV_CACHE_BUILD_FAILED", "AFFECTED_SELECTION_INCOMPLETE", "FAILURE_PACK_UNAVAILABLE", "RUNTIME_SCHEMA_INCOMPATIBLE", "RUNTIME_GENERATION_NOT_READY", "RUNTIME_LEADER_CONFLICT", "CROSS_GENERATION_RESOURCE_UNAVAILABLE", "CROSS_GENERATION_UPLOAD_UNAVAILABLE"],
+        "recommended_ai_text_write_workflow": ["put_generated_files"],
+        "recommended_small_text_workflow": ["put_generated_files"],
+        "recommended_large_file_workflow": ["put_generated_files"],
+        "recommended_atomic_multi_upload_workflow": ["put_generated_files"],
+        "legacy_upload_guidance": "begin/append/finalize and earlier put tools are compatibility-only; routine AI-generated text files must use put_generated_files",
+        "stable_write_error_codes": ["HEAD_CHANGED", "PAYLOAD_TOO_LARGE", "PATH_INVALID", "UTF8_REQUIRED", "NO_FILES", "WRITE_VERIFY_FAILED", "IDEMPOTENCY_CONFLICT", "BLOB_CHANGED", "GITHUB_WRITE_FAILED", "STAGING_FAILED", "PAYLOAD_INVALID", "PAYLOAD_REQUIRES_LOCAL_CANDIDATE", "PAYLOAD_LOCAL_CANDIDATE_UNAVAILABLE", "PAYLOAD_LOCAL_CANDIDATE_NOT_FOUND", "PAYLOAD_SIZE_MISMATCH", "PAYLOAD_SHA_MISMATCH", "BINARY_FILE_UNSUPPORTED", "BLOB_EXPECTATION_REQUIRED", "PATCH_DOES_NOT_APPLY", "PATCH_INVALID_FORMAT", "PATCH_TARGET_EXISTS", "PATCH_TEXT_MISMATCH", "IDEMPOTENCY_IN_PROGRESS", "UPLOAD_CHUNK_BASE64_INVALID", "UPLOAD_CHUNK_ENCODING_AMBIGUOUS", "UPLOAD_CHUNK_EMPTY", "UPLOAD_CHUNK_LIMIT_EXCEEDED", "UPLOAD_CHUNK_SHA_MISMATCH", "UPLOAD_OFFSET_MISMATCH", "UPLOAD_SIZE_EXCEEDED", "UPLOAD_NOT_FINALIZED", "WORKSPACE_LEASE_REQUIRED", "WORKSPACE_REVISION_MISMATCH", "WORKSPACE_BRANCH_DRIFTED", "DEVELOPMENT_SESSION_NOT_FOUND", "DEVELOPMENT_SESSION_CLOSED", "DEVELOPMENT_SESSION_STATE_INVALID", "DEVELOPMENT_SESSION_REVISION_MISMATCH", "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "MIRROR_UNAVAILABLE", "MIRROR_ORIGIN_MISMATCH", "MIRROR_FETCH_FAILED", "MIRROR_OBJECT_MISSING", "MIRROR_IDENTITY_MISMATCH", "FAST_CI_NOT_MERGE_ELIGIBLE", "CI_PROFILE_DISCOVERY_MISMATCH", "CI_ENV_CACHE_INVALID", "CI_ENV_CACHE_BUILD_FAILED", "AFFECTED_SELECTION_INCOMPLETE", "FAILURE_PACK_UNAVAILABLE", "RUNTIME_SCHEMA_INCOMPATIBLE", "RUNTIME_GENERATION_NOT_READY", "RUNTIME_LEADER_CONFLICT", "CROSS_GENERATION_RESOURCE_UNAVAILABLE", "CROSS_GENERATION_UPLOAD_UNAVAILABLE"],
         "deprecated_tools": [{"name": "get_github_file", "deprecated": True, "replacement": "get_github_file_manifest + read_github_file_chunk"}, {"name": "commit_github_files", "deprecated": True, "replacement": "apply_github_patch or commit_github_uploaded_files"}, {"name": "get_test_deployment_logs", "deprecated": True, "replacement": "get_test_deployment_log_tail"}],
     }
 
@@ -1656,6 +1665,101 @@ def prepare_inline_put_files(files: list[dict[str, Any]]) -> list[dict[str, Any]
     return prepared
 
 
+def _safe_generated_path(path: Any) -> str:
+    if not isinstance(path, str) or not path:
+        raise MyGithub10Error("PATH_INVALID", "file path must be a non-empty relative repository path")
+    if path.startswith(("/", "\\")) or "\\" in path or re.match(r"^[A-Za-z]:", path):
+        raise MyGithub10Error("PATH_INVALID", "file path must be relative to the repository", {"path": path})
+    parts = path.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise MyGithub10Error("PATH_INVALID", "file path contains an unsafe path segment", {"path": path})
+    if any(part.lower() == ".git" for part in parts):
+        raise MyGithub10Error("PATH_INVALID", ".git paths are not writable", {"path": path})
+    if any(ord(char) < 32 or ord(char) == 127 for char in path):
+        raise MyGithub10Error("PATH_INVALID", "file path contains control characters", {"path": path})
+    try:
+        path_bytes = path.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise MyGithub10Error("PATH_INVALID", "file path must be valid UTF-8") from exc
+    if len(path_bytes) > 4096:
+        raise MyGithub10Error("PATH_INVALID", "file path is too long", {"path": path})
+    return path
+
+
+def prepare_generated_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Validate and freeze the exact UTF-8 bytes used by dry-run and commit."""
+    if not isinstance(files, list) or not files:
+        raise MyGithub10Error("NO_FILES", "files must contain at least one UTF-8 text file")
+    if len(files) > MAX_UPLOAD_CHANGE_SET_FILES:
+        raise MyGithub10Error(
+            "PAYLOAD_TOO_LARGE",
+            "too many files for one atomic generated-file write",
+            {"file_count": len(files), "max_files": MAX_UPLOAD_CHANGE_SET_FILES},
+        )
+    prepared: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    total_size = 0
+    for item in files:
+        if not isinstance(item, dict):
+            raise MyGithub10Error("UTF8_REQUIRED", "each files item must contain path and UTF-8 text content")
+        path = _safe_generated_path(item.get("path"))
+        if path in seen_paths:
+            raise MyGithub10Error("PATH_INVALID", "duplicate file path in one request", {"path": path})
+        seen_paths.add(path)
+        content = item.get("content")
+        if not isinstance(content, str) or "\x00" in content:
+            raise MyGithub10Error("UTF8_REQUIRED", "content must be UTF-8 text without NUL bytes", {"path": path})
+        try:
+            data = content.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise MyGithub10Error("UTF8_REQUIRED", "content must be valid UTF-8 text", {"path": path}) from exc
+        prepared_item = _prepare_put_item(path, data)
+        total_size += int(prepared_item["size_bytes"])
+        prepared.append(prepared_item)
+    if total_size > MAX_HIGH_LEVEL_INLINE_CONTENT_BYTES:
+        raise MyGithub10Error(
+            "PAYLOAD_TOO_LARGE",
+            "generated-file payload exceeds the V1 inline text limit",
+            {"total_size_bytes": total_size, "max_bytes": MAX_HIGH_LEVEL_INLINE_CONTENT_BYTES},
+        )
+    return prepared
+
+
+def build_generated_files_request(
+    repository: str,
+    branch: str,
+    expected_head_sha: str,
+    prepared: list[dict[str, Any]],
+    commit_message: str,
+    idempotency_key: str,
+) -> tuple[dict[str, Any], str]:
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_head_sha or ""):
+        raise MyGithub10Error("HEAD_CHANGED", "expected_head_sha must be a full lowercase 40-character commit SHA")
+    if not isinstance(commit_message, str) or not commit_message.strip():
+        raise MyGithub10Error("PAYLOAD_INVALID", "commit_message is required")
+    request = {
+        "tool_name": "put_generated_files",
+        "repository": repository,
+        "branch": branch,
+        "expected_head_sha": expected_head_sha,
+        "files": sorted(
+            (
+                {
+                    "path": item["path"],
+                    "content_sha256": item["content_sha256"],
+                    "size_bytes": item["size_bytes"],
+                    "predicted_blob_sha": _git_blob_sha(item["data"]),
+                }
+                for item in prepared
+            ),
+            key=lambda item: item["path"],
+        ),
+        "commit_message": commit_message,
+        "idempotency_key": idempotency_key or "",
+    }
+    return request, _sha256(_json(request).encode("utf-8"))
+
+
 def prepare_local_candidate_file(
     path: str,
     expected_blob_sha: str,
@@ -1786,6 +1890,8 @@ def execute_put_files(
     commit_message: str,
     dry_run: bool,
     operation_id: str = "",
+    infer_expected_blob_shas: bool = False,
+    canonical_payload_hash: str = "",
 ) -> dict[str, Any]:
     paths = [item["path"] for item in prepared]
     expected_blob_shas = {item["path"]: item["expected_blob_sha"] for item in prepared}
@@ -1793,16 +1899,19 @@ def execute_put_files(
         _, _, _, actual_head, old_shas = _preflight_file_write(
             client, repository, branch, expected_head_sha, paths, expected_blob_shas
         )
-        for item in prepared:
-            old_sha = old_shas[item["path"]]
-            if old_sha and not item["expected_blob_sha"]:
-                raise MyGithub10Error(
-                    "BLOB_EXPECTATION_REQUIRED",
-                    f"expected_blob_sha is required when modifying an existing file: {item['path']}",
-                    {"path": item["path"], "actual": old_sha},
-                )
+        if infer_expected_blob_shas:
+            expected_blob_shas = {path: old_shas[path] or "" for path in paths}
+        else:
+            for item in prepared:
+                old_sha = old_shas[item["path"]]
+                if old_sha and not item["expected_blob_sha"]:
+                    raise MyGithub10Error(
+                        "BLOB_EXPECTATION_REQUIRED",
+                        f"expected_blob_sha is required when modifying an existing file: {item['path']}",
+                        {"path": item["path"], "actual": old_sha},
+                    )
         if dry_run:
-            return {
+            result = {
                 "ok": True,
                 "dry_run": True,
                 "repository": repository,
@@ -1821,6 +1930,18 @@ def execute_put_files(
                     for item in prepared
                 ],
             }
+            if infer_expected_blob_shas:
+                result.update({
+                    "expected_head_sha": expected_head_sha,
+                    "canonical_payload_hash": canonical_payload_hash,
+                    "would_commit": any(
+                        _git_blob_sha(item["data"]) != old_shas[item["path"]]
+                        for item in prepared
+                    ),
+                })
+                for item in result["changed_files"]:
+                    item["predicted_blob_sha"] = item["new_blob_sha"]
+            return result
     except Exception as exc:
         if operation_id:
             fail_put_operation(operation_id, exc, "preflight")
@@ -1896,6 +2017,23 @@ def execute_put_files(
                 "chunk_count": chunk_count,
             },
         }
+        if infer_expected_blob_shas:
+            result.update({
+                "expected_head_sha": expected_head_sha,
+                "canonical_payload_hash": canonical_payload_hash,
+                "would_commit": True,
+                "blob_evidence": [
+                    {
+                        "path": item["path"],
+                        "old_blob_sha": item["old_blob_sha"],
+                        "blob_sha": item["new_blob_sha"],
+                        "content_sha256": item["content_sha256"],
+                        "size_bytes": item["size_bytes"],
+                        "verified": True,
+                    }
+                    for item in result["changed_files"]
+                ],
+            })
         if operation_id:
             try:
                 _idempotent_mark_git_verified(operation_id, result)

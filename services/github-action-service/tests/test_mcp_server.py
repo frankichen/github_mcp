@@ -54,7 +54,7 @@ class TestMCPTools:
 
         monkeypatch.setenv("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", "true")
         tools = {tool.name: tool for tool in await mcp.list_tools()}
-        for name in ("build_github_patch", "replace_github_text_once", "edit_github_file_ranges", "apply_github_patch", "put_github_file", "put_github_files", "put_github_file_from_local_candidate", "get_mygithub_capabilities", "plan_private_ci_job", "resume_development_task"):
+        for name in ("build_github_patch", "replace_github_text_once", "edit_github_file_ranges", "apply_github_patch", "put_generated_files", "put_github_file", "put_github_files", "put_github_file_from_local_candidate", "get_mygithub_capabilities", "plan_private_ci_job", "resume_development_task"):
             assert name in tools
         assert "expected_blob_sha" in tools["edit_github_file_ranges"].description
         assert "expected_old_text" in tools["edit_github_file_ranges"].description
@@ -96,13 +96,13 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.5.0"
+        assert capabilities["version"] == "12.6.0"
         assert capabilities["max_upload_chunk_bytes"] == 24576
         assert capabilities["recommended_upload_chunk_bytes"] == 16384
         assert capabilities["preferred_upload_encoding"] == "text_for_utf8_base64_for_binary"
-        assert capabilities["tool_count"] == 171
-        assert capabilities["tool_manifest_count"] == 171
-        assert capabilities["compatibility_tool_count"] == 171
+        assert capabilities["tool_count"] == 172
+        assert capabilities["tool_manifest_count"] == 172
+        assert capabilities["compatibility_tool_count"] == 172
         assert capabilities["deprecated_tools_exposed"] is True
         assert capabilities["hidden_deprecated_tool_count"] == 0
         assert capabilities["hidden_deprecated_tools"] == []
@@ -115,7 +115,8 @@ class TestMCPTools:
         assert capabilities["supports_high_level_file_put"] is True
         assert capabilities["high_level_inline_content_limit_bytes"] == 48 * 1024
         assert capabilities["supports_local_candidate_file_put"] is True
-        assert capabilities["recommended_large_file_workflow"][0] == "put_github_file_from_local_candidate"
+        assert capabilities["recommended_ai_text_write_workflow"] == ["put_generated_files"]
+        assert capabilities["recommended_large_file_workflow"] == ["put_generated_files"]
         assert capabilities["supports_private_ci_applicability_planning"] is True
         assert capabilities["supports_development_task_orchestration"] is True
         assert capabilities["supports_development_sessions"] is True
