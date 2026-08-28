@@ -283,9 +283,15 @@ run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-go-cache" || die "go cache pre
 log "Preheating shared Playwright browser cache"
 run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-playwright-cache" || die "Playwright cache preheat failed"
 
-# ── 9. 最终验证 Agent / Controller 协议切换后的运行状态 ─────
+# ── 9. Controller 已切换、共享只读资产已预热后启用第二 Worker ─
+log "Ensuring ${SECOND_WORKER_SERVICE} is enabled after controller switch"
+systemctl enable --now "${SECOND_WORKER_SERVICE}" || die "second worker enable/start failed"
+sleep 3
+
+# ── 10. 最终验证两个 Agent / Controller 协议切换后的运行状态 ─
 log "DX2_PHASE=post_verify"
-systemctl is-active --quiet private-ci-agent.service || die "worker is not active after controller switch"
+systemctl is-active --quiet private-ci-agent.service || die "primary worker is not active after controller switch"
+systemctl is-active --quiet "${SECOND_WORKER_SERVICE}" || die "second worker is not active after controller switch"
 
 log "DONE. Worker restarted with local shared image and caches preheated."
-log "Verify: journalctl -u private-ci-agent.service -n 20"
+log "Verify: journalctl -u private-ci-agent.service -u ${SECOND_WORKER_SERVICE} -n 20"
