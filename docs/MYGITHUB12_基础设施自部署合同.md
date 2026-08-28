@@ -108,7 +108,7 @@ MYGITHUB12_DEPLOY_FAILURE_MODE=fail-stop
 Executor 脚本返回 0 还不能单独把部署标记 passed。Terminal complete 必须同时满足：
 
 - Executor 验证 Controller `/health` 正常；
-- Executor 验证 `private-ci-agent.service` active；
+- Executor 同时验证 `private-ci-agent.service`（w1）与 `private-ci-agent@wsl-ci-02.service`（w2）active；
 - 重启后的 Controller 自己确认 `runtime_build_sha() == target commit_sha`。
 
 只有三项一致，状态才可进入 `passed`。
