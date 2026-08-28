@@ -1,0 +1,5 @@
+MyGithut12 put_generated_files smoke test
+repository=frankichen/github_mcp
+branch=ai/put-generated-files-v1
+expected_head_sha=581dd993ab9659a935f350c535146df7ab6c1a63
+utf8=你好，上传功能测试
