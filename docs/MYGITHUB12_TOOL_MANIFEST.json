@@ -1,6 +1,6 @@
 {
   "service_name": "MyGithut12",
-  "service_version": "12.6.0",
+  "service_version": "12.6.1",
   "manifest_format": "composed-v2",
   "legacy_manifest": "MYGITHUB10_TOOL_MANIFEST.json",
   "legacy_tool_count": 120,

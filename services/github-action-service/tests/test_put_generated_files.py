@@ -2,7 +2,9 @@ import hashlib
 
 import pytest
 
-from app import mcp_server, mygithub10
+from app import development_orchestrator as development_dx
+from app import development_session_store as sessions
+from app import mcp_server, mygithub10, mygithub12
 
 
 HEAD = "a" * 40
@@ -93,6 +95,11 @@ def generated_env(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mygithub10, "_preflight_file_write", fake_preflight)
     monkeypatch.setattr(mygithub10, "_commit_files", fake_commit)
+    monkeypatch.setattr(
+        development_dx,
+        "resolve_generated_write_context",
+        lambda *_args, **_kwargs: {"managed": False, "workspace": None, "session": None},
+    )
     return state
 
 
@@ -238,6 +245,207 @@ async def test_schema_exposes_only_v1_window_payload_and_capabilities_recommend_
     assert capabilities["recommended_ai_text_write_workflow"] == ["put_generated_files"]
     assert capabilities["recommended_small_text_workflow"] == ["put_generated_files"]
     assert capabilities["recommended_atomic_multi_upload_workflow"] == ["put_generated_files"]
+    assert "workspace_session_resolution" in capabilities["generated_files_put_semantics"]["server_manages"]
+    assert "workspace_session_revision_cas" in capabilities["generated_files_put_semantics"]["server_manages"]
     assert "put_generated_files" in capabilities["legacy_upload_guidance"]
     for name in ("begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload"):
         assert "put_generated_files" in tools[name].description
+
+
+def _workspace(**overrides):
+    value = {
+        "workspace_id": "ws-generated",
+        "repository": "owner/allowed-repo",
+        "branch": "ai/generated-files-test",
+        "head_sha": HEAD,
+        "tree_sha": TREE,
+        "revision": 7,
+        "status": "active",
+        "lease_valid": True,
+    }
+    value.update(overrides)
+    return value
+
+
+def _session(**overrides):
+    value = {
+        "session_id": "dev-generated",
+        "workspace_id": "ws-generated",
+        "repository": "owner/allowed-repo",
+        "branch": "ai/generated-files-test",
+        "head_commit_sha": HEAD,
+        "tree_sha": TREE,
+        "workspace_revision": 7,
+        "session_revision": 11,
+        "status": "active",
+        "lease_valid": True,
+    }
+    value.update(overrides)
+    return value
+
+
+def test_resolve_generated_write_context_binds_unique_workspace_and_session(monkeypatch):
+    workspace = _workspace()
+    session = _session()
+    monkeypatch.setattr(mygithub12, "list_workspaces", lambda *args, **kwargs: {"items": [workspace]})
+    monkeypatch.setattr(sessions, "find_active_session_for_workspace", lambda workspace_id: session)
+    observed = {}
+
+    def fake_require(_service, session_id, session_revision, workspace_revision, expected_head_sha):
+        observed.update({
+            "session_id": session_id,
+            "session_revision": session_revision,
+            "workspace_revision": workspace_revision,
+            "expected_head_sha": expected_head_sha,
+        })
+        return session, workspace
+
+    monkeypatch.setattr(development_dx, "require_session_workspace", fake_require)
+    result = development_dx.resolve_generated_write_context(object(), "owner/allowed-repo", "ai/generated-files-test", HEAD)
+    assert result == {"managed": True, "workspace": workspace, "session": session}
+    assert observed == {
+        "session_id": "dev-generated",
+        "session_revision": 11,
+        "workspace_revision": 7,
+        "expected_head_sha": HEAD,
+    }
+
+
+@pytest.mark.parametrize(
+    ("workspace", "error_code"),
+    [
+        (_workspace(status="expired", lease_valid=False), "WORKSPACE_LEASE_REQUIRED"),
+        (_workspace(status="drifted", lease_valid=False), "WORKSPACE_BRANCH_DRIFTED"),
+    ],
+)
+def test_resolve_generated_write_context_fails_closed_for_stale_workspace(monkeypatch, workspace, error_code):
+    monkeypatch.setattr(mygithub12, "list_workspaces", lambda *args, **kwargs: {"items": [workspace]})
+    with pytest.raises(mygithub12.MyGithub12Error) as exc:
+        development_dx.resolve_generated_write_context(object(), "owner/allowed-repo", "ai/generated-files-test", HEAD)
+    assert exc.value.code == error_code
+
+
+def test_resolve_generated_write_context_allows_unmanaged_branch(monkeypatch):
+    monkeypatch.setattr(mygithub12, "list_workspaces", lambda *args, **kwargs: {"items": []})
+    assert development_dx.resolve_generated_write_context(
+        object(), "owner/allowed-repo", "feature/no-workspace", HEAD
+    ) == {"managed": False, "workspace": None, "session": None}
+
+
+@pytest.mark.asyncio
+async def test_generated_write_uses_internal_workspace_and_session_cas_without_schema_fields(generated_env, monkeypatch):
+    workspace = _workspace()
+    session = _session()
+    monkeypatch.setattr(
+        development_dx,
+        "resolve_generated_write_context",
+        lambda *_args: {"managed": True, "workspace": workspace, "session": session},
+    )
+    run_calls = []
+
+    async def fake_run(*args):
+        run_calls.append(args)
+        return {
+            "ok": True,
+            "commit_sha": COMMIT,
+            "tree_sha": TREE,
+            "write_verified": True,
+            "workspace": {**workspace, "revision": 8, "head_sha": COMMIT},
+            "workspace_revision_after": 8,
+        }
+
+    def fake_after(_service, session_id, session_revision, result, event_type):
+        assert session_id == "dev-generated"
+        assert session_revision == 11
+        assert result["commit_sha"] == COMMIT
+        assert event_type == "generated_files_committed"
+        return {"session": {**session, "session_revision": 12, "head_commit_sha": COMMIT}, "index": None, "index_error": None}
+
+    monkeypatch.setattr(mcp_server, "_run_high_level_put", fake_run)
+    monkeypatch.setattr(development_dx, "after_verified_change", fake_after)
+    result = await _call(_args(dry_run=False, idempotency_key="managed-generated-write"))
+    assert result["ok"] is True
+    assert run_calls[0][7:9] == ("ws-generated", 7)
+    assert result["coordination"] == {
+        "managed": True,
+        "workspace_id": "ws-generated",
+        "workspace_revision": 7,
+        "development_session_id": "dev-generated",
+        "session_revision": 11,
+        "workspace_revision_after": 8,
+        "session_revision_after": 12,
+    }
+    assert result["development_session"]["head_commit_sha"] == COMMIT
+    stored = mygithub10._idempotent_existing("managed-generated-write")
+    assert stored["workspace_id"] == "ws-generated"
+    assert stored["workspace_revision"] == 7
+
+
+@pytest.mark.asyncio
+async def test_generated_dry_run_reports_internal_coordination_without_advancing_session(generated_env, monkeypatch):
+    workspace = _workspace()
+    session = _session()
+    monkeypatch.setattr(
+        development_dx,
+        "resolve_generated_write_context",
+        lambda *_args: {"managed": True, "workspace": workspace, "session": session},
+    )
+
+    async def fake_run(*args):
+        assert args[5] is True
+        assert args[7:9] == ("ws-generated", 7)
+        return {"ok": True, "dry_run": True, "canonical_payload_hash": "f" * 64, "changed_files": []}
+
+    monkeypatch.setattr(mcp_server, "_run_high_level_put", fake_run)
+    monkeypatch.setattr(
+        development_dx,
+        "after_verified_change",
+        lambda *_args: pytest.fail("dry-run must not advance the development session"),
+    )
+    result = await _call(_args(dry_run=True, idempotency_key="managed-generated-dry-run"))
+    assert result["ok"] is True
+    assert result["coordination"] == {
+        "managed": True,
+        "workspace_id": "ws-generated",
+        "workspace_revision": 7,
+        "development_session_id": "dev-generated",
+        "session_revision": 11,
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_finalize_failure_preserves_verified_commit_and_marks_idempotency_indeterminate(generated_env, monkeypatch):
+    workspace = _workspace()
+    session = _session()
+    monkeypatch.setattr(
+        development_dx,
+        "resolve_generated_write_context",
+        lambda *_args: {"managed": True, "workspace": workspace, "session": session},
+    )
+
+    async def fake_run(*_args):
+        return {
+            "ok": True,
+            "commit_sha": COMMIT,
+            "tree_sha": TREE,
+            "write_verified": True,
+            "workspace": {**workspace, "revision": 8, "head_sha": COMMIT},
+            "workspace_revision_after": 8,
+        }
+
+    def fail_after(*_args):
+        raise mygithub12.MyGithub12Error(
+            "DEVELOPMENT_SESSION_REVISION_MISMATCH",
+            "session changed while finalizing",
+        )
+
+    monkeypatch.setattr(mcp_server, "_run_high_level_put", fake_run)
+    monkeypatch.setattr(development_dx, "after_verified_change", fail_after)
+    result = await _call(_args(dry_run=False, idempotency_key="managed-session-finalize-failure"))
+    assert result["ok"] is False
+    assert result["commit_sha"] == COMMIT
+    assert result["write_verified"] is True
+    assert result["failed_stage"] == "development_session_finalize"
+    assert result["recovery_required"] is True
+    stored = mygithub10._idempotent_existing("managed-session-finalize-failure")
+    assert stored["status"] == "indeterminate"

@@ -33,6 +33,7 @@ from app.github_policy import ensure_repository_allowed, repository_is_allowed
 from app import github_utils
 from app import mygithub10
 from app import mygithub12
+from app import development_orchestrator as development_dx
 from app import attestation_registry
 from app.version import runtime_build_sha
 from app.observability import current_request_id
@@ -1352,7 +1353,7 @@ async def _run_high_level_put(
     return result
 
 
-PUT_GENERATED_FILES_DESCRIPTION = "The only recommended entry point for routine AI-generated UTF-8 text files. Provide repository, branch, exact expected_head_sha, structured files[{path,content}], commit_message, dry_run, and optional idempotency_key. MyGithut12 discovers existing blobs and internally performs path validation, hashing, chunked staging, atomic CAS commit, and durable read-back. V1 rejects oversized payloads, binary content, and deletion; callers must not manage upload IDs, chunks, offsets, hashes, staging paths, or expected_blob_sha."
+PUT_GENERATED_FILES_DESCRIPTION = "The only recommended entry point for routine AI-generated UTF-8 text files. Provide repository, branch, exact expected_head_sha, structured files[{path,content}], commit_message, dry_run, and optional idempotency_key. MyGithut12 automatically binds the branch's active Workspace/Development Session when present, then internally performs collaboration revision CAS, existing-blob lookup, path validation, hashing, chunked staging, atomic Git CAS commit, durable read-back, and Workspace/Session finalization. V1 rejects oversized payloads, binary content, and deletion; callers must not manage Workspace/Session IDs, revisions, upload IDs, chunks, offsets, hashes, staging paths, or expected_blob_sha."
 
 
 async def put_generated_files(
@@ -1386,6 +1387,29 @@ async def put_generated_files(
         )
         if replay:
             return json.dumps(replay, ensure_ascii=False)
+        try:
+            coordination = await _github_call(
+                development_dx.resolve_generated_write_context,
+                _service,
+                repository,
+                branch,
+                expected_head_sha,
+            )
+        except Exception as exc:
+            if operation_id:
+                await _github_call(mygithub10.fail_put_operation, operation_id, exc, "coordination_preflight")
+            raise
+        workspace = coordination.get("workspace") if coordination.get("managed") else None
+        session = coordination.get("session") if coordination.get("managed") else None
+        workspace_id = str((workspace or {}).get("workspace_id") or "")
+        workspace_revision = int((workspace or {}).get("revision") or 0)
+        if operation_id and workspace_id:
+            await _github_call(
+                mygithub10.bind_operation_workspace,
+                operation_id,
+                workspace_id,
+                workspace_revision,
+            )
         result = await _run_high_level_put(
             repository,
             branch,
@@ -1394,11 +1418,77 @@ async def put_generated_files(
             commit_message,
             dry_run,
             operation_id,
-            "",
-            0,
+            workspace_id,
+            workspace_revision,
             True,
             canonical_payload_hash,
         )
+        result["coordination"] = {
+            "managed": bool(coordination.get("managed")),
+            "workspace_id": workspace_id or None,
+            "workspace_revision": workspace_revision or None,
+            "development_session_id": (session or {}).get("session_id"),
+            "session_revision": (session or {}).get("session_revision"),
+        }
+        if dry_run or not session:
+            if not dry_run and operation_id:
+                await _github_call(
+                    mygithub10._idempotent_finish,
+                    operation_id,
+                    "success_verified",
+                    result.get("commit_sha"),
+                    None,
+                    result,
+                )
+            return json.dumps(result, ensure_ascii=False)
+        try:
+            state = await _github_call(
+                development_dx.after_verified_change,
+                _service,
+                session["session_id"],
+                int(session["session_revision"]),
+                result,
+                "generated_files_committed",
+            )
+        except Exception as exc:
+            failure = _safe_write_failure(exc, failed_stage="development_session_finalize")
+            failure["details"].update({
+                "github_write_verified": True,
+                "new_commit_sha": result.get("commit_sha", ""),
+                "development_session_id": session["session_id"],
+                "recovery_required": True,
+            })
+            failed_result = {
+                **result,
+                "ok": False,
+                "failed_stage": "development_session_finalize",
+                "recovery_required": True,
+                "orchestration_error": failure,
+            }
+            if operation_id:
+                await _github_call(
+                    mygithub10._idempotent_finish,
+                    operation_id,
+                    "indeterminate",
+                    result.get("commit_sha"),
+                    failure["code"],
+                    failed_result,
+                )
+            return json.dumps(failed_result, ensure_ascii=False)
+        result["development_session"] = state["session"]
+        result["index"] = state["index"]
+        result["index_error"] = state["index_error"]
+        result["coordination"]["workspace_revision_after"] = result.get("workspace_revision_after")
+        result["coordination"]["session_revision_after"] = state["session"].get("session_revision")
+        if operation_id:
+            await _github_call(
+                mygithub10._idempotent_finish,
+                operation_id,
+                "success_verified",
+                result.get("commit_sha"),
+                None,
+                result,
+            )
         return json.dumps(result, ensure_ascii=False)
     except Exception as exc:
         return _mygithub10_error(exc)
