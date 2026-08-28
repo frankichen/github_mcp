@@ -340,3 +340,67 @@ def test_reconcile_worker_startup_clears_stale_pointer(tmp_path, monkeypatch):
         if database._local.db is not None:
             database._local.db.close()
             database._local.db = None
+
+
+def test_job_log_callback_rejects_stale_attempt(client, monkeypatch):
+    async def accept(_request):
+        return "wsl-ci-test"
+
+    def stale_write(*_args):
+        raise ci_worker.StaleJobLeaseError("job-stale")
+
+    monkeypatch.setattr(ci_worker, "verify_ci_worker", accept)
+    monkeypatch.setattr(ci_worker, "append_log_chunk", stale_write)
+    response = client.post(
+        "/internal/ci/jobs/job-stale/logs",
+        json={"content": "old attempt\n"},
+        headers={
+            "Authorization": "Bearer worker-token",
+            "X-Worker-ID": "wsl-ci-test",
+            "X-CI-Lease-Token": "old-lease",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"] == "stale_job_lease"
+
+
+def test_job_log_callback_passes_worker_and_attempt_lease(client, monkeypatch):
+    calls = []
+
+    async def accept(_request):
+        return "wsl-ci-test"
+
+    def current_write(job_id, content, worker_id, lease_token):
+        calls.append((job_id, content, worker_id, lease_token))
+        return len(content)
+
+    monkeypatch.setattr(ci_worker, "verify_ci_worker", accept)
+    monkeypatch.setattr(ci_worker, "append_log_chunk", current_write)
+    response = client.post(
+        "/internal/ci/jobs/job-current/logs",
+        json={"content": "current\n"},
+        headers={
+            "Authorization": "Bearer worker-token",
+            "X-Worker-ID": "wsl-ci-test",
+            "X-CI-Lease-Token": "current-lease",
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == [("job-current", "current\n", "wsl-ci-test", "current-lease")]
+
+
+def test_job_callback_without_attempt_lease_is_rejected(client, monkeypatch):
+    async def accept(_request):
+        return "wsl-ci-test"
+
+    monkeypatch.setattr(ci_worker, "verify_ci_worker", accept)
+    response = client.post(
+        "/internal/ci/jobs/job-current/logs",
+        json={"content": "current\n"},
+        headers={"Authorization": "Bearer worker-token", "X-Worker-ID": "wsl-ci-test"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"] == "stale_job_lease"
