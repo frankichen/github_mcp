@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
+from private_ci_agent.config import resolve_worker_id
+
 logger = logging.getLogger(__name__)
 JOB_ID_RE = re.compile(r"[^a-z0-9]+")
 DIAGNOSTIC_REASON_LIMIT = 500
@@ -92,6 +94,7 @@ class ServiceManager:
     def __init__(self, podman_binary: str = "/usr/bin/podman", config: dict | None = None):
         config = config or {}
         self.podman = podman_binary
+        self.worker_id = resolve_worker_id(config.get("worker_id"))
         self.images = {
             "postgres": config.get("ci_postgres_image", "docker.io/library/postgres:16-alpine"),
             "redis": config.get("ci_redis_image", "docker.io/library/redis:7-alpine"),
@@ -114,8 +117,8 @@ class ServiceManager:
             )
 
         suffix = safe_job_suffix(job_id)
-        network = f"ci-svc-{suffix}"
-        names = {kind: f"ci-{suffix}-{kind}" for kind in requested}
+        network = f"ci-svc-{self.worker_id}-{suffix}"
+        names = {kind: f"ci-{self.worker_id}-{suffix}-{kind}" for kind in requested}
         database = f"lenshub_ci_{suffix}"
         db_password = secrets.token_urlsafe(24)
         rabbit_password = secrets.token_urlsafe(24)
@@ -296,12 +299,12 @@ class ServiceManager:
         os.chmod(path, 0o600)
 
     def cleanup(self, job_id: str, workspace: str = "") -> None:
-        # 资源名和标签都绑定当前 Job；只处理精确前缀，绝不 prune 其他任务资源。
+        # 资源名绑定 Worker + Job，只处理当前实例自己的精确名称。
         suffix = safe_job_suffix(job_id)
-        pod_name = f"ci-svc-{suffix}"
+        pod_name = f"ci-svc-{self.worker_id}-{suffix}"
         self._cleanup_resource(["pod", "rm", "-f", pod_name], "pod", pod_name)
         for kind in self.images:
-            name = f"ci-{suffix}-{kind}"
+            name = f"ci-{self.worker_id}-{suffix}-{kind}"
             self._cleanup_resource(["rm", "-f", name], kind, name)
         if workspace:
             try:
