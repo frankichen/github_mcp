@@ -200,18 +200,14 @@ def test_list_workers_preserves_history_and_null_job(client, monkeypatch):
     assert response.json()["workers"][0]["current_job"] is None
 
 
-def test_heartbeat_renews_lease_with_body_lease_token_not_worker_auth(client, monkeypatch):
-    """The heartbeat must renew the job lease with the per-job lease token,
-    never with the worker registration token from the Authorization header."""
-    from app.routers import ci_worker
-
+def test_heartbeat_renews_current_job_lease_for_authenticated_worker(client, monkeypatch):
     renewed_with = []
 
     async def accept(_request):
         return "wsl-ci-test"
 
-    def fake_renew_lease(job_id, lease_token):
-        renewed_with.append((job_id, lease_token))
+    def fake_renew_lease(job_id, lease_token, worker_id):
+        renewed_with.append((job_id, lease_token, worker_id))
         return True
 
     monkeypatch.setattr(ci_worker, "verify_ci_worker", accept)
@@ -226,7 +222,9 @@ def test_heartbeat_renews_lease_with_body_lease_token_not_worker_auth(client, mo
     )
 
     assert response.status_code == 200
-    assert renewed_with == [("job-lease-1", "job-lease-secret")]
+    assert renewed_with == [("job-lease-1", "job-lease-secret", "wsl-ci-test")]
+    assert response.json()["lease_lost"] is False
+    assert response.json()["cancel_requested"] is False
 
 
 def test_heartbeat_falls_back_to_auth_when_lease_token_missing(client, monkeypatch):
