@@ -22,7 +22,6 @@ from private_ci_agent.source import (
     prepare_source_from_mirror, remove_source_worktree,
 )
 from private_ci_agent.workspace import WorkspaceManager
-from private_ci_agent.cleanup import cleanup_containers
 from private_ci_agent.podman import PodmanRunner
 from private_ci_agent.services import cleanup_job_services
 
@@ -119,13 +118,14 @@ def main():
     except Exception as e:
         logger.warning("Startup reconcile failed (non-fatal): %s", e)
 
-    # Cleanup on start
-    cleanup_containers(_podman_binary, [])
+    # Each Worker only reclaims its own namespaced Podman resources and its
+    # own writable workspace root. Starting wsl-ci-02 must not touch wsl-ci-01.
+    podman_runner = PodmanRunner(_podman_binary, worker_id)
+    podman_runner.cleanup_stale([])
     workspace_mgr = WorkspaceManager(workspace_root)
     workspace_mgr.cleanup_stale([])
 
     executor = JobExecutor(client, config)
-    podman_runner = PodmanRunner(_podman_binary)
 
     # Start heartbeat thread.  Cancellation is monitored here (and in the
     # lease loop) because podman run blocks the job thread: a cancel must be
@@ -224,7 +224,7 @@ def main():
             except Exception:
                 pass
 
-        cleanup_containers(_podman_binary, [])
+        podman_runner.cleanup_stale([])
         logger.info("CI Agent stopped")
 
 
