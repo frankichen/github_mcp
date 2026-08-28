@@ -307,14 +307,47 @@ def _worker_row_to_dict(row, ts) -> dict:
 
 
 def recover_worker_jobs(worker_id: str):
-    """Release all jobs leased to a lost worker."""
+    """Recover active jobs owned by a restarting/lost worker exactly once."""
     db = _get_db()
-    db.execute(
-        """UPDATE ci_jobs SET status = 'queued', worker_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL
-           WHERE worker_id = ? AND status IN ('leased', 'downloading', 'preparing', 'running')""",
-        (worker_id,),
-    )
-    db.commit()
+    ts = now_ts()
+    with _db_write_lock:
+        db.execute("BEGIN IMMEDIATE")
+        rows = db.execute(
+            """SELECT * FROM ci_jobs
+               WHERE worker_id = ? AND status IN ('leased', 'downloading', 'preparing', 'running')""",
+            (worker_id,),
+        ).fetchall()
+        for row in rows:
+            if row["attempts"] >= row["max_attempts"]:
+                db.execute(
+                    """UPDATE ci_jobs SET status = 'worker_lost', finished_at = ?, worker_id = NULL,
+                       lease_token_hash = NULL, lease_expires_at = NULL WHERE job_id = ?""",
+                    (ts, row["job_id"]),
+                )
+                _upsert_repo_queue_state(db, row["repository"], running_delta=-1)
+                recovered_status = "worker_lost"
+            else:
+                db.execute(
+                    """UPDATE ci_jobs SET status = 'queued', queued_at = ?, worker_id = NULL,
+                       lease_token_hash = NULL, lease_expires_at = NULL WHERE job_id = ?""",
+                    (ts, row["job_id"]),
+                )
+                _upsert_repo_queue_state(
+                    db, row["repository"], queued_delta=1, running_delta=-1
+                )
+                recovered_status = "queued"
+            _add_event(
+                db, row["job_id"], "worker_recovered",
+                json.dumps({"worker_id": worker_id, "status": recovered_status}),
+            )
+        db.execute(
+            "UPDATE ci_workers SET status = 'idle', current_job_id = NULL WHERE worker_id = ?",
+            (worker_id,),
+        )
+        db.commit()
+    for row in rows:
+        _notify_job_change(row["job_id"])
+    return len(rows)
 
 
 ### JOB OPERATIONS
@@ -661,8 +694,44 @@ def _parse_iso_ts(value: Optional[str]) -> Optional[float]:
         return None
 
 
+def _queue_worker_evidence(db, profile: str) -> tuple[list[str], Optional[str]]:
+    """Return online workers that can claim one queued job right now."""
+    ts = now_ts()
+    rows = db.execute(
+        """SELECT worker_id, supported_profiles, max_concurrent
+           FROM ci_workers WHERE last_heartbeat > ? ORDER BY worker_id""",
+        (ts - 60,),
+    ).fetchall()
+    supported = []
+    eligible = []
+    for worker in rows:
+        try:
+            profiles = json.loads(worker["supported_profiles"] or "[]")
+        except (TypeError, ValueError):
+            profiles = []
+        if profile not in profiles:
+            continue
+        supported.append(worker["worker_id"])
+        running = db.execute(
+            """SELECT COUNT(*) FROM ci_jobs WHERE worker_id = ?
+               AND status IN ('leased', 'downloading', 'preparing', 'running')""",
+            (worker["worker_id"],),
+        ).fetchone()[0]
+        if running < int(worker["max_concurrent"] or 1):
+            eligible.append(worker["worker_id"])
+    if eligible:
+        return eligible, None
+    if supported:
+        return [], "eligible_workers_at_capacity"
+    return [], "no_online_worker_supports_profile"
+
+
 def _job_row_to_dict(row, db) -> dict:
-    qpos = _get_queue_position(db, row["job_id"]) if row["status"] == "queued" else None
+    queued = row["status"] == "queued"
+    qpos = _get_queue_position(db, row["job_id"]) if queued else None
+    eligible_workers, unschedulable_reason = (
+        _queue_worker_evidence(db, row["profile"]) if queued else (None, None)
+    )
     summary = None
     if row["summary_json"]:
         try:
@@ -683,6 +752,8 @@ def _job_row_to_dict(row, db) -> dict:
         "priority": row["priority"],
         "worker_id": row["worker_id"],
         "queue_position": qpos,
+        "eligible_workers": eligible_workers,
+        "unschedulable_reason": unschedulable_reason,
         "current_step": None,
         "exit_code": row["exit_code"],
         "created_at": datetime.fromtimestamp(row["created_at"], tz=timezone.utc).isoformat() if row["created_at"] else None,
@@ -704,88 +775,85 @@ def _job_row_to_dict(row, db) -> dict:
 ### FAIR SCHEDULING: Lease a job
 
 def lease_job(worker_id: str, supported_profiles: list[str], max_concurrent: int) -> Optional[dict]:
+    if not supported_profiles:
+        return None
     db = _get_db()
     try:
-        db.execute("BEGIN IMMEDIATE")
+        with _db_write_lock:
+            db.execute("BEGIN IMMEDIATE")
 
-        # Check worker concurrency
-        running_count = db.execute(
-            "SELECT COUNT(*) FROM ci_jobs WHERE worker_id = ? AND status IN ('leased', 'downloading', 'preparing', 'running')",
-            (worker_id,),
-        ).fetchone()[0]
-        if running_count >= max_concurrent:
-            db.execute("ROLLBACK")
-            return None
+            running_count = db.execute(
+                """SELECT COUNT(*) FROM ci_jobs WHERE worker_id = ?
+                   AND status IN ('leased', 'downloading', 'preparing', 'running')""",
+                (worker_id,),
+            ).fetchone()[0]
+            if running_count >= max_concurrent:
+                db.rollback()
+                return None
 
-        # Generate lease token
-        lease_token = secrets.token_hex(16)
-        lease_token_hash = hashlib.sha256(lease_token.encode()).hexdigest()
-        ts = now_ts()
-        lease_expires = ts + 120
+            lease_token = secrets.token_hex(16)
+            lease_token_hash = hashlib.sha256(lease_token.encode()).hexdigest()
+            ts = now_ts()
+            lease_expires = ts + 120
 
-        # Fair scheduling:
-        # 1. Get queued jobs ordered by priority (higher=higher)
-        # 2. Within same priority, prefer repos with oldest last_dispatched_at (round-robin)
-        # 3. Within same repo, oldest first (FIFO)
+            profile_filter = " AND (" + " OR ".join(["profile = ?"] * len(supported_profiles)) + ")"
+            row = db.execute(
+                f"""SELECT j.*, COALESCE(rqs.last_dispatched_at, 0) AS repo_last_dispatched
+                   FROM ci_jobs j
+                   LEFT JOIN ci_repository_queue_state rqs ON j.repository = rqs.repository
+                   WHERE j.status = 'queued'{profile_filter}
+                   ORDER BY j.priority DESC, repo_last_dispatched ASC, j.created_at ASC
+                   LIMIT 1""",
+                supported_profiles,
+            ).fetchone()
+            if not row:
+                db.rollback()
+                return None
 
-        profile_filter = " AND (" + " OR ".join(["profile = ?"] * len(supported_profiles)) + ")"
-        params = []
+            job_id = row["job_id"]
+            repository = row["repository"]
+            attempt = int(row["attempts"] or 0) + 1
+            cursor = db.execute(
+                """UPDATE ci_jobs SET status = 'leased', worker_id = ?, lease_token_hash = ?,
+                   lease_expires_at = ?, attempts = attempts + 1, started_at = ?
+                   WHERE job_id = ? AND status = 'queued'""",
+                (worker_id, lease_token_hash, lease_expires, ts, job_id),
+            )
+            if cursor.rowcount != 1:
+                db.rollback()
+                return None
 
-        # Find the repository that was least recently dispatched among queued jobs
-        rows = db.execute(
-            f"""SELECT j.*, COALESCE(rqs.last_dispatched_at, 0) as repo_last_dispatched
-               FROM ci_jobs j
-               LEFT JOIN ci_repository_queue_state rqs ON j.repository = rqs.repository
-               WHERE j.status = 'queued'{profile_filter}
-               ORDER BY j.priority DESC, repo_last_dispatched ASC, j.created_at ASC
-               LIMIT 1""",
-            supported_profiles,
-        ).fetchone()
-
-        if not rows:
-            db.execute("ROLLBACK")
-            return None
-
-        job_id = rows["job_id"]
-        repository = rows["repository"]
-
-        db.execute(
-            """UPDATE ci_jobs SET status = 'leased', worker_id = ?, lease_token_hash = ?, lease_expires_at = ?,
-               attempts = attempts + 1, started_at = ?
-               WHERE job_id = ? AND status = 'queued'""",
-            (worker_id, lease_token_hash, lease_expires, ts, job_id),
-        )
-
-        if db.total_changes == 0:
-            db.execute("ROLLBACK")
-            return None
-
-        _upsert_repo_queue_state(db, repository, queued_delta=-1, running_delta=1, last_dispatched_at=ts)
-        set_worker_busy(worker_id, job_id)
-        _add_event(db, job_id, "leased", json.dumps({"worker_id": worker_id}))
-
-        db.commit()
+            _upsert_repo_queue_state(
+                db, repository, queued_delta=-1, running_delta=1, last_dispatched_at=ts
+            )
+            set_worker_busy(worker_id, job_id)
+            _add_event(
+                db, job_id, "leased",
+                json.dumps({"worker_id": worker_id, "attempt": attempt}),
+            )
+            db.commit()
 
         return {
             "job_id": job_id,
-            "repository": rows["repository"],
-            "branch": rows["branch"],
-            "commit_sha": rows["commit_sha"],
-            "base_sha": rows["base_sha"],
-            "changed_files": json.loads(rows["changed_files_json"] or "[]"),
-            "changed_files_total": rows["changed_files_total"],
-            "changed_files_truncated": bool(rows["changed_files_truncated"]),
-            "profile": rows["profile"],
-            "timeout_seconds": rows["timeout_seconds"],
+            "repository": row["repository"],
+            "branch": row["branch"],
+            "commit_sha": row["commit_sha"],
+            "base_sha": row["base_sha"],
+            "changed_files": json.loads(row["changed_files_json"] or "[]"),
+            "changed_files_total": row["changed_files_total"],
+            "changed_files_truncated": bool(row["changed_files_truncated"]),
+            "profile": row["profile"],
+            "timeout_seconds": row["timeout_seconds"],
+            "attempt": attempt,
             "lease_token": lease_token,
             "lease_expires_at": datetime.fromtimestamp(lease_expires, tz=timezone.utc).isoformat(),
         }
     except Exception as e:
         try:
-            db.execute("ROLLBACK")
+            db.rollback()
         except Exception:
             pass
-        logger.error(f"lease_job failed: {e}")
+        logger.error("lease_job failed: %s", e)
         return None
 
 
@@ -813,40 +881,69 @@ def _upsert_repo_queue_state(db, repository: str, queued_delta: int = 0, running
         )
 
 
-def complete_job(job_id: str, exit_code: int, status: str, summary: Optional[dict] = None, error_code: Optional[str] = None, error_message: Optional[str] = None):
+class StaleJobLeaseError(RuntimeError):
+    """Raised when a Worker callback no longer owns the current attempt."""
+
+
+def _begin_job_write(db, job_id: str, worker_id: Optional[str] = None, lease_token: Optional[str] = None):
+    """Begin one serialized write and optionally fence it to the current lease."""
+    db.execute("BEGIN IMMEDIATE")
+    guarded = worker_id is not None or lease_token is not None
+    if not guarded:
+        return
+    if not worker_id or not lease_token:
+        db.rollback()
+        raise StaleJobLeaseError(job_id)
+    token_hash = hashlib.sha256(lease_token.encode()).hexdigest()
+    ts = now_ts()
+    cursor = db.execute(
+        """UPDATE ci_jobs SET lease_expires_at = lease_expires_at
+           WHERE job_id = ? AND worker_id = ? AND lease_token_hash = ?
+             AND lease_expires_at > ?
+             AND status IN ('leased', 'downloading', 'preparing', 'running')""",
+        (job_id, worker_id, token_hash, ts),
+    )
+    if cursor.rowcount != 1:
+        db.rollback()
+        raise StaleJobLeaseError(job_id)
+
+
+def complete_job(
+    job_id: str, exit_code: int, status: str, summary: Optional[dict] = None,
+    error_code: Optional[str] = None, error_message: Optional[str] = None,
+    worker_id: Optional[str] = None, lease_token: Optional[str] = None,
+):
     db = _get_db()
     ts = now_ts()
+    with _db_write_lock:
+        _begin_job_write(db, job_id, worker_id, lease_token)
+        row = db.execute("SELECT * FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        if not row:
+            db.rollback()
+            return False
 
-    row = db.execute("SELECT * FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
-    if not row:
-        return
+        started = row["started_at"]
+        duration = ts - started if started else 0
+        owning_worker_id = row["worker_id"]
+        summary_json = json.dumps(summary) if summary else None
 
-    started = row["started_at"]
-    duration = ts - started if started else 0
-    worker_id = row["worker_id"]
-
-    summary_json = json.dumps(summary) if summary else None
-
-    db.execute(
-        """UPDATE ci_jobs SET status = ?, exit_code = ?, summary_json = ?, finished_at = ?, duration_seconds = ?,
-           error_code = ?, error_message = ?, lease_token_hash = NULL, lease_expires_at = NULL, worker_id = NULL
-           WHERE job_id = ?""",
-        (status, exit_code, summary_json, ts, duration, error_code, error_message, job_id),
-    )
-    if worker_id:
-        # Compare-and-clear: a delayed finish for an older job must never clear
-        # a worker that has already leased a newer job.
         db.execute(
-            """UPDATE ci_workers SET status = 'idle', current_job_id = NULL
-               WHERE worker_id = ? AND current_job_id = ?""",
-            (worker_id, job_id),
+            """UPDATE ci_jobs SET status = ?, exit_code = ?, summary_json = ?, finished_at = ?, duration_seconds = ?,
+               error_code = ?, error_message = ?, lease_token_hash = NULL, lease_expires_at = NULL, worker_id = NULL
+               WHERE job_id = ?""",
+            (status, exit_code, summary_json, ts, duration, error_code, error_message, job_id),
         )
-
-    repo = row["repository"]
-    _upsert_repo_queue_state(db, repo, running_delta=-1)
-    _add_event(db, job_id, "completed", json.dumps({"status": status, "exit_code": exit_code}))
-    db.commit()
+        if owning_worker_id:
+            db.execute(
+                """UPDATE ci_workers SET status = 'idle', current_job_id = NULL
+                   WHERE worker_id = ? AND current_job_id = ?""",
+                (owning_worker_id, job_id),
+            )
+        _upsert_repo_queue_state(db, row["repository"], running_delta=-1)
+        _add_event(db, job_id, "completed", json.dumps({"status": status, "exit_code": exit_code}))
+        db.commit()
     _notify_job_change(job_id)
+    return True
 
 
 def request_cancel_job(job_id: str) -> bool:
@@ -874,38 +971,48 @@ def cancel_queued_job(job_id: str) -> bool:
     return False
 
 
-def release_job(job_id: str):
+def release_job(job_id: str, worker_id: Optional[str] = None, lease_token: Optional[str] = None):
     db = _get_db()
-    row = db.execute("SELECT * FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
-    if not row:
-        return
-    worker_id = row["worker_id"]
-    db.execute("UPDATE ci_jobs SET status = 'queued', worker_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL WHERE job_id = ?", (job_id,))
-    if worker_id:
+    with _db_write_lock:
+        _begin_job_write(db, job_id, worker_id, lease_token)
+        row = db.execute("SELECT * FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        if not row:
+            db.rollback()
+            return False
+        owning_worker_id = row["worker_id"]
         db.execute(
-            """UPDATE ci_workers SET status = 'idle', current_job_id = NULL
-               WHERE worker_id = ? AND current_job_id = ?""",
-            (worker_id, job_id),
+            """UPDATE ci_jobs SET status = 'queued', queued_at = ?, worker_id = NULL,
+               lease_token_hash = NULL, lease_expires_at = NULL WHERE job_id = ?""",
+            (now_ts(), job_id),
         )
-    _upsert_repo_queue_state(db, row["repository"], queued_delta=1, running_delta=-1)
-    _add_event(db, job_id, "released", "{}")
-    db.commit()
+        if owning_worker_id:
+            db.execute(
+                """UPDATE ci_workers SET status = 'idle', current_job_id = NULL
+                   WHERE worker_id = ? AND current_job_id = ?""",
+                (owning_worker_id, job_id),
+            )
+        _upsert_repo_queue_state(db, row["repository"], queued_delta=1, running_delta=-1)
+        _add_event(db, job_id, "released", "{}")
+        db.commit()
     _notify_job_change(job_id)
+    return True
 
 
-def renew_lease(job_id: str, lease_token: str) -> bool:
+def renew_lease(job_id: str, lease_token: str, worker_id: str = "") -> bool:
+    if not lease_token:
+        return False
     db = _get_db()
     expected_hash = hashlib.sha256(lease_token.encode()).hexdigest()
     ts = now_ts()
     with _db_write_lock:
-        db.execute(
-            "UPDATE ci_jobs SET lease_expires_at = ? WHERE job_id = ? AND lease_token_hash = ?",
-            (ts + 120, job_id, expected_hash),
+        cursor = db.execute(
+            """UPDATE ci_jobs SET lease_expires_at = ?
+               WHERE job_id = ? AND lease_token_hash = ? AND lease_expires_at > ?
+                 AND status IN ('leased', 'downloading', 'preparing', 'running')
+                 AND (? = '' OR worker_id = ?)""",
+            (ts + 120, job_id, expected_hash, ts, worker_id, worker_id),
         )
-        changed = db.total_changes > 0
-        # This endpoint is called by every Worker heartbeat.  Leaving this
-        # UPDATE uncommitted keeps a write transaction open on the thread-local
-        # SQLite connection and blocks registration/job creation in others.
+        changed = cursor.rowcount == 1
         db.commit()
     return changed
 
@@ -924,44 +1031,71 @@ def need_heartbeat(job_id: str) -> bool:
 
 
 def recover_expired_leases():
-    """Recover jobs with expired leases."""
+    """Recover expired attempts without allowing stale callbacks to revive them."""
     db = _get_db()
     ts = now_ts()
-    rows = db.execute(
-        """SELECT * FROM ci_jobs WHERE status IN ('leased', 'downloading', 'preparing', 'running')
-           AND lease_expires_at < ?""",
-        (ts,),
-    ).fetchall()
-    for row in rows:
-        max_attempts = row["max_attempts"]
-        attempts = row["attempts"]
-        if attempts >= max_attempts:
-            db.execute(
-                "UPDATE ci_jobs SET status = 'worker_lost', finished_at = ?, worker_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL WHERE job_id = ?",
-                (ts, row["job_id"]),
+    recovered = []
+    with _db_write_lock:
+        db.execute("BEGIN IMMEDIATE")
+        rows = db.execute(
+            """SELECT * FROM ci_jobs WHERE status IN ('leased', 'downloading', 'preparing', 'running')
+               AND lease_expires_at < ?""",
+            (ts,),
+        ).fetchall()
+        for row in rows:
+            max_attempts = row["max_attempts"]
+            attempts = row["attempts"]
+            if attempts >= max_attempts:
+                db.execute(
+                    """UPDATE ci_jobs SET status = 'worker_lost', finished_at = ?, worker_id = NULL,
+                       lease_token_hash = NULL, lease_expires_at = NULL WHERE job_id = ?""",
+                    (ts, row["job_id"]),
+                )
+            else:
+                db.execute(
+                    """UPDATE ci_jobs SET status = 'queued', queued_at = ?, worker_id = NULL,
+                       lease_token_hash = NULL, lease_expires_at = NULL WHERE job_id = ?""",
+                    (ts, row["job_id"]),
+                )
+                _upsert_repo_queue_state(db, row["repository"], queued_delta=1)
+            _upsert_repo_queue_state(db, row["repository"], running_delta=-1)
+            if row["worker_id"]:
+                db.execute(
+                    """UPDATE ci_workers SET status = 'idle', current_job_id = NULL
+                       WHERE worker_id = ? AND current_job_id = ?""",
+                    (row["worker_id"], row["job_id"]),
+                )
+            _add_event(
+                db, row["job_id"], "lease_expired",
+                json.dumps({"attempts": attempts, "max_attempts": max_attempts}),
+            )
+            recovered.append(row["job_id"])
+        if rows:
+            db.commit()
+        else:
+            db.rollback()
+    for job_id in recovered:
+        _notify_job_change(job_id)
+    return len(recovered)
+
+
+def set_job_status(
+    job_id: str, status: str, worker_id: Optional[str] = None, lease_token: Optional[str] = None,
+):
+    db = _get_db()
+    with _db_write_lock:
+        _begin_job_write(db, job_id, worker_id, lease_token)
+        if status == "running":
+            cursor = db.execute(
+                "UPDATE ci_jobs SET status = 'running' WHERE job_id = ? AND status IN ('downloading', 'preparing')",
+                (job_id,),
             )
         else:
-            db.execute(
-                "UPDATE ci_jobs SET status = 'queued', worker_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL WHERE job_id = ?",
-                (row["job_id"],),
-            )
-        _upsert_repo_queue_state(db, row["repository"], running_delta=-1)
-        if row["worker_id"]:
-            set_worker_idle(row["worker_id"])
-        _add_event(db, row["job_id"], "lease_expired", json.dumps({"attempts": attempts, "max_attempts": max_attempts}))
-    if rows:
+            cursor = db.execute("UPDATE ci_jobs SET status = ? WHERE job_id = ?", (status, job_id))
         db.commit()
-
-
-def set_job_status(job_id: str, status: str):
-    db = _get_db()
-    ts = now_ts()
-    if status == "running":
-        db.execute("UPDATE ci_jobs SET status = 'running' WHERE job_id = ? AND status IN ('downloading', 'preparing')", (job_id,))
-    else:
-        db.execute("UPDATE ci_jobs SET status = ? WHERE job_id = ?", (status, job_id))
-    db.commit()
-    _notify_job_change(job_id)
+    if cursor.rowcount:
+        _notify_job_change(job_id)
+    return cursor.rowcount == 1
 
 
 def set_job_source_info(job_id: str, sha256: str, size_bytes: int):
@@ -971,52 +1105,97 @@ def set_job_source_info(job_id: str, sha256: str, size_bytes: int):
     _notify_job_change(job_id)
 
 
+def set_job_source_downloaded(
+    job_id: str, sha256: str, size_bytes: int, worker_id: str, lease_token: str,
+):
+    """Atomically record source evidence and downloading state for one attempt."""
+    db = _get_db()
+    with _db_write_lock:
+        _begin_job_write(db, job_id, worker_id, lease_token)
+        db.execute(
+            """UPDATE ci_jobs SET source_sha256 = ?, source_size_bytes = ?, status = 'downloading'
+               WHERE job_id = ?""",
+            (sha256, size_bytes, job_id),
+        )
+        _add_event(db, job_id, "source_downloaded", json.dumps({"size_bytes": int(size_bytes)}))
+        db.commit()
+    _notify_job_change(job_id)
+    return True
+
 ### LOGS
 
-def append_log_chunk(job_id: str, content: str) -> int:
+def append_log_chunk(
+    job_id: str, content: str, worker_id: Optional[str] = None, lease_token: Optional[str] = None,
+) -> int:
     db = _get_db()
-    current_offset = db.execute(
-        "SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id = ?", (job_id,)
-    ).fetchone()[0] or 0
-
-    chunk_index = db.execute(
-        "SELECT COALESCE(MAX(chunk_index), -1) + 1 FROM ci_job_log_chunks WHERE job_id = ?", (job_id,)
-    ).fetchone()[0]
-
-    content_len = len(content)
-    new_offset = current_offset + content_len
-
-    db.execute(
-        "INSERT INTO ci_job_log_chunks (job_id, chunk_index, offset_from, offset_to, content, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (job_id, chunk_index, current_offset, new_offset, content, now_ts()),
-    )
-    db.execute(
-        "UPDATE ci_jobs SET log_total_bytes = log_total_bytes + ? WHERE job_id = ?",
-        (content_len, job_id),
-    )
-    _add_event(db, job_id, "log_revision", json.dumps({"bytes": content_len}))
-    db.commit()
+    with _db_write_lock:
+        _begin_job_write(db, job_id, worker_id, lease_token)
+        current_offset = db.execute(
+            "SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id = ?", (job_id,)
+        ).fetchone()[0] or 0
+        chunk_index = db.execute(
+            "SELECT COALESCE(MAX(chunk_index), -1) + 1 FROM ci_job_log_chunks WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()[0]
+        content_len = len(content)
+        new_offset = current_offset + content_len
+        db.execute(
+            "INSERT INTO ci_job_log_chunks (job_id, chunk_index, offset_from, offset_to, content, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (job_id, chunk_index, current_offset, new_offset, content, now_ts()),
+        )
+        db.execute(
+            "UPDATE ci_jobs SET log_total_bytes = log_total_bytes + ? WHERE job_id = ?",
+            (content_len, job_id),
+        )
+        _add_event(db, job_id, "log_revision", json.dumps({"bytes": content_len}))
+        db.commit()
     _notify_job_change(job_id)
     return new_offset
 
 
-def append_log_batch(job_id: str, batch_id: str, content: str) -> tuple[int, bool]:
+def append_log_batch(
+    job_id: str, batch_id: str, content: str,
+    worker_id: Optional[str] = None, lease_token: Optional[str] = None,
+) -> tuple[int, bool]:
     db = _get_db()
-    if not batch_id or not content:
-        return 0, True
-    row = db.execute("SELECT 1 FROM ci_job_log_batches WHERE job_id=? AND batch_id=?", (job_id, batch_id)).fetchone()
-    if row:
-        offset = db.execute("SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id=?", (job_id,)).fetchone()[0] or 0
-        return offset, True
-    current_offset = db.execute("SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id = ?", (job_id,)).fetchone()[0] or 0
-    chunk_index = db.execute("SELECT COALESCE(MAX(chunk_index), -1) + 1 FROM ci_job_log_chunks WHERE job_id = ?", (job_id,)).fetchone()[0]
-    new_offset = current_offset + len(content)
-    now = now_ts()
-    db.execute("INSERT INTO ci_job_log_batches(job_id,batch_id,created_at) VALUES(?,?,?)", (job_id, batch_id, now))
-    db.execute("INSERT INTO ci_job_log_chunks(job_id,chunk_index,offset_from,offset_to,content,created_at) VALUES(?,?,?,?,?,?)", (job_id, chunk_index, current_offset, new_offset, content, now))
-    db.execute("UPDATE ci_jobs SET log_total_bytes=log_total_bytes+? WHERE job_id=?", (len(content), job_id))
-    _add_event(db, job_id, "log_revision", json.dumps({"bytes": len(content), "batch_id": batch_id}))
-    db.commit(); _notify_job_change(job_id)
+    with _db_write_lock:
+        _begin_job_write(db, job_id, worker_id, lease_token)
+        if not batch_id or not content:
+            db.commit()
+            return 0, True
+        row = db.execute(
+            "SELECT 1 FROM ci_job_log_batches WHERE job_id=? AND batch_id=?", (job_id, batch_id)
+        ).fetchone()
+        if row:
+            offset = db.execute(
+                "SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id=?", (job_id,)
+            ).fetchone()[0] or 0
+            db.commit()
+            return offset, True
+        current_offset = db.execute(
+            "SELECT MAX(offset_to) FROM ci_job_log_chunks WHERE job_id = ?", (job_id,)
+        ).fetchone()[0] or 0
+        chunk_index = db.execute(
+            "SELECT COALESCE(MAX(chunk_index), -1) + 1 FROM ci_job_log_chunks WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()[0]
+        new_offset = current_offset + len(content)
+        now = now_ts()
+        db.execute(
+            "INSERT INTO ci_job_log_batches(job_id,batch_id,created_at) VALUES(?,?,?)",
+            (job_id, batch_id, now),
+        )
+        db.execute(
+            "INSERT INTO ci_job_log_chunks(job_id,chunk_index,offset_from,offset_to,content,created_at) VALUES(?,?,?,?,?,?)",
+            (job_id, chunk_index, current_offset, new_offset, content, now),
+        )
+        db.execute(
+            "UPDATE ci_jobs SET log_total_bytes=log_total_bytes+? WHERE job_id=?",
+            (len(content), job_id),
+        )
+        _add_event(db, job_id, "log_revision", json.dumps({"bytes": len(content), "batch_id": batch_id}))
+        db.commit()
+    _notify_job_change(job_id)
     return new_offset, False
 
 
@@ -1090,32 +1269,62 @@ def get_log_tail(job_id: str, lines: int = 100, max_scan_bytes: int = 4 * 1024 *
 
 ### STEPS
 
-def add_step(job_id: str, step_name: str, status: str = "pending") -> int:
+def add_step(
+    job_id: str, step_name: str, status: str = "pending",
+    worker_id: Optional[str] = None, lease_token: Optional[str] = None,
+) -> int:
     db = _get_db()
     ts = now_ts()
-    cursor = db.execute(
-        "INSERT INTO ci_job_steps (job_id, step_name, status, started_at) VALUES (?, ?, ?, ?)",
-        (job_id, step_name, status, ts if status == "running" else None),
-    )
-    db.commit()
+    with _db_write_lock:
+        _begin_job_write(db, job_id, worker_id, lease_token)
+        cursor = db.execute(
+            "INSERT INTO ci_job_steps (job_id, step_name, status, started_at) VALUES (?, ?, ?, ?)",
+            (job_id, step_name, status, ts if status == "running" else None),
+        )
+        db.commit()
     _notify_job_change(job_id)
     return cursor.lastrowid
 
 
-def finish_step(step_id: int, status: str, exit_code: Optional[int] = None, log_end_offset: Optional[int] = None):
+def finish_step(
+    step_id: int, status: str, exit_code: Optional[int] = None,
+    log_end_offset: Optional[int] = None, job_id: Optional[str] = None,
+    worker_id: Optional[str] = None, lease_token: Optional[str] = None,
+):
     db = _get_db()
     ts = now_ts()
-    row = db.execute("SELECT job_id, step_name, started_at FROM ci_job_steps WHERE id = ?", (step_id,)).fetchone()
-    duration = ts - row["started_at"] if row and row["started_at"] else 0
-    db.execute(
-        "UPDATE ci_job_steps SET status = ?, exit_code = ?, finished_at = ?, duration_seconds = ?, log_end_offset = COALESCE(?, log_end_offset) WHERE id = ?",
-        (status, exit_code, ts, duration, log_end_offset, step_id),
-    )
-    if row:
-        _add_event(db, row["job_id"], "step_completed", json.dumps({"step_id": step_id, "step_name": row["step_name"], "status": status}))
-    db.commit()
-    if row:
-        _notify_job_change(row["job_id"])
+    with _db_write_lock:
+        if job_id is not None or worker_id is not None or lease_token is not None:
+            if not job_id:
+                raise StaleJobLeaseError(str(step_id))
+            _begin_job_write(db, job_id, worker_id, lease_token)
+            row = db.execute(
+                "SELECT job_id, step_name, started_at FROM ci_job_steps WHERE id = ? AND job_id = ?",
+                (step_id, job_id),
+            ).fetchone()
+        else:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT job_id, step_name, started_at FROM ci_job_steps WHERE id = ?",
+                (step_id,),
+            ).fetchone()
+        if not row:
+            db.rollback()
+            return False
+        duration = ts - row["started_at"] if row["started_at"] else 0
+        db.execute(
+            """UPDATE ci_job_steps SET status = ?, exit_code = ?, finished_at = ?,
+               duration_seconds = ?, log_end_offset = COALESCE(?, log_end_offset)
+               WHERE id = ? AND job_id = ?""",
+            (status, exit_code, ts, duration, log_end_offset, step_id, row["job_id"]),
+        )
+        _add_event(
+            db, row["job_id"], "step_completed",
+            json.dumps({"step_id": step_id, "step_name": row["step_name"], "status": status}),
+        )
+        db.commit()
+    _notify_job_change(row["job_id"])
+    return True
 
 
 def _newly_completed_steps(job_id: str, last_known_revision: int) -> list[dict]:
