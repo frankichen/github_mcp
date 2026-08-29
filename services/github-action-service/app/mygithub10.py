@@ -40,8 +40,9 @@ RECOMMENDED_UPLOAD_CHUNK_BYTES = 16384
 MAX_UPLOAD_BYTES = 1048576
 MAX_UPLOAD_CHANGE_SET_FILES = 64
 MAX_UPLOAD_CHANGE_SET_BYTES = 64 * MAX_UPLOAD_BYTES
+MAX_GENERATED_BUNDLE_BYTES = MAX_UPLOAD_CHANGE_SET_BYTES + (8 * 1024 * 1024)
 # Direct Web/MCP arguments must stay well below the 64 KiB transport ceiling.
-# Larger text is handed off by basename from the fixed local candidate root.
+# Oversized generated text stays on put_generated_files via a runtime file bundle.
 MAX_HIGH_LEVEL_INLINE_CONTENT_BYTES = 48 * 1024
 UPLOAD_TTL_SECONDS = 3600
 MAX_FILE_EDIT_OPERATIONS = 1000
@@ -1282,12 +1283,18 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "max_atomic_multi_upload_bytes": MAX_UPLOAD_CHANGE_SET_BYTES,
         "supports_high_level_file_put": True,
         "supports_generated_files_put_v1": True,
+        "supports_generated_files_put_v2": True,
         "generated_files_put_semantics": {
             "recommended_for": "routine AI-generated UTF-8 text add/modify writes",
-            "caller_supplies": ["repository", "branch", "expected_head_sha", "files", "commit_message", "dry_run", "idempotency_key"],
-            "server_manages": ["workspace_session_resolution", "workspace_session_revision_cas", "existing_blob_lookup", "path_validation", "hashing", "chunking", "staging", "atomic_commit", "read_back_verification"],
-            "unsupported": ["binary", "delete", "bundle"],
+            "ingress": ["inline_files", "runtime_file_bundle"],
+            "caller_supplies": ["repository", "branch", "expected_head_sha", "commit_message", "files_or_bundle_file", "dry_run", "idempotency_key"],
+            "server_manages": ["runtime_file_reference_resolution", "bundle_download", "bundle_validation", "workspace_session_resolution", "workspace_session_revision_cas", "existing_blob_lookup", "path_validation", "hashing", "chunking", "staging", "atomic_commit", "read_back_verification"],
+            "bundle_format_version": 1,
+            "max_file_bytes": MAX_UPLOAD_BYTES,
+            "max_bundle_content_bytes": MAX_UPLOAD_CHANGE_SET_BYTES,
+            "unsupported": ["binary", "delete"],
         },
+        "max_generated_bundle_download_bytes": MAX_GENERATED_BUNDLE_BYTES,
         "high_level_inline_content_limit_bytes": MAX_HIGH_LEVEL_INLINE_CONTENT_BYTES,
         "supports_local_candidate_file_put": True,
         "supports_dry_run": True,
@@ -1704,7 +1711,39 @@ def _safe_generated_path(path: Any) -> str:
     return path
 
 
-def prepare_generated_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def parse_generated_files_bundle(data: bytes) -> list[dict[str, Any]]:
+    if not isinstance(data, (bytes, bytearray)):
+        raise MyGithub10Error("PAYLOAD_INVALID", "generated bundle must be a byte payload")
+    if len(data) > MAX_GENERATED_BUNDLE_BYTES:
+        raise MyGithub10Error(
+            "PAYLOAD_TOO_LARGE",
+            "generated bundle exceeds the download limit",
+            {"size_bytes": len(data), "max_bytes": MAX_GENERATED_BUNDLE_BYTES},
+        )
+    try:
+        text = bytes(data).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise MyGithub10Error("UTF8_REQUIRED", "generated bundle must be UTF-8 JSON") from exc
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise MyGithub10Error("PAYLOAD_INVALID", "generated bundle must contain valid JSON") from exc
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise MyGithub10Error("PAYLOAD_INVALID", "generated bundle version must be 1")
+    unknown = set(payload) - {"version", "files"}
+    if unknown:
+        raise MyGithub10Error(
+            "PAYLOAD_INVALID", "generated bundle contains unsupported top-level fields", {"fields": sorted(unknown)}
+        )
+    files = payload.get("files")
+    if not isinstance(files, list) or not files:
+        raise MyGithub10Error("NO_FILES", "generated bundle files must contain at least one item")
+    return files
+
+
+def prepare_generated_files(
+    files: list[dict[str, Any]], allow_large_payload: bool = False,
+) -> list[dict[str, Any]]:
     """Validate and freeze the exact UTF-8 bytes used by dry-run and commit."""
     if not isinstance(files, list) or not files:
         raise MyGithub10Error("NO_FILES", "files must contain at least one UTF-8 text file")
@@ -1734,10 +1773,16 @@ def prepare_generated_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]
         prepared_item = _prepare_put_item(path, data)
         total_size += int(prepared_item["size_bytes"])
         prepared.append(prepared_item)
-    if total_size > MAX_HIGH_LEVEL_INLINE_CONTENT_BYTES:
+    if total_size > MAX_UPLOAD_CHANGE_SET_BYTES:
         raise MyGithub10Error(
             "PAYLOAD_TOO_LARGE",
-            "generated-file payload exceeds the V1 inline text limit",
+            "generated-file content exceeds the atomic write limit",
+            {"total_size_bytes": total_size, "max_bytes": MAX_UPLOAD_CHANGE_SET_BYTES},
+        )
+    if not allow_large_payload and total_size > MAX_HIGH_LEVEL_INLINE_CONTENT_BYTES:
+        raise MyGithub10Error(
+            "PAYLOAD_TOO_LARGE",
+            "inline generated-file payload exceeds the transport-safe limit; use bundle_file on put_generated_files",
             {"total_size_bytes": total_size, "max_bytes": MAX_HIGH_LEVEL_INLINE_CONTENT_BYTES},
         )
     return prepared

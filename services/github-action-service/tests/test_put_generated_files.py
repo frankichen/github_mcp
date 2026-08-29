@@ -1,4 +1,5 @@
 import hashlib
+import json
 
 import pytest
 
@@ -225,14 +226,107 @@ async def test_no_files_and_large_payload_have_window_facing_errors(generated_en
 
 
 @pytest.mark.asyncio
-async def test_schema_exposes_only_v1_window_payload_and_capabilities_recommend_it(monkeypatch):
+async def test_bundle_file_supports_large_generated_text_with_same_tool(generated_env, monkeypatch):
+    content = "x" * (mygithub10.MAX_HIGH_LEVEL_INLINE_CONTENT_BYTES + 1)
+    bundle = json.dumps(
+        {"version": 1, "files": [{"path": "src/large.py", "content": content}]},
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    async def fake_download(bundle_file):
+        assert bundle_file["file_id"] == "file_bundle_v2"
+        return bundle
+
+    monkeypatch.setattr(mcp_server, "_download_generated_bundle_file", fake_download)
+    args = _args(
+        files=[],
+        bundle_file={
+            "download_url": "https://files.example.test/generated.json",
+            "file_id": "file_bundle_v2",
+            "mime_type": "application/json",
+            "file_name": "generated.json",
+        },
+        idempotency_key="bundle-v2-large",
+    )
+    planned = await _call(args)
+    written = await _call({**args, "dry_run": False})
+    assert planned["ok"] is True
+    assert planned["payload_source"] == "bundle_file"
+    assert planned["changed_files"][0]["size_bytes"] > mygithub10.MAX_HIGH_LEVEL_INLINE_CONTENT_BYTES
+    assert planned["canonical_payload_hash"] == written["canonical_payload_hash"]
+    assert written["commit_sha"] == COMMIT
+    assert written["payload_source"] == "bundle_file"
+    assert written["staging"]["chunk_count"] > 1
+
+
+@pytest.mark.asyncio
+async def test_bundle_file_source_is_exclusive_and_format_is_validated(generated_env, monkeypatch):
+    ref = {"download_url": "https://files.example.test/generated.json", "file_id": "file_bundle_invalid"}
+    both = await _call(_args(bundle_file=ref))
+    assert both["error"]["code"] == "PAYLOAD_INVALID"
+    neither = await _call(_args(files=[]))
+    assert neither["error"]["code"] == "NO_FILES"
+
+    async def invalid_download(_bundle_file):
+        return b'{"version":2,"files":[]}'
+
+    monkeypatch.setattr(mcp_server, "_download_generated_bundle_file", invalid_download)
+    invalid = await _call(_args(files=[], bundle_file=ref, idempotency_key="bundle-invalid-format"))
+    assert invalid["error"]["code"] == "PAYLOAD_INVALID"
+    assert generated_env["commit_calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_bundle_idempotency_uses_content_not_ephemeral_file_reference(generated_env, monkeypatch):
+    bundle = b'{"version":1,"files":[{"path":"src/bundle.py","content":"value = 1\n"}]}'
+
+    async def stable_download(_bundle_file):
+        return bundle
+
+    monkeypatch.setattr(mcp_server, "_download_generated_bundle_file", stable_download)
+    first = await _call(_args(
+        files=[],
+        bundle_file={"download_url": "https://files.example.test/first", "file_id": "file_first"},
+        dry_run=False,
+        idempotency_key="bundle-stable-content",
+    ))
+    second = await _call(_args(
+        files=[],
+        bundle_file={"download_url": "https://files.example.test/second", "file_id": "file_second"},
+        dry_run=False,
+        idempotency_key="bundle-stable-content",
+    ))
+    assert first["commit_sha"] == second["commit_sha"] == COMMIT
+    assert second["replayed"] is True
+    assert len(generated_env["commit_calls"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_bundle_download_rejects_non_https_reference():
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        await mcp_server._download_generated_bundle_file(
+            {"download_url": "http://files.example.test/generated.json", "file_id": "file_http"}
+        )
+    assert exc.value.code == "PAYLOAD_INVALID"
+
+
+@pytest.mark.asyncio
+async def test_schema_exposes_v2_single_tool_bundle_ingress_and_capabilities(monkeypatch):
     monkeypatch.setenv("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", "true")
     tools = {tool.name: tool for tool in await mcp_server.mcp.list_tools()}
     tool = tools["put_generated_files"]
     assert set(tool.inputSchema["properties"]) == {
-        "repository", "branch", "expected_head_sha", "files", "commit_message", "dry_run", "idempotency_key"
+        "repository", "branch", "expected_head_sha", "commit_message", "files", "bundle_file",
+        "dry_run", "idempotency_key",
     }
-    item_schema = tool.inputSchema["properties"]["files"]["items"]
+    required = set(tool.inputSchema.get("required") or [])
+    assert required == {"repository", "branch", "expected_head_sha", "commit_message"}
+    tool_meta = getattr(tool, "meta", None) or getattr(tool, "_meta", None) or {}
+    assert tool_meta["openai/fileParams"] == ["bundle_file"]
+    files_schema = tool.inputSchema["properties"]["files"]
+    if "anyOf" in files_schema:
+        files_schema = next(schema for schema in files_schema["anyOf"] if schema.get("type") == "array")
+    item_schema = files_schema["items"]
     if "$ref" in item_schema:
         item_schema = tool.inputSchema["$defs"][item_schema["$ref"].rsplit("/", 1)[-1]]
     item_properties = item_schema["properties"]
@@ -245,6 +339,11 @@ async def test_schema_exposes_only_v1_window_payload_and_capabilities_recommend_
     assert capabilities["recommended_ai_text_write_workflow"] == ["put_generated_files"]
     assert capabilities["recommended_small_text_workflow"] == ["put_generated_files"]
     assert capabilities["recommended_atomic_multi_upload_workflow"] == ["put_generated_files"]
+    assert capabilities["supports_generated_files_put_v2"] is True
+    assert capabilities["generated_files_put_semantics"]["bundle_format_version"] == 1
+    assert "runtime_file_bundle" in capabilities["generated_files_put_semantics"]["ingress"]
+    assert "bundle_download" in capabilities["generated_files_put_semantics"]["server_manages"]
+    assert capabilities["generated_files_put_semantics"]["unsupported"] == ["binary", "delete"]
     assert "workspace_session_resolution" in capabilities["generated_files_put_semantics"]["server_manages"]
     assert "workspace_session_revision_cas" in capabilities["generated_files_put_semantics"]["server_manages"]
     assert "put_generated_files" in capabilities["legacy_upload_guidance"]
