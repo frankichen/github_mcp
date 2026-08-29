@@ -333,7 +333,7 @@ async def test_bundle_download_rejects_dns_resolving_to_private_address(monkeypa
     )
     with pytest.raises(mygithub10.MyGithub10Error) as exc:
         await mcp_server._download_generated_bundle_file(
-            {"download_url": "https://private.example.test/generated.json", "file_id": "file_private_dns"}
+            {"download_url": "https://files.oaiusercontent.com/generated.json", "file_id": "file_private_dns"}
         )
     assert exc.value.code == "PAYLOAD_INVALID"
 
@@ -343,13 +343,13 @@ async def test_bundle_redirect_to_private_destination_is_rejected_before_second_
     calls = []
 
     def fake_getaddrinfo(host, port, type=0):
-        assert host == "public.example.test"
+        assert host == "files.oaiusercontent.com"
         return [(mcp_server.socket.AF_INET, mcp_server.socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
 
     class FakeResponse:
         is_redirect = True
         headers = {"location": "https://127.0.0.1/internal"}
-        url = mcp_server.httpx.URL("https://public.example.test/start")
+        url = mcp_server.httpx.URL("https://files.oaiusercontent.com/start")
 
     class FakeStream:
         async def __aenter__(self):
@@ -373,10 +373,24 @@ async def test_bundle_redirect_to_private_destination_is_rejected_before_second_
     monkeypatch.setattr(mcp_server.httpx, "AsyncClient", lambda **kwargs: FakeClient())
     with pytest.raises(mygithub10.MyGithub10Error) as exc:
         await mcp_server._download_generated_bundle_file(
-            {"download_url": "https://public.example.test/start", "file_id": "file_redirect_private"}
+            {"download_url": "https://files.oaiusercontent.com/start", "file_id": "file_redirect_private"}
         )
     assert exc.value.code == "PAYLOAD_INVALID"
-    assert calls == ["https://public.example.test/start"]
+    assert calls == ["https://files.oaiusercontent.com/start"]
+
+
+@pytest.mark.asyncio
+async def test_bundle_download_rejects_non_openai_public_host_without_dns(monkeypatch):
+    monkeypatch.setattr(
+        mcp_server.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: pytest.fail("untrusted host must be rejected before DNS"),
+    )
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        await mcp_server._download_generated_bundle_file(
+            {"download_url": "https://example.com/generated.json", "file_id": "file_untrusted_host"}
+        )
+    assert exc.value.code == "PAYLOAD_INVALID"
 
 
 @pytest.mark.asyncio

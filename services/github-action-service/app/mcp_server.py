@@ -1364,17 +1364,24 @@ async def _run_high_level_put(
 
 
 _GENERATED_BUNDLE_MAX_REDIRECTS = 5
+_GENERATED_BUNDLE_ALLOWED_HOST_SUFFIXES = ("oaiusercontent.com",)
 
 
 def _validate_generated_bundle_url_destination(url: httpx.URL) -> None:
     host = str(url.host or "").strip().rstrip(".")
-    if url.scheme != "https" or not host:
-        raise mygithub10.MyGithub10Error("PAYLOAD_INVALID", "bundle_file download_url must use HTTPS")
     lowered = host.lower()
-    if lowered == "localhost" or lowered.endswith(".localhost"):
+    if url.scheme != "https" or not host or url.port not in (None, 443):
         raise mygithub10.MyGithub10Error(
             "PAYLOAD_INVALID",
-            "bundle_file download_url must resolve only to public network addresses",
+            "bundle_file download_url must use HTTPS on port 443",
+        )
+    if not any(
+        lowered == suffix or lowered.endswith("." + suffix)
+        for suffix in _GENERATED_BUNDLE_ALLOWED_HOST_SUFFIXES
+    ):
+        raise mygithub10.MyGithub10Error(
+            "PAYLOAD_INVALID",
+            "bundle_file download_url host is not allowlisted for ChatGPT file delivery",
             {"host": host},
         )
 
@@ -1383,7 +1390,7 @@ def _validate_generated_bundle_url_destination(url: httpx.URL) -> None:
         addresses.add(ipaddress.ip_address(host.split("%", 1)[0]))
     except ValueError:
         try:
-            resolved = socket.getaddrinfo(host, url.port or 443, type=socket.SOCK_STREAM)
+            resolved = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
         except OSError as exc:
             raise mygithub10.MyGithub10Error(
                 "PAYLOAD_INVALID",
