@@ -1,4 +1,4 @@
-"""Register the four stable DX-1 orchestration tools."""
+"""Register stable development orchestration and drift-recovery tools."""
 from __future__ import annotations
 
 import json
@@ -8,6 +8,7 @@ from typing import Any, Callable, Awaitable
 
 from mcp.types import ToolAnnotations
 
+from app import development_drift_recovery as drift_recovery
 from app import development_orchestrator as dx
 from app import development_resume as resume
 from app import development_session_store as sessions
@@ -62,6 +63,34 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
             result=await github_call(
                 resume.resume_task,service,repository,branch,pull_number,recover_stale_session,renew_lease,
                 expected_workspace_revision,expected_session_revision,lease_seconds,idempotency_key,
+            )
+            return json.dumps(result,ensure_ascii=False)
+        except Exception as exc: return _error(exc)
+
+    @mcp.tool(
+        name="recover_drifted_development_task",
+        description="Explicitly adopt a freshly verified forward-only externally advanced branch into drifted Workspace/Development Session control-plane state; never moves Git refs or writes repository files.",
+        annotations=_ORCHESTRATION,
+    )
+    async def recover_drifted_development_task(
+        repository: str,
+        branch: str,
+        workspace_id: str,
+        development_session_id: str,
+        expected_workspace_revision: int,
+        expected_session_revision: int,
+        expected_current_head_sha: str,
+        expected_current_tree_sha: str,
+        expected_base_branch: str,
+        expected_base_sha: str,
+        idempotency_key: str,
+        lease_seconds: int=mygithub12.DEFAULT_LEASE_SECONDS,
+    ) -> str:
+        try:
+            result=await github_call(
+                drift_recovery.recover_drifted_task,service,repository,branch,workspace_id,development_session_id,
+                expected_workspace_revision,expected_session_revision,expected_current_head_sha,expected_current_tree_sha,
+                expected_base_branch,expected_base_sha,idempotency_key,lease_seconds,
             )
             return json.dumps(result,ensure_ascii=False)
         except Exception as exc: return _error(exc)

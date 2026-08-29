@@ -193,7 +193,9 @@ def _workspace_recovery_plan(workspace: dict[str, Any] | None) -> dict[str, Any]
     if status == "drifted":
         return {
             "reason": "WORKSPACE_BRANCH_DRIFTED",
-            "action": "manual_branch_recovery",
+            "action": "recover_drifted_development_task",
+            "recovery_tool": "recover_drifted_development_task",
+            "manual_recovery_required": True,
             "workspace_id": workspace.get("workspace_id"),
             "drift_reason": workspace.get("drift_reason"),
         }
@@ -207,7 +209,7 @@ def _next_actions(blockers: list[str], workspace: dict[str, Any] | None, session
     if workspace.get("status") == "expired":
         return ["resume_development_workspace", "recovery_required"]
     if workspace.get("status") == "drifted":
-        return ["recovery_required"]
+        return ["recover_drifted_development_task", "recovery_required"]
     if not session:
         return ["recovery_required", "prepare_development_task"]
     if session.get("status") in BLOCKED_SESSION_STATUSES:
