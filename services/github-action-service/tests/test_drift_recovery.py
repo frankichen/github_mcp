@@ -8,6 +8,7 @@ from app import development_orchestrator as dx
 from app import development_resume as resume
 from app import development_session_store as sessions
 from app import mygithub12
+from app import mygithub12_workspace as workspace_scope
 
 REPO = "owner/repo"
 BRANCH = "ai/recovery"
@@ -96,7 +97,7 @@ def _workspace_row(*, status="active", revision=4, head=OLD_HEAD, tree=OLD_TREE,
         "chatgpt",
         now + 7200,
         head,
-        json.dumps({"paths": ["allowed"]}, separators=(",", ":")),
+        json.dumps({"paths": ["allowed/**"]}, separators=(",", ":")),
         drift_reason,
         None,
         now,
@@ -182,6 +183,75 @@ def _db_state(session_id):
             "SELECT * FROM development_session_events WHERE session_id=? ORDER BY id", (session_id,)
         ).fetchall()]
     return workspace, session, events
+
+
+@pytest.mark.parametrize(
+    ("declaration", "path", "expected"),
+    [
+        ("allowed/**", "allowed/feature.py", True),
+        ("allowed/**", "allowed/sub/feature.py", True),
+        ("allowed/**", "outside/feature.py", False),
+        ("allowed", "allowed/feature.py", True),
+        ("allowed/feature.py", "allowed/feature.py", True),
+        ("allowed/feature.py", "allowed/other.py", False),
+        ("allowed/*.py", "allowed/feature.py", True),
+        ("allowed/feature?.py", "allowed/feature1.py", True),
+        ("allowed/[ab].py", "allowed/a.py", True),
+    ],
+)
+def test_workspace_scope_path_matcher_supports_prefix_exact_and_glob(declaration, path, expected):
+    assert workspace_scope.scope_path_matches(path, declaration) is expected
+
+
+def test_multiple_glob_declarations_accept_real_p2p_recovery_paths():
+    workspace = {
+        "workspace_id": WORKSPACE_ID,
+        "scope": {
+            "paths": [
+                "internal/app/api/**",
+                "internal/modules/admindevice/**",
+                "internal/modules/devicebind/**",
+            ]
+        },
+    }
+    changed_paths = [
+        "internal/app/api/app.go",
+        "internal/modules/admindevice/bind_report_backend_cache_test.go",
+        "internal/modules/admindevice/service.go",
+        "internal/modules/devicebind/bind_report_projection_test.go",
+        "internal/modules/devicebind/service.go",
+        "internal/modules/devicebind/service_detail.go",
+        "internal/modules/devicebind/service_list.go",
+        "internal/modules/devicebind/types_detail.go",
+        "internal/modules/devicebind/types_list.go",
+    ]
+
+    evidence = recovery._verify_scope(workspace, changed_paths)
+
+    assert evidence["verified"] is True
+    assert evidence["outside_scope_paths"] == []
+    assert evidence["changed_paths"] == changed_paths
+
+
+def test_empty_scope_rejects_arbitrary_changed_path():
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        recovery._verify_scope({"workspace_id": WORKSPACE_ID, "scope": {"paths": []}}, ["allowed/feature.py"])
+    assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
+    assert exc.value.details["outside_scope_paths"] == ["allowed/feature.py"]
+
+
+def test_scope_matcher_exception_fails_recovery_closed(monkeypatch):
+    def fail_match(*args, **kwargs):
+        raise RuntimeError("injected matcher failure")
+
+    monkeypatch.setattr(workspace_scope, "fnmatchcase", fail_match)
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        recovery._verify_scope(
+            {"workspace_id": WORKSPACE_ID, "scope": {"paths": ["allowed/**"]}},
+            ["allowed/feature.py"],
+        )
+    assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
+    assert exc.value.details["outside_scope_paths"] == ["allowed/feature.py"]
 
 
 def test_forward_only_external_branch_advance_recovers_atomically(tmp_path, monkeypatch):

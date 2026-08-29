@@ -13,6 +13,7 @@ from typing import Any
 
 from app import development_session_store as sessions
 from app import mygithub12
+from app import mygithub12_workspace as workspace_scope
 
 MyGithub12Error = mygithub12.MyGithub12Error
 _ALLOWED_SESSION_STATES = frozenset({"active", "blocked", "drifted", "pr_ready"})
@@ -195,7 +196,7 @@ def _verify_scope(workspace: dict[str, Any], changed_paths: list[str]) -> dict[s
     declared = [str(value).strip().strip("/") for value in (scope.get("paths") or []) if str(value).strip().strip("/")]
     outside = [
         path for path in changed_paths
-        if not any(path.strip("/") == prefix or path.strip("/").startswith(prefix + "/") for prefix in declared)
+        if not any(workspace_scope.scope_path_matches(path, declaration) for declaration in declared)
     ]
     evidence = {"verified": not outside, "declared_paths": declared, "changed_paths": changed_paths, "outside_scope_paths": outside}
     if outside:

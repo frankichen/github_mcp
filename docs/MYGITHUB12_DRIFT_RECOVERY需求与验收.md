@@ -43,6 +43,11 @@ Recovery 的唯一语义是：**把已经存在并重新验真的当前 GitHub b
 5. 旧 Session HEAD 必须是 current branch HEAD 的 ancestor，且 compare 必须是纯 forward-only（ahead > 0、behind = 0、merge-base = old Session HEAD）。
 6. old Session HEAD 对应 Tree 必须仍等于 Session 保存的旧 Tree；无法证明 ancestry、force-push、rollback、rewrite、unrelated history 全部返回 `RECOVERY_ANCESTRY_MISMATCH`。
 7. old Session HEAD → current HEAD 的全部 changed paths 必须属于 Workspace 声明 scope；否则 `RECOVERY_SCOPE_VIOLATION`。
+   - scope path 不含 glob magic 时保持既有兼容语义：`path == declaration` 或位于该 declaration 目录前缀下；
+   - scope path 含 `*`、`**`、`?`、`[]` 时按大小写敏感的 repository-relative glob 匹配；
+   - `filename` 与 rename 的 `previous_filename` 必须使用同一个 matcher；
+   - empty scope 不允许任意 changed path；
+   - matcher 异常必须按“不匹配”处理并继续 fail closed，禁止异常时放行。
 8. 目标 drifted Workspace 必须仍是该 branch 既有 owner，不允许第二个 active/drifted owner，也不允许 high-overlap active Workspace。
 9. 在事务提交前再次 fresh-read GitHub HEAD / Tree / base；任一变化导致事务整体回滚。
 
@@ -138,5 +143,11 @@ Development Session：
 22. success 后 generated-file collaboration resolver 绑定 recovered state
 23. old Workspace/Session revision 不可继续使用
 24. unrecovered drifted Workspace 仍阻止 generated-file write
+25. `allowed/**` 匹配 `allowed/feature.py` 与 `allowed/sub/feature.py`
+26. plain directory prefix 与 exact file scope 保持兼容语义
+27. `*`、`**`、`?`、`[]` glob 匹配保持大小写敏感
+28. 多个 glob declaration 可覆盖同一 recovery 的不同合法模块
+29. rename 的 previous path 越界仍返回 `RECOVERY_SCOPE_VIOLATION`
+30. empty scope 或 matcher 异常均 fail closed
 
 此外必须回归现有 expired/resume/renew/write fail-stop、DX2 stale-safe recovery、refresh drift detection、HEAD/Workspace/Session CAS 和 scope isolation。

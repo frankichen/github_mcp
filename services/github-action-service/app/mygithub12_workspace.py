@@ -1,5 +1,6 @@
 """MyGithut12 shared development workspace state."""
 from __future__ import annotations
+from fnmatch import fnmatchcase
 import json, os, re, sqlite3, uuid
 from typing import Any
 from app import mygithub12 as core
@@ -19,6 +20,22 @@ resolve_identity=core.resolve_identity
 get_index_status=core.get_index_status
 _compare=core._compare
 init_db=core.init_db
+
+_GLOB_MAGIC = frozenset("*?[")
+
+
+def scope_path_matches(path: str, declaration: str) -> bool:
+    """Match one Git path against a Workspace scope declaration, failing closed."""
+    candidate = str(path).strip().strip("/")
+    declared = str(declaration).strip().strip("/")
+    if not candidate or not declared:
+        return False
+    if any(char in declared for char in _GLOB_MAGIC):
+        try:
+            return fnmatchcase(candidate, declared)
+        except Exception:
+            return False
+    return candidate == declared or candidate.startswith(declared + "/")
 
 def _effective_workspace_status(status: str, lease_expires_at: float | int | None, *, now: float | None = None) -> str:
     current=_now() if now is None else float(now)
