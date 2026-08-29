@@ -69,6 +69,7 @@ def _replay_result(
         and not workspace.get("drift_reason")
         and session.get("status") == "active"
         and int(workspace.get("revision") or 0) == int(after.get("workspace_revision") or -1)
+        and int(session.get("workspace_revision") or 0) == int(after.get("workspace_revision") or -1)
         and int(session.get("session_revision") or 0) == int(after.get("session_revision") or -1)
         and workspace.get("head_sha") == after.get("head_sha")
         and workspace.get("tree_sha") == after.get("tree_sha")
@@ -180,7 +181,12 @@ def _verify_forward_only(repo: Any, session: dict[str, Any], current_head: str) 
             "changed-path comparison reached the bounded recovery limit",
             {"file_count": len(files), "limit": _COMPARE_FILE_LIMIT},
         )
-    changed_paths = sorted({str(item.filename) for item in files if getattr(item, "filename", None)})
+    changed_paths = sorted({
+        str(path)
+        for item in files
+        for path in (getattr(item, "filename", None), getattr(item, "previous_filename", None))
+        if path
+    })
     return evidence, changed_paths
 
 
@@ -263,11 +269,47 @@ def _atomic_recover(
                 raise MyGithub12Error("WORKSPACE_NOT_FOUND", "workspace was not found", {"workspace_id": workspace_id})
             if not session_row:
                 raise MyGithub12Error("DEVELOPMENT_SESSION_NOT_FOUND", "development session was not found", {"development_session_id": session_id})
+            if workspace_row["base_commit_sha"] != base_sha or session_row["base_commit_sha"] != base_sha:
+                raise MyGithub12Error(
+                    "RECOVERY_BASE_CHANGED",
+                    "recovery base SHA differs from the Workspace/Development Session pinned base",
+                    {"workspace_base_sha": workspace_row["base_commit_sha"], "session_base_sha": session_row["base_commit_sha"], "expected_base_sha": base_sha},
+                )
             metadata = json.loads(session_row["metadata_json"] or "{}")
             record = metadata.get("last_manual_branch_recovery") if isinstance(metadata, dict) else None
             if isinstance(record, dict) and record.get("idempotency_key") == idempotency_key:
                 if record.get("request") != request:
                     raise MyGithub12Error("IDEMPOTENCY_CONFLICT", "manual branch recovery idempotency key payload changed")
+                after = record.get("after") if isinstance(record.get("after"), dict) else {}
+                replay_state_matches = (
+                    workspace_row["status"] == "active"
+                    and not workspace_row["drift_reason"]
+                    and session_row["status"] == "active"
+                    and int(workspace_row["revision"]) == int(after.get("workspace_revision") or -1)
+                    and int(session_row["workspace_revision"]) == int(after.get("workspace_revision") or -1)
+                    and int(session_row["session_revision"]) == int(after.get("session_revision") or -1)
+                    and workspace_row["head_sha"] == after.get("head_sha")
+                    and workspace_row["tree_sha"] == after.get("tree_sha")
+                    and session_row["head_commit_sha"] == after.get("head_sha")
+                    and session_row["tree_sha"] == after.get("tree_sha")
+                )
+                if not replay_state_matches:
+                    raise MyGithub12Error(
+                        "IDEMPOTENCY_CONFLICT",
+                        "recorded manual branch recovery result no longer matches current control-plane state",
+                    )
+                other = db.execute(
+                    """SELECT workspace_id FROM workspaces WHERE repository=? AND branch=? AND workspace_id<>?
+                    AND (status='drifted' OR (status='active' AND lease_expires_at>?)) LIMIT 1""",
+                    (repository, branch, workspace_id, now),
+                ).fetchone()
+                if other:
+                    raise MyGithub12Error(
+                        "RECOVERY_BRANCH_OWNERSHIP_CONFLICT",
+                        "another active or drifted Workspace claims the recovery branch",
+                        {"conflicting_workspace_id": other["workspace_id"]},
+                    )
+                _fresh_github_identity(service, repository, branch, current_head, current_tree, base_branch, base_sha)
                 return {"replayed": True, "before": record["before"], "after": record["after"], "audit": record["audit"]}
             if int(workspace_row["revision"]) != int(expected_workspace_revision):
                 raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH", "workspace revision changed before drift recovery")
@@ -484,8 +526,24 @@ def recover_drifted_task(
             "Workspace/Development Session do not match the requested repository, branch, or base branch",
             {"workspace_id": workspace_id, "development_session_id": development_session_id},
         )
+    if workspace.get("base_commit_sha") != expected_base_sha or session.get("base_commit_sha") != expected_base_sha:
+        raise MyGithub12Error(
+            "RECOVERY_BASE_CHANGED",
+            "recovery base SHA differs from the Workspace/Development Session pinned base",
+            {"workspace_base_sha": workspace.get("base_commit_sha"), "session_base_sha": session.get("base_commit_sha"), "expected_base_sha": expected_base_sha},
+        )
     replay = _replay_result(session, workspace, request, idempotency_key)
     if replay:
+        _fresh_github_identity(
+            service,
+            repository,
+            branch,
+            expected_current_head_sha,
+            expected_current_tree_sha,
+            expected_base_branch,
+            expected_base_sha,
+        )
+        _verify_ownership(service, workspace)
         index = _index_state(
             service,
             repository,

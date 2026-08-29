@@ -29,6 +29,7 @@ class FakeRepo:
         self.ahead_by = 1
         self.behind_by = 0
         self.changed_paths = ["allowed/feature.py"]
+        self.previous_filenames = {}
 
     def get_commit(self, sha):
         tree = self.trees[sha]
@@ -41,7 +42,10 @@ class FakeRepo:
             merge_base_commit=SimpleNamespace(sha=self.merge_base),
             ahead_by=self.ahead_by,
             behind_by=self.behind_by,
-            files=[SimpleNamespace(filename=path) for path in self.changed_paths],
+            files=[
+                SimpleNamespace(filename=path, previous_filename=self.previous_filenames.get(path))
+                for path in self.changed_paths
+            ],
         )
 
 
@@ -153,6 +157,23 @@ def _call(service, session, **overrides):
     return recovery.recover_drifted_task(service, **_args(session, **overrides))
 
 
+def _request(session):
+    args = _args(session)
+    return recovery._request_identity(
+        args["repository"],
+        args["branch"],
+        args["workspace_id"],
+        args["development_session_id"],
+        args["expected_workspace_revision"],
+        args["expected_session_revision"],
+        args["expected_current_head_sha"],
+        args["expected_current_tree_sha"],
+        args["expected_base_branch"],
+        args["expected_base_sha"],
+        args["lease_seconds"],
+    )
+
+
 def _db_state(session_id):
     with sessions._db() as db:
         workspace = dict(db.execute("SELECT * FROM workspaces WHERE workspace_id=?", (WORKSPACE_ID,)).fetchone())
@@ -213,6 +234,14 @@ def test_fresh_github_identity_mismatches_fail_stop(tmp_path, monkeypatch, kind,
     assert exc.value.code == error_code
 
 
+def test_caller_cannot_adopt_an_advanced_base_as_the_pinned_base(tmp_path, monkeypatch):
+    service, session = _seed(tmp_path, monkeypatch)
+    service.client.heads[BASE] = OTHER_HEAD
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session, expected_base_sha=OTHER_HEAD)
+    assert exc.value.code == "RECOVERY_BASE_CHANGED"
+
+
 @pytest.mark.parametrize(
     ("field", "value", "error_code"),
     [
@@ -252,6 +281,15 @@ def test_changed_paths_must_stay_inside_declared_workspace_scope(tmp_path, monke
         _call(service, session)
     assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
     assert exc.value.details["outside_scope_paths"] == ["outside/secret.py"]
+
+
+def test_renamed_previous_path_must_also_stay_inside_workspace_scope(tmp_path, monkeypatch):
+    service, session = _seed(tmp_path, monkeypatch)
+    service.repo.previous_filenames["allowed/feature.py"] = "outside/legacy.py"
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
+    assert exc.value.details["outside_scope_paths"] == ["outside/legacy.py"]
 
 
 @pytest.mark.parametrize(("status", "reason", "error_code"), [
@@ -298,6 +336,55 @@ def test_idempotent_replay_returns_same_recovery_result_without_new_revision(tmp
     assert second["after"] == first["after"]
     assert second["workspace"]["revision"] == first["workspace"]["revision"]
     assert second["development_session"]["session_revision"] == first["development_session"]["session_revision"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "error_code"),
+    [
+        ("head", "RECOVERY_HEAD_MISMATCH"),
+        ("tree", "RECOVERY_TREE_MISMATCH"),
+        ("base", "RECOVERY_BASE_CHANGED"),
+    ],
+)
+def test_idempotent_replay_still_requires_fresh_github_identity(tmp_path, monkeypatch, kind, error_code):
+    service, session = _seed(tmp_path, monkeypatch)
+    _call(service, session)
+    if kind == "head":
+        service.client.heads[BRANCH] = OTHER_HEAD
+    elif kind == "tree":
+        service.repo.trees[NEW_HEAD] = OTHER_TREE
+    else:
+        service.client.heads[BASE] = OTHER_HEAD
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == error_code
+
+
+def test_idempotent_replay_rechecks_current_overlap(tmp_path, monkeypatch):
+    service, session = _seed(tmp_path, monkeypatch)
+    _call(service, session)
+    monkeypatch.setattr(
+        recovery.mygithub12,
+        "workspace_overlap",
+        lambda *args, **kwargs: {"ok": True, "items": [{"workspace_id": "ws_other", "level": "high", "evidence": ["path"]}]},
+    )
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == "RECOVERY_WORKSPACE_OVERLAP"
+
+
+def test_atomic_replay_path_also_rechecks_fresh_github_identity(tmp_path, monkeypatch):
+    service, session = _seed(tmp_path, monkeypatch)
+    _call(service, session)
+    service.client.heads[BRANCH] = OTHER_HEAD
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        recovery._atomic_recover(
+            service,
+            request=_request(session),
+            idempotency_key="recover-once",
+            verification={"ancestry": {}, "scope": {}, "ownership": {}},
+        )
+    assert exc.value.code == "RECOVERY_HEAD_MISMATCH"
 
 
 def test_same_idempotency_key_with_different_payload_conflicts(tmp_path, monkeypatch):
