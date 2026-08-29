@@ -1,6 +1,6 @@
 # MyGithut12 Drifted Workspace / Development Session Recovery
 
-版本：12.6.3 candidate  
+版本：12.7.1  
 状态：正式 MCP contract  
 工具：`recover_drifted_development_task`
 
