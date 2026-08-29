@@ -314,6 +314,72 @@ async def test_bundle_download_rejects_non_https_reference():
 
 
 @pytest.mark.asyncio
+async def test_bundle_download_rejects_private_ip_literal():
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        await mcp_server._download_generated_bundle_file(
+            {"download_url": "https://127.0.0.1/generated.json", "file_id": "file_private"}
+        )
+    assert exc.value.code == "PAYLOAD_INVALID"
+
+
+@pytest.mark.asyncio
+async def test_bundle_download_rejects_dns_resolving_to_private_address(monkeypatch):
+    monkeypatch.setattr(
+        mcp_server.socket,
+        "getaddrinfo",
+        lambda host, port, type=0: [
+            (mcp_server.socket.AF_INET, mcp_server.socket.SOCK_STREAM, 6, "", ("10.0.0.5", port))
+        ],
+    )
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        await mcp_server._download_generated_bundle_file(
+            {"download_url": "https://private.example.test/generated.json", "file_id": "file_private_dns"}
+        )
+    assert exc.value.code == "PAYLOAD_INVALID"
+
+
+@pytest.mark.asyncio
+async def test_bundle_redirect_to_private_destination_is_rejected_before_second_request(monkeypatch):
+    calls = []
+
+    def fake_getaddrinfo(host, port, type=0):
+        assert host == "public.example.test"
+        return [(mcp_server.socket.AF_INET, mcp_server.socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    class FakeResponse:
+        is_redirect = True
+        headers = {"location": "https://127.0.0.1/internal"}
+        url = mcp_server.httpx.URL("https://public.example.test/start")
+
+    class FakeStream:
+        async def __aenter__(self):
+            return FakeResponse()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, method, url, headers=None):
+            calls.append(str(url))
+            return FakeStream()
+
+    monkeypatch.setattr(mcp_server.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    with pytest.raises(mygithub10.MyGithub10Error) as exc:
+        await mcp_server._download_generated_bundle_file(
+            {"download_url": "https://public.example.test/start", "file_id": "file_redirect_private"}
+        )
+    assert exc.value.code == "PAYLOAD_INVALID"
+    assert calls == ["https://public.example.test/start"]
+
+
+@pytest.mark.asyncio
 async def test_schema_exposes_v2_single_tool_bundle_ingress_and_capabilities(monkeypatch):
     monkeypatch.setenv("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", "true")
     tools = {tool.name: tool for tool in await mcp_server.mcp.list_tools()}
