@@ -9,6 +9,7 @@ from typing import Any, Callable, Awaitable
 from mcp.types import ToolAnnotations
 
 from app import development_drift_recovery as drift_recovery
+from app import development_converge as converge
 from app import development_orchestrator as dx
 from app import development_resume as resume
 from app import development_session_store as sessions
@@ -230,6 +231,20 @@ def register_dx_tools(mcp, github_call: Callable[..., Awaitable[Any]], service: 
                     "orchestration_error":observe_error["error"],
                 },ensure_ascii=False)
             return json.dumps({"ok":True,"development_session":final_session,"mode":mode,"lease_maintenance":lease_maintenance,**result},ensure_ascii=False)
+        except Exception as exc: return _error(exc)
+
+    @mcp.tool(name="converge_development_task",description="Converge exact-head Index, Change Context, Impact, Contract, Affected Tests and fast/full Private CI; never merges, deploys or rolls back.",annotations=_ORCHESTRATION)
+    async def converge_development_task(
+        development_session_id: str, expected_session_revision: int, mode: str="full", base_sha: str="",
+        index_wait_seconds: int=55, wait_seconds: int=55, force_rerun: bool=False,
+        supersede_previous: bool=True, include_failure_pack: bool=True, idempotency_key: str="",
+    ) -> str:
+        try:
+            result=await converge.converge_task(
+                github_call,service,development_session_id,expected_session_revision,mode,base_sha,
+                index_wait_seconds,wait_seconds,force_rerun,supersede_previous,include_failure_pack,idempotency_key,
+            )
+            return json.dumps(result,ensure_ascii=False)
         except Exception as exc: return _error(exc)
 
     @mcp.tool(name="finalize_development_task",description="Prepare/update Draft PR, read readiness, safely merge with explicit confirmation, or close a development session/workspace.",annotations=_ORCHESTRATION)

@@ -1334,6 +1334,7 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_private_ci_applicability_planning": True,
         "supports_repository_contract_change_detection": True,
         "supports_development_task_orchestration": True,
+        "supports_development_task_convergence": True,
         "supports_development_sessions": True,
         "supports_drifted_development_recovery": True,
         "supports_local_git_mirror_reads": True,

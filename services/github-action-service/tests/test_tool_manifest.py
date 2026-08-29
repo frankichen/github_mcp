@@ -7,14 +7,15 @@ import pytest
 from app.mcp_server import mcp
 
 
-EXPECTED_REGISTERED_TOOL_COUNT = 173
-EXPECTED_CANONICAL_TOOL_COUNT = 163
+EXPECTED_REGISTERED_TOOL_COUNT = 174
+EXPECTED_CANONICAL_TOOL_COUNT = 164
 DX1_TOOLS = [
     "prepare_development_task",
     "resume_development_task",
     "recover_drifted_development_task",
     "apply_development_change_set",
     "validate_development_task",
+    "converge_development_task",
     "finalize_development_task",
 ]
 INFRASTRUCTURE_DEPLOY_TOOLS = [
@@ -72,8 +73,8 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     tools = {tool.name: tool for tool in actual}
     assert MYGITHUB12_BASE_TOOLS <= set(actual_names)
     assert len(MYGITHUB12_BASE_TOOLS) == 40
-    assert actual_names[-13:-9] == HIGH_LEVEL_PUT_TOOLS
-    assert actual_names[-9:-3] == DX1_TOOLS
+    assert actual_names[-14:-10] == HIGH_LEVEL_PUT_TOOLS
+    assert actual_names[-10:-3] == DX1_TOOLS
     assert actual_names[-3:] == INFRASTRUCTURE_DEPLOY_TOOLS
     for name in DX1_TOOLS:
         assert tools[name].annotations.readOnlyHint is False
@@ -147,18 +148,18 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.7.1"
+    assert manifest["service_version"] == "12.8.0"
     assert manifest["manifest_format"] == "composed-v2"
     assert manifest["legacy_tool_count"] == 120
-    assert manifest["new_tool_count"] == 53
+    assert manifest["new_tool_count"] == 54
     assert manifest["tool_count"] == EXPECTED_CANONICAL_TOOL_COUNT
     assert manifest["compatibility_tool_count"] == EXPECTED_REGISTERED_TOOL_COUNT
     assert set(manifest["hidden_deprecated_tools"]) == HIDDEN_DEPRECATED_TOOLS
     assert manifest["schema_identity_algorithm"] == "sha256-canonical-mcp-tools-v1"
-    assert manifest["new_tools"][-13:-9] == HIGH_LEVEL_PUT_TOOLS
-    assert manifest["new_tools"][-9:-3] == DX1_TOOLS
+    assert manifest["new_tools"][-14:-10] == HIGH_LEVEL_PUT_TOOLS
+    assert manifest["new_tools"][-10:-3] == DX1_TOOLS
     assert manifest["new_tools"][-3:] == INFRASTRUCTURE_DEPLOY_TOOLS
-    assert set(manifest["new_tools"][:-13]) == MYGITHUB12_BASE_TOOLS
+    assert set(manifest["new_tools"][:-14]) == MYGITHUB12_BASE_TOOLS
     legacy = json.loads((root / "docs" / "MYGITHUB10_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert [tool["name"] for tool in legacy["tools"]].count("apply_github_patch_from_ref") == 1
     apply_tool = next(tool for tool in legacy["tools"] if tool["name"] == "apply_github_patch_from_ref")
