@@ -362,6 +362,13 @@ class StructuredFastMCP(FastMCP):
         "get_github_file",
         "commit_github_files",
         "get_test_deployment_logs",
+        "begin_github_file_upload",
+        "append_github_file_upload_chunk",
+        "finalize_github_file_upload",
+        "commit_github_uploaded_files",
+        "put_github_file",
+        "put_github_files",
+        "put_github_file_from_local_candidate",
     })
 
     @staticmethod
