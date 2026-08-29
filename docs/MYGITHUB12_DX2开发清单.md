@@ -82,7 +82,7 @@ DX2-WS-01 + DX2-RESUME-01
 | DX2-INFRA-01 | P1 | `DONE` | 长 self-deploy 持续 heartbeat | AC-INFRA-HB-01～05 |
 | DX2-INFRA-02 | P1 | `IN_PROGRESS` | self-deploy long-poll 和紧凑诊断 | AC-INFRA-WAIT-01～05 |
 | DX2-RESUME-01 | P1 | `IN_PROGRESS` | 新窗口一次恢复 branch/PR 开发上下文 | AC-RESUME-01～07 |
-| DX2-CONVERGE-01 | P1 | `NOT_STARTED` | 一次调用编排 post-write 收敛 | AC-CONV-01～07 |
+| DX2-CONVERGE-01 | P1 | `IN_PROGRESS` | 一次调用编排 post-write 收敛 | AC-CONV-01～07 |
 | DX2-PERF-01 | P2 | `NOT_STARTED` | 真实 CI 性能统计和回归依据 | AC-PERF-01～05 |
 | DX2-HYGIENE-01 | P2 | `NOT_STARTED` | 历史 Workspace/PR 可见性治理 | AC-HYGIENE-01～03 |
 
@@ -449,12 +449,13 @@ DX2-WS-01、DX2-SESSION-01。
 
 ### 状态
 
-`NOT_STARTED`
+`IN_PROGRESS`
 
 ### 预计修改模块
 
+- `services/github-action-service/app/development_converge.py`
 - `services/github-action-service/app/mygithub12_dx_mcp.py`
-- `services/github-action-service/app/development_orchestrator.py`
+- `services/github-action-service/app/development_orchestrator.py`（复用现有 validation 状态机，不改变原行为）
 - Index / Context Pack / impact / contract / affected tests orchestration
 - Private CI orchestration
 - Tool Manifest / tests
@@ -476,14 +477,16 @@ Session/Workspace/GitHub identity gate
 
 ### 实现清单
 
-- [ ] stale revision CAS 拒绝；
-- [ ] 新 HEAD 永不复用旧 Index；
-- [ ] candidate analysis 不冒充事实；
-- [ ] 任一分析降级时保守扩大测试；
-- [ ] full 固定 `repo-auto-check`；
-- [ ] Failure Pack 直达；
-- [ ] compact + Resource fallback；
-- [ ] 不 merge/deploy/rollback。
+- [x] stale revision CAS 拒绝；
+- [x] 新 HEAD 永不复用旧 Index；
+- [x] candidate analysis 不冒充事实；
+- [x] 任一分析降级时保守扩大测试；
+- [x] full 固定 `repo-auto-check`；
+- [x] Failure Pack 直达；
+- [x] compact + Resource fallback；
+- [x] 不 merge/deploy/rollback。
+
+源码实现与自动化测试已进入 12.8.0 候选；只有 exact final HEAD `repo-auto-check`、Draft PR 回读以及获得独立授权后的生产 self-deploy/E2E 证据齐全后，才允许把本项改为 `DONE`。
 
 ### 验收
 

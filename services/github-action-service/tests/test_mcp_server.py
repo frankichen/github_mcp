@@ -96,13 +96,13 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.7.1"
+        assert capabilities["version"] == "12.8.0"
         assert capabilities["max_upload_chunk_bytes"] == 24576
         assert capabilities["recommended_upload_chunk_bytes"] == 16384
         assert capabilities["preferred_upload_encoding"] == "text_for_utf8_base64_for_binary"
-        assert capabilities["tool_count"] == 173
-        assert capabilities["tool_manifest_count"] == 173
-        assert capabilities["compatibility_tool_count"] == 173
+        assert capabilities["tool_count"] == 174
+        assert capabilities["tool_manifest_count"] == 174
+        assert capabilities["compatibility_tool_count"] == 174
         assert capabilities["deprecated_tools_exposed"] is True
         assert capabilities["hidden_deprecated_tool_count"] == 0
         assert capabilities["hidden_deprecated_tools"] == []
@@ -126,6 +126,7 @@ class TestMCPTools:
         assert capabilities["recommended_large_file_workflow"] == ["put_generated_files"]
         assert capabilities["supports_private_ci_applicability_planning"] is True
         assert capabilities["supports_development_task_orchestration"] is True
+        assert capabilities["supports_development_task_convergence"] is True
         assert capabilities["supports_development_sessions"] is True
         assert capabilities["supports_local_git_mirror_reads"] is True
         assert capabilities["supports_context_pack_v2"] is True
