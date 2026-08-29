@@ -7,11 +7,12 @@ import pytest
 from app.mcp_server import mcp
 
 
-EXPECTED_REGISTERED_TOOL_COUNT = 172
-EXPECTED_CANONICAL_TOOL_COUNT = 162
+EXPECTED_REGISTERED_TOOL_COUNT = 173
+EXPECTED_CANONICAL_TOOL_COUNT = 163
 DX1_TOOLS = [
     "prepare_development_task",
     "resume_development_task",
+    "recover_drifted_development_task",
     "apply_development_change_set",
     "validate_development_task",
     "finalize_development_task",
@@ -71,8 +72,8 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     tools = {tool.name: tool for tool in actual}
     assert MYGITHUB12_BASE_TOOLS <= set(actual_names)
     assert len(MYGITHUB12_BASE_TOOLS) == 40
-    assert actual_names[-12:-8] == HIGH_LEVEL_PUT_TOOLS
-    assert actual_names[-8:-3] == DX1_TOOLS
+    assert actual_names[-13:-9] == HIGH_LEVEL_PUT_TOOLS
+    assert actual_names[-9:-3] == DX1_TOOLS
     assert actual_names[-3:] == INFRASTRUCTURE_DEPLOY_TOOLS
     for name in DX1_TOOLS:
         assert tools[name].annotations.readOnlyHint is False
@@ -82,6 +83,9 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert resume_schema["recover_stale_session"]["default"] is True
     assert resume_schema["renew_lease"]["default"] is False
     assert resume_schema["lease_seconds"]["default"] == 7200
+    recovery_schema = tools["recover_drifted_development_task"].inputSchema
+    assert {"repository", "branch", "workspace_id", "development_session_id", "expected_workspace_revision", "expected_session_revision", "expected_current_head_sha", "expected_current_tree_sha", "expected_base_branch", "expected_base_sha", "idempotency_key"} <= set(recovery_schema["required"])
+    assert recovery_schema["properties"]["lease_seconds"]["default"] == 7200
     assert tools["plan_infrastructure_deployment"].annotations.readOnlyHint is True
     assert tools["start_infrastructure_deployment"].annotations.readOnlyHint is False
     assert tools["start_infrastructure_deployment"].annotations.destructiveHint is True
@@ -143,18 +147,18 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.7.0"
+    assert manifest["service_version"] == "12.7.1"
     assert manifest["manifest_format"] == "composed-v2"
     assert manifest["legacy_tool_count"] == 120
-    assert manifest["new_tool_count"] == 52
+    assert manifest["new_tool_count"] == 53
     assert manifest["tool_count"] == EXPECTED_CANONICAL_TOOL_COUNT
     assert manifest["compatibility_tool_count"] == EXPECTED_REGISTERED_TOOL_COUNT
     assert set(manifest["hidden_deprecated_tools"]) == HIDDEN_DEPRECATED_TOOLS
     assert manifest["schema_identity_algorithm"] == "sha256-canonical-mcp-tools-v1"
-    assert manifest["new_tools"][-12:-8] == HIGH_LEVEL_PUT_TOOLS
-    assert manifest["new_tools"][-8:-3] == DX1_TOOLS
+    assert manifest["new_tools"][-13:-9] == HIGH_LEVEL_PUT_TOOLS
+    assert manifest["new_tools"][-9:-3] == DX1_TOOLS
     assert manifest["new_tools"][-3:] == INFRASTRUCTURE_DEPLOY_TOOLS
-    assert set(manifest["new_tools"][:-12]) == MYGITHUB12_BASE_TOOLS
+    assert set(manifest["new_tools"][:-13]) == MYGITHUB12_BASE_TOOLS
     legacy = json.loads((root / "docs" / "MYGITHUB10_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert [tool["name"] for tool in legacy["tools"]].count("apply_github_patch_from_ref") == 1
     apply_tool = next(tool for tool in legacy["tools"] if tool["name"] == "apply_github_patch_from_ref")

@@ -1335,6 +1335,7 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_repository_contract_change_detection": True,
         "supports_development_task_orchestration": True,
         "supports_development_sessions": True,
+        "supports_drifted_development_recovery": True,
         "supports_local_git_mirror_reads": True,
         "supports_context_pack_v2": True,
         "supports_fast_feedback_ci": True,

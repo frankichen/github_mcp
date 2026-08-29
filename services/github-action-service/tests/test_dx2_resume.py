@@ -179,7 +179,10 @@ def test_resume_task_drifted_workspace_never_invokes_session_recovery(monkeypatc
     result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
 
     assert "WORKSPACE_DRIFTED" in result["blockers"]
-    assert result["next_allowed_actions"] == ["recovery_required"]
+    assert result["recovery"]["action"] == "recover_drifted_development_task"
+    assert result["recovery"]["recovery_tool"] == "recover_drifted_development_task"
+    assert result["recovery"]["manual_recovery_required"] is True
+    assert result["next_allowed_actions"] == ["recover_drifted_development_task", "recovery_required"]
 
 
 def test_session_evidence_never_promotes_old_head_or_invalid_attestation(monkeypatch):
