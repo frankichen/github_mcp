@@ -8,7 +8,7 @@ from app.mcp_server import mcp
 
 
 EXPECTED_REGISTERED_TOOL_COUNT = 172
-EXPECTED_CANONICAL_TOOL_COUNT = 169
+EXPECTED_CANONICAL_TOOL_COUNT = 162
 DX1_TOOLS = [
     "prepare_development_task",
     "resume_development_task",
@@ -53,6 +53,9 @@ MYGITHUB12_BASE_TOOLS = {
 }
 HIDDEN_DEPRECATED_TOOLS = {
     "get_github_file", "commit_github_files", "get_test_deployment_logs",
+    "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload",
+    "commit_github_uploaded_files", "put_github_file", "put_github_files",
+    "put_github_file_from_local_candidate",
 }
 
 
@@ -132,13 +135,15 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert len(canonical_names) == EXPECTED_CANONICAL_TOOL_COUNT
     assert HIDDEN_DEPRECATED_TOOLS.isdisjoint(canonical_names)
     assert canonical_names == [name for name in actual_names if name not in HIDDEN_DEPRECATED_TOOLS]
+    assert "put_generated_files" in canonical_names
+    assert {"edit_github_file_ranges", "replace_github_text_once", "apply_github_patch"} <= set(canonical_names)
 
 
 def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.6.1"
+    assert manifest["service_version"] == "12.6.2"
     assert manifest["manifest_format"] == "composed-v2"
     assert manifest["legacy_tool_count"] == 120
     assert manifest["new_tool_count"] == 52

@@ -57,7 +57,7 @@ private-deploy-agent（服务器端）
 
 ## GitHub Action Service
 
-MyGithut12 源码当前版本为 `12.6.1`；生产运行版本必须以 `get_mygithub_capabilities` 的实时结果为准。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。AI 日常生成 UTF-8 文本文件的唯一推荐写入入口是 `put_generated_files`：调用方只提供 repository、branch、expected HEAD、`files[{path,content}]`、提交信息、dry-run 和可选幂等 key，服务端会自动绑定该分支唯一有效的 Workspace/Development Session，并在内部完成 revision CAS、旧 blob 读取、路径校验、hash、chunk、staging、原子 Commit、read-back 以及 Workspace/Session 写后推进。V1 不支持 binary、delete 或 bundle，超限 payload 直接返回 `PAYLOAD_TOO_LARGE`；旧高层写入和低层 upload 工具仅保留兼容，不作为 AI 日常开发路径。
+MyGithut12 源码当前版本为 `12.6.2`；生产运行版本必须以 `get_mygithub_capabilities` 的实时结果为准。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。AI 日常生成 UTF-8 文本文件的唯一推荐写入入口是 `put_generated_files`：调用方只提供 repository、branch、expected HEAD、`files[{path,content}]`、提交信息、dry-run 和可选幂等 key，服务端会自动绑定该分支唯一有效的 Workspace/Development Session，并在内部完成 revision CAS、旧 blob 读取、路径校验、hash、chunk、staging、原子 Commit、read-back 以及 Workspace/Session 写后推进。V1 不支持 binary、delete 或 bundle，超限 payload 直接返回 `PAYLOAD_TOO_LARGE`；旧高层写入和低层 upload 工具仅保留兼容，不作为 AI 日常开发路径，默认生产 Schema 会隐藏这些兼容写入工具。
 
 Workspace 写 Lease 默认 7200 秒（2 小时），最大仍为 14400 秒（4 小时）。DX2-WS-01 使用 activity-driven renew：仅受控 Development Session 动作在剩余 Lease 不超过 1800 秒时尝试自动续签，并在 fresh GitHub HEAD/Tree、Workspace/Session identity、revision CAS、drift 和有效 Lease 全部成立后，原子同步 Workspace 与 Session revision；闲置窗口不会后台无限续命。已经过期的 Workspace 不会被普通 renew 或自动续签复活，必须显式调用 `resume_development_workspace` 重新验证 branch/base/Tree 后恢复。
 
@@ -99,7 +99,7 @@ docker compose up -d --build
 
 ## MyGithut12 运行状态
 
-MyGithut12 `12.6.1` 源码的 compatibility registration 为 172 个工具，canonical production Schema 为 169 个可见工具；生产 Schema 身份必须以运行时 capability 为准。本版让 `put_generated_files` 自动绑定活动 Workspace/Development Session，在保持轻量 schema 的同时执行协作 revision CAS；旧写入工具继续保留兼容。Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
+MyGithut12 `12.6.2` 源码的 compatibility registration 为 172 个工具，canonical production Schema 为 162 个可见工具；生产 Schema 身份必须以运行时 capability 为准。本版继续让 `put_generated_files` 自动绑定活动 Workspace/Development Session，在保持轻量 schema 的同时执行协作 revision CAS；旧写入工具和低层 upload 工具继续保留兼容调用能力，但默认从 AI 窗口可见 Schema 中隐藏。Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
 
 ## Private Deploy Agent
 

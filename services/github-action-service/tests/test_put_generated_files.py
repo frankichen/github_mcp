@@ -250,6 +250,19 @@ async def test_schema_exposes_only_v1_window_payload_and_capabilities_recommend_
     assert "put_generated_files" in capabilities["legacy_upload_guidance"]
     for name in ("begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload"):
         assert "put_generated_files" in tools[name].description
+    monkeypatch.setenv("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", "false")
+    canonical_names = {tool.name for tool in await mcp_server.mcp.list_tools()}
+    assert "put_generated_files" in canonical_names
+    assert {"edit_github_file_ranges", "replace_github_text_once", "apply_github_patch"} <= canonical_names
+    assert {
+        "begin_github_file_upload",
+        "append_github_file_upload_chunk",
+        "finalize_github_file_upload",
+        "commit_github_uploaded_files",
+        "put_github_file",
+        "put_github_files",
+        "put_github_file_from_local_candidate",
+    }.isdisjoint(canonical_names)
 
 
 def _workspace(**overrides):
