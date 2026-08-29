@@ -5,14 +5,17 @@ import logging
 import base64
 import binascii
 import asyncio
+import ipaddress
 import os
 import re
+import socket
 import subprocess
 import inspect
 import uuid
 from pathlib import Path
 from typing import Annotated, Literal, Optional
-from typing_extensions import TypedDict
+from urllib.parse import urljoin
+from typing_extensions import NotRequired, TypedDict
 
 import httpx
 from pydantic import Field
@@ -53,6 +56,13 @@ logger = logging.getLogger(__name__)
 class GeneratedTextFile(TypedDict):
     path: str
     content: str
+
+
+class GeneratedBundleFile(TypedDict):
+    download_url: str
+    file_id: str
+    mime_type: NotRequired[str]
+    file_name: NotRequired[str]
 
 
 _client = GitHubClient()
@@ -1353,21 +1363,168 @@ async def _run_high_level_put(
     return result
 
 
-PUT_GENERATED_FILES_DESCRIPTION = "The only recommended entry point for routine AI-generated UTF-8 text files. Provide repository, branch, exact expected_head_sha, structured files[{path,content}], commit_message, dry_run, and optional idempotency_key. MyGithut12 automatically binds the branch's active Workspace/Development Session when present, then internally performs collaboration revision CAS, existing-blob lookup, path validation, hashing, chunked staging, atomic Git CAS commit, durable read-back, and Workspace/Session finalization. V1 rejects oversized payloads, binary content, and deletion; callers must not manage Workspace/Session IDs, revisions, upload IDs, chunks, offsets, hashes, staging paths, or expected_blob_sha."
+_GENERATED_BUNDLE_MAX_REDIRECTS = 5
+_GENERATED_BUNDLE_ALLOWED_HOST_SUFFIXES = ("oaiusercontent.com",)
+
+
+def _validate_generated_bundle_url_destination(url: httpx.URL) -> None:
+    host = str(url.host or "").strip().rstrip(".")
+    lowered = host.lower()
+    if url.scheme != "https" or not host or url.port not in (None, 443):
+        raise mygithub10.MyGithub10Error(
+            "PAYLOAD_INVALID",
+            "bundle_file download_url must use HTTPS on port 443",
+        )
+    if not any(
+        lowered == suffix or lowered.endswith("." + suffix)
+        for suffix in _GENERATED_BUNDLE_ALLOWED_HOST_SUFFIXES
+    ):
+        raise mygithub10.MyGithub10Error(
+            "PAYLOAD_INVALID",
+            "bundle_file download_url host is not allowlisted for ChatGPT file delivery",
+            {"host": host},
+        )
+
+    addresses: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+    try:
+        addresses.add(ipaddress.ip_address(host.split("%", 1)[0]))
+    except ValueError:
+        try:
+            resolved = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise mygithub10.MyGithub10Error(
+                "PAYLOAD_INVALID",
+                "bundle_file download_url host could not be resolved",
+                {"host": host, "cause_type": type(exc).__name__},
+            ) from exc
+        for item in resolved:
+            try:
+                addresses.add(ipaddress.ip_address(str(item[4][0]).split("%", 1)[0]))
+            except (IndexError, ValueError, TypeError):
+                continue
+    if not addresses or any(not address.is_global for address in addresses):
+        raise mygithub10.MyGithub10Error(
+            "PAYLOAD_INVALID",
+            "bundle_file download_url must resolve only to public network addresses",
+            {"host": host},
+        )
+
+
+async def _validate_generated_bundle_url(url: httpx.URL) -> None:
+    await asyncio.to_thread(_validate_generated_bundle_url_destination, url)
+
+
+async def _download_generated_bundle_file(bundle_file: GeneratedBundleFile) -> bytes:
+    if not isinstance(bundle_file, dict):
+        raise mygithub10.MyGithub10Error("PAYLOAD_INVALID", "bundle_file must be a runtime file reference")
+    download_url = bundle_file.get("download_url")
+    file_id = bundle_file.get("file_id")
+    if not isinstance(download_url, str) or not download_url or not isinstance(file_id, str) or not file_id:
+        raise mygithub10.MyGithub10Error(
+            "PAYLOAD_INVALID",
+            "bundle_file requires download_url and file_id",
+        )
+    try:
+        current_url = httpx.URL(download_url)
+    except (TypeError, ValueError) as exc:
+        raise mygithub10.MyGithub10Error("PAYLOAD_INVALID", "bundle_file download_url is invalid") from exc
+
+    max_bytes = mygithub10.MAX_GENERATED_BUNDLE_BYTES
+    data = bytearray()
+    try:
+        timeout = httpx.Timeout(30.0, connect=10.0)
+        async with httpx.AsyncClient(follow_redirects=False, timeout=timeout) as client:
+            for redirect_count in range(_GENERATED_BUNDLE_MAX_REDIRECTS + 1):
+                await _validate_generated_bundle_url(current_url)
+                async with client.stream("GET", current_url, headers={"Accept-Encoding": "identity"}) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location or redirect_count >= _GENERATED_BUNDLE_MAX_REDIRECTS:
+                            raise mygithub10.MyGithub10Error(
+                                "PAYLOAD_INVALID",
+                                "generated bundle redirect chain is invalid or too long",
+                            )
+                        try:
+                            current_url = httpx.URL(urljoin(str(response.url), location))
+                        except (TypeError, ValueError) as exc:
+                            raise mygithub10.MyGithub10Error(
+                                "PAYLOAD_INVALID", "generated bundle redirect URL is invalid"
+                            ) from exc
+                        continue
+                    response.raise_for_status()
+                    declared_size = response.headers.get("content-length")
+                    if declared_size:
+                        try:
+                            declared_bytes = int(declared_size)
+                        except ValueError:
+                            declared_bytes = None
+                        if declared_bytes is not None and declared_bytes > max_bytes:
+                            raise mygithub10.MyGithub10Error(
+                                "PAYLOAD_TOO_LARGE",
+                                "generated bundle file exceeds the download limit",
+                                {"max_bytes": max_bytes, "declared_bytes": declared_bytes},
+                            )
+                    async for chunk in response.aiter_bytes():
+                        if len(data) + len(chunk) > max_bytes:
+                            raise mygithub10.MyGithub10Error(
+                                "PAYLOAD_TOO_LARGE",
+                                "generated bundle file exceeds the download limit",
+                                {"max_bytes": max_bytes},
+                            )
+                        data.extend(chunk)
+                    return bytes(data)
+    except mygithub10.MyGithub10Error:
+        raise
+    except httpx.HTTPError as exc:
+        raise mygithub10.MyGithub10Error(
+            "PAYLOAD_INVALID",
+            "generated bundle file could not be downloaded",
+            {"file_id": file_id, "cause_type": type(exc).__name__},
+        ) from exc
+    raise mygithub10.MyGithub10Error("PAYLOAD_INVALID", "generated bundle redirect limit exceeded")
+
+
+PUT_GENERATED_FILES_DESCRIPTION = (
+    "The only recommended entry point for AI-generated UTF-8 text add/modify writes. "
+    "Use files[{path,content}] for normal payloads. When generated content exceeds the inline transport budget, "
+    "pass a runtime bundle_file containing JSON {version:1,files:[{path,content}]}; ChatGPT/Codex file handling "
+    "supplies the authorized temporary file reference. MyGithut12 downloads and validates the bundle, automatically "
+    "binds the active Workspace/Development Session, infers existing blobs, internally chunks/stages bytes, commits "
+    "atomically, and performs durable read-back. Exactly one of files or bundle_file is accepted. Binary repository "
+    "files and deletion remain unsupported; callers never manage upload IDs, chunks, offsets, hashes, staging paths, "
+    "Workspace/Session revisions, or expected_blob_sha."
+)
 
 
 async def put_generated_files(
     repository: str,
     branch: str,
     expected_head_sha: str,
-    files: list[GeneratedTextFile],
     commit_message: str,
+    files: Optional[list[GeneratedTextFile]] = None,
+    bundle_file: Optional[GeneratedBundleFile] = None,
     dry_run: bool = True,
     idempotency_key: str = "",
 ) -> str:
     operation_id = ""
     try:
-        prepared = mygithub10.prepare_generated_files(files)
+        inline_files = files or []
+        if inline_files and bundle_file is not None:
+            raise mygithub10.MyGithub10Error(
+                "PAYLOAD_INVALID", "provide either files or bundle_file to put_generated_files, not both"
+            )
+        if not inline_files and bundle_file is None:
+            raise mygithub10.MyGithub10Error(
+                "NO_FILES", "provide files or a runtime bundle_file to put_generated_files"
+            )
+        payload_source = "inline_files"
+        if bundle_file is not None:
+            bundle_data = await _download_generated_bundle_file(bundle_file)
+            bundled_files = await _github_call(mygithub10.parse_generated_files_bundle, bundle_data)
+            prepared = await _github_call(mygithub10.prepare_generated_files, bundled_files, True)
+            payload_source = "bundle_file"
+        else:
+            prepared = mygithub10.prepare_generated_files(inline_files)
         request, canonical_payload_hash = mygithub10.build_generated_files_request(
             repository,
             branch,
@@ -1423,6 +1580,7 @@ async def put_generated_files(
             True,
             canonical_payload_hash,
         )
+        result["payload_source"] = payload_source
         result["coordination"] = {
             "managed": bool(coordination.get("managed")),
             "workspace_id": workspace_id or None,
@@ -1884,6 +2042,7 @@ mcp.tool(
 mcp.tool(
     name="put_generated_files",
     description=PUT_GENERATED_FILES_DESCRIPTION,
+    meta={"openai/fileParams": ["bundle_file"]},
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=True,

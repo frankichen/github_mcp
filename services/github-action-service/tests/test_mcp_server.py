@@ -96,7 +96,7 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.6.2"
+        assert capabilities["version"] == "12.7.0"
         assert capabilities["max_upload_chunk_bytes"] == 24576
         assert capabilities["recommended_upload_chunk_bytes"] == 16384
         assert capabilities["preferred_upload_encoding"] == "text_for_utf8_base64_for_binary"
@@ -113,6 +113,12 @@ class TestMCPTools:
         assert capabilities["max_atomic_multi_upload_files"] == 64
         assert capabilities["max_atomic_multi_upload_bytes"] == 64 * 1024 * 1024
         assert capabilities["supports_high_level_file_put"] is True
+        assert capabilities["supports_generated_files_put_v1"] is True
+        assert capabilities["supports_generated_files_put_v2"] is True
+        assert capabilities["generated_files_put_semantics"]["bundle_format_version"] == 1
+        assert capabilities["generated_files_put_semantics"]["unsupported"] == ["binary", "delete"]
+        assert capabilities["generated_files_put_semantics"]["max_file_bytes"] == 1024 * 1024
+        assert capabilities["generated_files_put_semantics"]["max_bundle_content_bytes"] == 64 * 1024 * 1024
         assert capabilities["high_level_inline_content_limit_bytes"] == 48 * 1024
         assert capabilities["supports_local_candidate_file_put"] is True
         assert capabilities["recommended_ai_text_write_workflow"] == ["put_generated_files"]
