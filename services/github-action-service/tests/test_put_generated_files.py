@@ -278,7 +278,10 @@ async def test_bundle_file_source_is_exclusive_and_format_is_validated(generated
 
 @pytest.mark.asyncio
 async def test_bundle_idempotency_uses_content_not_ephemeral_file_reference(generated_env, monkeypatch):
-    bundle = b'{"version":1,"files":[{"path":"src/bundle.py","content":"value = 1\n"}]}'
+    bundle = json.dumps(
+        {"version": 1, "files": [{"path": "src/bundle.py", "content": "value = 1\n"}]},
+        separators=(",", ":"),
+    ).encode("utf-8")
 
     async def stable_download(_bundle_file):
         return bundle
