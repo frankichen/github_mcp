@@ -7,7 +7,7 @@ MyGithut12 12.9.0 将大 ChangeSet 的传输协议从聊天 inline string 扩展
 `apply_development_change_set` 的 Candidate 来源严格三选一：
 
 - 小 payload：`change_set_json`；上限由 `development_change_set_inline_limit_bytes` capability 返回。
-- 大或 exact-byte-sensitive payload：`change_set_file`，同时提供 `expected_change_set_size_bytes`、`expected_change_set_sha256`，可选 `expected_change_set_git_blob_sha`。
+- 大或 exact-byte-sensitive payload：优先使用 `change_set_file`；若 ChatGPT connector 只稳定转换 `bundle_file` 这个 fileParam 名，可在同一工具中使用 `bundle_file` 作为传输别名。两者都必须同时提供 `expected_change_set_size_bytes`、`expected_change_set_sha256`，可选 `expected_change_set_git_blob_sha`。
 - 已通过 strict dry-run 的 write：`prepared_change_set_id`，不得再次附带 raw Candidate。
 
 runtime file 模式严格按以下顺序处理：
@@ -35,7 +35,7 @@ raw source 的 `dry_run=true` 成功后返回 `prepared_change_set_id`、raw ide
 
 ## 下载安全
 
-`change_set_file` 与 `put_generated_files(bundle_file)` 共用同一 runtime-file ingress primitive：只允许 HTTPS/443、`*.oaiusercontent.com` 和受限的 OpenAI Azure Blob fileParam 投递域名（例如 `oai*.blob.core.windows.net`），每次 redirect 前重新做 allowlist、DNS 与公网 IP 校验，拒绝 response content encoding，并执行连接/总 timeout、Content-Length 与 streaming byte limit。signed URL 和 Candidate 内容不得进入日志或持久结果。
+`change_set_file`、其 `bundle_file` 传输别名与 `put_generated_files(bundle_file)` 共用同一 runtime-file ingress primitive：只允许 HTTPS/443、`*.oaiusercontent.com` 和受限的 OpenAI Azure Blob fileParam 投递域名（例如 `oai*.blob.core.windows.net`），每次 redirect 前重新做 allowlist、DNS 与公网 IP 校验，拒绝 response content encoding，并执行连接/总 timeout、Content-Length 与 streaming byte limit。signed URL 和 Candidate 内容不得进入日志或持久结果。
 
 ## capabilities
 

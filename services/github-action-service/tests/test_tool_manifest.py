@@ -94,13 +94,14 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
         "expected_workspace_revision", "expected_head_sha", "commit_message",
     }
     assert {
-        "change_set_json", "change_set_file", "prepared_change_set_id",
+        "change_set_json", "change_set_file", "bundle_file", "prepared_change_set_id",
         "expected_change_set_size_bytes", "expected_change_set_sha256",
         "expected_change_set_git_blob_sha",
     } <= set(change_set_schema["properties"])
     change_set_meta = getattr(change_set_tool, "meta", None) or getattr(change_set_tool, "_meta", None) or {}
-    assert change_set_meta["openai/fileParams"] == ["change_set_file"]
+    assert change_set_meta["openai/fileParams"] == ["change_set_file", "bundle_file"]
     assert "large or exact-byte-sensitive" in change_set_tool.description
+    assert "bundle_file as a transport alias" in change_set_tool.description
     assert tools["plan_infrastructure_deployment"].annotations.readOnlyHint is True
     assert tools["start_infrastructure_deployment"].annotations.readOnlyHint is False
     assert tools["start_infrastructure_deployment"].annotations.destructiveHint is True

@@ -113,16 +113,18 @@ def register_dx_tools(
         description=(
             "Strictly validate/apply a versioned patch/range/upload ChangeSet with Session, Workspace, "
             "HEAD/blob CAS and durable GitHub read-back. Small payloads may use change_set_json; large or "
-            "exact-byte-sensitive payloads must use change_set_file with raw size/SHA identity. A raw "
-            "strict dry-run freezes a short-lived prepared_change_set_id; the real write should use that ID "
-            "so the Candidate is not transported again. Exactly one raw/prepared source is accepted."
+            "exact-byte-sensitive payloads must use change_set_file with raw size/SHA identity. Web ChatGPT "
+            "may use bundle_file as a transport alias when the connector only registers that fileParam name. "
+            "A raw strict dry-run freezes a short-lived prepared_change_set_id; the real write should use "
+            "that ID so the Candidate is not transported again. Exactly one raw/prepared source is accepted."
         ),
-        meta={"openai/fileParams":["change_set_file"]},
+        meta={"openai/fileParams":["change_set_file","bundle_file"]},
         annotations=_ORCHESTRATION,
     )
     async def apply_development_change_set(
         development_session_id: str, expected_session_revision: int, expected_workspace_revision: int, expected_head_sha: str,
         commit_message: str, change_set_json: str="", change_set_file: RuntimeFileParam | None=None,
+        bundle_file: RuntimeFileParam | None=None,
         expected_change_set_size_bytes: int=0, expected_change_set_sha256: str="",
         expected_change_set_git_blob_sha: str="", prepared_change_set_id: str="",
         dry_run: bool=True, idempotency_key: str="", create_pull_request: bool=False, pull_request_json: str="{}",
@@ -131,25 +133,33 @@ def register_dx_tools(
         owned_artifact_id=""
         try:
             inline_source=isinstance(change_set_json,str) and bool(change_set_json)
-            file_source=change_set_file is not None
+            canonical_file_source=change_set_file is not None
+            alias_file_source=bundle_file is not None
+            if canonical_file_source and alias_file_source:
+                raise mygithub12.MyGithub12Error(
+                    "CHANGE_SET_SOURCE_CONFLICT",
+                    "change_set_file and bundle_file alias are mutually exclusive",
+                )
+            runtime_change_set_file=change_set_file if canonical_file_source else bundle_file
+            file_source=runtime_change_set_file is not None
             prepared_source=bool(prepared_change_set_id)
             source_count=sum((inline_source,file_source,prepared_source))
             if source_count==0:
                 raise mygithub12.MyGithub12Error(
                     "CHANGE_SET_FILE_REQUIRED",
-                    "provide exactly one of change_set_json, change_set_file, or prepared_change_set_id",
+                    "provide exactly one of change_set_json, change_set_file/bundle_file, or prepared_change_set_id",
                 )
             if source_count!=1:
                 raise mygithub12.MyGithub12Error(
                     "CHANGE_SET_SOURCE_CONFLICT",
-                    "change_set_json, change_set_file, and prepared_change_set_id are mutually exclusive",
+                    "change_set_json, change_set_file/bundle_file, and prepared_change_set_id are mutually exclusive",
                 )
             if not file_source and (
                 expected_change_set_size_bytes or expected_change_set_sha256 or expected_change_set_git_blob_sha
             ):
                 raise mygithub12.MyGithub12Error(
                     "CHANGE_SET_SOURCE_CONFLICT",
-                    "expected raw file identities are valid only with change_set_file",
+                    "expected raw file identities are valid only with change_set_file or bundle_file alias",
                 )
             pr_cfg=None
             if create_pull_request:
@@ -348,16 +358,17 @@ def register_dx_tools(
                 }
             else:
                 if file_source:
+                    file_parameter="change_set_file" if canonical_file_source else "bundle_file"
                     if ingest_runtime_artifact is None:
                         raise mygithub12.MyGithub12Error(
                             "CHANGE_SET_FILE_INVALID","runtime-file ingress is unavailable"
                         )
                     try:
                         source_artifact=await ingest_runtime_artifact(
-                            change_set_file,
+                            runtime_change_set_file,
                             kind="development_change_set",
                             max_bytes=mygithub10.MAX_DEVELOPMENT_CHANGE_SET_FILE_BYTES,
-                            label="change_set_file",
+                            label="change_set_file" if canonical_file_source else "bundle_file",
                             session_scope=development_session_id,
                             ttl_seconds=mygithub10.PREPARED_CHANGE_SET_TTL_SECONDS,
                         )
@@ -378,6 +389,7 @@ def register_dx_tools(
                         "received_size_bytes":source_artifact.size_bytes,
                         "received_sha256":source_artifact.sha256,
                         "received_git_blob_sha":source_artifact.git_blob_sha,
+                        "file_parameter":file_parameter,
                     }
                     if isinstance(expected_change_set_size_bytes,bool) or expected_change_set_size_bytes<=0:
                         raise mygithub12.MyGithub12Error(
