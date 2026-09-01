@@ -34,6 +34,11 @@ async def lifespan(app: FastAPI):
         from app.attestation_registry import init_registry_db
         from app.mygithub12 import init_db as init_mygithub12_db, recover_orphaned_index_jobs
         from app.development_session_store import init_session_db, recover_sessions
+        from app.artifact_store import init_artifact_db, cleanup_expired as cleanup_expired_artifacts
+        from app.development_change_set_store import (
+            init_prepared_change_set_db,
+            cleanup_expired as cleanup_expired_prepared_change_sets,
+        )
         from app.runtime_generation import (
             acquire_leader,
             init_runtime_db,
@@ -48,6 +53,10 @@ async def lifespan(app: FastAPI):
         init_registry_db()
         init_mygithub12_db()
         init_session_db()
+        init_artifact_db()
+        init_prepared_change_set_db()
+        cleanup_expired_artifacts()
+        cleanup_expired_prepared_change_sets()
         init_runtime_db()
         generation = register_generation()
         maintenance_leader = {"acquired": False, "reason": "runtime_not_active"}

@@ -311,8 +311,7 @@ def resolve_generated_write_context(service: Any, repository: str, branch: str, 
     return {"managed":True,"workspace":checked_workspace,"session":checked_session}
 
 
-def parse_change_set(change_set_json: str) -> dict[str,Any]:
-    change=_json(change_set_json,dict,"change_set_json",{})
+def _validate_change_set(change: dict[str,Any]) -> dict[str,Any]:
     if change.get("schema_version")!=1: raise MyGithub12Error("PATCH_INVALID_FORMAT","change_set_json schema_version must be 1")
     mode=change.get("mode")
     if mode not in {"patch","range","upload"}: raise MyGithub12Error("PATCH_INVALID_FORMAT","change set mode must be patch, range, or upload")
@@ -332,6 +331,41 @@ def parse_change_set(change_set_json: str) -> dict[str,Any]:
             paths.append(path); upload_ids.append(upload_id)
     canonical=json.dumps(change,ensure_ascii=False,sort_keys=True,separators=(",",":"))
     return {"change":change,"mode":mode,"canonical_hash":hashlib.sha256(canonical.encode()).hexdigest()}
+
+
+def parse_change_set(change_set_json: str) -> dict[str,Any]:
+    return _validate_change_set(_json(change_set_json,dict,"change_set_json",{}))
+
+
+def parse_change_set_bytes(raw_bytes: bytes) -> dict[str,Any]:
+    """Parse exact downloaded bytes without newline, BOM, or Unicode normalization."""
+    try:
+        text=raw_bytes.decode("utf-8",errors="strict")
+    except UnicodeDecodeError as exc:
+        raise MyGithub12Error(
+            "CHANGE_SET_INVALID_UTF8","change_set_file must contain strict UTF-8 JSON",
+            {"start":exc.start,"end":exc.end},
+        ) from exc
+    try:
+        change=json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise MyGithub12Error(
+            "CHANGE_SET_INVALID_JSON","change_set_file must contain valid JSON",
+            {"position":exc.pos},
+        ) from exc
+    if not isinstance(change,dict):
+        raise MyGithub12Error("CHANGE_SET_INVALID_JSON","change_set_file JSON must be an object")
+    return _validate_change_set(change)
+
+
+def change_set_raw_identity(raw_bytes: bytes) -> dict[str,Any]:
+    return {
+        "received_size_bytes":len(raw_bytes),
+        "received_sha256":hashlib.sha256(raw_bytes).hexdigest(),
+        "received_git_blob_sha":hashlib.sha1(
+            f"blob {len(raw_bytes)}\0".encode("ascii")+raw_bytes
+        ).hexdigest(),
+    }
 
 
 def execute_change_set(service: Any, session: dict[str,Any], workspace: dict[str,Any], parsed: dict[str,Any], expected_head_sha: str, expected_workspace_revision: int, commit_message: str, dry_run: bool, idempotency_key: str, audit_context: dict[str,Any]) -> dict[str,Any]:
@@ -375,6 +409,51 @@ def after_verified_change(service: Any, session_id: str, expected_session_revisi
     except Exception as exc:
         index=None; index_error={"code":getattr(exc,"code","INDEX_BUILD_FAILED"),"message":getattr(exc,"message","incremental index request failed")}
     return {"session":session,"index":index,"index_error":index_error}
+
+
+def recover_after_verified_change(service: Any, session_id: str, expected_session_revision: int, finalized_write: dict[str,Any], event_type: str="change_set_committed") -> dict[str,Any]:
+    """Resume Session/index finalization after a verified Git/Workspace write.
+
+    A process can disappear after the Workspace CAS but before the Development
+    Session response is persisted. Accept exactly the two safe states: the
+    original Session revision (finish it now), or the immediately advanced
+    revision already synchronized to the verified Workspace. Anything else is
+    concurrent drift and must fail-stop.
+    """
+    ws=finalized_write.get("workspace")
+    if not isinstance(ws,dict):
+        raise MyGithub12Error("DEVELOPMENT_SESSION_RECOVERY_REQUIRED","verified write did not return finalized workspace evidence")
+    current=sessions.get_session(session_id)
+    current_revision=int(current.get("session_revision") or 0)
+    if current_revision==int(expected_session_revision):
+        return after_verified_change(service,session_id,expected_session_revision,finalized_write,event_type)
+    if (
+        current_revision==int(expected_session_revision)+1
+        and current.get("workspace_id")==ws.get("workspace_id")
+        and current.get("repository")==ws.get("repository")
+        and current.get("branch")==ws.get("branch")
+        and current.get("head_commit_sha")==ws.get("head_sha")
+        and current.get("tree_sha")==ws.get("tree_sha")
+        and int(current.get("workspace_revision") or 0)==int(ws.get("revision") or 0)
+    ):
+        try:
+            index=mygithub12.request_index_build(service,current["repository"],current["head_commit_sha"],"auto",finalized_write.get("old_head_sha",current["base_commit_sha"]),"interactive",f"session-index:{session_id}:{current['head_commit_sha']}",False)
+            index_error=None
+        except Exception as exc:
+            index=None; index_error={"code":getattr(exc,"code","INDEX_BUILD_FAILED"),"message":getattr(exc,"message","incremental index request failed")}
+        return {"session":current,"index":index,"index_error":index_error,"recovered":True}
+    raise MyGithub12Error(
+        "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+        "Development Session changed after the verified Git write",
+        {
+            "development_session_id":session_id,
+            "expected_session_revision":expected_session_revision,
+            "actual_session_revision":current_revision,
+            "verified_head_sha":ws.get("head_sha"),
+            "actual_head_sha":current.get("head_commit_sha"),
+            "recovery_required":True,
+        },
+    )
 
 
 def affected_selection(service: Any, session: dict[str,Any], base_sha: str) -> dict[str,Any]:

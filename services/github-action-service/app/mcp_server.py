@@ -5,16 +5,13 @@ import logging
 import base64
 import binascii
 import asyncio
-import ipaddress
 import os
 import re
-import socket
 import subprocess
 import inspect
 import uuid
 from pathlib import Path
 from typing import Annotated, Literal, Optional
-from urllib.parse import urljoin
 from typing_extensions import NotRequired, TypedDict
 
 import httpx
@@ -37,6 +34,8 @@ from app import github_utils
 from app import mygithub10
 from app import mygithub12
 from app import development_orchestrator as development_dx
+from app import artifact_store
+from app import runtime_file_ingress
 from app import attestation_registry
 from app.version import runtime_build_sha
 from app.observability import current_request_id
@@ -1363,127 +1362,6 @@ async def _run_high_level_put(
     return result
 
 
-_GENERATED_BUNDLE_MAX_REDIRECTS = 5
-_GENERATED_BUNDLE_ALLOWED_HOST_SUFFIXES = ("oaiusercontent.com",)
-
-
-def _validate_generated_bundle_url_destination(url: httpx.URL) -> None:
-    host = str(url.host or "").strip().rstrip(".")
-    lowered = host.lower()
-    if url.scheme != "https" or not host or url.port not in (None, 443):
-        raise mygithub10.MyGithub10Error(
-            "PAYLOAD_INVALID",
-            "bundle_file download_url must use HTTPS on port 443",
-        )
-    if not any(
-        lowered == suffix or lowered.endswith("." + suffix)
-        for suffix in _GENERATED_BUNDLE_ALLOWED_HOST_SUFFIXES
-    ):
-        raise mygithub10.MyGithub10Error(
-            "PAYLOAD_INVALID",
-            "bundle_file download_url host is not allowlisted for ChatGPT file delivery",
-            {"host": host},
-        )
-
-    addresses: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
-    try:
-        addresses.add(ipaddress.ip_address(host.split("%", 1)[0]))
-    except ValueError:
-        try:
-            resolved = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-        except OSError as exc:
-            raise mygithub10.MyGithub10Error(
-                "PAYLOAD_INVALID",
-                "bundle_file download_url host could not be resolved",
-                {"host": host, "cause_type": type(exc).__name__},
-            ) from exc
-        for item in resolved:
-            try:
-                addresses.add(ipaddress.ip_address(str(item[4][0]).split("%", 1)[0]))
-            except (IndexError, ValueError, TypeError):
-                continue
-    if not addresses or any(not address.is_global for address in addresses):
-        raise mygithub10.MyGithub10Error(
-            "PAYLOAD_INVALID",
-            "bundle_file download_url must resolve only to public network addresses",
-            {"host": host},
-        )
-
-
-async def _validate_generated_bundle_url(url: httpx.URL) -> None:
-    await asyncio.to_thread(_validate_generated_bundle_url_destination, url)
-
-
-async def _download_generated_bundle_file(bundle_file: GeneratedBundleFile) -> bytes:
-    if not isinstance(bundle_file, dict):
-        raise mygithub10.MyGithub10Error("PAYLOAD_INVALID", "bundle_file must be a runtime file reference")
-    download_url = bundle_file.get("download_url")
-    file_id = bundle_file.get("file_id")
-    if not isinstance(download_url, str) or not download_url or not isinstance(file_id, str) or not file_id:
-        raise mygithub10.MyGithub10Error(
-            "PAYLOAD_INVALID",
-            "bundle_file requires download_url and file_id",
-        )
-    try:
-        current_url = httpx.URL(download_url)
-    except (TypeError, ValueError) as exc:
-        raise mygithub10.MyGithub10Error("PAYLOAD_INVALID", "bundle_file download_url is invalid") from exc
-
-    max_bytes = mygithub10.MAX_GENERATED_BUNDLE_BYTES
-    data = bytearray()
-    try:
-        timeout = httpx.Timeout(30.0, connect=10.0)
-        async with httpx.AsyncClient(follow_redirects=False, timeout=timeout) as client:
-            for redirect_count in range(_GENERATED_BUNDLE_MAX_REDIRECTS + 1):
-                await _validate_generated_bundle_url(current_url)
-                async with client.stream("GET", current_url, headers={"Accept-Encoding": "identity"}) as response:
-                    if response.is_redirect:
-                        location = response.headers.get("location")
-                        if not location or redirect_count >= _GENERATED_BUNDLE_MAX_REDIRECTS:
-                            raise mygithub10.MyGithub10Error(
-                                "PAYLOAD_INVALID",
-                                "generated bundle redirect chain is invalid or too long",
-                            )
-                        try:
-                            current_url = httpx.URL(urljoin(str(response.url), location))
-                        except (TypeError, ValueError) as exc:
-                            raise mygithub10.MyGithub10Error(
-                                "PAYLOAD_INVALID", "generated bundle redirect URL is invalid"
-                            ) from exc
-                        continue
-                    response.raise_for_status()
-                    declared_size = response.headers.get("content-length")
-                    if declared_size:
-                        try:
-                            declared_bytes = int(declared_size)
-                        except ValueError:
-                            declared_bytes = None
-                        if declared_bytes is not None and declared_bytes > max_bytes:
-                            raise mygithub10.MyGithub10Error(
-                                "PAYLOAD_TOO_LARGE",
-                                "generated bundle file exceeds the download limit",
-                                {"max_bytes": max_bytes, "declared_bytes": declared_bytes},
-                            )
-                    async for chunk in response.aiter_bytes():
-                        if len(data) + len(chunk) > max_bytes:
-                            raise mygithub10.MyGithub10Error(
-                                "PAYLOAD_TOO_LARGE",
-                                "generated bundle file exceeds the download limit",
-                                {"max_bytes": max_bytes},
-                            )
-                        data.extend(chunk)
-                    return bytes(data)
-    except mygithub10.MyGithub10Error:
-        raise
-    except httpx.HTTPError as exc:
-        raise mygithub10.MyGithub10Error(
-            "PAYLOAD_INVALID",
-            "generated bundle file could not be downloaded",
-            {"file_id": file_id, "cause_type": type(exc).__name__},
-        ) from exc
-    raise mygithub10.MyGithub10Error("PAYLOAD_INVALID", "generated bundle redirect limit exceeded")
-
-
 PUT_GENERATED_FILES_DESCRIPTION = (
     "The only recommended entry point for AI-generated UTF-8 text add/modify writes. "
     "Use files[{path,content}] for normal payloads. When generated content exceeds the inline transport budget, "
@@ -1519,9 +1397,41 @@ async def put_generated_files(
             )
         payload_source = "inline_files"
         if bundle_file is not None:
-            bundle_data = await _download_generated_bundle_file(bundle_file)
-            bundled_files = await _github_call(mygithub10.parse_generated_files_bundle, bundle_data)
-            prepared = await _github_call(mygithub10.prepare_generated_files, bundled_files, True)
+            bundle_artifact = None
+            try:
+                bundle_artifact = await runtime_file_ingress.ingest_runtime_artifact(
+                    bundle_file,
+                    kind="generated_files_bundle",
+                    max_bytes=mygithub10.MAX_GENERATED_BUNDLE_BYTES,
+                    label="bundle_file",
+                    repository_scope=repository,
+                    principal_scope=current_request_id(),
+                )
+                bundle_data = await _github_call(
+                    artifact_store.read_artifact_bytes,
+                    bundle_artifact.artifact_id,
+                    repository_scope=repository,
+                )
+                bundled_files = await _github_call(
+                    mygithub10.parse_generated_files_bundle, bundle_data
+                )
+                prepared = await _github_call(
+                    mygithub10.prepare_generated_files, bundled_files, True
+                )
+            except runtime_file_ingress.RuntimeFileIngressError as exc:
+                code = (
+                    "PAYLOAD_TOO_LARGE" if exc.code == "TOO_LARGE" else "PAYLOAD_INVALID"
+                )
+                raise mygithub10.MyGithub10Error(code, exc.message, exc.details) from exc
+            except artifact_store.ArtifactStoreError as exc:
+                raise mygithub10.MyGithub10Error(
+                    "PAYLOAD_INVALID", exc.message, exc.details
+                ) from exc
+            finally:
+                if bundle_artifact is not None:
+                    await _github_call(
+                        artifact_store.consume_artifact,bundle_artifact.artifact_id
+                    )
             payload_source = "bundle_file"
         else:
             prepared = mygithub10.prepare_generated_files(inline_files)
@@ -2059,7 +1969,13 @@ mcp.tool(
 
 # Stable DX-1 high-level orchestration surface. Keep registration after the
 # pre-12.1 tool set so manifest ordering remains backward compatible.
-register_dx_tools(mcp, _github_call, _service, _finalize_durable_write)
+register_dx_tools(
+    mcp,
+    _github_call,
+    _service,
+    _finalize_durable_write,
+    runtime_file_ingress.ingest_runtime_artifact,
+)
 register_infrastructure_deployment_tools(mcp, _github_call)
 
 
