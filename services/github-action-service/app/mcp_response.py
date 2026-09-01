@@ -363,7 +363,14 @@ def _structured_wrapper(function: Callable[..., Any]) -> Callable[..., Any]:
     wrapped.__module__ = function.__module__
     wrapped.__doc__ = function.__doc__
     wrapped.__annotations__ = annotations
-    wrapped.__signature__ = signature.replace(return_annotation=dict[str, Any])
+    resolved_parameters = [
+        parameter.replace(annotation=annotations.get(name, parameter.annotation))
+        for name, parameter in signature.parameters.items()
+    ]
+    wrapped.__signature__ = signature.replace(
+        parameters=resolved_parameters,
+        return_annotation=dict[str, Any],
+    )
     return wrapped
 
 
