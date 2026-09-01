@@ -16,6 +16,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, get_type_hints
+from typing_extensions import NotRequired, TypedDict
 
 from mcp.server.fastmcp import FastMCP
 
@@ -24,6 +25,14 @@ MAX_SAFE_INLINE_BYTES = 32 * 1024
 MAX_RESPONSE_RESOURCE_CHUNK_BYTES = 24 * 1024
 RESPONSE_RESOURCE_TTL_SECONDS = 60 * 60
 RESOURCE_URI_PREFIX = "mygithub12://response/"
+
+
+class RuntimeFileParam(TypedDict):
+    download_url: str
+    file_id: str
+    mime_type: NotRequired[str]
+    file_name: NotRequired[str]
+
 
 _IDENTITY_KEYS = {
     "ok", "job_id", "repository", "branch", "base_branch", "commit_sha",

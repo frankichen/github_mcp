@@ -7,7 +7,6 @@ import logging
 import re
 import uuid
 from typing import Any, Callable, Awaitable
-from typing_extensions import NotRequired, TypedDict
 
 from mcp.types import ToolAnnotations
 
@@ -19,17 +18,11 @@ from app import development_resume as resume
 from app import development_session_store as sessions
 from app import development_change_set_store as prepared_store
 from app import github_utils, mygithub12
+from app.mcp_response import RuntimeFileParam
 from app import mygithub10
 
 logger=logging.getLogger(__name__)
 _ORCHESTRATION=ToolAnnotations(readOnlyHint=False,destructiveHint=False,idempotentHint=False,openWorldHint=True)
-
-
-class RuntimeFileParam(TypedDict):
-    download_url: str
-    file_id: str
-    mime_type: NotRequired[str]
-    file_name: NotRequired[str]
 
 
 def _error_payload(exc: Exception, *, log_unexpected: bool = True) -> dict[str, Any]:
