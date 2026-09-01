@@ -59,9 +59,13 @@ def _successful_runner_factory(calls):
 
 @pytest.mark.parametrize("worker_id", agent_config.ALLOWED_WORKER_IDS)
 def test_preheat_uses_worker_runtime_cache_and_matching_podman_identity(
-    tmp_path, monkeypatch, worker_id
+    exec_capable_tmp_path, monkeypatch, worker_id
 ):
-    monkeypatch.setattr(agent_config, "WORKER_STATE_ROOT", str(tmp_path / "workers"))
+    monkeypatch.setattr(
+        agent_config,
+        "WORKER_STATE_ROOT",
+        str(exec_capable_tmp_path / "workers"),
+    )
     calls = []
 
     binary = preheat_go_cache(
@@ -94,8 +98,14 @@ def test_preheat_uses_worker_runtime_cache_and_matching_podman_identity(
     assert f"type=bind,src={mounted_go_cache},dst=/ci-cache,rw" in mounts
 
 
-def test_preheat_uses_postgresql_only_goose_build_tags(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent_config, "WORKER_STATE_ROOT", str(tmp_path / "workers"))
+def test_preheat_uses_postgresql_only_goose_build_tags(
+    exec_capable_tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        agent_config,
+        "WORKER_STATE_ROOT",
+        str(exec_capable_tmp_path / "workers"),
+    )
     calls = []
 
     preheat_go_cache(

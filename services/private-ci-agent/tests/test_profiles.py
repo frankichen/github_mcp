@@ -417,9 +417,9 @@ def test_go_migration_cache_miss_fails_before_make(tmp_path):
     assert not (tmp_path / "migrate-ran").exists()
 
 
-def test_go_migration_uses_preheated_binary(tmp_path):
+def test_go_migration_uses_preheated_binary(tmp_path, exec_capable_tmp_path):
     (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
-    goose = tmp_path / "goose"
+    goose = exec_capable_tmp_path / "goose"
     goose.write_text("#!/bin/sh\necho 'goose version test'\n", encoding="utf-8")
     goose.chmod(0o700)
     (tmp_path / "Makefile").write_text(
