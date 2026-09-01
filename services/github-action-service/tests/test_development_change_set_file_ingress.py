@@ -748,3 +748,72 @@ async def test_runtime_ingress_rejects_stream_limit_and_content_encoding(
             ),
         )
     assert encoded.value.code == "INVALID_REFERENCE"
+
+
+def test_recover_executing_write_releases_only_unstarted_stale_claim(tmp_path, monkeypatch):
+    prepared = _prepared_for_store(tmp_path, monkeypatch)
+    prepared_id = prepared["prepared_change_set_id"]
+    prepared_store.claim_for_write(
+        prepared_id,
+        idempotency_key="recover-key",
+        request_fingerprint="fingerprint",
+    )
+    monkeypatch.setattr(
+        prepared_store.mygithub10, "_idempotent_existing", lambda _key: None
+    )
+    monkeypatch.setattr(
+        prepared_store.core,
+        "_now",
+        lambda: prepared["created_at"] + prepared_store.EXECUTION_STALE_SECONDS + 1,
+    )
+
+    recovered = prepared_store.recover_executing_write(
+        prepared_id,
+        idempotency_key="recover-key",
+        request_fingerprint="fingerprint",
+    )
+
+    assert recovered == {"action": "retry_unstarted"}
+    assert prepared_store.get_prepared_change_set(prepared_id)["status"] == "PREPARED"
+    metadata, raw = prepared_store.load_prepared_bytes(prepared_id)
+    assert metadata["prepared_change_set_id"] == prepared_id
+    assert raw == _raw_change_set("concurrency")
+
+
+def test_recover_executing_write_resumes_verified_durable_operation(tmp_path, monkeypatch):
+    prepared = _prepared_for_store(tmp_path, monkeypatch)
+    prepared_id = prepared["prepared_change_set_id"]
+    prepared_store.claim_for_write(
+        prepared_id,
+        idempotency_key="recover-key",
+        request_fingerprint="fingerprint",
+    )
+    durable_result = {
+        "write_verified": True,
+        "commit_sha": NEW_HEAD,
+        "tree_sha": TREE,
+        "repository": "owner/repo",
+        "branch": "ai/task",
+    }
+    monkeypatch.setattr(
+        prepared_store.mygithub10,
+        "_idempotent_existing",
+        lambda _key: {
+            "status": "git_verified",
+            "operation_id": "op-recover",
+            "result_json": json.dumps(durable_result),
+        },
+    )
+
+    recovered = prepared_store.recover_executing_write(
+        prepared_id,
+        idempotency_key="recover-key",
+        request_fingerprint="fingerprint",
+    )
+
+    assert recovered == {
+        "action": "resume_git_verified",
+        "operation_id": "op-recover",
+        "result": durable_result,
+    }
+    assert prepared_store.get_prepared_change_set(prepared_id)["status"] == "EXECUTING"

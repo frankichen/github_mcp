@@ -14,6 +14,7 @@ from app import mygithub12 as core
 
 MyGithub12Error = core.MyGithub12Error
 PREPARED_CHANGE_SET_TTL_SECONDS = mygithub10.PREPARED_CHANGE_SET_TTL_SECONDS
+EXECUTION_STALE_SECONDS = 300
 _ID_RE = re.compile(r"^pcs_[A-Za-z0-9_-]{24,80}$")
 
 
@@ -272,6 +273,121 @@ def load_prepared_bytes(prepared_id: str) -> tuple[dict[str, Any], bytes]:
             "PREPARED_CHANGE_SET_NOT_FOUND", "prepared artifact identity is invalid"
         )
     return prepared, raw
+
+
+def recover_executing_write(
+    prepared_id: str,
+    *,
+    idempotency_key: str,
+    request_fingerprint: str,
+) -> dict[str, Any] | None:
+    """Recover an interrupted prepared write without ever issuing a second Git write.
+
+    The durable MyGithub10 idempotency row is the authority for whether Git was
+    reached. A stale claim with no underlying operation can be safely released;
+    any operation that may have reached Git is resumed or fail-stopped instead.
+    """
+    row = _row(prepared_id)
+    if row["status"] != "EXECUTING":
+        return None
+    if row["execution_idempotency_key"] != idempotency_key:
+        raise MyGithub12Error(
+            "PREPARED_CHANGE_SET_ALREADY_CONSUMED",
+            "prepared change set is executing under another idempotency key",
+            {"prepared_change_set_id": prepared_id, "status": row["status"]},
+        )
+    if row["execution_fingerprint"] != request_fingerprint:
+        raise MyGithub12Error(
+            "IDEMPOTENCY_CONFLICT",
+            "idempotency key was used with a different prepared write request",
+            {"prepared_change_set_id": prepared_id},
+        )
+
+    operation = mygithub10._idempotent_existing(idempotency_key)
+    executing_at = float(row["executing_at"] or row["created_at"] or 0)
+    age_seconds = max(0.0, core._now() - executing_at)
+    if operation is None:
+        if age_seconds <= EXECUTION_STALE_SECONDS:
+            raise MyGithub12Error(
+                "IDEMPOTENCY_IN_PROGRESS",
+                "prepared change set write is already executing",
+                {
+                    "prepared_change_set_id": prepared_id,
+                    "retryable": True,
+                    "age_seconds": age_seconds,
+                },
+            )
+        # The claim was persisted, but the lower-level durable operation never
+        # started. Releasing only this exact stale claim is safe: there is no Git
+        # operation to replay or duplicate.
+        with core._LOCK, core._db() as db:
+            cur = db.execute(
+                """UPDATE prepared_change_sets
+                   SET status='PREPARED',execution_idempotency_key=NULL,
+                       execution_fingerprint=NULL,executing_at=NULL
+                   WHERE prepared_change_set_id=? AND status='EXECUTING'
+                     AND execution_idempotency_key=? AND execution_fingerprint=?""",
+                (prepared_id, idempotency_key, request_fingerprint),
+            )
+            if cur.rowcount != 1:
+                raise MyGithub12Error(
+                    "PREPARED_CHANGE_SET_RECOVERY_REQUIRED",
+                    "prepared execution state changed during stale-claim recovery",
+                    {"prepared_change_set_id": prepared_id, "recovery_required": True},
+                )
+        return {"action": "retry_unstarted"}
+
+    operation_status = str(operation.get("status") or "")
+    operation_id = str(operation.get("operation_id") or "")
+    result_json = operation.get("result_json")
+    if operation_status in {"git_verified", "success_verified"} and result_json:
+        try:
+            result = json.loads(result_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise MyGithub12Error(
+                "PREPARED_CHANGE_SET_RECOVERY_REQUIRED",
+                "durable Git operation result is unreadable",
+                {
+                    "prepared_change_set_id": prepared_id,
+                    "operation_id": operation_id,
+                    "recovery_required": True,
+                },
+            ) from exc
+        return {
+            "action": "resume_success_verified"
+            if operation_status == "success_verified"
+            else "resume_git_verified",
+            "operation_id": operation_id,
+            "result": result,
+        }
+
+    if operation_status in {"in_progress", "running"} and age_seconds <= EXECUTION_STALE_SECONDS:
+        raise MyGithub12Error(
+            "IDEMPOTENCY_IN_PROGRESS",
+            "prepared change set write is already executing",
+            {
+                "prepared_change_set_id": prepared_id,
+                "operation_id": operation_id,
+                "retryable": True,
+                "age_seconds": age_seconds,
+            },
+        )
+
+    # Once a durable lower-level operation exists, never reset the prepared
+    # record to PREPARED automatically. A commit may exist even when final
+    # orchestration did not complete; manual/replay recovery must inspect it.
+    raise MyGithub12Error(
+        "PREPARED_CHANGE_SET_RECOVERY_REQUIRED",
+        "prepared write has an incomplete durable Git operation and cannot be retried blindly",
+        {
+            "prepared_change_set_id": prepared_id,
+            "operation_id": operation_id,
+            "operation_status": operation_status,
+            "result_commit_sha": operation.get("result_commit_sha"),
+            "recovery_required": True,
+            "retryable": False,
+        },
+    )
 
 
 def replay_write(

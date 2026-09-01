@@ -205,6 +205,82 @@ def register_dx_tools(
                     "create_pull_request":create_pull_request,
                     "pull_request_json":pull_request_json,
                 },ensure_ascii=False,sort_keys=True,separators=(",",":")).encode("utf-8")).hexdigest()
+                recovery=await github_call(
+                    prepared_store.recover_executing_write,prepared_change_set_id,
+                    idempotency_key=effective_idempotency_key,request_fingerprint=fingerprint,
+                )
+                if recovery and recovery.get("action") in {"resume_git_verified","resume_success_verified"}:
+                    recovered_result=dict(recovery.get("result") or {})
+                    recovered_result.update({
+                        "payload_source":"prepared_change_set",
+                        "received_size_bytes":int(prepared["raw_size_bytes"]),
+                        "received_sha256":prepared["raw_sha256"],
+                        "received_git_blob_sha":prepared["raw_git_blob_sha"],
+                        "change_set_canonical_hash":prepared["canonical_change_set_hash"],
+                    })
+                    if recovery["action"]=="resume_git_verified":
+                        recovered_result["_operation_id"]=recovery.get("operation_id","")
+                        try:
+                            finalized=await finalize_write(
+                                recovered_result,prepared["workspace_id"],int(prepared["workspace_revision"])
+                            )
+                        except Exception as finalize_exc:
+                            finalize_error=_error_payload(finalize_exc)
+                            committed_response={
+                                "ok":False,**recovered_result,
+                                "prepared_change_set_id":prepared_change_set_id,
+                                "development_session_id":development_session_id,
+                                "recovery_required":True,
+                                "failed_stage":"workspace_finalize",
+                                "orchestration_error":finalize_error["error"],
+                                "recovered_from_interrupted_execution":True,
+                            }
+                            await github_call(
+                                prepared_store.mark_committed,prepared_change_set_id,committed_response
+                            )
+                            return json.dumps(committed_response,ensure_ascii=False)
+                    else:
+                        finalized=recovered_result
+                    try:
+                        state=await github_call(
+                            dx.recover_after_verified_change,service,development_session_id,
+                            expected_session_revision,finalized,
+                        )
+                    except Exception as state_exc:
+                        state_error=_error_payload(state_exc)
+                        committed_response={
+                            "ok":False,**finalized,"write_verified":True,
+                            "prepared_change_set_id":prepared_change_set_id,
+                            "development_session_id":development_session_id,
+                            "recovery_required":True,
+                            "failed_stage":"development_session_finalize",
+                            "orchestration_error":state_error["error"],
+                            "recovered_from_interrupted_execution":True,
+                        }
+                        await github_call(
+                            prepared_store.mark_committed,prepared_change_set_id,committed_response
+                        )
+                        return json.dumps(committed_response,ensure_ascii=False)
+                    response={
+                        "ok":True,**finalized,
+                        "prepared_change_set_id":prepared_change_set_id,
+                        "development_session":state["session"],
+                        "index":state["index"],"index_error":state["index_error"],
+                        "recovered_from_interrupted_execution":True,
+                        "lease_maintenance":{"renewed":False,"remaining_seconds":None,"audit":None,"recovery":None},
+                    }
+                    if create_pull_request:
+                        response["pull_request"]=None
+                        response["pull_request_error"]={
+                            "code":"PULL_REQUEST_RECOVERY_REQUIRED",
+                            "message":"verified commit was recovered; prepare or update the pull request from the recovered Development Session",
+                            "details":{"commit_already_verified":True,"session_recovery_required":False},
+                        }
+                        response["partial_success"]=True
+                    await github_call(
+                        prepared_store.mark_committed,prepared_change_set_id,response
+                    )
+                    return json.dumps(response,ensure_ascii=False)
                 replay=await github_call(
                     prepared_store.replay_write,prepared_change_set_id,
                     idempotency_key=effective_idempotency_key,request_fingerprint=fingerprint,

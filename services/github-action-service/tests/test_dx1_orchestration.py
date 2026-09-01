@@ -444,11 +444,19 @@ async def test_apply_change_set_pr_failure_is_partial_success_after_verified_com
             raise mygithub12.MyGithub12Error("GITHUB_API_ERROR", "PR create failed", {"retryable": True})
 
     service = Service()
-    session = {"repository": "owner/repo", "branch": "ai/task", "base_branch": "main", "head_commit_sha": SHA_B}
-    workspace = {"workspace_id": "ws_test"}
+    session = {
+        "session_id": "dev_test", "session_revision": 1, "workspace_revision": 3,
+        "repository": "owner/repo", "branch": "ai/task",
+        "base_branch": "main", "head_commit_sha": SHA_B,
+    }
+    workspace = {"workspace_id": "ws_test", "revision": 3}
     monkeypatch.setattr(dx, "require_session_workspace", lambda *args, **kwargs: (session, workspace))
     monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: _no_renewal(session))
-    monkeypatch.setattr(dx, "execute_change_set", lambda *args, **kwargs: {"write_verified": True})
+    monkeypatch.setattr(
+        dx,
+        "execute_change_set",
+        lambda *args, **kwargs: {"write_verified": not bool(args[7]), "changed_files": []},
+    )
     monkeypatch.setattr(
         dx, "after_verified_change",
         lambda *args, **kwargs: {"session": {"session_id": "dev_test", "session_revision": 2, "status": "active", "repository": "owner/repo", "branch": "ai/task", "base_branch": "main", "head_commit_sha": SHA_C, "pull_number": None}, "index": None, "index_error": None},
@@ -461,10 +469,16 @@ async def test_apply_change_set_pr_failure_is_partial_success_after_verified_com
         return {"write_verified": True, "commit_sha": SHA_C, "tree_sha": SHA_A, "operation_id": "op-2"}
 
     dx_mcp.register_dx_tools(mcp, github_call, service, finalize_write)
-    result = _structured_result(await mcp.call_tool("apply_development_change_set", {
+    prepared = _structured_result(await mcp.call_tool("apply_development_change_set", {
         "development_session_id": "dev_test", "expected_session_revision": 1,
         "expected_workspace_revision": 3, "expected_head_sha": SHA_B,
         "change_set_json": json.dumps({"schema_version": 1, "mode": "patch", "patch": "x"}),
+        "commit_message": "test", "dry_run": True,
+    }))
+    result = _structured_result(await mcp.call_tool("apply_development_change_set", {
+        "development_session_id": "dev_test", "expected_session_revision": 1,
+        "expected_workspace_revision": 3, "expected_head_sha": SHA_B,
+        "prepared_change_set_id": prepared["prepared_change_set_id"],
         "commit_message": "test", "dry_run": False, "create_pull_request": True,
         "pull_request_json": "{}",
     }))

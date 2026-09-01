@@ -31,7 +31,7 @@ raw source 的 `dry_run=true` 成功后返回 `prepared_change_set_id`、raw ide
 
 `dry_run=false` 使用 `prepared_change_set_id` 时，服务端重新验证 artifact TTL/state、repository、branch、Session、Workspace、revisions、HEAD、affected paths 和 blob identities，再原子 claim。真实写入继续使用现有 GitHub non-force CAS、atomic Commit、durable read-back、Workspace finalize 和 Session advance。消费、失败或过期后原始 artifact 删除；同一 prepared ID 只能产生一次 Commit。
 
-相同 idempotency key 与相同 write request 可回放已验证结果；同 key 不同 request 返回 `IDEMPOTENCY_CONFLICT`；并发 claim、过期、wrong scope 和重复消费均 fail-stop。
+状态机为 `PREPARED -> EXECUTING -> COMMITTED/FAILED_TERMINAL/EXPIRED`。相同 idempotency key 与相同 write request 可回放已验证结果；同 key 不同 request 返回 `IDEMPOTENCY_CONFLICT`；并发 claim、过期、wrong scope 和重复消费均 fail-stop。若 Controller 在 claim 后中断，恢复时只允许两种安全路径：底层 Git operation 尚未创建且 claim 已超过短保护窗口时释放回 `PREPARED` 重试；底层 operation 已达到 `git_verified/success_verified` 时恢复 Workspace/Session finalize。任何已创建但未验证完成的底层 operation 都返回 `PREPARED_CHANGE_SET_RECOVERY_REQUIRED`，不得盲目二次 Git 写入。
 
 ## 下载安全
 
