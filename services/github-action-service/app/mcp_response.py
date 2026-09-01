@@ -15,7 +15,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, get_type_hints
 
 from mcp.server.fastmcp import FastMCP
 
@@ -336,7 +336,10 @@ def normalize_json_tool_result(result: Any) -> dict[str, Any]:
 
 def _structured_wrapper(function: Callable[..., Any]) -> Callable[..., Any]:
     signature = inspect.signature(function)
-    annotations = dict(getattr(function, "__annotations__", {}))
+    try:
+        annotations = dict(get_type_hints(function, include_extras=True))
+    except Exception:
+        annotations = dict(getattr(function, "__annotations__", {}))
     annotations["return"] = dict[str, Any]
 
     if inspect.iscoroutinefunction(function):
