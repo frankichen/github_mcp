@@ -1,5 +1,4 @@
 """Register stable development orchestration and drift-recovery tools."""
-from __future__ import annotations
 
 import json
 import hashlib
