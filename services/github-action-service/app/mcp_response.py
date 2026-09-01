@@ -15,7 +15,8 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, get_type_hints
+from typing_extensions import NotRequired, TypedDict
 
 from mcp.server.fastmcp import FastMCP
 
@@ -24,6 +25,14 @@ MAX_SAFE_INLINE_BYTES = 32 * 1024
 MAX_RESPONSE_RESOURCE_CHUNK_BYTES = 24 * 1024
 RESPONSE_RESOURCE_TTL_SECONDS = 60 * 60
 RESOURCE_URI_PREFIX = "mygithub12://response/"
+
+
+class RuntimeFileParam(TypedDict):
+    download_url: str
+    file_id: str
+    mime_type: NotRequired[str]
+    file_name: NotRequired[str]
+
 
 _IDENTITY_KEYS = {
     "ok", "job_id", "repository", "branch", "base_branch", "commit_sha",
@@ -336,7 +345,10 @@ def normalize_json_tool_result(result: Any) -> dict[str, Any]:
 
 def _structured_wrapper(function: Callable[..., Any]) -> Callable[..., Any]:
     signature = inspect.signature(function)
-    annotations = dict(getattr(function, "__annotations__", {}))
+    try:
+        annotations = dict(get_type_hints(function, include_extras=True))
+    except Exception:
+        annotations = dict(getattr(function, "__annotations__", {}))
     annotations["return"] = dict[str, Any]
 
     if inspect.iscoroutinefunction(function):
@@ -351,7 +363,14 @@ def _structured_wrapper(function: Callable[..., Any]) -> Callable[..., Any]:
     wrapped.__module__ = function.__module__
     wrapped.__doc__ = function.__doc__
     wrapped.__annotations__ = annotations
-    wrapped.__signature__ = signature.replace(return_annotation=dict[str, Any])
+    resolved_parameters = [
+        parameter.replace(annotation=annotations.get(name, parameter.annotation))
+        for name, parameter in signature.parameters.items()
+    ]
+    wrapped.__signature__ = signature.replace(
+        parameters=resolved_parameters,
+        return_annotation=dict[str, Any],
+    )
     return wrapped
 
 

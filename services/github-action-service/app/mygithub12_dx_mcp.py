@@ -18,6 +18,7 @@ from app import development_resume as resume
 from app import development_session_store as sessions
 from app import development_change_set_store as prepared_store
 from app import github_utils, mygithub12
+from app.mcp_response import RuntimeFileParam
 from app import mygithub10
 
 logger=logging.getLogger(__name__)
@@ -121,7 +122,7 @@ def register_dx_tools(
     )
     async def apply_development_change_set(
         development_session_id: str, expected_session_revision: int, expected_workspace_revision: int, expected_head_sha: str,
-        commit_message: str, change_set_json: str="", change_set_file: dict | None=None,
+        commit_message: str, change_set_json: str="", change_set_file: RuntimeFileParam | None=None,
         expected_change_set_size_bytes: int=0, expected_change_set_sha256: str="",
         expected_change_set_git_blob_sha: str="", prepared_change_set_id: str="",
         dry_run: bool=True, idempotency_key: str="", create_pull_request: bool=False, pull_request_json: str="{}",

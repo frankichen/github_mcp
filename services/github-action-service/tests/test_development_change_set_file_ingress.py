@@ -286,6 +286,18 @@ async def test_schema_has_runtime_file_param_and_mutually_exclusive_sources(ingr
         "expected_change_set_sha256",
         "expected_change_set_git_blob_sha",
     } <= set(properties)
+    change_set_file_schema = properties["change_set_file"]
+    if "anyOf" in change_set_file_schema:
+        change_set_file_schema = next(
+            schema for schema in change_set_file_schema["anyOf"]
+            if schema.get("type") == "object" or "$ref" in schema
+        )
+    if "$ref" in change_set_file_schema:
+        change_set_file_schema = tool.inputSchema["$defs"][
+            change_set_file_schema["$ref"].rsplit("/", 1)[-1]
+        ]
+    assert {"download_url", "file_id"} <= set(change_set_file_schema["properties"])
+    assert {"download_url", "file_id"} <= set(change_set_file_schema["required"])
     tool_meta = getattr(tool, "meta", None) or getattr(tool, "_meta", None) or {}
     assert tool_meta["openai/fileParams"] == ["change_set_file"]
     both = await ingress_env["call"](change_set_json="{}")
