@@ -8,6 +8,7 @@ import yaml
 
 import private_ci_agent.config as agent_config
 from private_ci_agent.config import DEFAULT_CONFIG
+from private_ci_agent.executor import build_cache_map
 from private_ci_agent.profiles import PROFILE_COMMANDS, get_repository_overrides
 
 
@@ -299,6 +300,20 @@ if name == "systemctl":
 if name == "systemd-run":
     if args[-2:] == ["/usr/bin/id", "-u"]:
         print("1500")
+    failed_worker = os.environ.get("FAKE_GO_PREHEAT_FAIL_WORKER", "")
+    if (
+        failed_worker
+        and "prepare-go-cache" in " ".join(args)
+        and f"--setenv=PRIVATE_CI_WORKER_ID={failed_worker}" in args
+        and "--verify-only" not in args
+    ):
+        sys.exit(1)
+    sys.exit(0)
+
+if name == "python3":
+    if "--list-worker-ids" in args:
+        print("wsl-ci-01")
+        print("wsl-ci-02")
     sys.exit(0)
 
 if name in {"touch", "mount", "rm", "install", "sleep", "runuser", "mkdir", "chown", "chmod"}:
@@ -324,7 +339,7 @@ def _stage_apply_fixes_repo(tmp_path):
         "repositories: {}\n", encoding="utf-8"
     )
     for name in (
-        "config.py", "executor.py", "main.py", "podman.py",
+        "config.py", "executor.py", "go_cache.py", "main.py", "podman.py",
         "profiles.py", "source.py", "controller_client.py", "services.py",
     ):
         (source_root / name).write_text("# test fixture\n", encoding="utf-8")
@@ -341,6 +356,7 @@ def _run_apply_fixes(
     docker_run_fail=False,
     docker_run_creates_container=False,
     health_mode="success",
+    go_preheat_fail_worker="",
 ):
     repo_root, staged_script = _stage_apply_fixes_repo(tmp_path)
     fake_tool = tmp_path / "fake-tool.py"
@@ -348,6 +364,7 @@ def _run_apply_fixes(
     commands = (
         "docker", "jq", "curl", "git", "systemctl", "touch", "mount", "rm",
         "install", "sleep", "runuser", "systemd-run", "mkdir", "chown", "chmod",
+        "python3",
     )
     bash_env = tmp_path / "bash_env"
     functions = ['_fake_tool() { "$FAKE_PYTHON" "$FAKE_TOOL_SCRIPT" "$@"; }']
@@ -367,6 +384,7 @@ def _run_apply_fixes(
         "FAKE_DOCKER_RUN_FAIL": "1" if docker_run_fail else "0",
         "FAKE_DOCKER_RUN_CREATES_CONTAINER": "1" if docker_run_creates_container else "0",
         "FAKE_HEALTH_MODE": health_mode,
+        "FAKE_GO_PREHEAT_FAIL_WORKER": go_preheat_fail_worker,
     })
     if failure_mode is None:
         env.pop("MYGITHUB12_DEPLOY_FAILURE_MODE", None)
@@ -477,15 +495,25 @@ def test_apply_fixes_rejects_invalid_mode_before_controller_switch(tmp_path):
 def test_apply_fixes_success_path_continues_in_fail_stop_mode(tmp_path):
     result, calls, state = _run_apply_fixes(tmp_path, failure_mode="fail-stop")
     assert result.returncode == 0, _output(result)
-    assert "DONE. Worker restarted with local shared image and caches preheated." in _output(result)
+    assert "DONE. Workers restarted with shared images and worker-local caches preheated." in _output(result)
     broker_calls = [call for call in calls if call.startswith("systemd-run ")]
     preheat_calls = [call for call in broker_calls if "prepare-" in call]
-    assert len(broker_calls) == 5
-    assert len(preheat_calls) == 4
+    assert len(broker_calls) == 8
+    assert len(preheat_calls) == 7
     assert all("--property=User=ciworker" in call for call in broker_calls)
     assert all("--property=Group=ciworker" in call for call in broker_calls)
     assert all("--setenv=HOME=/home/ciworker" in call for call in broker_calls)
     assert any("prepare-python-ci" in call for call in preheat_calls)
+    goose_calls = [call for call in preheat_calls if "prepare-go-cache" in call]
+    assert len(goose_calls) == 4
+    for worker_id in agent_config.ALLOWED_WORKER_IDS:
+        worker_calls = [
+            call
+            for call in goose_calls
+            if f"--setenv=PRIVATE_CI_WORKER_ID={worker_id}" in call
+        ]
+        assert len(worker_calls) == 2
+        assert sum("--verify-only" in call for call in worker_calls) == 1
     assert not any(call.startswith("runuser ") for call in calls)
     assert "systemctl restart private-ci-agent.service" in calls
     assert "systemctl is-active --quiet private-ci-agent.service" in calls
@@ -516,6 +544,11 @@ def test_worker_runtime_roots_are_fixed_and_writable_state_is_isolated(monkeypat
     assert primary["environment_cache_root"] == secondary["environment_cache_root"]
     assert primary["shared_playwright_cache"] == secondary["shared_playwright_cache"]
     assert primary["source_mirror_root"] == secondary["source_mirror_root"]
+    primary_cache_map = build_cache_map(primary)
+    secondary_cache_map = build_cache_map(secondary)
+    assert primary_cache_map["go"] == primary["writable_cache_root"] + "/go"
+    assert secondary_cache_map["go"] == secondary["writable_cache_root"] + "/go"
+    assert primary_cache_map["go"] != secondary_cache_map["go"]
 
     monkeypatch.setenv("PRIVATE_CI_WORKER_ID", "wsl-ci-02")
     monkeypatch.setattr(agent_config.os.path, "exists", lambda _path: False)
@@ -558,3 +591,25 @@ def test_second_worker_first_enable_happens_after_controller_switch():
     assert second_enable > controller_switch
     assert "private-ci-agent@wsl-ci-02.service" in script
     assert 'systemctl is-active --quiet "${SECOND_WORKER_SERVICE}"' in script
+
+
+def test_apply_fixes_gets_goose_preheat_workers_from_python_allowlist():
+    script = APPLY_FIXES_SCRIPT.read_text(encoding="utf-8")
+
+    assert "private_ci_agent.go_cache --list-worker-ids" in script
+    assert 'for worker_id in "${PRIVATE_CI_WORKER_IDS[@]}"' in script
+    assert "for worker_id in wsl-ci-01 wsl-ci-02" not in script
+    assert "go cache preheat failed for worker ${worker_id}" in script
+    assert "goose binary verification failed for worker ${worker_id}" in script
+
+
+def test_apply_fixes_fail_stops_when_any_worker_goose_preheat_fails(tmp_path):
+    result, calls, _state = _run_apply_fixes(
+        tmp_path,
+        failure_mode="fail-stop",
+        go_preheat_fail_worker="wsl-ci-02",
+    )
+
+    assert result.returncode != 0
+    assert "go cache preheat failed for worker wsl-ci-02" in _output(result)
+    assert not any("prepare-playwright-cache" in call for call in calls)

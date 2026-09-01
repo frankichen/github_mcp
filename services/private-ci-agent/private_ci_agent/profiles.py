@@ -771,16 +771,14 @@ WORKSPACE_HOOKS = {
             "command": (
                 "if [ -f Makefile ] && grep -Eq '^migrate-up:' Makefile; then "
                 "echo '[go:.:migrate] shared Go cache active'; "
-                "if [ -x /ci-cache/.tool-bin/goose ]; then "
+                "if [ ! -x /ci-cache/.tool-bin/goose ]; then "
+                "echo 'CI_INFRA_GOOSE_BINARY_UNAVAILABLE: "
+                "/ci-cache/.tool-bin/goose is missing or not executable' >&2; "
+                "exit 86; "
+                "fi; "
                 "timeout --foreground --signal=TERM --kill-after=15s "
                 "\"${CI_MIGRATION_TIMEOUT_SECONDS:-300}s\" "
                 "make --no-print-directory GOOSE=/ci-cache/.tool-bin/goose migrate-up; "
-                "else "
-                "echo '[go:.:migrate] shared goose binary missing; using workspace fallback'; "
-                "timeout --foreground --signal=TERM --kill-after=15s "
-                "\"${CI_MIGRATION_TIMEOUT_SECONDS:-300}s\" "
-                "make --no-print-directory migrate-up; "
-                "fi; "
                 "else echo 'SKIP: Make target migrate-up not present'; fi 2>&1"
             ),
         },

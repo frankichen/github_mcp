@@ -382,7 +382,69 @@ def test_go_mod_requirement_selects_compatible_version_and_build(tmp_path):
     migration = next(item for item in configured["setup"] if item["name"] == "migrate")
     assert "/ci-cache/.tool-bin/goose" in migration["command"]
     assert "CI_MIGRATION_TIMEOUT_SECONDS" in migration["command"]
+    assert "CI_INFRA_GOOSE_BINARY_UNAVAILABLE" in migration["command"]
+    assert "using workspace fallback" not in migration["command"]
+    assert "make --no-print-directory migrate-up" not in migration["command"]
     assert "ai-integrity" in [item["name"] for item in configured["check"]]
+
+
+def test_go_migration_cache_miss_fails_before_make(tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    (tmp_path / "Makefile").write_text(
+        "migrate-up:\n\t@touch migrate-ran\n", encoding="utf-8"
+    )
+    commands = apply_workspace_hooks(
+        go_commands_for_workspace(str(tmp_path)),
+        {"path": ".", "stack": "go", "hooks": ["go-migrate"]},
+    )
+    command = next(item for item in commands["setup"] if item["name"] == "migrate")[
+        "command"
+    ]
+    command = command.replace(
+        "/ci-cache/.tool-bin/goose", str(tmp_path / "missing-goose")
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 86
+    assert "CI_INFRA_GOOSE_BINARY_UNAVAILABLE" in result.stdout + result.stderr
+    assert not (tmp_path / "migrate-ran").exists()
+
+
+def test_go_migration_uses_preheated_binary(tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    goose = tmp_path / "goose"
+    goose.write_text("#!/bin/sh\necho 'goose version test'\n", encoding="utf-8")
+    goose.chmod(0o700)
+    (tmp_path / "Makefile").write_text(
+        'migrate-up:\n\t@"$(GOOSE)" -version >/dev/null\n'
+        '\t@printf \'%s\' "$(GOOSE)" > used-goose\n',
+        encoding="utf-8",
+    )
+    commands = apply_workspace_hooks(
+        go_commands_for_workspace(str(tmp_path)),
+        {"path": ".", "stack": "go", "hooks": ["go-migrate"]},
+    )
+    command = next(item for item in commands["setup"] if item["name"] == "migrate")[
+        "command"
+    ].replace("/ci-cache/.tool-bin/goose", str(goose))
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "used-goose").read_text(encoding="utf-8") == str(goose)
 
 
 def test_go_toolchain_is_the_effective_minimum(tmp_path):

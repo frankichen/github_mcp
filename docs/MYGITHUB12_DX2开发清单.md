@@ -212,6 +212,8 @@ CI-A 仅完成 Controller/现有 Agent 的安全调度基础与自动化测试�
 - [x] `wsl-ci-01` / `wsl-ci-02` 使用独立 work/log/run root；
 - [x] Podman job/service 名称和临时目录按 Worker 隔离，startup/shutdown 只清理自身 namespace；
 - [x] 可写语言缓存按 Worker 隔离，仅共享 sealed environment cache、只读 Playwright cache 和带锁 bare mirror；
+- [x] Goose 预热复用 `worker_runtime_config()`，为 allowlist 中每个 Worker 写入自己的 writable Go cache，并以相同 Worker identity 运行 Podman；
+- [x] deployment 为每个 Worker 分别预热并复验 executable；migration cache miss 以 `CI_INFRA_GOOSE_BINARY_UNAVAILABLE` fail-fast，不再执行 workspace 网络安装 fallback；
 - [x] 固定 systemd CPU/RAM/Tasks 上限，并保留 Podman memory/swap/pids/tmpfs 上限；
 - [ ] production self-deploy 后确认两个 Worker 均完成注册和 heartbeat；
 - [ ] CI-C 通过真实并发/故障样本确认单 Worker 故障不拖垮另一个。

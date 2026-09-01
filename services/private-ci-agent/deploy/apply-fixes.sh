@@ -56,6 +56,14 @@ handle_controller_failure() {
 }
 
 run_ciworker_preheat() {
+    local worker_id=""
+    local -a worker_environment=()
+    if [ "${1:-}" = "--worker-id" ]; then
+        [ "$#" -ge 3 ] || die "run_ciworker_preheat requires a worker id and command"
+        worker_id="$2"
+        shift 2
+        worker_environment=("--setenv=PRIVATE_CI_WORKER_ID=${worker_id}")
+    fi
     systemd-run --quiet --wait --pipe --collect \
         --property=User=ciworker \
         --property=Group=ciworker \
@@ -63,6 +71,7 @@ run_ciworker_preheat() {
         --setenv=XDG_RUNTIME_DIR=/run/user/1500 \
         --setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1500/bus \
         --setenv=PYTHONPATH="${AGENT_DIR}" \
+        "${worker_environment[@]}" \
         "$@"
 }
 
@@ -111,6 +120,14 @@ install -o nobody -g nogroup -m 644 \
     "${REPO_ROOT}/services/private-ci-agent/deploy/Dockerfile.python-ci" \
     "${AGENT_DIR}/deploy/Dockerfile.python-ci"
 
+# Worker allowlist has one Python source of truth. Reuse it for directory
+# creation, Goose preheat, and post-deployment binary verification.
+PRIVATE_CI_WORKER_IDS_OUTPUT="$(
+    PYTHONPATH="${AGENT_DIR}" python3 -m private_ci_agent.go_cache --list-worker-ids
+)" || die "cannot load private CI Worker allowlist"
+[ -n "${PRIVATE_CI_WORKER_IDS_OUTPUT}" ] || die "private CI Worker allowlist is empty"
+mapfile -t PRIVATE_CI_WORKER_IDS <<< "${PRIVATE_CI_WORKER_IDS_OUTPUT}"
+
 # DX2-CI-B：legacy wsl-ci-01 保留原 unit，仅补充新状态目录写权限；
 # wsl-ci-02 使用受审的实例模板。两个 Worker 的所有可写运行目录互相隔离。
 install -D -o root -g root -m 644 \
@@ -119,7 +136,7 @@ install -D -o root -g root -m 644 \
 install -o root -g root -m 644 \
     "${REPO_ROOT}/services/private-ci-agent/deploy/private-ci-agent@.service" \
     /etc/systemd/system/private-ci-agent@.service
-for worker_id in wsl-ci-01 wsl-ci-02; do
+for worker_id in "${PRIVATE_CI_WORKER_IDS[@]}"; do
     worker_root="/srv/private-ci/workers/${worker_id}"
     install -d -o ciworker -g ciworker -m 0700 \
         "${worker_root}" "${worker_root}/workspaces" "${worker_root}/cache" \
@@ -272,12 +289,13 @@ run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-python-ci" || die "Python CI i
 log "Preheating shared local Node Chromium image"
 run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-node-chromium" || die "Node Chromium image preheat failed"
 
-# ── 7. 预热共享 Go 缓存（goose 模块进 file:// 命中）────────
-log "Preheating shared Go module cache (goose)"
-mkdir -p /srv/private-ci/cache/go
-chown "${CIWORKER_UID}:${CIWORKER_UID}" /srv/private-ci/cache/go
-chmod 700 /srv/private-ci/cache/go
-run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-go-cache" || die "go cache preheat failed"
+# ── 7. 为全部 Worker 分别预热可写 Go cache / Goose binary ───
+for worker_id in "${PRIVATE_CI_WORKER_IDS[@]}"; do
+    log "Preheating worker-local Go cache (goose) worker=${worker_id}"
+    run_ciworker_preheat --worker-id "${worker_id}" \
+        "${AGENT_DIR}/deploy/prepare-go-cache" \
+        || die "go cache preheat failed for worker ${worker_id}"
+done
 
 # ── 8. 预热共享 Playwright 浏览器缓存 ──────────────────────
 log "Preheating shared Playwright browser cache"
@@ -292,6 +310,12 @@ sleep 3
 log "DX2_PHASE=post_verify"
 systemctl is-active --quiet private-ci-agent.service || die "primary worker is not active after controller switch"
 systemctl is-active --quiet "${SECOND_WORKER_SERVICE}" || die "second worker is not active after controller switch"
+for worker_id in "${PRIVATE_CI_WORKER_IDS[@]}"; do
+    log "Verifying worker-local Goose binary worker=${worker_id}"
+    run_ciworker_preheat --worker-id "${worker_id}" \
+        "${AGENT_DIR}/deploy/prepare-go-cache" --verify-only \
+        || die "goose binary verification failed for worker ${worker_id}"
+done
 
-log "DONE. Worker restarted with local shared image and caches preheated."
+log "DONE. Workers restarted with shared images and worker-local caches preheated."
 log "Verify: journalctl -u private-ci-agent.service -u ${SECOND_WORKER_SERVICE} -n 20"
