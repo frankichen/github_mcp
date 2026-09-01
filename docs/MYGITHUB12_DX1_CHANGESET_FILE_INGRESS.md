@@ -35,7 +35,7 @@ raw source 的 `dry_run=true` 成功后返回 `prepared_change_set_id`、raw ide
 
 ## 下载安全
 
-`change_set_file` 与 `put_generated_files(bundle_file)` 共用同一 runtime-file ingress primitive：只允许 HTTPS/443 和 `*.oaiusercontent.com`，每次 redirect 前重新做 allowlist、DNS 与公网 IP 校验，拒绝 response content encoding，并执行连接/总 timeout、Content-Length 与 streaming byte limit。signed URL 和 Candidate 内容不得进入日志或持久结果。
+`change_set_file` 与 `put_generated_files(bundle_file)` 共用同一 runtime-file ingress primitive：只允许 HTTPS/443、`*.oaiusercontent.com` 和受限的 OpenAI Azure Blob fileParam 投递域名（例如 `oai*.blob.core.windows.net`），每次 redirect 前重新做 allowlist、DNS 与公网 IP 校验，拒绝 response content encoding，并执行连接/总 timeout、Content-Length 与 streaming byte limit。signed URL 和 Candidate 内容不得进入日志或持久结果。
 
 ## capabilities
 

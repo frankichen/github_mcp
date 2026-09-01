@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import re
 import socket
 from typing import Any, Callable
 from urllib.parse import urljoin
@@ -13,7 +14,27 @@ from app import artifact_store
 
 
 ALLOWED_HOST_SUFFIXES = ("oaiusercontent.com",)
+AZURE_OPENAI_BLOB_SUFFIX = "blob.core.windows.net"
+AZURE_OPENAI_BLOB_ACCOUNT_RE = re.compile(r"^oai[a-z0-9]{0,21}$")
 MAX_REDIRECTS = 5
+
+
+def _is_allowlisted_openai_delivery_host(host: str) -> bool:
+    lowered = host.lower().strip().rstrip(".")
+    if any(
+        lowered == suffix or lowered.endswith("." + suffix)
+        for suffix in ALLOWED_HOST_SUFFIXES
+    ):
+        return True
+    suffix = "." + AZURE_OPENAI_BLOB_SUFFIX
+    if not lowered.endswith(suffix):
+        return False
+    account = lowered[: -len(suffix)]
+    # ChatGPT/Codex fileParams may be delivered through OpenAI-managed
+    # Azure Storage accounts such as oaisdmntprpolandcentral.blob.core.windows.net.
+    # Keep this constrained to Azure storage account syntax and the OpenAI `oai`
+    # account prefix; DNS/public-IP checks below still run before any request.
+    return bool(AZURE_OPENAI_BLOB_ACCOUNT_RE.fullmatch(account))
 
 
 class RuntimeFileIngressError(Exception):
@@ -36,10 +57,7 @@ def _validate_destination(
         raise RuntimeFileIngressError(
             "INVALID_REFERENCE", f"{label} download_url must use HTTPS on port 443"
         )
-    if not any(
-        lowered == suffix or lowered.endswith("." + suffix)
-        for suffix in ALLOWED_HOST_SUFFIXES
-    ):
+    if not _is_allowlisted_openai_delivery_host(lowered):
         raise RuntimeFileIngressError(
             "INVALID_REFERENCE",
             f"{label} download_url host is not allowlisted for OpenAI file delivery",

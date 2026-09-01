@@ -393,6 +393,37 @@ async def test_bundle_redirect_to_private_destination_is_rejected_before_second_
     assert calls == ["https://files.oaiusercontent.com/start"]
 
 
+def test_runtime_file_ingress_allows_openai_azure_blob_delivery_host():
+    seen = []
+
+    def fake_resolver(host, port, type=0):
+        seen.append(host)
+        return [(2, 1, 6, "", ("20.60.1.5", port))]
+
+    runtime_file_ingress._validate_destination(
+        runtime_file_ingress.httpx.URL(
+            "https://oaisdmntprpolandcentral.blob.core.windows.net/generated.json"
+        ),
+        label="bundle_file",
+        resolver=fake_resolver,
+    )
+    assert seen == ["oaisdmntprpolandcentral.blob.core.windows.net"]
+
+
+def test_runtime_file_ingress_rejects_arbitrary_azure_blob_host_before_dns():
+    with pytest.raises(runtime_file_ingress.RuntimeFileIngressError) as exc:
+        runtime_file_ingress._validate_destination(
+            runtime_file_ingress.httpx.URL(
+                "https://attackerblob.blob.core.windows.net/generated.json"
+            ),
+            label="bundle_file",
+            resolver=lambda *args, **kwargs: pytest.fail(
+                "untrusted Azure blob host must be rejected before DNS"
+            ),
+        )
+    assert exc.value.code == "INVALID_REFERENCE"
+
+
 @pytest.mark.asyncio
 async def test_bundle_download_rejects_non_openai_public_host_without_dns(monkeypatch):
     with pytest.raises(runtime_file_ingress.RuntimeFileIngressError) as exc:
