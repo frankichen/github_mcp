@@ -311,8 +311,7 @@ def resolve_generated_write_context(service: Any, repository: str, branch: str, 
     return {"managed":True,"workspace":checked_workspace,"session":checked_session}
 
 
-def parse_change_set(change_set_json: str) -> dict[str,Any]:
-    change=_json(change_set_json,dict,"change_set_json",{})
+def _validate_change_set(change: dict[str,Any]) -> dict[str,Any]:
     if change.get("schema_version")!=1: raise MyGithub12Error("PATCH_INVALID_FORMAT","change_set_json schema_version must be 1")
     mode=change.get("mode")
     if mode not in {"patch","range","upload"}: raise MyGithub12Error("PATCH_INVALID_FORMAT","change set mode must be patch, range, or upload")
@@ -332,6 +331,41 @@ def parse_change_set(change_set_json: str) -> dict[str,Any]:
             paths.append(path); upload_ids.append(upload_id)
     canonical=json.dumps(change,ensure_ascii=False,sort_keys=True,separators=(",",":"))
     return {"change":change,"mode":mode,"canonical_hash":hashlib.sha256(canonical.encode()).hexdigest()}
+
+
+def parse_change_set(change_set_json: str) -> dict[str,Any]:
+    return _validate_change_set(_json(change_set_json,dict,"change_set_json",{}))
+
+
+def parse_change_set_bytes(raw_bytes: bytes) -> dict[str,Any]:
+    """Parse exact downloaded bytes without newline, BOM, or Unicode normalization."""
+    try:
+        text=raw_bytes.decode("utf-8",errors="strict")
+    except UnicodeDecodeError as exc:
+        raise MyGithub12Error(
+            "CHANGE_SET_INVALID_UTF8","change_set_file must contain strict UTF-8 JSON",
+            {"start":exc.start,"end":exc.end},
+        ) from exc
+    try:
+        change=json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise MyGithub12Error(
+            "CHANGE_SET_INVALID_JSON","change_set_file must contain valid JSON",
+            {"position":exc.pos},
+        ) from exc
+    if not isinstance(change,dict):
+        raise MyGithub12Error("CHANGE_SET_INVALID_JSON","change_set_file JSON must be an object")
+    return _validate_change_set(change)
+
+
+def change_set_raw_identity(raw_bytes: bytes) -> dict[str,Any]:
+    return {
+        "received_size_bytes":len(raw_bytes),
+        "received_sha256":hashlib.sha256(raw_bytes).hexdigest(),
+        "received_git_blob_sha":hashlib.sha1(
+            f"blob {len(raw_bytes)}\0".encode("ascii")+raw_bytes
+        ).hexdigest(),
+    }
 
 
 def execute_change_set(service: Any, session: dict[str,Any], workspace: dict[str,Any], parsed: dict[str,Any], expected_head_sha: str, expected_workspace_revision: int, commit_message: str, dry_run: bool, idempotency_key: str, audit_context: dict[str,Any]) -> dict[str,Any]:

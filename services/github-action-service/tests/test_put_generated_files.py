@@ -3,9 +3,11 @@ import json
 
 import pytest
 
+from app import artifact_store
 from app import development_orchestrator as development_dx
 from app import development_session_store as sessions
 from app import mcp_server, mygithub10, mygithub12
+from app import runtime_file_ingress
 
 
 HEAD = "a" * 40
@@ -22,6 +24,21 @@ def _structured_result(call_result):
 
 async def _call(arguments: dict):
     return _structured_result(await mcp_server.mcp.call_tool("put_generated_files", arguments))
+
+
+def _artifact_ingester(data: bytes):
+    async def ingest(reference, **kwargs):
+        assert reference["file_id"]
+        return artifact_store.store_bytes(
+            data,
+            kind=kwargs["kind"],
+            max_bytes=kwargs["max_bytes"],
+            source_transport="test_openai_adapter",
+            repository_scope=kwargs.get("repository_scope", ""),
+            principal_scope=kwargs.get("principal_scope", ""),
+        )
+
+    return ingest
 
 
 def _args(**overrides):
@@ -42,6 +59,8 @@ def _args(**overrides):
 def generated_env(tmp_path, monkeypatch):
     monkeypatch.setattr(mygithub10, "_UPLOAD_ROOT", tmp_path / "uploads")
     monkeypatch.setattr(mygithub10.settings, "IDEMPOTENCY_DB_PATH", str(tmp_path / "idempotency.db"))
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "mygithub12.db"))
+    monkeypatch.setenv("MYGITHUB12_ARTIFACT_DIR", str(tmp_path / "artifacts"))
     monkeypatch.delenv("REQUIRE_WORKSPACE_FOR_AI_WRITES", raising=False)
     state = {"existing": {}, "commit_calls": [], "preflight_calls": []}
 
@@ -233,11 +252,9 @@ async def test_bundle_file_supports_large_generated_text_with_same_tool(generate
         separators=(",", ":"),
     ).encode("utf-8")
 
-    async def fake_download(bundle_file):
-        assert bundle_file["file_id"] == "file_bundle_v2"
-        return bundle
-
-    monkeypatch.setattr(mcp_server, "_download_generated_bundle_file", fake_download)
+    monkeypatch.setattr(
+        runtime_file_ingress, "ingest_runtime_artifact", _artifact_ingester(bundle)
+    )
     args = _args(
         files=[],
         bundle_file={
@@ -267,10 +284,11 @@ async def test_bundle_file_source_is_exclusive_and_format_is_validated(generated
     neither = await _call(_args(files=[]))
     assert neither["error"]["code"] == "NO_FILES"
 
-    async def invalid_download(_bundle_file):
-        return b'{"version":2,"files":[]}'
-
-    monkeypatch.setattr(mcp_server, "_download_generated_bundle_file", invalid_download)
+    monkeypatch.setattr(
+        runtime_file_ingress,
+        "ingest_runtime_artifact",
+        _artifact_ingester(b'{"version":2,"files":[]}'),
+    )
     invalid = await _call(_args(files=[], bundle_file=ref, idempotency_key="bundle-invalid-format"))
     assert invalid["error"]["code"] == "PAYLOAD_INVALID"
     assert generated_env["commit_calls"] == []
@@ -283,10 +301,9 @@ async def test_bundle_idempotency_uses_content_not_ephemeral_file_reference(gene
         separators=(",", ":"),
     ).encode("utf-8")
 
-    async def stable_download(_bundle_file):
-        return bundle
-
-    monkeypatch.setattr(mcp_server, "_download_generated_bundle_file", stable_download)
+    monkeypatch.setattr(
+        runtime_file_ingress, "ingest_runtime_artifact", _artifact_ingester(bundle)
+    )
     first = await _call(_args(
         files=[],
         bundle_file={"download_url": "https://files.example.test/first", "file_id": "file_first"},
@@ -306,36 +323,33 @@ async def test_bundle_idempotency_uses_content_not_ephemeral_file_reference(gene
 
 @pytest.mark.asyncio
 async def test_bundle_download_rejects_non_https_reference():
-    with pytest.raises(mygithub10.MyGithub10Error) as exc:
-        await mcp_server._download_generated_bundle_file(
-            {"download_url": "http://files.example.test/generated.json", "file_id": "file_http"}
+    with pytest.raises(runtime_file_ingress.RuntimeFileIngressError) as exc:
+        await runtime_file_ingress.ingest_runtime_artifact(
+            {"download_url": "http://files.example.test/generated.json", "file_id": "file_http"},
+            kind="generated_files_bundle",max_bytes=1024,label="bundle_file",
         )
-    assert exc.value.code == "PAYLOAD_INVALID"
+    assert exc.value.code == "INVALID_REFERENCE"
 
 
 @pytest.mark.asyncio
 async def test_bundle_download_rejects_private_ip_literal():
-    with pytest.raises(mygithub10.MyGithub10Error) as exc:
-        await mcp_server._download_generated_bundle_file(
-            {"download_url": "https://127.0.0.1/generated.json", "file_id": "file_private"}
+    with pytest.raises(runtime_file_ingress.RuntimeFileIngressError) as exc:
+        await runtime_file_ingress.ingest_runtime_artifact(
+            {"download_url": "https://127.0.0.1/generated.json", "file_id": "file_private"},
+            kind="generated_files_bundle",max_bytes=1024,label="bundle_file",
         )
-    assert exc.value.code == "PAYLOAD_INVALID"
+    assert exc.value.code == "INVALID_REFERENCE"
 
 
 @pytest.mark.asyncio
 async def test_bundle_download_rejects_dns_resolving_to_private_address(monkeypatch):
-    monkeypatch.setattr(
-        mcp_server.socket,
-        "getaddrinfo",
-        lambda host, port, type=0: [
-            (mcp_server.socket.AF_INET, mcp_server.socket.SOCK_STREAM, 6, "", ("10.0.0.5", port))
-        ],
-    )
-    with pytest.raises(mygithub10.MyGithub10Error) as exc:
-        await mcp_server._download_generated_bundle_file(
-            {"download_url": "https://files.oaiusercontent.com/generated.json", "file_id": "file_private_dns"}
+    with pytest.raises(runtime_file_ingress.RuntimeFileIngressError) as exc:
+        await runtime_file_ingress.ingest_runtime_artifact(
+            {"download_url": "https://files.oaiusercontent.com/generated.json", "file_id": "file_private_dns"},
+            kind="generated_files_bundle",max_bytes=1024,label="bundle_file",
+            resolver=lambda host, port, type=0: [(2,1,6,"",("10.0.0.5",port))],
         )
-    assert exc.value.code == "PAYLOAD_INVALID"
+    assert exc.value.code == "INVALID_REFERENCE"
 
 
 @pytest.mark.asyncio
@@ -344,12 +358,12 @@ async def test_bundle_redirect_to_private_destination_is_rejected_before_second_
 
     def fake_getaddrinfo(host, port, type=0):
         assert host == "files.oaiusercontent.com"
-        return [(mcp_server.socket.AF_INET, mcp_server.socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+        return [(2, 1, 6, "", ("93.184.216.34", port))]
 
     class FakeResponse:
         is_redirect = True
         headers = {"location": "https://127.0.0.1/internal"}
-        url = mcp_server.httpx.URL("https://files.oaiusercontent.com/start")
+        url = runtime_file_ingress.httpx.URL("https://files.oaiusercontent.com/start")
 
     class FakeStream:
         async def __aenter__(self):
@@ -369,28 +383,25 @@ async def test_bundle_redirect_to_private_destination_is_rejected_before_second_
             calls.append(str(url))
             return FakeStream()
 
-    monkeypatch.setattr(mcp_server.socket, "getaddrinfo", fake_getaddrinfo)
-    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", lambda **kwargs: FakeClient())
-    with pytest.raises(mygithub10.MyGithub10Error) as exc:
-        await mcp_server._download_generated_bundle_file(
-            {"download_url": "https://files.oaiusercontent.com/start", "file_id": "file_redirect_private"}
+    with pytest.raises(runtime_file_ingress.RuntimeFileIngressError) as exc:
+        await runtime_file_ingress.ingest_runtime_artifact(
+            {"download_url": "https://files.oaiusercontent.com/start", "file_id": "file_redirect_private"},
+            kind="generated_files_bundle",max_bytes=1024,label="bundle_file",
+            resolver=fake_getaddrinfo,client_factory=lambda **kwargs: FakeClient(),
         )
-    assert exc.value.code == "PAYLOAD_INVALID"
+    assert exc.value.code == "INVALID_REFERENCE"
     assert calls == ["https://files.oaiusercontent.com/start"]
 
 
 @pytest.mark.asyncio
 async def test_bundle_download_rejects_non_openai_public_host_without_dns(monkeypatch):
-    monkeypatch.setattr(
-        mcp_server.socket,
-        "getaddrinfo",
-        lambda *args, **kwargs: pytest.fail("untrusted host must be rejected before DNS"),
-    )
-    with pytest.raises(mygithub10.MyGithub10Error) as exc:
-        await mcp_server._download_generated_bundle_file(
-            {"download_url": "https://example.com/generated.json", "file_id": "file_untrusted_host"}
+    with pytest.raises(runtime_file_ingress.RuntimeFileIngressError) as exc:
+        await runtime_file_ingress.ingest_runtime_artifact(
+            {"download_url": "https://example.com/generated.json", "file_id": "file_untrusted_host"},
+            kind="generated_files_bundle",max_bytes=1024,label="bundle_file",
+            resolver=lambda *args, **kwargs: pytest.fail("untrusted host must be rejected before DNS"),
         )
-    assert exc.value.code == "PAYLOAD_INVALID"
+    assert exc.value.code == "INVALID_REFERENCE"
 
 
 @pytest.mark.asyncio

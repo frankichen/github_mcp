@@ -87,6 +87,20 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     recovery_schema = tools["recover_drifted_development_task"].inputSchema
     assert {"repository", "branch", "workspace_id", "development_session_id", "expected_workspace_revision", "expected_session_revision", "expected_current_head_sha", "expected_current_tree_sha", "expected_base_branch", "expected_base_sha", "idempotency_key"} <= set(recovery_schema["required"])
     assert recovery_schema["properties"]["lease_seconds"]["default"] == 7200
+    change_set_tool = tools["apply_development_change_set"]
+    change_set_schema = change_set_tool.inputSchema
+    assert set(change_set_schema["required"]) == {
+        "development_session_id", "expected_session_revision",
+        "expected_workspace_revision", "expected_head_sha", "commit_message",
+    }
+    assert {
+        "change_set_json", "change_set_file", "prepared_change_set_id",
+        "expected_change_set_size_bytes", "expected_change_set_sha256",
+        "expected_change_set_git_blob_sha",
+    } <= set(change_set_schema["properties"])
+    change_set_meta = getattr(change_set_tool, "meta", None) or getattr(change_set_tool, "_meta", None) or {}
+    assert change_set_meta["openai/fileParams"] == ["change_set_file"]
+    assert "large or exact-byte-sensitive" in change_set_tool.description
     assert tools["plan_infrastructure_deployment"].annotations.readOnlyHint is True
     assert tools["start_infrastructure_deployment"].annotations.readOnlyHint is False
     assert tools["start_infrastructure_deployment"].annotations.destructiveHint is True
@@ -148,7 +162,7 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.8.0"
+    assert manifest["service_version"] == "12.9.0"
     assert manifest["manifest_format"] == "composed-v2"
     assert manifest["legacy_tool_count"] == 120
     assert manifest["new_tool_count"] == 54
