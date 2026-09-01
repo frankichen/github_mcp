@@ -422,11 +422,25 @@ def test_go_migration_uses_preheated_binary(tmp_path, exec_capable_tmp_path):
     goose = exec_capable_tmp_path / "goose"
     goose.write_text("#!/bin/sh\necho 'goose version test'\n", encoding="utf-8")
     goose.chmod(0o700)
-    (tmp_path / "Makefile").write_text(
-        'migrate-up:\n\t@"$(GOOSE)" -version >/dev/null\n'
-        '\t@printf \'%s\' "$(GOOSE)" > used-goose\n',
+    goose_check = subprocess.run(
+        [str(goose), "-version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert goose_check.returncode == 0, goose_check.stdout + goose_check.stderr
+
+    fake_bin = exec_capable_tmp_path / "bin"
+    fake_bin.mkdir()
+    make_args = exec_capable_tmp_path / "make-args"
+    fake_make = fake_bin / "make"
+    fake_make.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$@\" > \"$FAKE_MAKE_ARGS\"\n",
         encoding="utf-8",
     )
+    fake_make.chmod(0o700)
+    (tmp_path / "Makefile").write_text("migrate-up:\n", encoding="utf-8")
     commands = apply_workspace_hooks(
         go_commands_for_workspace(str(tmp_path)),
         {"path": ".", "stack": "go", "hooks": ["go-migrate"]},
@@ -435,16 +449,24 @@ def test_go_migration_uses_preheated_binary(tmp_path, exec_capable_tmp_path):
         "command"
     ].replace("/ci-cache/.tool-bin/goose", str(goose))
 
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["FAKE_MAKE_ARGS"] = str(make_args)
     result = subprocess.run(
         ["/bin/sh", "-c", command],
         cwd=tmp_path,
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (tmp_path / "used-goose").read_text(encoding="utf-8") == str(goose)
+    assert make_args.read_text(encoding="utf-8").splitlines() == [
+        "--no-print-directory",
+        f"GOOSE={goose}",
+        "migrate-up",
+    ]
 
 
 def test_go_toolchain_is_the_effective_minimum(tmp_path):
