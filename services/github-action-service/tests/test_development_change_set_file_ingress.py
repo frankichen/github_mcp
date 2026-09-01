@@ -277,6 +277,23 @@ def test_capabilities_separate_changeset_transport_from_patch_limit():
 async def test_schema_has_runtime_file_param_and_mutually_exclusive_sources(ingress_env):
     tools = {tool.name: tool for tool in await ingress_env["mcp"].list_tools()}
     tool = tools["apply_development_change_set"]
+    prepare_tool = tools["prepare_development_change_set_file"]
+    prepare_meta = getattr(prepare_tool, "meta", None) or getattr(prepare_tool, "_meta", None) or {}
+    assert prepare_meta["openai/fileParams"] == ["bundle_file"]
+    prepare_properties = prepare_tool.inputSchema["properties"]
+    assert "bundle_file" in prepare_properties
+    bundle_schema = prepare_properties["bundle_file"]
+    if "anyOf" in bundle_schema:
+        bundle_schema = next(
+            schema for schema in bundle_schema["anyOf"]
+            if schema.get("type") == "object" or "$ref" in schema
+        )
+    if "$ref" in bundle_schema:
+        bundle_schema = prepare_tool.inputSchema["$defs"][
+            bundle_schema["$ref"].rsplit("/", 1)[-1]
+        ]
+    assert {"download_url", "file_id"} <= set(bundle_schema["properties"])
+    assert {"download_url", "file_id"} <= set(bundle_schema["required"])
     properties = tool.inputSchema["properties"]
     assert {
         "change_set_json",
