@@ -281,6 +281,7 @@ async def test_schema_has_runtime_file_param_and_mutually_exclusive_sources(ingr
     assert {
         "change_set_json",
         "change_set_file",
+        "bundle_file",
         "prepared_change_set_id",
         "expected_change_set_size_bytes",
         "expected_change_set_sha256",
@@ -298,10 +299,29 @@ async def test_schema_has_runtime_file_param_and_mutually_exclusive_sources(ingr
         ]
     assert {"download_url", "file_id"} <= set(change_set_file_schema["properties"])
     assert {"download_url", "file_id"} <= set(change_set_file_schema["required"])
+    bundle_file_schema = properties["bundle_file"]
+    if "anyOf" in bundle_file_schema:
+        bundle_file_schema = next(
+            schema for schema in bundle_file_schema["anyOf"]
+            if schema.get("type") == "object" or "$ref" in schema
+        )
+    if "$ref" in bundle_file_schema:
+        bundle_file_schema = tool.inputSchema["$defs"][
+            bundle_file_schema["$ref"].rsplit("/", 1)[-1]
+        ]
+    assert {"download_url", "file_id"} <= set(bundle_file_schema["properties"])
+    assert {"download_url", "file_id"} <= set(bundle_file_schema["required"])
     tool_meta = getattr(tool, "meta", None) or getattr(tool, "_meta", None) or {}
-    assert tool_meta["openai/fileParams"] == ["change_set_file"]
+    assert tool_meta["openai/fileParams"] == ["change_set_file", "bundle_file"]
     both = await ingress_env["call"](change_set_json="{}")
     assert both["error"]["code"] == "CHANGE_SET_SOURCE_CONFLICT"
+    both_file_names = await ingress_env["call"](
+        bundle_file={
+            "download_url": "https://files.oaiusercontent.com/alias.json",
+            "file_id": "file_alias",
+        }
+    )
+    assert both_file_names["error"]["code"] == "CHANGE_SET_SOURCE_CONFLICT"
     neither = await ingress_env["call"](
         change_set_file=None,
         expected_change_set_size_bytes=0,
@@ -385,6 +405,23 @@ async def test_truncated_invalid_and_oversized_files_fail_stop(ingress_env, monk
 
 
 @pytest.mark.asyncio
+async def test_bundle_file_alias_uses_same_changeset_ingress(ingress_env):
+    result = await ingress_env["call"](
+        change_set_file=None,
+        bundle_file={
+            "download_url": "https://files.oaiusercontent.com/candidate-alias.json",
+            "file_id": "file_candidate_alias",
+        },
+        idempotency_key="prepare-key-alias",
+    )
+    assert result["ok"] is True
+    assert result["payload_source"] == "change_set_file"
+    assert result["file_parameter"] == "bundle_file"
+    assert result["prepared_change_set_id"].startswith("pcs_")
+    assert ingress_env["state"]["ingress_calls"] == 1
+
+
+@pytest.mark.asyncio
 async def test_large_exact_file_dry_run_freezes_then_writes_same_candidate(ingress_env):
     large_payload = "x" * 120_000 + "\r\n中文😀\n"
     raw = _raw_change_set(large_payload, trailing_newline=True)
@@ -397,6 +434,7 @@ async def test_large_exact_file_dry_run_freezes_then_writes_same_candidate(ingre
     )
     assert prepared["ok"] is True
     assert prepared["payload_source"] == "change_set_file"
+    assert prepared["file_parameter"] == "change_set_file"
     assert prepared["received_size_bytes"] == len(raw)
     assert prepared["received_sha256"] == hashlib.sha256(raw).hexdigest()
     assert prepared["received_git_blob_sha"] == _git_blob_sha(raw)
