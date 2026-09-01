@@ -100,9 +100,9 @@ class TestMCPTools:
         assert capabilities["max_upload_chunk_bytes"] == 24576
         assert capabilities["recommended_upload_chunk_bytes"] == 16384
         assert capabilities["preferred_upload_encoding"] == "text_for_utf8_base64_for_binary"
-        assert capabilities["tool_count"] == 174
-        assert capabilities["tool_manifest_count"] == 174
-        assert capabilities["compatibility_tool_count"] == 174
+        assert capabilities["tool_count"] == 175
+        assert capabilities["tool_manifest_count"] == 175
+        assert capabilities["compatibility_tool_count"] == 175
         assert capabilities["deprecated_tools_exposed"] is True
         assert capabilities["hidden_deprecated_tool_count"] == 0
         assert capabilities["hidden_deprecated_tools"] == []
