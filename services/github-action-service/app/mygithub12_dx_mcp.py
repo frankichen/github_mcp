@@ -7,6 +7,7 @@ import logging
 import re
 import uuid
 from typing import Any, Callable, Awaitable
+from typing_extensions import NotRequired, TypedDict
 
 from mcp.types import ToolAnnotations
 
@@ -22,6 +23,13 @@ from app import mygithub10
 
 logger=logging.getLogger(__name__)
 _ORCHESTRATION=ToolAnnotations(readOnlyHint=False,destructiveHint=False,idempotentHint=False,openWorldHint=True)
+
+
+class RuntimeFileParam(TypedDict):
+    download_url: str
+    file_id: str
+    mime_type: NotRequired[str]
+    file_name: NotRequired[str]
 
 
 def _error_payload(exc: Exception, *, log_unexpected: bool = True) -> dict[str, Any]:
@@ -121,7 +129,7 @@ def register_dx_tools(
     )
     async def apply_development_change_set(
         development_session_id: str, expected_session_revision: int, expected_workspace_revision: int, expected_head_sha: str,
-        commit_message: str, change_set_json: str="", change_set_file: dict | None=None,
+        commit_message: str, change_set_json: str="", change_set_file: RuntimeFileParam | None=None,
         expected_change_set_size_bytes: int=0, expected_change_set_sha256: str="",
         expected_change_set_git_blob_sha: str="", prepared_change_set_id: str="",
         dry_run: bool=True, idempotency_key: str="", create_pull_request: bool=False, pull_request_json: str="{}",
