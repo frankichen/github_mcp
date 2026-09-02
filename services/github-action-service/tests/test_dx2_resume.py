@@ -103,6 +103,7 @@ def test_resume_task_rejects_branch_pr_mismatch(monkeypatch):
 def _ready_session(*, head=SHA_A, tree=TREE_A, workspace_revision=2, lease=9999999999.0):
     return {
         "session_id": "dev_resume", "status": "active", "session_revision": 4,
+        "repository": "owner/repo", "branch": "ai/resume",
         "workspace_revision": workspace_revision, "head_commit_sha": head, "tree_sha": tree,
         "lease_expires_at": lease, "pull_number": None, "last_fast_ci_job_id": None,
         "last_full_ci_job_id": None, "last_attestation_id": None, "last_failure_resource_uri": None,
@@ -123,6 +124,153 @@ def _stub_resume_context(monkeypatch, *, ws=None, session=None, pr=None, branch_
     monkeypatch.setattr(resume.mygithub12, "workspace_overlap", lambda service, workspace_id: {"ok": True, "workspace_id": workspace_id, "items": []})
     monkeypatch.setattr(resume, "db_list_jobs", lambda **kwargs: [])
     monkeypatch.setattr(resume.github_utils, "get_github_pull_request_merge_readiness", lambda *args, **kwargs: readiness or {"ok": True, "ready": False})
+
+
+def _validation_job(*, mode="fast", status="passed", job_id="job-exact", tree=TREE_A):
+    return {
+        "job_id": job_id,
+        "repository": "owner/repo",
+        "branch": "ai/resume",
+        "commit_sha": SHA_A,
+        "profile": "repo-fast-check" if mode == "fast" else "repo-auto-check",
+        "status": status,
+        "exit_code": 0 if status == "passed" else 1,
+        "summary": {"git_tree_sha": tree},
+    }
+
+
+def _stub_transient_recovery(monkeypatch, *, mode="fast", status="passed", correlations=1):
+    ws = _workspace()
+    phase = "validating_fast" if mode == "fast" else "validating_full"
+    session = {**_ready_session(), "status": phase}
+    _stub_resume_context(monkeypatch, ws=ws, session=session)
+    job = _validation_job(mode=mode, status=status)
+    rows = [
+        {
+            "job_id": job["job_id"] if i == 0 else f"job-other-{i}",
+            "session_revision": session["session_revision"],
+            "tree_sha": session["tree_sha"],
+            "evidence": {"selection": {"complete": True, "changed_paths": ["x.py"]}},
+        }
+        for i in range(correlations)
+    ]
+    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: rows)
+    monkeypatch.setattr(resume, "db_get_job", lambda job_id: job if job_id == job["job_id"] else {**job, "job_id": job_id})
+    return ws, session, job
+
+
+def test_resume_reconciles_exact_terminal_fast_validation(monkeypatch):
+    _, session, job = _stub_transient_recovery(monkeypatch)
+    result_payload = {"terminal": True, "merge_eligible": False, "attestation": None, "failure_pack": None}
+    monkeypatch.setattr(resume.dx, "validation_result", lambda *args, **kwargs: result_payload)
+    recovered = {**session, "status": "active", "session_revision": 5, "last_fast_ci_job_id": job["job_id"]}
+    monkeypatch.setattr(resume.sessions, "transition", lambda *args, **kwargs: recovered)
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume", expected_session_revision=4)
+
+    assert result["recovery"]["transient"]["reconciled"] is True
+    assert result["development_session"]["status"] == "active"
+    assert result["development_session"]["last_fast_ci_job_id"] == "job-exact"
+    assert "continue_write" in result["next_allowed_actions"]
+
+
+def test_resume_keeps_running_validation_fail_closed(monkeypatch):
+    _, session, _ = _stub_transient_recovery(monkeypatch, status="running")
+    monkeypatch.setattr(resume.dx, "validation_result", lambda *args, **kwargs: pytest.fail("running CI must not be observed as terminal"))
+    monkeypatch.setattr(resume.sessions, "transition", lambda *args, **kwargs: pytest.fail("running CI must not change Session state"))
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["development_session"] == session
+    assert result["recovery"]["transient"]["validation_in_progress"] is True
+    assert "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS" in result["blockers"]
+    assert result["next_allowed_actions"] == ["wait_private_ci_job", "resume_development_task"]
+    assert "continue_write" not in result["next_allowed_actions"]
+
+
+def test_resume_reconciles_terminal_failed_without_forging_pass(monkeypatch):
+    _, session, job = _stub_transient_recovery(monkeypatch, status="failed")
+    failure = {"resource_uri": "mygithub12://response/failure"}
+    monkeypatch.setattr(resume.dx, "validation_result", lambda *args, **kwargs: {"terminal": True, "merge_eligible": False, "attestation": None, "failure_pack": failure})
+    captured = {}
+
+    def transition(*args, **kwargs):
+        captured.update(kwargs)
+        return {**session, "status": "active", "session_revision": 5, "last_fast_ci_job_id": job["job_id"], "last_failure_resource_uri": failure["resource_uri"]}
+
+    monkeypatch.setattr(resume.sessions, "transition", transition)
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["development_session"]["status"] == "active"
+    assert captured["fields"]["last_failure_resource_uri"] == failure["resource_uri"]
+    assert captured["fields"].get("last_attestation_id") is None
+
+
+def test_resume_reconciles_terminal_full_pass_to_pr_ready(monkeypatch):
+    _, session, job = _stub_transient_recovery(monkeypatch, mode="full")
+    attestation = {"attestation_id": "att-exact"}
+    monkeypatch.setattr(resume.dx, "validation_result", lambda *args, **kwargs: {"terminal": True, "merge_eligible": True, "attestation": attestation, "failure_pack": None})
+    monkeypatch.setattr(resume.sessions, "transition", lambda *args, **kwargs: {**session, "status": "pr_ready", "session_revision": 5, "last_full_ci_job_id": job["job_id"], "last_attestation_id": "att-exact"})
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["development_session"]["status"] == "pr_ready"
+    assert result["development_session"]["last_attestation_id"] == "att-exact"
+
+
+def test_resume_fails_stop_when_validation_job_is_not_unique(monkeypatch):
+    _, session, _ = _stub_transient_recovery(monkeypatch, correlations=2)
+    monkeypatch.setattr(resume.dx, "validation_result", lambda *args, **kwargs: pytest.fail("ambiguous CI must not be observed"))
+    monkeypatch.setattr(resume.sessions, "transition", lambda *args, **kwargs: pytest.fail("ambiguous CI must not change Session state"))
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["development_session"] == session
+    assert result["recovery"]["transient"]["error_code"] == "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    assert "DEVELOPMENT_SESSION_RECOVERY_REQUIRED" in result["blockers"]
+
+
+def test_resume_transient_recovery_does_not_bypass_live_branch_drift(monkeypatch):
+    ws, session, _ = _stub_transient_recovery(monkeypatch)
+    ws["head_sha"] = SHA_B
+    monkeypatch.setattr(resume, "_select_workspace", lambda *args: (ws, [ws]))
+    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: pytest.fail("drift must win before transient recovery"))
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert "WORKSPACE_BRANCH_DRIFTED" in result["blockers"]
+    assert result["development_session"] == session
+
+
+def test_resume_transient_recovery_preserves_session_revision_cas(monkeypatch):
+    _stub_transient_recovery(monkeypatch)
+
+    with pytest.raises(resume.MyGithub12Error) as exc:
+        resume.resume_task(FakeService(), "owner/repo", branch="ai/resume", expected_session_revision=3)
+
+    assert exc.value.code == "DEVELOPMENT_SESSION_REVISION_MISMATCH"
+
+
+def test_resume_recovers_restart_after_nonterminal_observation_with_legacy_fast_tree(monkeypatch):
+    _, session, job = _stub_transient_recovery(monkeypatch)
+    session["last_fast_ci_job_id"] = job["job_id"]
+    job["summary"] = {}
+    monkeypatch.setattr(
+        resume.sessions,
+        "validation_correlations",
+        lambda *args: [{
+            "job_id": job["job_id"], "session_revision": session["session_revision"] - 1,
+            "tree_sha": "", "evidence": {"selection": {"complete": True}},
+        }],
+    )
+    monkeypatch.setattr(resume.dx, "validation_result", lambda *args, **kwargs: {"terminal": True, "merge_eligible": False, "attestation": None, "failure_pack": None})
+    monkeypatch.setattr(resume.sessions, "transition", lambda *args, **kwargs: {**session, "status": "active", "session_revision": session["session_revision"] + 1})
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["development_session"]["status"] == "active"
+    assert result["recovery"]["transient"]["correlation_source"] == "session_last_observed_job"
+    assert result["recovery"]["transient"]["tree_evidence"] == "exact_immutable_commit_identity"
 
 
 def test_resume_task_rejects_repository_before_github_reads(monkeypatch):

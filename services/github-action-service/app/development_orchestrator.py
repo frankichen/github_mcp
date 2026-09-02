@@ -518,8 +518,11 @@ def wait_validation(job_id: str, wait_seconds: int) -> dict[str,Any]:
     return job
 
 
+VALIDATION_TERMINAL_STATUSES = {"passed", "failed", "timed_out", "cancelled", "superseded", "worker_lost", "internal_error"}
+
+
 def validation_result(session_id: str, session_revision: int, mode: str, job: dict[str,Any], selection: dict[str,Any], include_failure_pack: bool=True) -> dict[str,Any]:
-    status=job.get("status"); terminal=status in {"passed","failed","timed_out","cancelled","superseded"}; merge_eligible=bool(mode!="fast" and status=="passed")
+    status=job.get("status"); terminal=status in VALIDATION_TERMINAL_STATUSES; merge_eligible=bool(mode!="fast" and status=="passed")
     attestation=None; failure=None
     if merge_eligible:
         try: attestation=attestation_registry.create_attestation_for_passed_job(job_id=job["job_id"])

@@ -458,11 +458,59 @@ def record_validation(session_id: str, session_revision: int, mode: str, commit_
     init_session_db()
     get_session(session_id)
     with _LOCK, _db() as db:
+        existing = db.execute(
+            """SELECT id FROM development_session_validations
+               WHERE session_id=? AND session_revision=? AND mode=? AND commit_sha=?
+                 AND tree_sha=? AND job_id=? ORDER BY id DESC LIMIT 1""",
+            (session_id, session_revision, mode, commit_sha, tree_sha, job_id or None),
+        ).fetchone()
+        if existing:
+            db.execute(
+                """UPDATE development_session_validations
+                   SET status=?,merge_eligible=?,attestation_id=?,evidence_json=?,finished_at=?
+                   WHERE id=?""",
+                (
+                    status,
+                    1 if merge_eligible else 0,
+                    attestation_id or None,
+                    json.dumps(evidence or {}, ensure_ascii=False, separators=(",", ":")),
+                    _now() if finished else None,
+                    int(existing["id"]),
+                ),
+            )
+            return int(existing["id"])
         cur = db.execute(
             """INSERT INTO development_session_validations(session_id,session_revision,mode,commit_sha,tree_sha,job_id,status,merge_eligible,attestation_id,evidence_json,created_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
             (session_id, session_revision, mode, commit_sha, tree_sha, job_id or None, status, 1 if merge_eligible else 0, attestation_id or None, json.dumps(evidence or {}, ensure_ascii=False, separators=(",", ":")), _now(), _now() if finished else None),
         )
         return int(cur.lastrowid)
+
+
+def validation_correlations(
+    session_id: str,
+    session_revision: int,
+    mode: str,
+    commit_sha: str,
+    tree_sha: str,
+) -> list[dict[str, Any]]:
+    """Return exact persisted validation/job correlations for reconciliation."""
+    init_session_db()
+    get_session(session_id)
+    with _db() as db:
+        rows = db.execute(
+            """SELECT * FROM development_session_validations
+               WHERE session_id=? AND session_revision<=? AND mode=?
+                 AND commit_sha=? AND (tree_sha=? OR tree_sha='') AND job_id IS NOT NULL
+               ORDER BY id DESC""",
+            (session_id, session_revision, mode, commit_sha, tree_sha),
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["merge_eligible"] = bool(item["merge_eligible"])
+        item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+        result.append(item)
+    return result
 
 
 def list_events(session_id: str, limit: int = 100) -> list[dict[str, Any]]:
@@ -476,7 +524,7 @@ def list_events(session_id: str, limit: int = 100) -> list[dict[str, Any]]:
 
 
 def recover_sessions(workspace_getter) -> dict[str, int]:
-    """Mark only provably stale sessions; never acquire leases or mutate Git refs."""
+    """Fail-stop ambiguous startup phases while preserving reconcilable validation evidence."""
     init_session_db()
     checked = recovered = 0
     with _db() as db:
@@ -487,9 +535,9 @@ def recover_sessions(workspace_getter) -> dict[str, int]:
             ws = workspace_getter(row["workspace_id"])
         except Exception:
             continue
-        # A process restart cannot know whether an interrupted orchestration
-        # completed external effects; force explicit recovery instead of guessing.
-        if row["status"] in {"preparing", "validating_fast", "validating_full", "closing"}:
+        # validating_* is deliberately preserved. resume_task reconciles it
+        # from the exact persisted validation/job correlation after restart.
+        if row["status"] in {"preparing", "closing"}:
             try:
                 transition(row["session_id"], row["session_revision"], "blocked", event_type="restart_recovery_required", fields={"workspace_revision": ws["revision"], "head_commit_sha": ws["head_sha"], "tree_sha": ws["tree_sha"]})
                 recovered += 1

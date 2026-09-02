@@ -366,6 +366,32 @@ async def converge_task(
             },
         ) from start_exc
 
+    try:
+        await github_call(
+            sessions.record_validation,
+            development_session_id,
+            phase_session["session_revision"],
+            mode,
+            phase_session["head_commit_sha"],
+            phase_session["tree_sha"],
+            job_id=job["job_id"],
+            status=job.get("status") or "queued",
+            evidence={"selection": selection},
+        )
+    except Exception as correlate_exc:
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+            "private CI started but its validation correlation could not be persisted",
+            {
+                "validation_started": True,
+                "recovery_required": True,
+                "failed_stage": "validation_correlate",
+                "job_id": job.get("job_id"),
+                "job_status": job.get("status"),
+                "cause_type": type(correlate_exc).__name__,
+            },
+        ) from correlate_exc
+
     result = None
     try:
         job = await github_call(dx.wait_validation, job["job_id"], wait_seconds)
