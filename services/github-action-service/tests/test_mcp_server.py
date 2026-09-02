@@ -54,7 +54,7 @@ class TestMCPTools:
 
         monkeypatch.setenv("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", "true")
         tools = {tool.name: tool for tool in await mcp.list_tools()}
-        for name in ("build_github_patch", "replace_github_text_once", "edit_github_file_ranges", "apply_github_patch", "put_generated_files", "put_github_file", "put_github_files", "put_github_file_from_local_candidate", "get_mygithub_capabilities", "plan_private_ci_job", "resume_development_task", "recover_drifted_development_task"):
+        for name in ("build_github_patch", "replace_github_text_once", "edit_github_file_ranges", "apply_github_patch", "put_generated_files", "put_github_file", "put_github_files", "put_github_file_from_local_candidate", "get_mygithub_capabilities", "plan_private_ci_job", "resume_development_task", "recover_drifted_development_task", "recover_base_synced_development_task"):
             assert name in tools
         assert "expected_blob_sha" in tools["edit_github_file_ranges"].description
         assert "expected_old_text" in tools["edit_github_file_ranges"].description
@@ -96,13 +96,13 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.9.1"
+        assert capabilities["version"] == "12.9.2"
         assert capabilities["max_upload_chunk_bytes"] == 24576
         assert capabilities["recommended_upload_chunk_bytes"] == 16384
         assert capabilities["preferred_upload_encoding"] == "text_for_utf8_base64_for_binary"
-        assert capabilities["tool_count"] == 174
-        assert capabilities["tool_manifest_count"] == 174
-        assert capabilities["compatibility_tool_count"] == 174
+        assert capabilities["tool_count"] == 175
+        assert capabilities["tool_manifest_count"] == 175
+        assert capabilities["compatibility_tool_count"] == 175
         assert capabilities["deprecated_tools_exposed"] is True
         assert capabilities["hidden_deprecated_tool_count"] == 0
         assert capabilities["hidden_deprecated_tools"] == []
@@ -116,6 +116,7 @@ class TestMCPTools:
         assert capabilities["supports_generated_files_put_v1"] is True
         assert capabilities["supports_generated_files_put_v2"] is True
         assert capabilities["supports_drifted_development_recovery"] is True
+        assert capabilities["supports_base_synced_development_recovery"] is True
         assert capabilities["generated_files_put_semantics"]["bundle_format_version"] == 1
         assert capabilities["generated_files_put_semantics"]["unsupported"] == ["binary", "delete"]
         assert capabilities["generated_files_put_semantics"]["max_file_bytes"] == 1024 * 1024
@@ -727,9 +728,11 @@ class TestMergeIndexBootstrap:
         }
         calls = []
 
-        async def fake_github_call(function, *args):
+        async def fake_github_call(function, *args, **kwargs):
             if function is mcp_server.github_utils.merge_github_pull_request:
                 return dict(merged)
+            if function is mcp_server.development_managed_merge.finalize_managed_pr_merge:
+                return {"ok": True, "status": "not_applicable", "managed": False}
             if function is mcp_server.mygithub12.request_index_build:
                 calls.append(args)
                 return {
@@ -782,9 +785,11 @@ class TestMergeIndexBootstrap:
             "merge_commit_sha": new_base,
         }
 
-        async def fake_github_call(function, *args):
+        async def fake_github_call(function, *args, **kwargs):
             if function is mcp_server.github_utils.merge_github_pull_request:
                 return dict(merged)
+            if function is mcp_server.development_managed_merge.finalize_managed_pr_merge:
+                return {"ok": True, "status": "not_applicable", "managed": False}
             if function is mcp_server.mygithub12.request_index_build:
                 raise RuntimeError("index backend unavailable")
             raise AssertionError(function)
@@ -829,7 +834,7 @@ class TestMergeIndexBootstrap:
         digest = hashlib.sha256(encoded).hexdigest()
         observed = {}
 
-        async def fake_github_call(function, *args):
+        async def fake_github_call(function, *args, **kwargs):
             assert function is mcp_server.mygithub10.append_upload
             observed["content"] = args[2]
             return {

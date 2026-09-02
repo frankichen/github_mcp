@@ -454,6 +454,99 @@ def transition(
     return _public(updated)
 
 
+
+
+def finalize_merged_session_workspace(
+    session_id: str,
+    expected_session_revision: int,
+    workspace_id: str,
+    expected_workspace_revision: int,
+    *,
+    merge_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Atomically mark a managed Session merged and release its Workspace Writer lease/index pin."""
+    init_session_db()
+    now = _now()
+    with _LOCK, _db() as db:
+        session_row = db.execute("SELECT * FROM development_sessions WHERE session_id=?", (session_id,)).fetchone()
+        workspace_row = db.execute("SELECT * FROM workspaces WHERE workspace_id=?", (workspace_id,)).fetchone()
+        if not session_row:
+            raise MyGithub12Error("DEVELOPMENT_SESSION_NOT_FOUND", "development session was not found", {"development_session_id": session_id})
+        if not workspace_row:
+            raise MyGithub12Error("WORKSPACE_NOT_FOUND", "workspace was not found", {"workspace_id": workspace_id})
+        if int(session_row["session_revision"]) != int(expected_session_revision):
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_REVISION_MISMATCH", "development session changed before merge finalization",
+                {"expected": expected_session_revision, "actual": session_row["session_revision"]},
+            )
+        if int(workspace_row["revision"]) != int(expected_workspace_revision):
+            raise MyGithub12Error(
+                "WORKSPACE_REVISION_MISMATCH", "workspace changed before merge finalization",
+                {"expected": expected_workspace_revision, "actual": workspace_row["revision"]},
+            )
+        if session_row["workspace_id"] != workspace_id or int(session_row["workspace_revision"]) != int(expected_workspace_revision):
+            raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "session and workspace identities differ before merge finalization")
+        if session_row["status"] not in {"active", "pr_ready"}:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_STATE_INVALID", "development session state does not allow merge finalization",
+                {"status": session_row["status"]},
+            )
+        if workspace_row["status"] != "active":
+            raise MyGithub12Error(
+                "WORKSPACE_CLOSED", "managed merge finalization requires the active owning Workspace",
+                {"workspace_id": workspace_id, "status": workspace_row["status"]},
+            )
+        if (
+            session_row["repository"] != workspace_row["repository"]
+            or session_row["branch"] != workspace_row["branch"]
+            or session_row["base_branch"] != workspace_row["base_branch"]
+            or session_row["base_commit_sha"] != workspace_row["base_commit_sha"]
+            or session_row["head_commit_sha"] != workspace_row["head_sha"]
+            or session_row["tree_sha"] != workspace_row["tree_sha"]
+        ):
+            raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "session and workspace Git identities differ before merge finalization")
+        new_workspace_revision = int(expected_workspace_revision) + 1
+        workspace_update = db.execute(
+            """UPDATE workspaces SET status='closed',lease_expires_at=0,index_commit_sha=NULL,drift_reason=NULL,
+            revision=revision+1,updated_at=? WHERE workspace_id=? AND revision=? AND status='active'""",
+            (now, workspace_id, expected_workspace_revision),
+        )
+        if workspace_update.rowcount != 1:
+            raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH", "workspace changed while finalizing managed merge")
+        session_update = db.execute(
+            """UPDATE development_sessions SET status='merged',workspace_revision=?,lease_expires_at=0,
+            session_revision=session_revision+1,updated_at=?,closed_at=?
+            WHERE session_id=? AND session_revision=?""",
+            (new_workspace_revision, now, now, session_id, expected_session_revision),
+        )
+        if session_update.rowcount != 1:
+            raise MyGithub12Error("DEVELOPMENT_SESSION_REVISION_MISMATCH", "development session changed while finalizing managed merge")
+        updated = db.execute("SELECT * FROM development_sessions WHERE session_id=?", (session_id,)).fetchone()
+        closed_workspace = db.execute("SELECT * FROM workspaces WHERE workspace_id=?", (workspace_id,)).fetchone()
+        audit = {
+            "workspace_id": workspace_id,
+            "workspace_closed": True,
+            "old_workspace_revision": int(expected_workspace_revision),
+            "new_workspace_revision": new_workspace_revision,
+            "merge": dict(merge_evidence or {}),
+        }
+        _append_event(
+            db,
+            updated,
+            "pull_request_merged",
+            session_row["status"],
+            "merged",
+            int(updated["session_revision"]),
+            audit,
+        )
+    workspace_value = dict(closed_workspace)
+    workspace_value["scope"] = json.loads(workspace_value.pop("scope_json") or "{}")
+    workspace_value["persisted_status"] = workspace_value["status"]
+    workspace_value["lease_valid"] = False
+    workspace_value["index_pin_active"] = False
+    workspace_value["index_pin_grace_expires_at"] = 0.0
+    return {"session": _public(updated), "workspace": workspace_value, "audit": audit}
+
 def record_validation(session_id: str, session_revision: int, mode: str, commit_sha: str, tree_sha: str, *, job_id: str = "", status: str = "queued", merge_eligible: bool = False, attestation_id: str = "", evidence: dict[str, Any] | None = None, finished: bool = False) -> int:
     init_session_db()
     get_session(session_id)

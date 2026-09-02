@@ -1137,10 +1137,15 @@ def merge_github_pull_request(repository: str, pull_number: int, merge_method: s
         merge_sha = getattr(merged_pr, "merge_commit_sha", None) or result.sha
         if not merge_sha or not SHA_RE.fullmatch(merge_sha):
             return _error_response("MERGE_COMMIT_SHA_INVALID", "GitHub did not return a full merge commit SHA")
+        merged_head = getattr(getattr(merged_pr, "head", None), "sha", None) or expected_head_sha
+        merged_branch = getattr(getattr(merged_pr, "head", None), "ref", None) or readiness.get("head_branch") or ""
+        merged_at = getattr(merged_pr, "merged_at", None)
         return {"ok": True, "merged": True, "repository": repository, "pull_number": pull_number,
                 "merge_method": merge_method, "previous_head_sha": expected_head_sha,
+                "head_branch": merged_branch, "head_sha": merged_head,
                 "merge_commit_sha": merge_sha, "base_branch": expected_base_branch,
                 "base_head_before": readiness["base_sha"], "base_head_after": base_after,
+                "merged_at": merged_at.isoformat() if merged_at else None,
                 "html_url": merged_pr.html_url, "head_branch_deleted": False,
                 "message": result.message}
     except TypeError as e:
