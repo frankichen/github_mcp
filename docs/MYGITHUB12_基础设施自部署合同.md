@@ -169,4 +169,6 @@ DX2-CI-B 的双 Worker rollout 固定在同一 `apply-fixes.sh` 合同内：部�
 
 Worker 隔离合同：`workspace/log/run/可写语言 cache` 按 Worker 分目录；job/service Podman 名称包含 Worker identity；共享内容仅限 sealed dependency environment cache、只读 Playwright browser cache，以及使用同仓库互斥锁的 bare Git mirror。每个 job 保留固定 Podman CPU/memory/swap/pids/tmpfs 限额，systemd 实例另有固定 Memory/CPU/Tasks 上限。
 
+Goose 属于 Worker-local writable Go cache 的受控预热工具，不属于共享只读资产。`apply-fixes.sh` 必须从 Agent Python 配置取得完整 Worker allowlist，分别设置 `PRIVATE_CI_WORKER_ID`，通过 `worker_runtime_config()` 把 Goose 写入 `<writable_cache_root>/go/.tool-bin/goose`，并让 `PodmanRunner` 使用同一个 Worker identity。预热使用 PostgreSQL-capable 精简 build tags，部署 `post_verify` 必须为每个 Worker 验证 binary executable 且 `goose -version` 成功，任一 Worker 失败即 fail-stop。需要 `go-migrate` hook 的 CI job 只允许使用挂载到 `/ci-cache/.tool-bin/goose` 的预热 binary；缺失时必须立即输出 `CI_INFRA_GOOSE_BINARY_UNAVAILABLE`，不得在 migration timeout 内回退到 workspace 网络安装。
+
 marker 仅决定只读诊断中的阶段，不改变 shell、脚本、host、failure mode 或 rollback 合同。未知 marker 不扩展允许阶段。日志 tail 在返回前再次执行 Secret / Authorization / Cookie / Token / database connection URL 脱敏；本扩展不增加 cancel、rollback 或任意执行入口。
