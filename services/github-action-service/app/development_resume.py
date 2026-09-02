@@ -413,6 +413,14 @@ def _next_actions(blockers: list[str], workspace: dict[str, Any] | None, session
     actions: list[str] = []
     if not workspace:
         return ["prepare_development_task"]
+    if (
+        pr
+        and pr.get("merged") is True
+        and session
+        and session.get("status") in ACTIVE_SESSION_STATUSES
+        and "MANAGED_MERGE_RECONCILIATION_REQUIRED" in blockers
+    ):
+        return ["resume_development_task"]
     if workspace.get("status") == "expired":
         return ["resume_development_workspace", "recovery_required"]
     if workspace.get("status") == "drifted":

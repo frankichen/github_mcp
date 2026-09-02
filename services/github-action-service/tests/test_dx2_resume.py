@@ -424,14 +424,14 @@ def test_resume_task_branch_only_discovers_existing_pr_and_readiness(monkeypatch
 
 
 def test_resume_task_reconciles_historical_merged_managed_pr(monkeypatch):
-    ws = _workspace(status="active")
+    ws = _workspace(status="expired", lease=0)
     session = {
         "session_id": "dev_resume", "workspace_id": ws["workspace_id"],
         "repository": "owner/repo", "branch": "ai/resume", "base_branch": "main",
         "status": "pr_ready", "session_revision": 4,
         "workspace_revision": ws["revision"], "head_commit_sha": SHA_A,
         "tree_sha": TREE_A, "lease_expires_at": ws["lease_expires_at"],
-        "pull_number": 7, "last_fast_ci_job_id": None,
+        "pull_number": None, "last_fast_ci_job_id": None,
         "last_full_ci_job_id": "job-full", "last_attestation_id": "att",
         "last_failure_resource_uri": None,
     }
@@ -442,7 +442,7 @@ def test_resume_task_reconciles_historical_merged_managed_pr(monkeypatch):
         "merge_commit_sha": "c" * 40,
     }
     closed_ws = {**ws, "status": "closed", "persisted_status": "closed", "revision": 3, "lease_valid": False}
-    merged_session = {**session, "status": "merged", "session_revision": 5, "workspace_revision": 3, "lease_valid": False}
+    merged_session = {**session, "status": "merged", "pull_number": 7, "session_revision": 5, "workspace_revision": 3, "lease_valid": False}
     _stub_resume_context(monkeypatch, ws=ws, session=session, pr=pr)
 
     def finalize(*args, **kwargs):
@@ -462,5 +462,36 @@ def test_resume_task_reconciles_historical_merged_managed_pr(monkeypatch):
     assert result["recovery"]["managed_merge_reconciliation"]["status"] == "finalized"
     assert result["workspace"]["status"] == "closed"
     assert result["development_session"]["status"] == "merged"
+    assert result["development_session"]["pull_number"] == 7
     assert result["blockers"] == []
     assert result["next_allowed_actions"] == ["managed_merge_finalized"]
+
+
+def test_resume_merged_legacy_task_never_suggests_writer_lease_recovery(monkeypatch):
+    ws = _workspace(status="expired", lease=0)
+    session = {
+        "session_id": "dev_resume", "workspace_id": ws["workspace_id"],
+        "repository": "owner/repo", "branch": "ai/resume", "base_branch": "main",
+        "status": "pr_ready", "session_revision": 4,
+        "workspace_revision": ws["revision"], "head_commit_sha": SHA_A,
+        "tree_sha": TREE_A, "lease_expires_at": 0,
+        "pull_number": None, "last_fast_ci_job_id": None,
+        "last_full_ci_job_id": "job-full", "last_attestation_id": "att",
+        "last_failure_resource_uri": None,
+    }
+    pr = {
+        "ok": True, "pull_number": 7, "merged": True, "state": "closed",
+        "head_branch": "ai/resume", "head_sha": SHA_A,
+        "base_branch": "main", "base_sha": SHA_B,
+        "merge_commit_sha": "c" * 40,
+    }
+    _stub_resume_context(monkeypatch, ws=ws, session=session, pr=pr)
+
+    result = resume.resume_task(
+        FakeService(), "owner/repo", pull_number=7, recover_stale_session=False,
+    )
+
+    assert "MANAGED_MERGE_RECONCILIATION_REQUIRED" in result["blockers"]
+    assert result["recovery"]["managed_merge_reconciliation"]["reason"] == "MANAGED_MERGE_RECONCILIATION_REQUIRED"
+    assert result["next_allowed_actions"] == ["resume_development_task"]
+    assert "resume_development_workspace" not in result["next_allowed_actions"]

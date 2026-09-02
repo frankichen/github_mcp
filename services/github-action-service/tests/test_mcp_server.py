@@ -96,7 +96,7 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.9.3"
+        assert capabilities["version"] == "12.9.4"
         assert capabilities["max_upload_chunk_bytes"] == 24576
         assert capabilities["recommended_upload_chunk_bytes"] == 16384
         assert capabilities["preferred_upload_encoding"] == "text_for_utf8_base64_for_binary"

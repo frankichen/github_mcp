@@ -505,6 +505,24 @@ def finalize_merged_session_workspace(
             or session_row["tree_sha"] != workspace_row["tree_sha"]
         ):
             raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "session and workspace Git identities differ before merge finalization")
+        merge_pull_number = int((merge_evidence or {}).get("pull_number") or 0)
+        if merge_pull_number <= 0:
+            raise MyGithub12Error(
+                "MERGE_EVIDENCE_INCOMPLETE",
+                "managed merge finalization requires a verified pull_number",
+            )
+        current_pull_number = session_row["pull_number"]
+        if current_pull_number is not None and int(current_pull_number) != merge_pull_number:
+            raise MyGithub12Error(
+                "MANAGED_PR_IDENTITY_MISMATCH",
+                "development session is already bound to another pull request",
+                {
+                    "development_session_id": session_id,
+                    "expected_pull_number": merge_pull_number,
+                    "actual_pull_number": int(current_pull_number),
+                },
+            )
+        pull_number_backfilled = current_pull_number is None
         new_workspace_revision = int(expected_workspace_revision) + 1
         workspace_update = db.execute(
             """UPDATE workspaces SET status='closed',lease_expires_at=0,index_commit_sha=NULL,drift_reason=NULL,
@@ -514,10 +532,10 @@ def finalize_merged_session_workspace(
         if workspace_update.rowcount != 1:
             raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH", "workspace changed while finalizing managed merge")
         session_update = db.execute(
-            """UPDATE development_sessions SET status='merged',workspace_revision=?,lease_expires_at=0,
+            """UPDATE development_sessions SET status='merged',pull_number=?,workspace_revision=?,lease_expires_at=0,
             session_revision=session_revision+1,updated_at=?,closed_at=?
             WHERE session_id=? AND session_revision=?""",
-            (new_workspace_revision, now, now, session_id, expected_session_revision),
+            (merge_pull_number, new_workspace_revision, now, now, session_id, expected_session_revision),
         )
         if session_update.rowcount != 1:
             raise MyGithub12Error("DEVELOPMENT_SESSION_REVISION_MISMATCH", "development session changed while finalizing managed merge")
@@ -528,6 +546,8 @@ def finalize_merged_session_workspace(
             "workspace_closed": True,
             "old_workspace_revision": int(expected_workspace_revision),
             "new_workspace_revision": new_workspace_revision,
+            "pull_number": merge_pull_number,
+            "pull_number_backfilled": pull_number_backfilled,
             "merge": dict(merge_evidence or {}),
         }
         _append_event(
