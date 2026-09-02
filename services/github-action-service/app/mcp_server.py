@@ -34,6 +34,7 @@ from app import github_utils
 from app import mygithub10
 from app import mygithub12
 from app import development_orchestrator as development_dx
+from app import development_managed_merge
 from app import artifact_store
 from app import runtime_file_ingress
 from app import attestation_registry
@@ -803,13 +804,41 @@ async def plan_github_pull_request_merge(repository: str, pull_number: int, merg
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
 
-@mcp.tool(name="merge_github_pull_request", description="Safely merge a PR only after readiness gates, exact SHA, passed private CI, and explicit confirm=true. Never deploys. A confirmed merge also queues exact-SHA repository index bootstrap for the new base head.")
+@mcp.tool(name="merge_github_pull_request", description="Safely merge a PR only after readiness gates, exact SHA, passed private CI, and explicit confirm=true. Never deploys. A confirmed merge finalizes any exact managed Development Session/Workspace and queues exact-SHA repository index bootstrap for the new base head.")
 async def merge_github_pull_request(repository: str, pull_number: int, merge_method: str = "squash", expected_head_sha: str = "", required_private_ci_job_id: str = "", expected_base_branch: str = "main", commit_title: str = "", commit_message: str = "", delete_head_branch: bool = False, confirm: bool = False) -> str:
     try:
         if delete_head_branch:
             return json.dumps(github_utils._error_response("HEAD_BRANCH_DELETE_REQUIRES_SEPARATE_AUTHORIZATION", "Automatic head branch deletion is disabled; use delete_github_branch separately."))
         result = await _github_call(github_utils.merge_github_pull_request, repository, pull_number, merge_method, expected_head_sha, required_private_ci_job_id, expected_base_branch, commit_title, commit_message, delete_head_branch, confirm)
         if result.get("ok") and result.get("merged"):
+            try:
+                managed_finalization = await _github_call(
+                    development_managed_merge.finalize_managed_pr_merge,
+                    _service,
+                    repository,
+                    pull_number,
+                    expected_head_sha,
+                    expected_base_branch,
+                    result,
+                    pull_request=result,
+                    allow_no_context=True,
+                )
+                result["managed_finalization"] = managed_finalization
+            except Exception as finalize_exc:
+                state_error = _mygithub10_error(finalize_exc)
+                try:
+                    parsed_error = json.loads(state_error).get("error", {})
+                except Exception:
+                    parsed_error = {"code": type(finalize_exc).__name__, "message": "managed merge finalization failed"}
+                return json.dumps({
+                    **result,
+                    "ok": False,
+                    "merge_completed": True,
+                    "recovery_required": True,
+                    "failed_stage": "development_session_merge_finalize",
+                    "managed_finalization": {"ok": False, "error": parsed_error},
+                    "orchestration_error": parsed_error,
+                }, ensure_ascii=False)
             base_after = str(result.get("base_head_after") or "")
             base_before = str(result.get("base_head_before") or "")
             if re.fullmatch(r"[0-9a-f]{40}", base_after):

@@ -421,3 +421,45 @@ def test_resume_task_branch_only_discovers_existing_pr_and_readiness(monkeypatch
     assert result["pull_request"]["draft"] is True
     assert result["pull_request_readiness"] == readiness
     assert "readiness" in result["candidate_next_actions"]
+
+
+def test_resume_task_reconciles_historical_merged_managed_pr(monkeypatch):
+    ws = _workspace(status="active")
+    session = {
+        "session_id": "dev_resume", "workspace_id": ws["workspace_id"],
+        "repository": "owner/repo", "branch": "ai/resume", "base_branch": "main",
+        "status": "pr_ready", "session_revision": 4,
+        "workspace_revision": ws["revision"], "head_commit_sha": SHA_A,
+        "tree_sha": TREE_A, "lease_expires_at": ws["lease_expires_at"],
+        "pull_number": 7, "last_fast_ci_job_id": None,
+        "last_full_ci_job_id": "job-full", "last_attestation_id": "att",
+        "last_failure_resource_uri": None,
+    }
+    pr = {
+        "ok": True, "pull_number": 7, "merged": True, "state": "closed",
+        "head_branch": "ai/resume", "head_sha": SHA_A,
+        "base_branch": "main", "base_sha": SHA_B,
+        "merge_commit_sha": "c" * 40,
+    }
+    closed_ws = {**ws, "status": "closed", "persisted_status": "closed", "revision": 3, "lease_valid": False}
+    merged_session = {**session, "status": "merged", "session_revision": 5, "workspace_revision": 3, "lease_valid": False}
+    _stub_resume_context(monkeypatch, ws=ws, session=session, pr=pr)
+
+    def finalize(*args, **kwargs):
+        assert kwargs["expected_workspace_id"] == ws["workspace_id"]
+        assert kwargs["expected_session_id"] == session["session_id"]
+        return {
+            "ok": True, "status": "finalized", "managed": True,
+            "workspace": closed_ws, "development_session": merged_session,
+            "evidence": {"merge_commit_sha": "c" * 40},
+        }
+
+    monkeypatch.setattr(resume.managed_merge, "finalize_managed_pr_merge", finalize)
+
+    result = resume.resume_task(FakeService(), "owner/repo", pull_number=7)
+
+    assert result["recovery"]["managed_merge_reconciliation"]["status"] == "finalized"
+    assert result["workspace"]["status"] == "closed"
+    assert result["development_session"]["status"] == "merged"
+    assert result["blockers"] == []
+    assert result["next_allowed_actions"] == ["managed_merge_finalized"]

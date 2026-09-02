@@ -728,9 +728,11 @@ class TestMergeIndexBootstrap:
         }
         calls = []
 
-        async def fake_github_call(function, *args):
+        async def fake_github_call(function, *args, **kwargs):
             if function is mcp_server.github_utils.merge_github_pull_request:
                 return dict(merged)
+            if function is mcp_server.development_managed_merge.finalize_managed_pr_merge:
+                return {"ok": True, "status": "not_applicable", "managed": False}
             if function is mcp_server.mygithub12.request_index_build:
                 calls.append(args)
                 return {
@@ -783,9 +785,11 @@ class TestMergeIndexBootstrap:
             "merge_commit_sha": new_base,
         }
 
-        async def fake_github_call(function, *args):
+        async def fake_github_call(function, *args, **kwargs):
             if function is mcp_server.github_utils.merge_github_pull_request:
                 return dict(merged)
+            if function is mcp_server.development_managed_merge.finalize_managed_pr_merge:
+                return {"ok": True, "status": "not_applicable", "managed": False}
             if function is mcp_server.mygithub12.request_index_build:
                 raise RuntimeError("index backend unavailable")
             raise AssertionError(function)
@@ -830,7 +834,7 @@ class TestMergeIndexBootstrap:
         digest = hashlib.sha256(encoded).hexdigest()
         observed = {}
 
-        async def fake_github_call(function, *args):
+        async def fake_github_call(function, *args, **kwargs):
             assert function is mcp_server.mygithub10.append_upload
             observed["content"] = args[2]
             return {

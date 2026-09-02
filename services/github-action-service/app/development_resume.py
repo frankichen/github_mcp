@@ -15,6 +15,7 @@ from typing import Any
 from app import development_orchestrator as dx
 from app import development_session_store as sessions
 from app import attestation_registry, github_utils, mygithub12
+from app import development_managed_merge as managed_merge
 from app.github_policy import repository_is_allowed
 from app.ci_repository_config import is_private_ci_enabled, is_test_deploy_enabled, is_self_deploy_enabled
 from app.ci_database import get_job as db_get_job, list_jobs as db_list_jobs
@@ -407,6 +408,8 @@ def _reconcile_transient_validation(session: dict[str, Any]) -> tuple[dict[str, 
 
 
 def _next_actions(blockers: list[str], workspace: dict[str, Any] | None, session: dict[str, Any] | None, index: dict[str, Any] | None, pr: dict[str, Any] | None, policy: dict[str, Any], recovery_plan: dict[str, Any] | None = None) -> list[str]:
+    if pr and pr.get("merged") is True and session and session.get("status") == "merged" and workspace and str(workspace.get("status")) == "closed":
+        return ["managed_merge_finalized"]
     actions: list[str] = []
     if not workspace:
         return ["prepare_development_task"]
@@ -490,7 +493,11 @@ def resume_task(
                 )
             workspace = mygithub12.resume_workspace(service, workspace["workspace_id"], expected_workspace_revision, lease_seconds)
             recovery = {"workspace_resumed": True, "resume_evidence": workspace.get("resume_evidence")}
-        session_candidates = find_sessions_for_workspace(str(workspace["workspace_id"]), include_terminal=False, limit=20)
+        session_candidates = find_sessions_for_workspace(
+            str(workspace["workspace_id"]),
+            include_terminal=bool(pr and pr.get("merged") is True),
+            limit=20,
+        )
         session = session_candidates[0] if session_candidates else None
         if session and expected_session_revision and int(session["session_revision"]) != int(expected_session_revision):
             raise MyGithub12Error(
@@ -498,6 +505,37 @@ def resume_task(
                 "development session revision changed",
                 {"expected": int(expected_session_revision), "actual": int(session["session_revision"]), "development_session_id": session["session_id"]},
             )
+        if pr and pr.get("merged") is True and workspace and session:
+            if recover_stale_session:
+                merge_reconciliation = managed_merge.finalize_managed_pr_merge(
+                    service,
+                    repository,
+                    int(pr.get("pull_number") or pull_number or 0),
+                    branch_head,
+                    current_main["branch"],
+                    {"base_head_after": current_main["commit_sha"], "merge_commit_sha": pr.get("merge_commit_sha")},
+                    pull_request=pr,
+                    expected_workspace_id=str(workspace["workspace_id"]),
+                    expected_session_id=str(session["session_id"]),
+                    expected_workspace_revision=int(workspace["revision"]),
+                    expected_session_revision=int(session["session_revision"]),
+                    allow_no_context=False,
+                )
+                recovery = {**(recovery or {}), "managed_merge_reconciliation": merge_reconciliation}
+                if merge_reconciliation.get("managed"):
+                    session = merge_reconciliation.get("development_session") or session
+                    workspace = merge_reconciliation.get("workspace") or workspace
+                    session_candidates = [session]
+                    workspace_candidates = [workspace]
+            else:
+                recovery = {**(recovery or {}), "managed_merge_reconciliation": {
+                    "action": "resume_development_task",
+                    "manual_recovery_required": True,
+                    "reason": "MANAGED_MERGE_RECONCILIATION_REQUIRED",
+                    "development_session_id": session.get("session_id"),
+                    "workspace_id": workspace.get("workspace_id"),
+                }}
+                blockers.append("MANAGED_MERGE_RECONCILIATION_REQUIRED")
         stale = bool(session) and (
             int(session.get("workspace_revision") or 0) != int(workspace.get("revision") or 0)
             or session.get("head_commit_sha") != workspace.get("head_sha")
@@ -536,7 +574,14 @@ def resume_task(
             recovery = {**(recovery or {}), "transient": transient_recovery}
             if transient_blocker:
                 blockers.append(transient_blocker)
-        if workspace.get("status") in {"expired", "drifted", "closed"}:
+        settled_managed_merge = bool(
+            pr and pr.get("merged") is True
+            and session
+            and session.get("status") == "merged"
+            and workspace
+            and workspace.get("status") == "closed"
+        )
+        if workspace.get("status") in {"expired", "drifted", "closed"} and not settled_managed_merge:
             blockers.append("WORKSPACE_" + str(workspace.get("status", "unknown")).upper())
         if (
             session

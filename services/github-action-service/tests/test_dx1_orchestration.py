@@ -615,7 +615,7 @@ async def test_finalize_merge_keeps_merge_evidence_when_session_finalize_fails(m
         lambda *args, **kwargs: {"ok": True, "merged": True, "merge_commit_sha": SHA_C},
     )
     monkeypatch.setattr(
-        sessions, "finalize_merged_session_workspace",
+        dx_mcp.managed_merge, "finalize_managed_pr_merge",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             mygithub12.MyGithub12Error("DEVELOPMENT_SESSION_REVISION_MISMATCH", "session changed")
         ),

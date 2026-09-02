@@ -13,6 +13,7 @@ from mcp.types import ToolAnnotations
 from app import artifact_store
 from app import development_drift_recovery as drift_recovery
 from app import development_base_sync_recovery as base_sync_recovery
+from app import development_managed_merge as managed_merge
 from app import development_converge as converge
 from app import development_orchestrator as dx
 from app import development_resume as resume
@@ -753,11 +754,14 @@ def register_dx_tools(
                 if not merged.get("ok") or not merged.get("merged"): return json.dumps({"ok":False,"development_session":session,"merge":merged},ensure_ascii=False)
                 try:
                     finalized=await github_call(
-                        sessions.finalize_merged_session_workspace,
-                        development_session_id,effective_session_revision,session["workspace_id"],int(session["workspace_revision"]),
-                        merge_evidence={"pull_number":session.get("pull_number"),"merge_commit_sha":merged.get("merge_commit_sha")},
+                        managed_merge.finalize_managed_pr_merge,
+                        service,session["repository"],int(session["pull_number"]),session["head_commit_sha"],session["base_branch"],merged,
+                        pull_request=merged,
+                        expected_workspace_id=session["workspace_id"],expected_session_id=development_session_id,
+                        expected_workspace_revision=int(session["workspace_revision"]),expected_session_revision=effective_session_revision,
+                        allow_no_context=False,
                     )
-                    updated=finalized["session"]
+                    updated=finalized["development_session"]
                     closed_workspace=finalized["workspace"]
                 except Exception as state_exc:
                     state_error=_error_payload(state_exc)
@@ -765,11 +769,12 @@ def register_dx_tools(
                         "ok":False,"development_session":session,"merge":merged,
                         "merge_completed":True,"recovery_required":True,
                         "failed_stage":"development_session_merge_finalize",
+                        "managed_finalization":{"ok":False,"error":state_error["error"]},
                         "orchestration_error":state_error["error"],
                     },ensure_ascii=False)
                 return json.dumps({
                     "ok":True,"development_session":updated,"workspace":closed_workspace,"merge":merged,
-                    "merge_finalization":finalized.get("audit"),"lease_maintenance":lease_maintenance,
+                    "managed_finalization":finalized,"merge_finalization":finalized.get("audit"),"lease_maintenance":lease_maintenance,
                 },ensure_ascii=False)
             # close
             closing=await github_call(sessions.transition,development_session_id,effective_session_revision,"closing",event_type="session_closing",allowed_from={"active","pr_ready","drifted","blocked","validating_fast","validating_full"})
