@@ -116,11 +116,35 @@ def test_development_session_idempotency_conflict_and_restart_recovery(tmp_path,
             workspace_id=workspace_id, revision=7, head_sha=SHA_C, tree_sha=SHA_B
         )
     )
-    assert recovered == {"checked_sessions": 1, "recovery_required": 1}
+    assert recovered == {"checked_sessions": 1, "recovery_required": 0}
     current = sessions.get_session(validating["session_id"])
-    assert current["status"] == "blocked"
-    assert current["workspace_revision"] == 7
-    assert current["head_commit_sha"] == SHA_C
+    assert current["status"] == "validating_full"
+    assert current["workspace_revision"] == validating["workspace_revision"]
+    assert current["head_commit_sha"] == validating["head_commit_sha"]
+
+
+def test_validation_correlation_is_restart_durable_and_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "validation-correlation.db"))
+    created = sessions.create_session(_workspace(), idempotency_key="correlation")
+    validating = sessions.transition(created["session_id"], created["session_revision"], "validating_fast", allowed_from={"active"})
+
+    first_id = sessions.record_validation(
+        validating["session_id"], validating["session_revision"], "fast", SHA_B, SHA_C,
+        job_id="job-exact", status="running", evidence={"selection": {"complete": True}},
+    )
+    second_id = sessions.record_validation(
+        validating["session_id"], validating["session_revision"], "fast", SHA_B, SHA_C,
+        job_id="job-exact", status="passed", evidence={"selection": {"complete": True}}, finished=True,
+    )
+    correlations = sessions.validation_correlations(
+        validating["session_id"], validating["session_revision"], "fast", SHA_B, SHA_C,
+    )
+
+    assert second_id == first_id
+    assert len(correlations) == 1
+    assert correlations[0]["job_id"] == "job-exact"
+    assert correlations[0]["status"] == "passed"
+    assert correlations[0]["finished_at"] is not None
 
 
 def test_atomic_session_workspace_auto_renew_syncs_revisions_and_audit(tmp_path, monkeypatch):

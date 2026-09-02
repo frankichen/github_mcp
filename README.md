@@ -57,7 +57,7 @@ private-deploy-agent（服务器端）
 
 ## GitHub Action Service
 
-MyGithut12 源码当前版本为 `12.9.0`；生产运行版本必须以 `get_mygithub_capabilities` 的实时结果为准。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。AI 日常生成 UTF-8 文本文件继续只有一个推荐入口 `put_generated_files`：普通内容使用 `files[{path,content}]`，超过 inline transport budget 时仍调用同一个工具，由 ChatGPT/Codex runtime 通过顶层 `bundle_file` 交付 version=1 的 JSON 文件包；服务端负责临时文件下载、JSON/UTF-8/路径/大小校验、Workspace/Session CAS、旧 blob 推断、hash、chunk staging、原子 Commit 和 durable read-back。bundle 下载只接受 `*.oaiusercontent.com` 或受限 OpenAI Azure Blob fileParam 投递域名的 HTTPS/443 临时 URL，并在首跳与每次 redirect 前重新校验域名 allowlist 和公网 DNS；窗口不管理 upload/chunk/offset/hash/candidate/expected_blob；V2 仍不支持二进制仓库文件和删除。
+MyGithut12 源码当前版本为 `12.9.1`；生产运行版本必须以 `get_mygithub_capabilities` 的实时结果为准。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。AI 日常生成 UTF-8 文本文件继续只有一个推荐入口 `put_generated_files`：普通内容使用 `files[{path,content}]`，超过 inline transport budget 时仍调用同一个工具，由 ChatGPT/Codex runtime 通过顶层 `bundle_file` 交付 version=1 的 JSON 文件包；服务端负责临时文件下载、JSON/UTF-8/路径/大小校验、Workspace/Session CAS、旧 blob 推断、hash、chunk staging、原子 Commit 和 durable read-back。bundle 下载只接受 `*.oaiusercontent.com` 或受限 OpenAI Azure Blob fileParam 投递域名的 HTTPS/443 临时 URL，并在首跳与每次 redirect 前重新校验域名 allowlist 和公网 DNS；窗口不管理 upload/chunk/offset/hash/candidate/expected_blob；V2 仍不支持二进制仓库文件和删除。
 
 DX-1 的 `apply_development_change_set` 对小 Candidate 保留 `change_set_json`，对大或 exact-byte-sensitive Candidate 使用 MCP runtime `change_set_file`；当 ChatGPT connector 对该字段未稳定注册 fileParam 时，可使用同工具内的 `bundle_file` 作为传输别名，服务端仍按 ChangeSet artifact 处理并返回 `payload_source=change_set_file`。服务端先校验下载原始 bytes 的长度、SHA-256 与可选 Git Blob SHA，再 strict UTF-8 decode、JSON parse 和 ChangeSet validation；不执行 CRLF、Unicode、BOM 或末尾换行规范化。raw strict dry-run 会持久化一个默认 30 分钟、Session/Workspace/HEAD/blob scope 绑定的 `prepared_change_set_id`，真实 write 使用该 ID 并重新执行全部 CAS，而不要求 AI 再传一次 Candidate。下载安全实现与 `put_generated_files(bundle_file)` 共享。
 
@@ -103,7 +103,7 @@ docker compose up -d --build
 
 ## MyGithut12 运行状态
 
-MyGithut12 `12.9.0` 源码的 compatibility registration 为 174 个工具，canonical production Schema 为 164 个可见工具；生产 Schema 身份必须以运行时 capability 为准。本版新增 DX-1 ChangeSet runtime-file ingress 与 server-side prepared artifact；`converge_development_task` 继续在准确 Development Session revision 与 HEAD/Tree 门禁下编排 exact-HEAD Index、Change Context、Change Impact、Contract Change Detection、Affected Tests 与 fast/full Private CI。Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
+MyGithut12 `12.9.1` 源码的 compatibility registration 为 174 个工具，canonical production Schema 为 164 个可见工具；生产 Schema 身份必须以运行时 capability 为准。本版为中断的 `validating_fast` / `validating_full` 增加 exact-job、CAS-safe reconciliation；`converge_development_task` 继续在准确 Development Session revision 与 HEAD/Tree 门禁下编排 exact-HEAD Index、Change Context、Change Impact、Contract Change Detection、Affected Tests 与 fast/full Private CI。Repository Index 数据格式没有改变，因此 `repository_index_version` 继续为 `12.0.0-1`。
 
 ## Private Deploy Agent
 

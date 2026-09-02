@@ -609,6 +609,20 @@ def register_dx_tools(
                     "validation_started":False,"recovery_required":not bool(rollback),
                     "error":start_error["error"],
                 },ensure_ascii=False)
+            try:
+                await github_call(
+                    sessions.record_validation,development_session_id,phase_session["session_revision"],mode,
+                    phase_session["head_commit_sha"],phase_session["tree_sha"],job_id=job["job_id"],
+                    status=job.get("status") or "queued",evidence={"selection":selection},
+                )
+            except Exception as correlate_exc:
+                correlate_error=_error_payload(correlate_exc)
+                return json.dumps({
+                    "ok":False,"development_session":phase_session,"mode":mode,
+                    "validation_started":True,"recovery_required":True,
+                    "job":{"job_id":job.get("job_id"),"status":job.get("status"),"profile":job.get("profile"),"commit_sha":job.get("commit_sha")},
+                    "failed_stage":"validation_correlate","orchestration_error":correlate_error["error"],
+                },ensure_ascii=False)
             result=None
             try:
                 job=await github_call(dx.wait_validation,job["job_id"],wait_seconds)
