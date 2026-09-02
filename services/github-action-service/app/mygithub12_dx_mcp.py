@@ -12,6 +12,7 @@ from mcp.types import ToolAnnotations
 
 from app import artifact_store
 from app import development_drift_recovery as drift_recovery
+from app import development_base_sync_recovery as base_sync_recovery
 from app import development_converge as converge
 from app import development_orchestrator as dx
 from app import development_resume as resume
@@ -104,6 +105,41 @@ def register_dx_tools(
                 drift_recovery.recover_drifted_task,service,repository,branch,workspace_id,development_session_id,
                 expected_workspace_revision,expected_session_revision,expected_current_head_sha,expected_current_tree_sha,
                 expected_base_branch,expected_base_sha,idempotency_key,lease_seconds,
+            )
+            return json.dumps(result,ensure_ascii=False)
+        except Exception as exc: return _error(exc)
+
+    @mcp.tool(
+        name="recover_base_synced_development_task",
+        description=(
+            "Explicitly adopt a freshly verified conflict-free base synchronization into a drifted "
+            "Workspace/Development Session. Requires exact old/new base, old Session HEAD and current "
+            "HEAD/Tree identities; never moves Git refs or writes repository files."
+        ),
+        annotations=_ORCHESTRATION,
+    )
+    async def recover_base_synced_development_task(
+        repository: str,
+        branch: str,
+        workspace_id: str,
+        development_session_id: str,
+        expected_workspace_revision: int,
+        expected_session_revision: int,
+        expected_old_base_sha: str,
+        expected_new_base_sha: str,
+        expected_base_branch: str,
+        expected_old_session_head_sha: str,
+        expected_current_head_sha: str,
+        expected_current_tree_sha: str,
+        idempotency_key: str,
+        lease_seconds: int=mygithub12.DEFAULT_LEASE_SECONDS,
+    ) -> str:
+        try:
+            result=await github_call(
+                base_sync_recovery.recover_base_synced_task,service,repository,branch,workspace_id,development_session_id,
+                expected_workspace_revision,expected_session_revision,expected_old_base_sha,expected_new_base_sha,
+                expected_base_branch,expected_old_session_head_sha,expected_current_head_sha,expected_current_tree_sha,
+                idempotency_key,lease_seconds,
             )
             return json.dumps(result,ensure_ascii=False)
         except Exception as exc: return _error(exc)
@@ -716,7 +752,13 @@ def register_dx_tools(
                 merged=await github_call(github_utils.merge_github_pull_request,session["repository"],int(session["pull_number"]),merge_method,session["head_commit_sha"],required_private_ci_job_id,session["base_branch"],"","",delete_head_branch,True)
                 if not merged.get("ok") or not merged.get("merged"): return json.dumps({"ok":False,"development_session":session,"merge":merged},ensure_ascii=False)
                 try:
-                    updated=await github_call(sessions.transition,development_session_id,effective_session_revision,"merged",event_type="pull_request_merged",allowed_from={"active","pr_ready"})
+                    finalized=await github_call(
+                        sessions.finalize_merged_session_workspace,
+                        development_session_id,effective_session_revision,session["workspace_id"],int(session["workspace_revision"]),
+                        merge_evidence={"pull_number":session.get("pull_number"),"merge_commit_sha":merged.get("merge_commit_sha")},
+                    )
+                    updated=finalized["session"]
+                    closed_workspace=finalized["workspace"]
                 except Exception as state_exc:
                     state_error=_error_payload(state_exc)
                     return json.dumps({
@@ -725,7 +767,10 @@ def register_dx_tools(
                         "failed_stage":"development_session_merge_finalize",
                         "orchestration_error":state_error["error"],
                     },ensure_ascii=False)
-                return json.dumps({"ok":True,"development_session":updated,"merge":merged,"lease_maintenance":lease_maintenance},ensure_ascii=False)
+                return json.dumps({
+                    "ok":True,"development_session":updated,"workspace":closed_workspace,"merge":merged,
+                    "merge_finalization":finalized.get("audit"),"lease_maintenance":lease_maintenance,
+                },ensure_ascii=False)
             # close
             closing=await github_call(sessions.transition,development_session_id,effective_session_revision,"closing",event_type="session_closing",allowed_from={"active","pr_ready","drifted","blocked","validating_fast","validating_full"})
             try:

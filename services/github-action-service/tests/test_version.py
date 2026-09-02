@@ -39,7 +39,7 @@ def test_runtime_version_must_match_authoritative_version(monkeypatch):
 
 def test_authoritative_version_is_1280():
     assert version.SERVICE_NAME == "MyGithut12"
-    assert version.SERVICE_VERSION == "12.9.1"
+    assert version.SERVICE_VERSION == "12.9.2"
 
 
 def test_controller_dockerfile_routes_apt_through_inherited_proxy():

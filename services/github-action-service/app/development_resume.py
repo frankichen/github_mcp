@@ -181,7 +181,38 @@ def _session_evidence(session: dict[str, Any] | None, current_head: str) -> dict
     return {"current_head": current, "historical": historical}
 
 
-def _workspace_recovery_plan(workspace: dict[str, Any] | None) -> dict[str, Any] | None:
+def _resume_ancestry_evidence(service: Any, repository: str, ancestor: str, descendant: str) -> dict[str, Any]:
+    try:
+        repo = mygithub12._service_repo(service, repository)
+        comparison = repo.compare(ancestor, descendant)
+        merge_base = str(comparison.merge_base_commit.sha) if getattr(comparison, "merge_base_commit", None) else ""
+        ahead_by = int(getattr(comparison, "ahead_by", 0) or 0)
+        behind_by = int(getattr(comparison, "behind_by", 0) or 0)
+        return {
+            "verified": merge_base == ancestor and behind_by == 0,
+            "ancestor": ancestor,
+            "descendant": descendant,
+            "merge_base": merge_base,
+            "ahead_by": ahead_by,
+            "behind_by": behind_by,
+        }
+    except Exception as exc:
+        return {
+            "verified": False,
+            "ancestor": ancestor,
+            "descendant": descendant,
+            "error_type": type(exc).__name__,
+        }
+
+
+def _workspace_recovery_plan(
+    workspace: dict[str, Any] | None,
+    *,
+    service: Any | None = None,
+    session: dict[str, Any] | None = None,
+    current_main: dict[str, Any] | None = None,
+    branch_state: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     if not workspace:
         return None
     status = workspace.get("status")
@@ -193,6 +224,47 @@ def _workspace_recovery_plan(workspace: dict[str, Any] | None) -> dict[str, Any]
             "expected_workspace_revision": workspace.get("revision"),
         }
     if status == "drifted":
+        old_base = str(workspace.get("base_commit_sha") or "")
+        session_base = str((session or {}).get("base_commit_sha") or "")
+        new_base = str((current_main or {}).get("commit_sha") or "")
+        old_head = str((session or {}).get("head_commit_sha") or "")
+        current_head = str((branch_state or {}).get("commit_sha") or "")
+        base_sync = bool(
+            service
+            and session
+            and current_main
+            and branch_state
+            and workspace.get("drift_reason") == "branch_moved_externally"
+            and old_base
+            and session_base == old_base
+            and new_base
+            and new_base != old_base
+            and old_head
+            and current_head
+        )
+        if base_sync:
+            repository = str(workspace.get("repository") or "")
+            preflight = {
+                "base_ancestry": _resume_ancestry_evidence(service, repository, old_base, new_base),
+                "task_ancestry": _resume_ancestry_evidence(service, repository, old_head, current_head),
+                "new_base_ancestry": _resume_ancestry_evidence(service, repository, new_base, current_head),
+            }
+            preflight["verified"] = all(item.get("verified") for item in preflight.values() if isinstance(item, dict))
+            return {
+                "reason": "WORKSPACE_BASE_SYNCED_EXTERNALLY",
+                "action": "recover_base_synced_development_task",
+                "recovery_tool": "recover_base_synced_development_task",
+                "manual_recovery_required": True,
+                "workspace_id": workspace.get("workspace_id"),
+                "development_session_id": session.get("session_id"),
+                "drift_reason": workspace.get("drift_reason"),
+                "expected_old_base_sha": old_base,
+                "expected_new_base_sha": new_base,
+                "expected_old_session_head_sha": old_head,
+                "expected_current_head_sha": current_head,
+                "expected_current_tree_sha": branch_state.get("tree_sha"),
+                "preflight": preflight,
+            }
         return {
             "reason": "WORKSPACE_BRANCH_DRIFTED",
             "action": "recover_drifted_development_task",
@@ -334,14 +406,15 @@ def _reconcile_transient_validation(session: dict[str, Any]) -> tuple[dict[str, 
     }, None
 
 
-def _next_actions(blockers: list[str], workspace: dict[str, Any] | None, session: dict[str, Any] | None, index: dict[str, Any] | None, pr: dict[str, Any] | None, policy: dict[str, Any]) -> list[str]:
+def _next_actions(blockers: list[str], workspace: dict[str, Any] | None, session: dict[str, Any] | None, index: dict[str, Any] | None, pr: dict[str, Any] | None, policy: dict[str, Any], recovery_plan: dict[str, Any] | None = None) -> list[str]:
     actions: list[str] = []
     if not workspace:
         return ["prepare_development_task"]
     if workspace.get("status") == "expired":
         return ["resume_development_workspace", "recovery_required"]
     if workspace.get("status") == "drifted":
-        return ["recover_drifted_development_task", "recovery_required"]
+        action = str((recovery_plan or {}).get("action") or "recover_drifted_development_task")
+        return [action, "recovery_required"]
     if not session:
         return ["recovery_required", "prepare_development_task"]
     if "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS" in blockers:
@@ -499,6 +572,13 @@ def resume_task(
     ci = _recent_ci(repository, effective_branch, branch_head)
     session_evidence = _session_evidence(session, branch_head)
     blockers = list(dict.fromkeys(blockers))
+    workspace_recovery = recovery or _workspace_recovery_plan(
+        workspace,
+        service=service,
+        session=session,
+        current_main=current_main,
+        branch_state=branch_state,
+    )
     response = {
         "ok": True,
         "repository": repository,
@@ -515,11 +595,11 @@ def resume_task(
         "private_ci": {"current_head": ci, "session_evidence": session_evidence},
         "pull_request_readiness": readiness,
         "overlap": overlap,
-        "recovery": recovery or _workspace_recovery_plan(workspace),
+        "recovery": workspace_recovery,
         "blockers": blockers,
         "degraded": degraded,
     }
-    next_actions = _next_actions(blockers, workspace, session, index, pr, policy)
+    next_actions = _next_actions(blockers, workspace, session, index, pr, policy, workspace_recovery)
     response["live_facts"] = {
         "policy": policy, "current_main": current_main, "branch": branch_state, "pull_request": pr,
         "workspace": workspace, "development_session": session, "index": index,
