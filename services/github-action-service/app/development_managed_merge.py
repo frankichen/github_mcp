@@ -96,6 +96,7 @@ def _canonical_context(
     *,
     expected_workspace_id: str = "",
     expected_session_id: str = "",
+    allow_legacy_exact_fallback: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     workspaces = _workspace_candidates(
         service, repository, pull_number, head_branch, head_sha, base_branch
@@ -107,6 +108,50 @@ def _canonical_context(
         workspaces = [item for item in workspaces if item.get("workspace_id") == expected_workspace_id]
     if expected_session_id:
         sessions_for_pr = [item for item in sessions_for_pr if item.get("session_id") == expected_session_id]
+
+    if (
+        allow_legacy_exact_fallback
+        and expected_workspace_id
+        and expected_session_id
+        and (not workspaces or not sessions_for_pr)
+    ):
+        try:
+            workspace = mygithub12.get_workspace(service, expected_workspace_id)
+            session = sessions.get_session(expected_session_id)
+        except MyGithub12Error as exc:
+            if exc.code in {"WORKSPACE_NOT_FOUND", "DEVELOPMENT_SESSION_NOT_FOUND"}:
+                return None, None
+            raise
+
+        session_pull = session.get("pull_number")
+        workspace_pull = workspace.get("pr_number")
+        checks = {
+            "workspace_id": workspace.get("workspace_id") == expected_workspace_id,
+            "session_id": session.get("session_id") == expected_session_id,
+            "session_workspace_id": session.get("workspace_id") == expected_workspace_id,
+            "repository": session.get("repository") == workspace.get("repository") == repository,
+            "branch": session.get("branch") == workspace.get("branch") == head_branch,
+            "base_branch": session.get("base_branch") == workspace.get("base_branch") == base_branch,
+            "head_sha": session.get("head_commit_sha") == workspace.get("head_sha") == head_sha,
+            "tree_sha": session.get("tree_sha") == workspace.get("tree_sha"),
+            "workspace_revision": int(session.get("workspace_revision") or 0) == int(workspace.get("revision") or 0),
+            "session_pull_number": session_pull is None or int(session_pull) == int(pull_number),
+            "workspace_pull_number": workspace_pull is None or int(workspace_pull) == int(pull_number),
+        }
+        mismatches = [key for key, ok in checks.items() if not ok]
+        if mismatches:
+            raise _error(
+                "MANAGED_PR_IDENTITY_MISMATCH",
+                "legacy managed PR Workspace and Development Session identities differ",
+                {
+                    "repository": repository,
+                    "pull_number": int(pull_number),
+                    "workspace_id": workspace.get("workspace_id"),
+                    "session_id": session.get("session_id"),
+                    "mismatches": mismatches,
+                },
+            )
+        return workspace, session
 
     if not workspaces and not sessions_for_pr:
         return None, None
@@ -367,6 +412,7 @@ def finalize_managed_pr_merge(
         str(evidence["base_branch"]),
         expected_workspace_id=expected_workspace_id,
         expected_session_id=expected_session_id,
+        allow_legacy_exact_fallback=True,
     )
     if workspace is None and session is None:
         if allow_no_context:

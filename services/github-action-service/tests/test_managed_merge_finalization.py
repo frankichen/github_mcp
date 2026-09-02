@@ -342,3 +342,139 @@ def test_merged_pr_head_must_match_managed_session_head():
         )
 
     assert exc.value.code == "MANAGED_PR_IDENTITY_MISMATCH"
+
+
+def test_legacy_null_pull_number_exact_ids_reconciles_atomically_and_idempotently(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "legacy-null.db"))
+    workspace = _insert_workspace(lease=0)
+    assert workspace["status"] == "expired"
+    session = sessions.create_session(
+        {**workspace, "status": "active", "pr_number": None},
+        status="pr_ready",
+    )
+    assert session["pull_number"] is None
+
+    first = managed_merge.finalize_managed_pr_merge(
+        FakeService(), REPO, 7, HEAD, BASE_BRANCH, _merge_result(),
+        pull_request=_merged_pr(),
+        expected_workspace_id=workspace["workspace_id"],
+        expected_session_id=session["session_id"],
+        expected_workspace_revision=workspace["revision"],
+        expected_session_revision=session["session_revision"],
+        allow_no_context=False,
+    )
+
+    assert first["development_session"]["status"] == "merged"
+    assert first["development_session"]["pull_number"] == 7
+    assert first["workspace"]["status"] == "closed"
+    assert first["workspace"]["lease_expires_at"] == 0
+    assert first["audit"]["pull_number"] == 7
+    assert first["audit"]["pull_number_backfilled"] is True
+
+    second = managed_merge.finalize_managed_pr_merge(
+        FakeService(), REPO, 7, HEAD, BASE_BRANCH, _merge_result(),
+        pull_request=_merged_pr(),
+        expected_workspace_id=workspace["workspace_id"],
+        expected_session_id=session["session_id"],
+        expected_workspace_revision=first["workspace"]["revision"],
+        expected_session_revision=first["development_session"]["session_revision"],
+        allow_no_context=False,
+    )
+    assert second["status"] == "already_finalized"
+    assert second["development_session"]["pull_number"] == 7
+    assert second["development_session"]["session_revision"] == first["development_session"]["session_revision"]
+    assert second["workspace"]["revision"] == first["workspace"]["revision"]
+
+
+def test_legacy_null_pull_number_without_exact_ids_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "legacy-no-ids.db"))
+    workspace = _insert_workspace()
+    sessions.create_session({**workspace, "pr_number": None}, status="pr_ready")
+
+    with pytest.raises(managed_merge.MyGithub12Error) as exc:
+        managed_merge.finalize_managed_pr_merge(
+            FakeService(), REPO, 7, HEAD, BASE_BRANCH, _merge_result(),
+            pull_request=_merged_pr(),
+            allow_no_context=False,
+        )
+
+    assert exc.value.code == "MANAGED_PR_CONTEXT_AMBIGUOUS"
+
+
+def test_legacy_exact_fallback_rejects_session_bound_to_other_pr(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "legacy-other-pr.db"))
+    workspace = _insert_workspace()
+    session = sessions.create_session({**workspace, "pr_number": 8}, status="pr_ready")
+
+    with pytest.raises(managed_merge.MyGithub12Error) as exc:
+        managed_merge.finalize_managed_pr_merge(
+            FakeService(), REPO, 7, HEAD, BASE_BRANCH, _merge_result(),
+            pull_request=_merged_pr(),
+            expected_workspace_id=workspace["workspace_id"],
+            expected_session_id=session["session_id"],
+            expected_workspace_revision=workspace["revision"],
+            expected_session_revision=session["session_revision"],
+            allow_no_context=False,
+        )
+
+    assert exc.value.code == "MANAGED_PR_IDENTITY_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    ("workspace_id", "session_id"),
+    [("ws_missing", None), (None, "dev_missing")],
+)
+def test_legacy_exact_fallback_rejects_wrong_expected_ids(tmp_path, monkeypatch, workspace_id, session_id):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / f"legacy-wrong-{workspace_id}-{session_id}.db"))
+    workspace = _insert_workspace()
+    session = sessions.create_session({**workspace, "pr_number": None}, status="pr_ready")
+
+    with pytest.raises(managed_merge.MyGithub12Error) as exc:
+        managed_merge.finalize_managed_pr_merge(
+            FakeService(), REPO, 7, HEAD, BASE_BRANCH, _merge_result(),
+            pull_request=_merged_pr(),
+            expected_workspace_id=workspace_id or workspace["workspace_id"],
+            expected_session_id=session_id or session["session_id"],
+            expected_workspace_revision=workspace["revision"],
+            expected_session_revision=session["session_revision"],
+            allow_no_context=False,
+        )
+
+    assert exc.value.code == "MANAGED_PR_CONTEXT_NOT_FOUND"
+
+
+def test_legacy_exact_fallback_rejects_session_workspace_revision_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "legacy-revision.db"))
+    workspace = _insert_workspace()
+    session = sessions.create_session(
+        {**workspace, "revision": workspace["revision"] + 1, "pr_number": None},
+        status="pr_ready",
+    )
+
+    with pytest.raises(managed_merge.MyGithub12Error) as exc:
+        managed_merge.finalize_managed_pr_merge(
+            FakeService(), REPO, 7, HEAD, BASE_BRANCH, _merge_result(),
+            pull_request=_merged_pr(),
+            expected_workspace_id=workspace["workspace_id"],
+            expected_session_id=session["session_id"],
+            expected_workspace_revision=workspace["revision"],
+            expected_session_revision=session["session_revision"],
+            allow_no_context=False,
+        )
+
+    assert exc.value.code == "MANAGED_PR_IDENTITY_MISMATCH"
+    assert "workspace_revision" in exc.value.details["mismatches"]
+
+
+def test_open_pr_preflight_never_uses_legacy_exact_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "legacy-open.db"))
+    workspace = _insert_workspace()
+    sessions.create_session({**workspace, "pr_number": None}, status="pr_ready")
+    open_pr = {**_merged_pr(), "merged": False, "state": "open"}
+
+    with pytest.raises(managed_merge.MyGithub12Error) as exc:
+        managed_merge.preflight_managed_pr_context(
+            FakeService(), REPO, 7, HEAD, BASE_BRANCH, pull_request=open_pr,
+        )
+
+    assert exc.value.code == "MANAGED_PR_CONTEXT_AMBIGUOUS"
