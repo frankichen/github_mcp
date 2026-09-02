@@ -8,6 +8,7 @@ from app import github_utils, deployment_service, ci_repository_config
 def _pr(head="a" * 40, requested=None, reviews=None):
     pr = MagicMock()
     pr.number = 544; pr.title = "测试"; pr.body = ""; pr.state = "open"; pr.draft = False; pr.merged = False
+    pr.merge_commit_sha = None
     pr.mergeable = True; pr.mergeable_state = "clean"; pr.head.ref = "feature"; pr.head.sha = head
     pr.base.ref = "main"; pr.base.sha = "b" * 40; pr.user.login = "owner"; pr.html_url = "https://example/pr/544"
     pr.created_at = pr.updated_at = pr.closed_at = pr.merged_at = None
@@ -31,6 +32,34 @@ def test_pull_request_read_has_separate_requested_and_submitted_reviews(monkeypa
     assert result["requested_teams"] == ["backend"]
     assert result["reviews"][0]["state"] == "APPROVED"
     assert result["review_decision"] == "APPROVED"
+
+
+def test_pull_request_detail_includes_merge_commit_sha_for_merged_pr(monkeypatch):
+    expected = "c" * 40
+    pr = _pr()
+    pr.state = "closed"
+    pr.merged = True
+    pr.merge_commit_sha = expected
+    repo = MagicMock(); repo.full_name = "owner/repo"; repo.get_pull.return_value = pr
+    monkeypatch.setattr(github_utils, "_get_gh", lambda: MagicMock(get_repo=lambda _: repo))
+
+    result = github_utils.get_github_pull_request("owner/repo", 813)
+
+    assert result["merged"] is True
+    assert result["merge_commit_sha"] == expected
+
+
+def test_pull_request_detail_keeps_merge_commit_sha_field_for_open_pr(monkeypatch):
+    pr = _pr()
+    pr.merge_commit_sha = None
+    repo = MagicMock(); repo.full_name = "owner/repo"; repo.get_pull.return_value = pr
+    monkeypatch.setattr(github_utils, "_get_gh", lambda: MagicMock(get_repo=lambda _: repo))
+
+    result = github_utils.get_github_pull_request("owner/repo", 814)
+
+    assert result["merged"] is False
+    assert "merge_commit_sha" in result
+    assert result["merge_commit_sha"] is None
 
 
 def test_reviewer_rest_fallback_when_sdk_method_missing():

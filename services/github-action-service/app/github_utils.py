@@ -587,6 +587,7 @@ def get_github_pull_request(repository: str, pull_number: int) -> dict:
             "state": pr.state,
             "draft": pr.draft,
             "merged": pr.merged,
+            "merge_commit_sha": pr.merge_commit_sha,
             "mergeable": mergeable,
             "mergeable_state": getattr(pr, "mergeable_state", None),
             "head_branch": pr.head.ref,
