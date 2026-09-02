@@ -96,7 +96,7 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.9.2"
+        assert capabilities["version"] == "12.9.3"
         assert capabilities["max_upload_chunk_bytes"] == 24576
         assert capabilities["recommended_upload_chunk_bytes"] == 16384
         assert capabilities["preferred_upload_encoding"] == "text_for_utf8_base64_for_binary"
@@ -153,6 +153,29 @@ class TestMCPTools:
         assert "create_github_branch" in tool_names
         assert "commit_github_files" in tool_names
         assert "create_github_pull_request" in tool_names
+
+    @pytest.mark.asyncio
+    async def test_get_github_pull_request_mcp_response_keeps_merge_commit_sha(self, monkeypatch):
+        import json
+        from app import mcp_server
+
+        expected = "c" * 40
+
+        async def fake_github_call(function, *args, **kwargs):
+            assert function is mcp_server.github_utils.get_github_pull_request
+            return {
+                "ok": True,
+                "repository": "owner/allowed-repo",
+                "pull_number": 813,
+                "merged": True,
+                "merge_commit_sha": expected,
+            }
+
+        monkeypatch.setattr(mcp_server, "_github_call", fake_github_call)
+        result = json.loads(await mcp_server.get_github_pull_request("owner/allowed-repo", 813))
+
+        assert result["merge_commit_sha"] == expected
+
 
     @pytest.mark.asyncio
     async def test_mcp_tool_set_and_key_tools(self):

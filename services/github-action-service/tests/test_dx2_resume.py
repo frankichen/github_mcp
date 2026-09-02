@@ -446,6 +446,7 @@ def test_resume_task_reconciles_historical_merged_managed_pr(monkeypatch):
     _stub_resume_context(monkeypatch, ws=ws, session=session, pr=pr)
 
     def finalize(*args, **kwargs):
+        assert args[5]["merge_commit_sha"] == "c" * 40
         assert kwargs["expected_workspace_id"] == ws["workspace_id"]
         assert kwargs["expected_session_id"] == session["session_id"]
         return {
