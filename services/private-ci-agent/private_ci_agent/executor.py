@@ -522,7 +522,7 @@ class JobExecutor:
     def _explicit_plan(self, profile: str, source_dir: str, repo_config: dict | None = None) -> dict:
         stack = profile.removesuffix("-check")
         configured_workspaces = (repo_config or {}).get("workspaces") or []
-        if profile == "node-check" and configured_workspaces:
+        if configured_workspaces:
             discovery_config = repo_config
         else:
             discovery_config = {"workspaces": [{"path": ".", "type": stack}]}

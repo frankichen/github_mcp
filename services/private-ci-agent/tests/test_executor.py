@@ -929,6 +929,30 @@ def test_explicit_node_plan_uses_repository_workspace_overrides(tmp_path):
     assert plan["workspaces"][0]["required_scripts"] == ["test:run", "typecheck", "build"]
 
 
+def test_explicit_go_plan_preserves_repository_service_controls(tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    repo_config = {
+        "workspaces": [
+            {
+                "path": ".",
+                "type": "auto",
+                "services": ["postgres", "redis", "rabbitmq"],
+                "hooks": ["go-migrate", "ai-integrity"],
+            }
+        ]
+    }
+    executor = JobExecutor.__new__(JobExecutor)
+
+    plan = executor._explicit_plan("go-check", str(tmp_path), repo_config)
+
+    assert "error" not in plan
+    assert plan["workspaces"] == [{
+        "path": ".", "stack": "go",
+        "services": ["postgres", "redis", "rabbitmq"],
+        "hooks": ["go-migrate", "ai-integrity"],
+    }]
+
+
 def test_explicit_non_node_profile_keeps_root_only_scope(tmp_path):
     nested = tmp_path / "services" / "worker"
     nested.mkdir(parents=True)
