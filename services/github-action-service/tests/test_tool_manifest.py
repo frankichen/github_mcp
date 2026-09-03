@@ -15,6 +15,7 @@ DX1_TOOLS = [
     "recover_drifted_development_task",
     "recover_base_synced_development_task",
     "apply_development_change_set",
+    "prepare_development_change_set_file",
     "validate_development_task",
     "converge_development_task",
     "finalize_development_task",

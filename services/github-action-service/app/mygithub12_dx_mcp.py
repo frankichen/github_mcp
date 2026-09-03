@@ -605,6 +605,42 @@ def register_dx_tools(
                     logger.exception("unprepared ChangeSet artifact could not be invalidated")
             return _error(exc)
 
+    @mcp.tool(
+        name="prepare_development_change_set_file",
+        description=(
+            "Strictly prepare a runtime-file ChangeSet through the stable bundle_file fileParam ingress. "
+            "This is a ChatGPT-compatible prepare-only alias for large or exact-byte-sensitive ChangeSets; "
+            "it returns a prepared_change_set_id and never commits. Use apply_development_change_set with "
+            "prepared_change_set_id for the real write."
+        ),
+        meta={"openai/fileParams":["bundle_file"]},
+        annotations=_ORCHESTRATION,
+    )
+    async def prepare_development_change_set_file(
+        development_session_id: str, expected_session_revision: int, expected_workspace_revision: int,
+        expected_head_sha: str, commit_message: str, bundle_file: RuntimeFileParam | None=None,
+        expected_change_set_size_bytes: int=0, expected_change_set_sha256: str="",
+        expected_change_set_git_blob_sha: str="", idempotency_key: str="",
+    ) -> str:
+        return await apply_development_change_set(
+            development_session_id=development_session_id,
+            expected_session_revision=expected_session_revision,
+            expected_workspace_revision=expected_workspace_revision,
+            expected_head_sha=expected_head_sha,
+            commit_message=commit_message,
+            change_set_json="",
+            change_set_file=bundle_file,
+            expected_change_set_size_bytes=expected_change_set_size_bytes,
+            expected_change_set_sha256=expected_change_set_sha256,
+            expected_change_set_git_blob_sha=expected_change_set_git_blob_sha,
+            prepared_change_set_id="",
+            dry_run=True,
+            idempotency_key=idempotency_key,
+            create_pull_request=False,
+            pull_request_json="{}",
+        )
+
+
     @mcp.tool(name="validate_development_task",description="Run or reuse fast/full private CI for an exact Session head; fast feedback never becomes merge-eligible, full success yields attestation.",annotations=_ORCHESTRATION)
     async def validate_development_task(
         development_session_id: str, expected_session_revision: int, mode: str="fast", base_sha: str="", force_rerun: bool=False,
