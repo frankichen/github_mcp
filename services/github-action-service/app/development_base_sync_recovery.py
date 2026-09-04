@@ -155,7 +155,7 @@ def _verify_base_sync_deltas(
     old_task_ancestry, old_task_delta_paths = _compare_delta(
         repo, old_base_sha, old_session_head_sha, label="old_base_to_old_task_head",
     )
-    task_ancestry, _ = _compare_delta(
+    task_ancestry, forward_task_delta_paths = _compare_delta(
         repo, old_session_head_sha, current_head_sha, label="old_task_head_to_current_head",
     )
     new_base_ancestry, new_task_delta_paths = _compare_delta(
@@ -172,13 +172,20 @@ def _verify_base_sync_deltas(
                 "base_delta_paths": base_delta_paths,
             },
         )
-    if old_task_delta_paths != new_task_delta_paths:
+    # A canonical task may continue forward after the base sync. Path-set
+    # changes are therefore valid only when the verified H0 -> H1 comparison
+    # explains every difference.
+    task_path_changes = sorted(set(old_task_delta_paths) ^ set(new_task_delta_paths))
+    unexplained_task_path_changes = sorted(set(task_path_changes) - set(forward_task_delta_paths))
+    if unexplained_task_path_changes:
         raise MyGithub12Error(
             "RECOVERY_TASK_DIFF_MISMATCH",
-            "task changed paths differ before and after base synchronization",
+            "task path-set changes are not explained by the verified forward task advance",
             {
                 "old_task_delta_paths": old_task_delta_paths,
                 "new_task_delta_paths": new_task_delta_paths,
+                "forward_task_delta_paths": forward_task_delta_paths,
+                "unexplained_task_path_changes": unexplained_task_path_changes,
             },
         )
     return {
@@ -189,8 +196,53 @@ def _verify_base_sync_deltas(
         "base_delta_paths": base_delta_paths,
         "old_task_delta_paths": old_task_delta_paths,
         "new_task_delta_paths": new_task_delta_paths,
+        "forward_task_delta_paths": forward_task_delta_paths,
+        "task_path_changes": task_path_changes,
+        "unexplained_task_path_changes": unexplained_task_path_changes,
         "base_task_overlap_paths": overlap,
     }
+
+
+def _verify_base_sync_scope(workspace: dict[str, Any], changed_paths: list[str]) -> dict[str, Any]:
+    """Preserve legacy empty scope without treating it as unrestricted scope."""
+    scope = workspace.get("scope") if isinstance(workspace.get("scope"), dict) else {}
+    declared = [str(value).strip().strip("/") for value in (scope.get("paths") or []) if str(value).strip().strip("/")]
+    if declared:
+        evidence = same_base._verify_scope(workspace, changed_paths)
+        return {**evidence, "declaration_required": False, "enforcement": "declared_scope"}
+    return {
+        "verified": True,
+        "declared_paths": [],
+        "changed_paths": changed_paths,
+        "outside_scope_paths": [],
+        "declaration_required": True,
+        "enforcement": "actual_changed_paths_overlap_only",
+    }
+
+
+def _current_task_overlap(overlap: dict[str, Any], current_task_paths: list[str]) -> dict[str, Any]:
+    """Remove imported-base paths from current-task overlap evidence."""
+    task_paths = set(current_task_paths)
+    normalized_items: list[dict[str, Any]] = []
+    for raw_item in overlap.get("items") or []:
+        item = dict(raw_item)
+        evidence: list[dict[str, Any]] = []
+        had_changed_paths = False
+        for raw_evidence in item.get("evidence") or []:
+            entry = dict(raw_evidence)
+            if entry.get("kind") == "changed_paths":
+                had_changed_paths = True
+                items = sorted(task_paths & {str(path) for path in (entry.get("items") or [])})
+                if items:
+                    evidence.append({**entry, "items": items})
+            else:
+                evidence.append(entry)
+        item["evidence"] = evidence
+        if had_changed_paths:
+            kinds = {entry.get("kind") for entry in evidence}
+            item["level"] = "high" if kinds & {"changed_paths", "migrations", "tables", "apis"} else "medium" if evidence else "none"
+        normalized_items.append(item)
+    return {**overlap, "items": normalized_items, "current_task_delta_paths": current_task_paths}
 
 
 def _latest_workspace_session_status(workspace_id: str) -> dict[str, Any] | None:
@@ -238,6 +290,7 @@ def _verify_base_sync_ownership(
     repo: Any,
     workspace: dict[str, Any],
     new_base_sha: str,
+    current_task_paths: list[str],
 ) -> dict[str, Any]:
     repository = str(workspace["repository"])
     branch = str(workspace["branch"])
@@ -261,7 +314,9 @@ def _verify_base_sync_ownership(
             "another active or drifted Workspace claims the recovery branch",
             {"workspace_id": workspace_id, "conflicting_workspace_ids": [item.get("workspace_id") for item in conflicts]},
         )
-    overlap = mygithub12.workspace_overlap(service, workspace_id)
+    overlap = _current_task_overlap(
+        mygithub12.workspace_overlap(service, workspace_id), current_task_paths,
+    )
     blocked: list[dict[str, Any]] = []
     ignored_merged: list[dict[str, Any]] = []
     for item in (overlap.get("items") or []):
@@ -490,6 +545,9 @@ def _atomic_recover_base_sync(
                 "base_delta_paths": verification["deltas"]["base_delta_paths"],
                 "old_task_delta_paths": verification["deltas"]["old_task_delta_paths"],
                 "new_task_delta_paths": verification["deltas"]["new_task_delta_paths"],
+                "forward_task_delta_paths": verification["deltas"]["forward_task_delta_paths"],
+                "task_path_changes": verification["deltas"]["task_path_changes"],
+                "unexplained_task_path_changes": verification["deltas"]["unexplained_task_path_changes"],
                 "overlap_result": {
                     "base_task_overlap_paths": verification["deltas"]["base_task_overlap_paths"],
                     "workspace": verification["ownership"],
@@ -670,11 +728,16 @@ def recover_base_synced_task(
             expected_base_branch,
             expected_new_base_sha,
         )
-        ownership = _verify_base_sync_ownership(service, repo, workspace, expected_new_base_sha)
+        replay_audit = replay.get("audit") if isinstance(replay.get("audit"), dict) else {}
+        ownership = _verify_base_sync_ownership(
+            service, repo, workspace, expected_new_base_sha,
+            list(replay_audit.get("new_task_delta_paths") or []),
+        )
         index = _base_sync_index_state(
             service, repository, expected_current_head_sha, expected_current_tree_sha,
             expected_new_base_sha, development_session_id,
         )
+        scope_declaration_required = bool((replay_audit.get("scope") or {}).get("declaration_required"))
         return {
             "ok": True,
             "control_plane_recovery": "CONTROL_PLANE_BASE_SYNC_RECOVERY_SUCCESS",
@@ -687,7 +750,8 @@ def recover_base_synced_task(
             "verification": {"github": github_identity, "ownership": ownership},
             "index": index,
             "index_required": index["index_required"],
-            "writer_ready": index["ready"],
+            "scope_declaration_required": scope_declaration_required,
+            "writer_ready": index["ready"] and not scope_declaration_required,
         }
     if workspace.get("status") == "closed":
         raise MyGithub12Error("WORKSPACE_CLOSED", "closed Workspace cannot be recovered")
@@ -741,8 +805,10 @@ def recover_base_synced_task(
         expected_current_head_sha,
     )
     # Scope belongs to the task under the new base, never to the imported base delta.
-    scope = same_base._verify_scope(workspace, deltas["new_task_delta_paths"])
-    ownership = _verify_base_sync_ownership(service, repo, workspace, expected_new_base_sha)
+    scope = _verify_base_sync_scope(workspace, deltas["new_task_delta_paths"])
+    ownership = _verify_base_sync_ownership(
+        service, repo, workspace, expected_new_base_sha, deltas["new_task_delta_paths"],
+    )
     verification = {"github": github_identity, "deltas": deltas, "scope": scope, "ownership": ownership}
     recovered = _atomic_recover_base_sync(
         service, request=request, idempotency_key=idempotency_key, verification=verification,
@@ -769,6 +835,6 @@ def recover_base_synced_task(
         "verification": verification,
         "index": index,
         "index_required": index["index_required"],
-        "writer_ready": index["ready"],
+        "scope_declaration_required": scope["declaration_required"],
+        "writer_ready": index["ready"] and not scope["declaration_required"],
     }
-

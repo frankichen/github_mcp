@@ -251,6 +251,27 @@ def _workspace_recovery_plan(
                 "new_base_ancestry": _resume_ancestry_evidence(service, repository, new_base, current_head),
             }
             preflight["verified"] = all(item.get("verified") for item in preflight.values() if isinstance(item, dict))
+            workspace_has_current_identity = (
+                workspace.get("head_sha") == current_head
+                and workspace.get("tree_sha") == branch_state.get("tree_sha")
+            )
+            if not workspace_has_current_identity:
+                return {
+                    "reason": "WORKSPACE_REFRESH_REQUIRED_BEFORE_BASE_SYNC_RECOVERY",
+                    "action": "refresh_development_workspace",
+                    "manual_recovery_required": True,
+                    "workspace_id": workspace.get("workspace_id"),
+                    "development_session_id": session.get("session_id"),
+                    "expected_workspace_revision": workspace.get("revision"),
+                    "expected_current_head_sha": current_head,
+                    "expected_current_tree_sha": branch_state.get("tree_sha"),
+                    "next_action": "recover_base_synced_development_task",
+                    "recovery_sequence": [
+                        "refresh_development_workspace",
+                        "recover_base_synced_development_task",
+                    ],
+                    "preflight": preflight,
+                }
             return {
                 "reason": "WORKSPACE_BASE_SYNCED_EXTERNALLY",
                 "action": "recover_base_synced_development_task",
