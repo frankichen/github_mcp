@@ -317,6 +317,13 @@ def test_fixed_deploy_script_contains_dx2_phase_markers():
     assert content.index("systemctl restart private-ci-agent.service") < content.index("DX2_PHASE=controller_switch")
     assert content.index('systemctl enable --now "${SECOND_WORKER_SERVICE}"') > content.index("DX2_PHASE=controller_switch")
     assert "private-ci-agent@wsl-ci-02.service" in content
+    assert "DX2_RECOVERY_MODE=post_switch_same_sha" in content
+    assert "MYGITHUB12_EXPECTED_PARENT_BUILD_SHA" in content
+    assert "TARGET_BUILD_SHA" in content
+    recovery = content.index("DX2_RECOVERY_MODE=post_switch_same_sha")
+    normal_build = content.index("DX2_PHASE=controller_build")
+    assert recovery < normal_build
+    assert "Post-switch same-SHA recovery completed without rebuilding or switching Controller." in content
 
 
 def test_fixed_health_evidence_requires_both_private_ci_workers(monkeypatch):

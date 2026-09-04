@@ -51,6 +51,52 @@ LEGACY_PHASE_MAP = {
 ERROR_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _lock = threading.Lock()
 
+EXECUTION_MODE_FULL = "full"
+EXECUTION_MODE_POST_SWITCH_RECOVERY = "post_switch_recovery"
+RECOVERY_SWITCH_MARKER = "DX2_PHASE=controller_switch"
+
+
+def _validate_recovery_source(
+    source,
+    repository: str,
+    environment: str,
+    scope: str,
+    commit_sha: str,
+    tree_sha: str,
+) -> str | None:
+    if source is None:
+        return "INFRASTRUCTURE_RECOVERY_SOURCE_NOT_FOUND"
+    if str(source["status"] or "") != "failed":
+        return "INFRASTRUCTURE_RECOVERY_SOURCE_NOT_FAILED"
+    if (
+        source["repository"] != repository
+        or source["environment"] != environment
+        or source["requested_scope"] != scope
+    ):
+        return "INFRASTRUCTURE_RECOVERY_SOURCE_SCOPE_MISMATCH"
+    if source["commit_sha"] != commit_sha or source["tree_sha"] != tree_sha:
+        return "INFRASTRUCTURE_RECOVERY_SOURCE_TARGET_MISMATCH"
+    source_mode = str(source["execution_mode"] or EXECUTION_MODE_FULL)
+    inherited_post_switch = (
+        source_mode == EXECUTION_MODE_POST_SWITCH_RECOVERY
+        and bool(str(source["recovery_of_deployment_id"] or ""))
+    )
+    if RECOVERY_SWITCH_MARKER not in str(source["log_text"] or "") and not inherited_post_switch:
+        return "INFRASTRUCTURE_RECOVERY_SOURCE_NOT_POST_SWITCH"
+    return None
+
+
+def _recovery_source_summary(source) -> dict | None:
+    if source is None:
+        return None
+    return {
+        "deployment_id": source["deployment_id"],
+        "status": source["status"],
+        "error_code": source["error_code"],
+        "execution_mode": source["execution_mode"],
+        "recovery_of_deployment_id": source["recovery_of_deployment_id"],
+    }
+
 
 def init_infrastructure_deployment_db() -> None:
     store.init_db()
@@ -166,6 +212,7 @@ def plan_infrastructure_deployment(
     private_ci_job_id: str,
     expected_current_build_sha: str,
     scope: str = SCOPE,
+    recovery_of_deployment_id: str = "",
 ) -> dict:
     reason = _validate_common(
         repository,
@@ -187,13 +234,27 @@ def plan_infrastructure_deployment(
             "message": type(exc).__name__,
         }
 
+    recovery_id = str(recovery_of_deployment_id or "").strip()
+    execution_mode = (
+        EXECUTION_MODE_POST_SWITCH_RECOVERY if recovery_id else EXECUTION_MODE_FULL
+    )
+    recovery_source = store.get_deployment(recovery_id) if recovery_id else None
+
     reasons: list[str] = []
     if main_sha != commit_sha:
         reasons.append("COMMIT_NOT_CURRENT_MAIN")
     current_build_sha = runtime_build_sha()
     if current_build_sha != expected_current_build_sha:
         reasons.append("CURRENT_BUILD_SHA_MISMATCH")
-    if current_build_sha == commit_sha:
+    if recovery_id:
+        recovery_reason = _validate_recovery_source(
+            recovery_source, repository, environment, scope, commit_sha, tree_sha
+        )
+        if recovery_reason:
+            reasons.append(recovery_reason)
+        if current_build_sha != commit_sha:
+            reasons.append("INFRASTRUCTURE_RECOVERY_RUNTIME_NOT_TARGET")
+    elif current_build_sha == commit_sha:
         reasons.append("ALREADY_DEPLOYED")
 
     ci_reason, ci_job = _ci_gate(repository, private_ci_job_id, commit_sha, tree_sha)
@@ -231,8 +292,15 @@ def plan_infrastructure_deployment(
         },
         "expected_current_build_sha": expected_current_build_sha,
         "current_build_sha": current_build_sha,
+        "execution_mode": execution_mode,
+        "recovery_of_deployment_id": recovery_id or None,
+        "recovery_source": _recovery_source_summary(recovery_source),
         "executor": executor,
-        "execution_contract": "fixed-executor/fail-stop/no-auto-rollback",
+        "execution_contract": (
+            "fixed-executor/post-switch-recovery/fail-stop/no-auto-rollback"
+            if recovery_id
+            else "fixed-executor/fail-stop/no-auto-rollback"
+        ),
     }
 
 
@@ -245,9 +313,11 @@ def start_infrastructure_deployment(
     scope: str = SCOPE,
     confirm: bool = False,
     requested_by: str = "mcp",
+    recovery_of_deployment_id: str = "",
 ) -> dict:
     if not confirm:
         return _error_response("CONFIRM_REQUIRED", "confirm must be true")
+    recovery_id = str(recovery_of_deployment_id or "").strip()
     plan = plan_infrastructure_deployment(
         repository,
         environment,
@@ -255,6 +325,7 @@ def start_infrastructure_deployment(
         private_ci_job_id,
         expected_current_build_sha,
         scope,
+        recovery_id,
     )
     if not plan.get("ready"):
         return {
@@ -294,9 +365,9 @@ def start_infrastructure_deployment(
             """
             INSERT INTO infrastructure_deployments(
               deployment_id,repository,environment,requested_scope,commit_sha,tree_sha,
-              private_ci_job_id,expected_current_build_sha,requested_by,status,current_step,
-              created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,'queued','queued',?,?)
+              private_ci_job_id,expected_current_build_sha,requested_by,execution_mode,
+              recovery_of_deployment_id,status,current_step,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,'queued','queued',?,?)
             """,
             (
                 deployment_id,
@@ -308,6 +379,8 @@ def start_infrastructure_deployment(
                 private_ci_job_id,
                 expected_current_build_sha,
                 requested_by,
+                plan["execution_mode"],
+                recovery_id or None,
                 timestamp,
                 timestamp,
             ),
@@ -323,7 +396,9 @@ def start_infrastructure_deployment(
         "commit_sha": commit_sha,
         "tree_sha": plan["tree_sha"],
         "expected_current_build_sha": expected_current_build_sha,
-        "execution_contract": "fixed-executor/fail-stop/no-auto-rollback",
+        "execution_mode": plan["execution_mode"],
+        "recovery_of_deployment_id": recovery_id or None,
+        "execution_contract": plan["execution_contract"],
     }
 
 
@@ -451,6 +526,7 @@ def claim_infrastructure_deployment(executor_id: str) -> dict:
             row["commit_sha"],
             row["tree_sha"],
         )
+        current_build_sha = runtime_build_sha()
         stale_code = None
         stale_message = None
         if main_sha != row["commit_sha"] or tree_sha != row["tree_sha"]:
@@ -459,9 +535,33 @@ def claim_infrastructure_deployment(executor_id: str) -> dict:
         elif ci_reason:
             stale_code = ci_reason
             stale_message = "private CI gate changed before executor claim"
-        elif runtime_build_sha() != row["expected_current_build_sha"]:
+        elif current_build_sha != row["expected_current_build_sha"]:
             stale_code = "CURRENT_BUILD_SHA_CHANGED"
             stale_message = "current build changed before executor claim"
+        elif row["execution_mode"] == EXECUTION_MODE_POST_SWITCH_RECOVERY:
+            source_id = str(row["recovery_of_deployment_id"] or "")
+            source = (
+                db.execute(
+                    "SELECT * FROM infrastructure_deployments WHERE deployment_id=?",
+                    (source_id,),
+                ).fetchone()
+                if source_id
+                else None
+            )
+            recovery_reason = _validate_recovery_source(
+                source,
+                row["repository"],
+                row["environment"],
+                row["requested_scope"],
+                row["commit_sha"],
+                row["tree_sha"],
+            )
+            if recovery_reason:
+                stale_code = recovery_reason
+                stale_message = "recovery source changed or is no longer eligible"
+            elif current_build_sha != row["commit_sha"]:
+                stale_code = "INFRASTRUCTURE_RECOVERY_RUNTIME_NOT_TARGET"
+                stale_message = "recovery requires the current runtime to already match the target commit"
         if stale_code:
             timestamp = store.now()
             db.execute(
