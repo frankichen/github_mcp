@@ -421,3 +421,137 @@ def test_terminal_diagnostics_and_redacted_log_tail(monkeypatch, isolated_store)
     assert "token=***" in tail
     assert "password=***" in tail
     assert "safe=text" in tail
+
+
+def _failed_post_switch_source(monkeypatch):
+    _ready_plan(monkeypatch)
+    started = service.start_infrastructure_deployment(
+        service.REPOSITORY,
+        service.ENVIRONMENT,
+        SHA_B,
+        "job-1",
+        SHA_A,
+        confirm=True,
+    )
+    service.claim_infrastructure_deployment(service.DEFAULT_EXECUTOR_ID)
+    service.update_infrastructure_deployment_progress(
+        started["deployment_id"],
+        "controller_switch",
+        "DX2_PHASE=controller_switch",
+    )
+    service.fail_infrastructure_deployment(
+        started["deployment_id"],
+        1,
+        "INFRASTRUCTURE_DEPLOYMENT_FAILED",
+        "post-switch preheat failed",
+    )
+    return started["deployment_id"]
+
+
+def test_normal_plan_still_rejects_already_deployed(monkeypatch, isolated_store):
+    _ready_plan(monkeypatch)
+    monkeypatch.setattr(service, "runtime_build_sha", lambda: SHA_B)
+    result = service.plan_infrastructure_deployment(
+        service.REPOSITORY, service.ENVIRONMENT, SHA_B, "job-1", SHA_B
+    )
+    assert result["ready"] is False
+    assert "ALREADY_DEPLOYED" in result["reasons"]
+    assert result["execution_mode"] == service.EXECUTION_MODE_FULL
+
+
+def test_post_switch_recovery_creates_new_auditable_deployment(monkeypatch, isolated_store):
+    source_id = _failed_post_switch_source(monkeypatch)
+    source_before = service.get_infrastructure_deployment(source_id)["deployment"]
+    monkeypatch.setattr(service, "runtime_build_sha", lambda: SHA_B)
+
+    planned = service.plan_infrastructure_deployment(
+        service.REPOSITORY,
+        service.ENVIRONMENT,
+        SHA_B,
+        "job-1",
+        SHA_B,
+        recovery_of_deployment_id=source_id,
+    )
+    assert planned["ready"] is True
+    assert "ALREADY_DEPLOYED" not in planned["reasons"]
+    assert planned["execution_mode"] == service.EXECUTION_MODE_POST_SWITCH_RECOVERY
+    assert planned["recovery_source"]["deployment_id"] == source_id
+    assert planned["execution_contract"] == "fixed-executor/post-switch-recovery/fail-stop/no-auto-rollback"
+
+    recovered = service.start_infrastructure_deployment(
+        service.REPOSITORY,
+        service.ENVIRONMENT,
+        SHA_B,
+        "job-1",
+        SHA_B,
+        confirm=True,
+        recovery_of_deployment_id=source_id,
+    )
+    assert recovered["deployment_id"] != source_id
+    assert recovered["execution_mode"] == service.EXECUTION_MODE_POST_SWITCH_RECOVERY
+    assert recovered["recovery_of_deployment_id"] == source_id
+
+    source_after = service.get_infrastructure_deployment(source_id)["deployment"]
+    assert source_after["status"] == "failed"
+    assert source_after["error_code"] == source_before["error_code"]
+    claimed = service.claim_infrastructure_deployment(service.DEFAULT_EXECUTOR_ID)
+    assert claimed["deployment"]["deployment_id"] == recovered["deployment_id"]
+    assert claimed["deployment"]["execution_mode"] == service.EXECUTION_MODE_POST_SWITCH_RECOVERY
+
+
+def test_recovery_requires_failed_post_switch_exact_target(monkeypatch, isolated_store):
+    _ready_plan(monkeypatch)
+    started = service.start_infrastructure_deployment(
+        service.REPOSITORY, service.ENVIRONMENT, SHA_B, "job-1", SHA_A, confirm=True
+    )
+    service.claim_infrastructure_deployment(service.DEFAULT_EXECUTOR_ID)
+    service.fail_infrastructure_deployment(
+        started["deployment_id"], 1, "EARLY_FAILURE", "failed before controller switch"
+    )
+    monkeypatch.setattr(service, "runtime_build_sha", lambda: SHA_B)
+    planned = service.plan_infrastructure_deployment(
+        service.REPOSITORY,
+        service.ENVIRONMENT,
+        SHA_B,
+        "job-1",
+        SHA_B,
+        recovery_of_deployment_id=started["deployment_id"],
+    )
+    assert planned["ready"] is False
+    assert "INFRASTRUCTURE_RECOVERY_SOURCE_NOT_POST_SWITCH" in planned["reasons"]
+
+
+def test_recovery_requires_live_runtime_to_match_target(monkeypatch, isolated_store):
+    source_id = _failed_post_switch_source(monkeypatch)
+    planned = service.plan_infrastructure_deployment(
+        service.REPOSITORY,
+        service.ENVIRONMENT,
+        SHA_B,
+        "job-1",
+        SHA_A,
+        recovery_of_deployment_id=source_id,
+    )
+    assert planned["ready"] is False
+    assert "INFRASTRUCTURE_RECOVERY_RUNTIME_NOT_TARGET" in planned["reasons"]
+
+
+def test_store_upgrades_legacy_deployment_table_for_recovery(isolated_store):
+    db = store.get_db()
+    db.execute("DROP TABLE IF EXISTS infrastructure_deployments")
+    db.executescript(
+        """
+        CREATE TABLE infrastructure_deployments (
+          deployment_id TEXT PRIMARY KEY, repository TEXT NOT NULL, environment TEXT NOT NULL,
+          requested_scope TEXT NOT NULL, commit_sha TEXT NOT NULL, tree_sha TEXT NOT NULL,
+          private_ci_job_id TEXT NOT NULL, expected_current_build_sha TEXT NOT NULL,
+          requested_by TEXT NOT NULL DEFAULT 'mcp', status TEXT NOT NULL, current_step TEXT,
+          exit_code INTEGER, error_code TEXT, error_message TEXT, created_at REAL NOT NULL,
+          started_at REAL, finished_at REAL, updated_at REAL NOT NULL,
+          log_revision INTEGER NOT NULL DEFAULT 0, log_text TEXT NOT NULL DEFAULT ''
+        );
+        """
+    )
+    db.commit()
+    store.init_db()
+    columns = {row[1] for row in db.execute("PRAGMA table_info(infrastructure_deployments)")}
+    assert {"execution_mode", "recovery_of_deployment_id"} <= columns

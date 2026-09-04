@@ -66,6 +66,8 @@ def init_db() -> None:
           private_ci_job_id TEXT NOT NULL,
           expected_current_build_sha TEXT NOT NULL,
           requested_by TEXT NOT NULL DEFAULT 'mcp',
+          execution_mode TEXT NOT NULL DEFAULT 'full',
+          recovery_of_deployment_id TEXT,
           status TEXT NOT NULL,
           current_step TEXT,
           exit_code INTEGER,
@@ -88,6 +90,21 @@ def init_db() -> None:
           updated_at REAL NOT NULL
         );
         """
+    )
+    columns = {row[1] for row in db.execute("PRAGMA table_info(infrastructure_deployments)")}
+    if "execution_mode" not in columns:
+        db.execute(
+            "ALTER TABLE infrastructure_deployments "
+            "ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'full'"
+        )
+    if "recovery_of_deployment_id" not in columns:
+        db.execute(
+            "ALTER TABLE infrastructure_deployments "
+            "ADD COLUMN recovery_of_deployment_id TEXT"
+        )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_infrastructure_deployments_recovery "
+        "ON infrastructure_deployments(recovery_of_deployment_id)"
     )
     db.commit()
 

@@ -116,6 +116,12 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert tools["start_infrastructure_deployment"].annotations.readOnlyHint is False
     assert tools["start_infrastructure_deployment"].annotations.destructiveHint is True
     assert tools["get_infrastructure_deployment"].annotations.readOnlyHint is True
+    infrastructure_plan_schema = tools["plan_infrastructure_deployment"].inputSchema
+    infrastructure_start_schema = tools["start_infrastructure_deployment"].inputSchema
+    assert infrastructure_plan_schema["properties"]["recovery_of_deployment_id"]["default"] == ""
+    assert infrastructure_start_schema["properties"]["recovery_of_deployment_id"]["default"] == ""
+    assert "recovery_of_deployment_id" not in infrastructure_plan_schema["required"]
+    assert "recovery_of_deployment_id" not in infrastructure_start_schema["required"]
     infrastructure_get_input = tools["get_infrastructure_deployment"].inputSchema
     assert infrastructure_get_input["required"] == ["deployment_id"]
     infrastructure_get_schema = infrastructure_get_input["properties"]

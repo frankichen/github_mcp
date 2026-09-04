@@ -75,6 +75,72 @@ run_ciworker_preheat() {
         "$@"
 }
 
+# Same-SHA post-switch recovery. The Controller only queues this mode when a prior
+# exact-target deployment failed after reaching the switch boundary and the live
+# runtime still reports the target SHA. The fixed Executor already exports the
+# verified current-build CAS as MYGITHUB12_EXPECTED_PARENT_BUILD_SHA.
+TARGET_BUILD_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+EXPECTED_PARENT_BUILD_SHA="${MYGITHUB12_EXPECTED_PARENT_BUILD_SHA:-}"
+if [ -n "${EXPECTED_PARENT_BUILD_SHA}" ] && [ "${EXPECTED_PARENT_BUILD_SHA}" = "${TARGET_BUILD_SHA}" ]; then
+    log "DX2_RECOVERY_MODE=post_switch_same_sha"
+
+    if ! touch "${AGENT_DIR}/.wtest" 2>/dev/null; then
+        log "Remounting / read-write for post-switch recovery"
+        mount -o remount,rw / || die "cannot remount / rw"
+        touch "${AGENT_DIR}/.wtest" 2>/dev/null || die "agent dir still not writable after remount"
+        rm -f "${AGENT_DIR}/.wtest"
+    fi
+
+    command -v systemd-run >/dev/null 2>&1 || die "systemd-run is required for ciworker preheat broker"
+    RECOVERY_BROKER_UID="$(run_ciworker_preheat /usr/bin/id -u)" || die "ciworker preheat broker probe failed"
+    [ "${RECOVERY_BROKER_UID}" = "${CIWORKER_UID}" ] || die "ciworker preheat broker returned unexpected uid"
+
+    RECOVERY_WORKER_IDS_OUTPUT="$(
+        PYTHONPATH="${AGENT_DIR}" python3 -m private_ci_agent.go_cache --list-worker-ids
+    )" || die "cannot load installed private CI Worker allowlist"
+    [ -n "${RECOVERY_WORKER_IDS_OUTPUT}" ] || die "private CI Worker allowlist is empty"
+    mapfile -t RECOVERY_WORKER_IDS <<< "${RECOVERY_WORKER_IDS_OUTPUT}"
+
+    RECOVERY_PHASE_HEALTH="health"
+    RECOVERY_PHASE_PREHEAT="preheat"
+    RECOVERY_PHASE_POST_VERIFY="post_verify"
+    log "DX2_PHASE=${RECOVERY_PHASE_HEALTH}"
+    curl -fsS --noproxy '*' --max-time 3 http://127.0.0.1:8765/health >/dev/null \
+        || die "current target controller health failed during recovery"
+
+    log "DX2_PHASE=${RECOVERY_PHASE_PREHEAT}"
+    run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-python-ci" \
+        || die "Python CI image preheat failed"
+    run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-node-chromium" \
+        || die "Node Chromium image preheat failed"
+    for worker_id in "${RECOVERY_WORKER_IDS[@]}"; do
+        log "Recovery preheating worker-local Go cache worker=${worker_id}"
+        run_ciworker_preheat --worker-id "${worker_id}" \
+            "${AGENT_DIR}/deploy/prepare-go-cache" \
+            || die "go cache preheat failed for worker ${worker_id}"
+    done
+    run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-playwright-cache" \
+        || die "Playwright cache preheat failed"
+
+    RECOVERY_SECOND_WORKER_SERVICE="private-ci-agent@wsl-ci-02.service"
+    systemctl enable --now "${RECOVERY_SECOND_WORKER_SERVICE}" \
+        || die "second worker enable/start failed"
+    sleep 3
+
+    log "DX2_PHASE=${RECOVERY_PHASE_POST_VERIFY}"
+    systemctl is-active --quiet private-ci-agent.service \
+        || die "primary worker is not active during recovery verification"
+    systemctl is-active --quiet "${RECOVERY_SECOND_WORKER_SERVICE}" \
+        || die "second worker is not active during recovery verification"
+    for worker_id in "${RECOVERY_WORKER_IDS[@]}"; do
+        run_ciworker_preheat --worker-id "${worker_id}" \
+            "${AGENT_DIR}/deploy/prepare-go-cache" --verify-only \
+            || die "goose binary verification failed for worker ${worker_id}"
+    done
+    log "DONE. Post-switch same-SHA recovery completed without rebuilding or switching Controller."
+    exit 0
+fi
+
 # ── 1. 根文件系统需要可写（当前 ro）────────────────────────
 if ! touch "${AGENT_DIR}/.wtest" 2>/dev/null; then
     log "Remounting / read-write (was read-only)"

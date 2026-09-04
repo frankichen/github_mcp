@@ -59,7 +59,9 @@ def register_infrastructure_deployment_tools(mcp, github_call) -> None:
         description=(
             "Plan the fixed MyGithut12 production control-plane deployment. "
             "Requires exact current main, exact repo-auto-check evidence, current-build CAS, "
-            "and a fresh fixed executor heartbeat. Never accepts host, shell, script, rollback, or failure-mode input."
+            "and a fresh fixed executor heartbeat. A failed post-switch deployment may be supplied "
+            "as recovery_of_deployment_id for same-SHA health/preheat recovery. Never accepts host, "
+            "shell, script, rollback, or failure-mode input."
         ),
         annotations=_READ_ONLY,
     )
@@ -70,6 +72,7 @@ def register_infrastructure_deployment_tools(mcp, github_call) -> None:
         private_ci_job_id: str,
         expected_current_build_sha: str,
         scope: str = infrastructure.SCOPE,
+        recovery_of_deployment_id: str = "",
     ) -> str:
         return await _call(
             github_call,
@@ -80,13 +83,16 @@ def register_infrastructure_deployment_tools(mcp, github_call) -> None:
             private_ci_job_id,
             expected_current_build_sha,
             scope,
+            recovery_of_deployment_id,
         )
 
     @mcp.tool(
         name="start_infrastructure_deployment",
         description=(
             "Queue the fixed MyGithut12 production control-plane deployment after all plan gates. "
-            "Requires confirm=true. The executor contract is always fail-stop and never auto-rolls back."
+            "Requires confirm=true. A recovery_of_deployment_id is accepted only for a failed, exact-target, "
+            "post-switch deployment while the current runtime already matches that target. The executor contract "
+            "is always fail-stop and never auto-rolls back."
         ),
         annotations=_CONSEQUENTIAL,
     )
@@ -98,6 +104,7 @@ def register_infrastructure_deployment_tools(mcp, github_call) -> None:
         expected_current_build_sha: str,
         scope: str = infrastructure.SCOPE,
         confirm: bool = False,
+        recovery_of_deployment_id: str = "",
     ) -> str:
         return await _call(
             github_call,
@@ -109,6 +116,8 @@ def register_infrastructure_deployment_tools(mcp, github_call) -> None:
             expected_current_build_sha,
             scope,
             confirm,
+            "mcp",
+            recovery_of_deployment_id,
         )
 
     @mcp.tool(
