@@ -132,6 +132,7 @@ def test_multidataplane_prepare_provisions_three_independent_postgres_instances(
     ]
     assert len(postgres_runs) == 3
     assert all("--memory=160m" in command and "--cpus=0.30" in command for command in postgres_runs)
+    assert all("max_connections=100" in command for command in postgres_runs)
     assert any("port=5432" in command for command in postgres_runs)
     assert any("port=5433" in command for command in postgres_runs)
     assert any("port=5434" in command for command in postgres_runs)

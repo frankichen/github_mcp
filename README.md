@@ -61,7 +61,7 @@ private-deploy-agent（服务器端）
 
 多数据面 Job 对测试进程暴露 `CI_GLOBAL_DATABASE_URL`、`CI_REGIONAL_CN_DATABASE_URL`、`CI_REGIONAL_DE_DATABASE_URL`。为保持旧测试兼容，`DATABASE_URL` 与 `CI_GLOBAL_DATABASE_URL` 指向同一 Global PostgreSQL；任何一个数据面未 ready 都在测试命令启动前以 `CI_INFRA_POSTGRES_*` 失败，不会回退到其它数据库。凭据仅进入权限 `0600` 的 Job 临时环境文件和受控容器环境，CI summary/attestation 只记录 `service:postgres:global`、`service:postgres:regional-cn`、`service:postgres:regional-de` 等无 DSN 服务身份。
 
-当前 Worker 仍固定 `max_concurrent_jobs=1`。多数据面路径为三套 PostgreSQL、Redis、RabbitMQ 设置固定容器资源上限，并按 `worker_id + job_id + logical service` 命名；成功、失败、timeout 或 cancel 后只删除当前 Job 的 Pod、容器、三个临时 PostgreSQL volume 与环境文件，不执行 prune，也不清理其它 Job/Worker。
+当前 Worker 仍固定 `max_concurrent_jobs=1`。多数据面路径为三套 PostgreSQL、Redis、RabbitMQ 设置固定容器资源上限，并按 `worker_id + job_id + logical service` 命名；三套 PostgreSQL 固定 `max_connections=100`，保持旧单 PostgreSQL 默认连接容量基线，避免 `sxt` 根 Go workspace 的真实数据库并发测试被新拓扑人为压缩到更低连接上限；成功、失败、timeout 或 cancel 后只删除当前 Job 的 Pod、容器、三个临时 PostgreSQL volume 与环境文件，不执行 prune，也不清理其它 Job/Worker。
 
 ## GitHub Action Service
 

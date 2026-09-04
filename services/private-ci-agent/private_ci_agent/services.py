@@ -605,7 +605,7 @@ class MultiDataPlaneServiceManager(ServiceManager):
                         self.images[kind],
                         "-c", f"port={spec['port']}",
                         "-c", "shared_buffers=32MB",
-                        "-c", "max_connections=30",
+                        "-c", "max_connections=100",
                     ],
                     spec["error_code"],
                     resource_type=kind, operation="start_container",
