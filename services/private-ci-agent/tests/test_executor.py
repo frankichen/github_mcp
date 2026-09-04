@@ -1093,6 +1093,43 @@ def test_workspace_image_identity_is_deterministic_and_includes_services(tmp_pat
     assert all(item["digest"].startswith("sha256:") for item in first)
 
 
+
+def test_multidataplane_service_env_keeps_database_url_as_global_alias():
+    env = SimpleNamespace(
+        database_url="postgres://global",
+        global_database_url="postgres://global",
+        regional_cn_database_url="postgres://cn",
+        regional_de_database_url="postgres://de",
+        redis_addr="redis:6379", redis_db="0", rabbitmq_url="amqp://rabbitmq/vhost",
+    )
+    exported = JobExecutor._service_env(env)
+    assert exported["DATABASE_URL"] == exported["CI_GLOBAL_DATABASE_URL"]
+    assert exported["CI_REGIONAL_CN_DATABASE_URL"] != exported["CI_GLOBAL_DATABASE_URL"]
+    assert exported["CI_REGIONAL_DE_DATABASE_URL"] != exported["CI_REGIONAL_CN_DATABASE_URL"]
+
+
+def test_workspace_image_identity_keeps_three_logical_postgres_services(tmp_path):
+    executor = make_executor(FakePodman())
+    image = "docker.io/library/postgres:16-alpine"
+    executor.services.images = {
+        "postgres-global": image,
+        "postgres-regional-cn": image,
+        "postgres-regional-de": image,
+    }
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    records = executor._workspace_images([{
+        "path": ".", "stack": "go",
+        "services": ["postgres-global", "postgres-regional-cn", "postgres-regional-de"],
+    }], str(tmp_path))
+    service_stacks = [item["stack"] for item in records if item["stack"].startswith("service:")]
+    assert service_stacks == [
+        "service:postgres:global",
+        "service:postgres:regional-cn",
+        "service:postgres:regional-de",
+    ]
+    assert len({item["digest"] for item in records if item["stack"].startswith("service:")}) == 1
+
+
 def test_image_identity_gate_accepts_no_planned_images_but_rejects_missing_identity():
     assert JobExecutor._images_have_immutable_identity([]) is True
     assert JobExecutor._images_have_immutable_identity([

@@ -447,5 +447,338 @@ class ServiceManager:
         )
 
 
+
+@dataclass
+class MultiDataPlaneServiceEnvironment(ServiceEnvironment):
+    global_database_url: str = ""
+    regional_cn_database_url: str = ""
+    regional_de_database_url: str = ""
+    service_evidence: tuple[str, ...] = ()
+
+    def public_summary(self) -> str:
+        return " ".join(f"{item}=ready" for item in self.service_evidence)
+
+
+_MULTI_POSTGRES = {
+    "postgres-global": {
+        "role": "global",
+        "host": "postgres",
+        "port": 5432,
+        "error_code": "CI_INFRA_POSTGRES_GLOBAL_UNAVAILABLE",
+    },
+    "postgres-regional-cn": {
+        "role": "regional-cn",
+        "host": "postgres-regional-cn",
+        "port": 5433,
+        "error_code": "CI_INFRA_POSTGRES_REGIONAL_CN_UNAVAILABLE",
+    },
+    "postgres-regional-de": {
+        "role": "regional-de",
+        "host": "postgres-regional-de",
+        "port": 5434,
+        "error_code": "CI_INFRA_POSTGRES_REGIONAL_DE_UNAVAILABLE",
+    },
+}
+_MULTI_POSTGRES_SERVICES = tuple(_MULTI_POSTGRES)
+_MULTI_POSTGRES_LIMITS = (
+    "--pids-limit=128", "--memory=160m", "--memory-swap=192m", "--cpus=0.30",
+)
+_MULTI_REDIS_LIMITS = (
+    "--pids-limit=96", "--memory=64m", "--memory-swap=96m", "--cpus=0.15",
+)
+_MULTI_RABBITMQ_LIMITS = (
+    "--pids-limit=192", "--memory=256m", "--memory-swap=320m", "--cpus=0.30",
+)
+
+
+def service_evidence_name(service: str) -> str:
+    spec = _MULTI_POSTGRES.get(service)
+    return f"postgres:{spec['role']}" if spec else service
+
+
+class MultiDataPlaneServiceManager(ServiceManager):
+    """Add a fixed three-PostgreSQL topology without changing legacy service behavior."""
+
+    SUPPORTED_SERVICES = ServiceManager.SUPPORTED_SERVICES + _MULTI_POSTGRES_SERVICES
+
+    def __init__(self, podman_binary: str = "/usr/bin/podman", config: dict | None = None):
+        super().__init__(podman_binary, config)
+        postgres_image = self.images["postgres"]
+        self.images.update({name: postgres_image for name in _MULTI_POSTGRES_SERVICES})
+
+    def _volume_name(self, suffix: str, service: str) -> str:
+        return f"ci-{self.worker_id}-{suffix}-{service}-data"
+
+    def prepare(
+        self,
+        job_id: str,
+        workspace: str = "",
+        services: list[str] | tuple[str, ...] | None = None,
+    ) -> ServiceEnvironment:
+        requested = tuple(dict.fromkeys(services or ()))
+        invalid = sorted(set(requested) - set(self.SUPPORTED_SERVICES))
+        if invalid or not requested:
+            raise ServiceSetupError(
+                "SERVICE_CONFIGURATION_INVALID",
+                f"code=SERVICE_CONFIGURATION_INVALID operation=validate resource=services invalid={invalid or ['none']}",
+            )
+        multi_requested = tuple(name for name in requested if name in _MULTI_POSTGRES)
+        if not multi_requested:
+            return super().prepare(job_id, workspace, requested)
+        if "postgres" in requested or set(multi_requested) != set(_MULTI_POSTGRES_SERVICES):
+            raise ServiceSetupError(
+                "SERVICE_CONFIGURATION_INVALID",
+                "code=SERVICE_CONFIGURATION_INVALID operation=validate resource=postgres-multidataplane reason=fixed_three_postgres_required",
+            )
+
+        suffix = safe_job_suffix(job_id)
+        network = f"ci-svc-{self.worker_id}-{suffix}"
+        names = {kind: f"ci-{self.worker_id}-{suffix}-{kind}" for kind in requested}
+        volumes = {kind: self._volume_name(suffix, kind) for kind in _MULTI_POSTGRES_SERVICES}
+        database = f"lenshub_ci_{suffix}"[:63]
+        passwords = {kind: secrets.token_urlsafe(24) for kind in _MULTI_POSTGRES_SERVICES}
+        rabbit_password = secrets.token_urlsafe(24)
+        rabbit_vhost = f"ci_{suffix}"[:48]
+        created_pod = False
+        created_volumes = []
+
+        try:
+            for kind in requested:
+                image = self.images[kind]
+                error_code = _MULTI_POSTGRES.get(kind, {}).get(
+                    "error_code",
+                    "REDIS_UNAVAILABLE" if kind == "redis" else "RABBITMQ_UNAVAILABLE",
+                )
+                self._run(
+                    ["image", "exists", image], error_code,
+                    resource_type=kind, operation="inspect", image=image,
+                )
+
+            for kind in _MULTI_POSTGRES_SERVICES:
+                volume = volumes[kind]
+                self._run(
+                    [
+                        "volume", "create",
+                        "--label", f"{JOB_LABEL}={suffix}",
+                        "--label", f"{RESOURCE_LABEL}={kind}-data",
+                        volume,
+                    ],
+                    _MULTI_POSTGRES[kind]["error_code"],
+                    resource_type=kind,
+                    operation="create_volume",
+                    resource_name=volume,
+                )
+                created_volumes.append(volume)
+
+            pod_command = [
+                "pod", "create", "--name", network,
+                "--label", f"{JOB_LABEL}={suffix}",
+                "--label", f"{RESOURCE_LABEL}=pod",
+                "--userns=keep-id",
+                "--network", "slirp4netns:allow_host_loopback=true",
+            ]
+            aliases = list(requested)
+            if "postgres-global" in requested:
+                aliases.append("postgres")
+            for alias in dict.fromkeys(aliases):
+                pod_command.extend(["--add-host", f"{alias}:127.0.0.1"])
+            self._run(
+                pod_command,
+                "SERVICE_NETWORK_UNAVAILABLE",
+                resource_type="pod", operation="create", resource_name=network,
+            )
+            created_pod = True
+
+            for kind in _MULTI_POSTGRES_SERVICES:
+                spec = _MULTI_POSTGRES[kind]
+                self._run(
+                    [
+                        "run", "-d", "--name", names[kind],
+                        "--label", f"{JOB_LABEL}={suffix}",
+                        "--label", f"{RESOURCE_LABEL}={kind}",
+                        "--http-proxy=false", "--pod", network, "--user", "0",
+                        *_MULTI_POSTGRES_LIMITS,
+                        "-v", f"{volumes[kind]}:/var/lib/postgresql/data:Z",
+                        "-e", "POSTGRES_USER=lenshub",
+                        "-e", f"POSTGRES_PASSWORD={passwords[kind]}",
+                        "-e", "POSTGRES_DB=postgres",
+                        self.images[kind],
+                        "-c", f"port={spec['port']}",
+                        "-c", "shared_buffers=32MB",
+                        "-c", "max_connections=30",
+                    ],
+                    spec["error_code"],
+                    resource_type=kind, operation="start_container",
+                    image=self.images[kind], resource_name=names[kind],
+                )
+
+            if "redis" in requested:
+                self._run(
+                    [
+                        "run", "-d", "--name", names["redis"],
+                        "--label", f"{JOB_LABEL}={suffix}",
+                        "--label", f"{RESOURCE_LABEL}=redis",
+                        "--http-proxy=false", "--pod", network,
+                        *_MULTI_REDIS_LIMITS,
+                        self.images["redis"],
+                    ],
+                    "REDIS_UNAVAILABLE", resource_type="redis", operation="start_container",
+                    image=self.images["redis"], resource_name=names["redis"],
+                )
+
+            if "rabbitmq" in requested:
+                self._run(
+                    [
+                        "run", "-d", "--name", names["rabbitmq"],
+                        "--label", f"{JOB_LABEL}={suffix}",
+                        "--label", f"{RESOURCE_LABEL}=rabbitmq",
+                        "--http-proxy=false", "--pod", network,
+                        *_MULTI_RABBITMQ_LIMITS,
+                        "-e", "RABBITMQ_DEFAULT_USER=lenshub",
+                        "-e", f"RABBITMQ_DEFAULT_PASS={rabbit_password}",
+                        "-e", f"RABBITMQ_DEFAULT_VHOST={rabbit_vhost}",
+                        self.images["rabbitmq"],
+                    ],
+                    "RABBITMQ_UNAVAILABLE", resource_type="rabbitmq", operation="start_container",
+                    image=self.images["rabbitmq"], resource_name=names["rabbitmq"],
+                )
+
+            self._wait_ready_multi(names)
+            for kind in _MULTI_POSTGRES_SERVICES:
+                spec = _MULTI_POSTGRES[kind]
+                self._run(
+                    [
+                        "exec", names[kind], "psql", "-U", "lenshub", "-d", "postgres",
+                        "-p", str(spec["port"]), "-v", "ON_ERROR_STOP=1", "-c",
+                        f"CREATE DATABASE {database};",
+                    ],
+                    spec["error_code"],
+                    resource_type=kind, operation="create_database", resource_name=names[kind],
+                )
+
+            urls = {}
+            for kind in _MULTI_POSTGRES_SERVICES:
+                spec = _MULTI_POSTGRES[kind]
+                urls[kind] = (
+                    f"postgres://lenshub:{quote(passwords[kind])}@{spec['host']}:{spec['port']}/"
+                    f"{database}?sslmode=disable"
+                )
+            env = MultiDataPlaneServiceEnvironment(
+                network=network,
+                database_url=urls["postgres-global"],
+                redis_addr="redis:6379" if "redis" in requested else "",
+                redis_db="0" if "redis" in requested else "",
+                rabbitmq_url=(
+                    f"amqp://lenshub:{quote(rabbit_password)}@rabbitmq:5672/{quote(rabbit_vhost, safe='')}"
+                    if "rabbitmq" in requested else ""
+                ),
+                env_file=str(Path(workspace or "/tmp") / "runtime" / "services.env"),
+                global_database_url=urls["postgres-global"],
+                regional_cn_database_url=urls["postgres-regional-cn"],
+                regional_de_database_url=urls["postgres-regional-de"],
+                service_evidence=tuple(
+                    [f"service:{service_evidence_name(kind)}" for kind in _MULTI_POSTGRES_SERVICES]
+                    + (["service:redis"] if "redis" in requested else [])
+                    + (["service:rabbitmq"] if "rabbitmq" in requested else [])
+                ),
+            )
+            self._write_multi_env(env)
+            logger.info("services:ready job=%s %s", suffix, env.public_summary())
+            return env
+        except ServiceSetupError:
+            if created_pod or created_volumes:
+                self.cleanup(job_id, workspace)
+            raise
+        except Exception as exc:
+            if created_pod or created_volumes:
+                self.cleanup(job_id, workspace)
+            raise ServiceSetupError(
+                "SERVICE_SETUP_FAILED",
+                self._diagnostic(
+                    "SERVICE_SETUP_FAILED", "prepare", "services", None, False,
+                    type(exc).__name__,
+                ),
+            ) from exc
+
+    def _wait_ready_multi(self, names: dict[str, str]) -> None:
+        deadline = time.monotonic() + self.timeout
+        probes = {
+            kind: ["exec", names[kind], "pg_isready", "-U", "lenshub", "-p", str(_MULTI_POSTGRES[kind]["port"])]
+            for kind in _MULTI_POSTGRES_SERVICES
+        }
+        if "redis" in names:
+            probes["redis"] = ["exec", names["redis"], "redis-cli", "ping"]
+        if "rabbitmq" in names:
+            probes["rabbitmq"] = ["exec", names["rabbitmq"], "rabbitmq-diagnostics", "-q", "ping"]
+        ready = set()
+        attempts = 0
+        while time.monotonic() < deadline:
+            attempts += 1
+            for kind, command in probes.items():
+                if kind in ready:
+                    continue
+                result = self._try_result(command)
+                if result is not None and result.returncode == 0:
+                    ready.add(kind)
+                    continue
+                state = self._container_state(names[kind])
+                if state and state.get("status") not in {"running", "paused"}:
+                    error_code = _MULTI_POSTGRES.get(kind, {}).get(
+                        "error_code",
+                        "REDIS_UNAVAILABLE" if kind == "redis" else "RABBITMQ_UNAVAILABLE",
+                    )
+                    raise ServiceSetupError(
+                        error_code,
+                        self._diagnostic(
+                            error_code, "readiness", kind,
+                            int(state.get("exit_code", -1)), False,
+                            f"attempts={attempts} state={state.get('status', 'unknown')} "
+                            f"health={state.get('health', 'unknown')}",
+                            resource_name=names[kind],
+                        ),
+                    )
+            if len(ready) == len(probes):
+                return
+            time.sleep(1)
+        missing = next(kind for kind in probes if kind not in ready)
+        error_code = _MULTI_POSTGRES.get(missing, {}).get(
+            "error_code",
+            "REDIS_UNAVAILABLE" if missing == "redis" else "RABBITMQ_UNAVAILABLE",
+        )
+        raise ServiceSetupError(
+            error_code,
+            self._diagnostic(
+                error_code, "readiness", missing, -1, True,
+                f"attempts={attempts} health=not_ready",
+                resource_name=names[missing],
+            ),
+        )
+
+    def _write_multi_env(self, env: MultiDataPlaneServiceEnvironment) -> None:
+        path = Path(env.env_file)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_text(
+            "\n".join([
+                f"DATABASE_URL={env.database_url}",
+                f"CI_GLOBAL_DATABASE_URL={env.global_database_url}",
+                f"CI_REGIONAL_CN_DATABASE_URL={env.regional_cn_database_url}",
+                f"CI_REGIONAL_DE_DATABASE_URL={env.regional_de_database_url}",
+                f"REDIS_ADDR={env.redis_addr}",
+                "REDIS_PASSWORD=",
+                f"REDIS_DB={env.redis_db}",
+                f"RABBITMQ_URL={env.rabbitmq_url}",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        os.chmod(path, 0o600)
+
+    def cleanup(self, job_id: str, workspace: str = "") -> None:
+        suffix = safe_job_suffix(job_id)
+        super().cleanup(job_id, workspace)
+        for kind in _MULTI_POSTGRES_SERVICES:
+            volume = self._volume_name(suffix, kind)
+            self._cleanup_resource(["volume", "rm", "-f", volume], kind, volume)
+
 def cleanup_job_services(podman_binary: str, job_id: str, workspace: str = "") -> None:
-    ServiceManager(podman_binary).cleanup(job_id, workspace)
+    MultiDataPlaneServiceManager(podman_binary).cleanup(job_id, workspace)

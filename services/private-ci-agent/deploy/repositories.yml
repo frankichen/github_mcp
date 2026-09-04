@@ -30,7 +30,9 @@ repositories:
       - path: .
         type: auto
         services:
-          - postgres
+          - postgres-global
+          - postgres-regional-cn
+          - postgres-regional-de
           - redis
           - rabbitmq
         hooks:

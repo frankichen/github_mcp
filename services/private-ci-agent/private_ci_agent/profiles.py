@@ -434,7 +434,7 @@ def _load_json(path: Path) -> dict:
         return {"_configuration_error": f"invalid package.json: {exc}"}
 
 
-SUPPORTED_WORKSPACE_SERVICES = ("postgres", "redis", "rabbitmq")
+SUPPORTED_WORKSPACE_SERVICES = ("postgres", "postgres-global", "postgres-regional-cn", "postgres-regional-de", "redis", "rabbitmq")
 SUPPORTED_WORKSPACE_HOOKS = ("go-migrate", "ai-integrity")
 
 
