@@ -685,14 +685,19 @@ class MultiDataPlaneServiceManager(ServiceManager):
             self._write_multi_env(env)
             logger.info("services:ready job=%s %s", suffix, env.public_summary())
             return env
-        except (ServiceSetupError, OSError) as exc:
+        except ServiceSetupError:
             if created_pod or created_volumes:
                 self.cleanup(job_id, workspace)
-            if isinstance(exc, ServiceSetupError):
-                raise
+            raise
+        except Exception as exc:
+            if created_pod or created_volumes:
+                self.cleanup(job_id, workspace)
             raise ServiceSetupError(
                 "SERVICE_SETUP_FAILED",
-                f"code=SERVICE_SETUP_FAILED operation=prepare reason={type(exc).__name__}",
+                self._diagnostic(
+                    "SERVICE_SETUP_FAILED", "prepare", "services", None, False,
+                    type(exc).__name__,
+                ),
             ) from exc
 
     def _wait_ready_multi(self, names: dict[str, str]) -> None:
@@ -712,8 +717,8 @@ class MultiDataPlaneServiceManager(ServiceManager):
             for kind, command in probes.items():
                 if kind in ready:
                     continue
-                result = self._try_result(command, timeout=5)
-                if result.returncode == 0:
+                result = self._try_result(command)
+                if result is not None and result.returncode == 0:
                     ready.add(kind)
                     continue
                 state = self._container_state(names[kind])
@@ -725,13 +730,11 @@ class MultiDataPlaneServiceManager(ServiceManager):
                     raise ServiceSetupError(
                         error_code,
                         self._diagnostic(
-                            error_code,
-                            resource_type=kind,
-                            operation="readiness",
+                            error_code, "readiness", kind,
+                            int(state.get("exit_code", -1)), False,
+                            f"attempts={attempts} state={state.get('status', 'unknown')} "
+                            f"health={state.get('health', 'unknown')}",
                             resource_name=names[kind],
-                            exit_code=int(state.get("exit_code", -1)),
-                            stderr=f"state={state.get('status', 'unknown')} health={state.get('health', 'unknown')}",
-                            attempts=attempts,
                         ),
                     )
             if len(ready) == len(probes):
@@ -745,13 +748,9 @@ class MultiDataPlaneServiceManager(ServiceManager):
         raise ServiceSetupError(
             error_code,
             self._diagnostic(
-                error_code,
-                resource_type=missing,
-                operation="readiness",
+                error_code, "readiness", missing, -1, True,
+                f"attempts={attempts} health=not_ready",
                 resource_name=names[missing],
-                stderr="health=not_ready",
-                timed_out=True,
-                attempts=attempts,
             ),
         )
 
@@ -779,7 +778,7 @@ class MultiDataPlaneServiceManager(ServiceManager):
         super().cleanup(job_id, workspace)
         for kind in _MULTI_POSTGRES_SERVICES:
             volume = self._volume_name(suffix, kind)
-            self._try(["volume", "rm", "-f", volume], resource_type=kind, operation="cleanup_volume", resource_name=volume)
+            self._cleanup_resource(["volume", "rm", "-f", volume], kind, volume)
 
 def cleanup_job_services(podman_binary: str, job_id: str, workspace: str = "") -> None:
     MultiDataPlaneServiceManager(podman_binary).cleanup(job_id, workspace)
