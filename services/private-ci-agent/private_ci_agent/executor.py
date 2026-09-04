@@ -31,7 +31,7 @@ from private_ci_agent.profiles import (
 )
 from private_ci_agent.podman import PodmanRunner
 from private_ci_agent.logs import LogManager
-from private_ci_agent.services import ServiceManager, ServiceSetupError
+from private_ci_agent.services import MultiDataPlaneServiceManager, ServiceSetupError, service_evidence_name
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,7 @@ class JobExecutor:
             config.get("podman_binary", "/usr/bin/podman"), config.get("worker_id")
         )
         self.log_manager = LogManager(controller_client, config.get("max_log_bytes", 10485760))
-        self.services = ServiceManager(config.get("podman_binary", "/usr/bin/podman"), config)
+        self.services = MultiDataPlaneServiceManager(config.get("podman_binary", "/usr/bin/podman"), config)
         self.environment_cache = DependencyEnvironmentCache(
             config.get("environment_cache_root", "/srv/private-ci/cache/environments")
         )
@@ -443,7 +443,7 @@ class JobExecutor:
                     continue
                 records.append({
                     "workspace": workspace_path,
-                    "stack": f"service:{service}",
+                    "stack": f"service:{service_evidence_name(service)}",
                     "image": image,
                     "digest": self.podman.image_digest(image) or "",
                 })
@@ -901,8 +901,17 @@ class JobExecutor:
     def _service_env(service_env):
         if not service_env:
             return None
-        return {"DATABASE_URL": service_env.database_url, "REDIS_ADDR": service_env.redis_addr,
-                "REDIS_PASSWORD": "", "REDIS_DB": service_env.redis_db, "RABBITMQ_URL": service_env.rabbitmq_url}
+        env = {"DATABASE_URL": service_env.database_url, "REDIS_ADDR": service_env.redis_addr,
+               "REDIS_PASSWORD": "", "REDIS_DB": service_env.redis_db, "RABBITMQ_URL": service_env.rabbitmq_url}
+        for key, attribute in (
+            ("CI_GLOBAL_DATABASE_URL", "global_database_url"),
+            ("CI_REGIONAL_CN_DATABASE_URL", "regional_cn_database_url"),
+            ("CI_REGIONAL_DE_DATABASE_URL", "regional_de_database_url"),
+        ):
+            value = getattr(service_env, attribute, "")
+            if value:
+                env[key] = value
+        return env
 
     def _upload_output(self, job_id, result):
         output = result.get("stdout", "")

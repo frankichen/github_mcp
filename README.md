@@ -55,6 +55,14 @@ private-deploy-agent（服务器端）
 - 私有部署 Worker：[`services/private-deploy-agent`](services/private-deploy-agent)
 - WSL Executor：[`services/private-ci-deploy-executor`](services/private-ci-deploy-executor)
 
+## Private CI 多 PostgreSQL 数据面合同
+
+`frankichen/sxt` 的根 Go workspace 在 `repo-auto-check` 与 `go-check` 中使用固定、服务端控制的三 PostgreSQL 测试拓扑：`postgres-global`、`postgres-regional-cn`、`postgres-regional-de`。三者是三个独立 PostgreSQL 容器，分别绑定独立临时数据卷、独立凭据、独立生命周期与固定连接端口；调用方不能指定镜像、主机、端口、实例数量、卷路径、密码或任意 shell。普通仓库以及仍声明 `postgres` 的 workspace 保持原单 PostgreSQL 行为。
+
+多数据面 Job 对测试进程暴露 `CI_GLOBAL_DATABASE_URL`、`CI_REGIONAL_CN_DATABASE_URL`、`CI_REGIONAL_DE_DATABASE_URL`。为保持旧测试兼容，`DATABASE_URL` 与 `CI_GLOBAL_DATABASE_URL` 指向同一 Global PostgreSQL；任何一个数据面未 ready 都在测试命令启动前以 `CI_INFRA_POSTGRES_*` 失败，不会回退到其它数据库。凭据仅进入权限 `0600` 的 Job 临时环境文件和受控容器环境，CI summary/attestation 只记录 `service:postgres:global`、`service:postgres:regional-cn`、`service:postgres:regional-de` 等无 DSN 服务身份。
+
+当前 Worker 仍固定 `max_concurrent_jobs=1`。多数据面路径为三套 PostgreSQL、Redis、RabbitMQ 设置固定容器资源上限，并按 `worker_id + job_id + logical service` 命名；成功、失败、timeout 或 cancel 后只删除当前 Job 的 Pod、容器、三个临时 PostgreSQL volume 与环境文件，不执行 prune，也不清理其它 Job/Worker。
+
 ## GitHub Action Service
 
 MyGithut12 源码当前版本为 `12.9.4`；生产运行版本必须以 `get_mygithub_capabilities` 的实时结果为准。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。AI 日常生成 UTF-8 文本文件继续只有一个推荐入口 `put_generated_files`：普通内容使用 `files[{path,content}]`，超过 inline transport budget 时仍调用同一个工具，由 ChatGPT/Codex runtime 通过顶层 `bundle_file` 交付 version=1 的 JSON 文件包；服务端负责临时文件下载、JSON/UTF-8/路径/大小校验、Workspace/Session CAS、旧 blob 推断、hash、chunk staging、原子 Commit 和 durable read-back。bundle 下载只接受 `*.oaiusercontent.com` 或受限 OpenAI Azure Blob fileParam 投递域名的 HTTPS/443 临时 URL，并在首跳与每次 redirect 前重新校验域名 allowlist 和公网 DNS；窗口不管理 upload/chunk/offset/hash/candidate/expected_blob；V2 仍不支持二进制仓库文件和删除。

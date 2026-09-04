@@ -115,6 +115,19 @@ def test_operator_workspace_controls_are_preserved_only_for_configured_workspace
     assert "hooks" not in automatic
 
 
+
+def test_operator_workspace_controls_accept_fixed_multidataplane_services(tmp_path):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    config = {"workspaces": [{
+        "path": ".", "type": "go",
+        "services": ["postgres-global", "postgres-regional-cn", "postgres-regional-de", "redis", "rabbitmq"],
+    }]}
+    configured = discover_workspaces(str(tmp_path), config)["workspaces"][0]
+    assert configured["services"] == [
+        "postgres-global", "postgres-regional-cn", "postgres-regional-de", "redis", "rabbitmq",
+    ]
+
+
 def test_operator_workspace_allowlist_is_authoritative(tmp_path):
     (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
     gradle = tmp_path / "tools" / "android-tester"

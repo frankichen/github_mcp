@@ -375,12 +375,23 @@ def test_service_environment_is_forwarded_without_host_env(monkeypatch, tmp_path
     PodmanRunner("podman").run_command(
         "100.118.124.97:5555/library/golang:1.26.4", "job-123", str(tmp_path / "source"),
         {"go": str(cache)}, "go test ./...", 30,
-        env={"DATABASE_URL": "postgres://lenshub:REDACTED@postgres:5432/lenshub_ci_job", "CI_WORKER_TOKEN": "no"},
+        env={
+            "DATABASE_URL": "postgres://lenshub:REDACTED@postgres:5432/lenshub_ci_job",
+            "CI_GLOBAL_DATABASE_URL": "postgres://lenshub:REDACTED@postgres:5432/lenshub_ci_job",
+            "CI_REGIONAL_CN_DATABASE_URL": "postgres://lenshub:REDACTED@postgres-regional-cn:5433/lenshub_ci_job",
+            "CI_REGIONAL_DE_DATABASE_URL": "postgres://lenshub:REDACTED@postgres-regional-de:5434/lenshub_ci_job",
+            "CI_WORKER_TOKEN": "no",
+        },
         network_name="ci-job_123",
     )
     command = captured[0]
     assert "--pod" in command and "ci-job_123" in command
     assert any(item.startswith("DATABASE_URL=") for item in command)
+    assert any(item.startswith("CI_GLOBAL_DATABASE_URL=") for item in command)
+    assert any(item.startswith("CI_REGIONAL_CN_DATABASE_URL=") for item in command)
+    assert any(item.startswith("CI_REGIONAL_DE_DATABASE_URL=") for item in command)
+    no_proxy = next(item for item in command if item.startswith("NO_PROXY="))
+    assert "postgres-regional-cn" in no_proxy and "postgres-regional-de" in no_proxy
     assert "CI_WORKER_TOKEN" not in " ".join(command)
     assert "postgres" in next(item for item in command if item.startswith("NO_PROXY="))
 

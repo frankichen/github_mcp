@@ -76,7 +76,7 @@ def test_sxt_runtime_overrides_request_only_lenshub_services_and_hooks():
     data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
     root = next(item for item in data["repositories"]["frankichen/sxt"]["workspaces"] if item["path"] == ".")
 
-    assert root["services"] == ["postgres", "redis", "rabbitmq"]
+    assert root["services"] == ["postgres-global", "postgres-regional-cn", "postgres-regional-de", "redis", "rabbitmq"]
     assert root["hooks"] == ["go-migrate", "ai-integrity"]
 
 

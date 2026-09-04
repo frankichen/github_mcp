@@ -18,7 +18,7 @@ PROXY_ENV_NAMES = {
     "http_proxy", "https_proxy", "all_proxy",
 }
 PIP_CONTROL_ENV_NAMES = {"PIP_INDEX_URL", "PIP_TRUSTED_HOST"}
-REQUIRED_NO_PROXY = ("postgres", "redis", "rabbitmq", "localhost", "127.0.0.1", "::1")
+REQUIRED_NO_PROXY = ("postgres", "postgres-global", "postgres-regional-cn", "postgres-regional-de", "redis", "rabbitmq", "localhost", "127.0.0.1", "::1")
 LOOPBACK_PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 CONTAINER_PROXY_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
 PIP_TRUSTED_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]{1,5})?$")
@@ -615,7 +615,9 @@ class PodmanRunner:
             safe_env["NUGET_PACKAGES"] = "/ci-cache/nuget"
         if env:
             allowed = {
-                "DATABASE_URL", "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "RABBITMQ_URL",
+                "DATABASE_URL", "CI_GLOBAL_DATABASE_URL",
+                "CI_REGIONAL_CN_DATABASE_URL", "CI_REGIONAL_DE_DATABASE_URL",
+                "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "RABBITMQ_URL",
                 "AI_INTEGRITY_BASE_SHA", "AI_INTEGRITY_REPORT", "AI_INTEGRITY_CHANGED_FILES",
                 "AI_INTEGRITY_CONTRACT_GATE_ATTESTED",
                 "CI_COMMIT_SHA", "CI_REPOSITORY_ROOT",

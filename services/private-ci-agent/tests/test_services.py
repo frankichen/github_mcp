@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from private_ci_agent.services import ServiceManager, ServiceSetupError, safe_job_suffix, sanitize_service_stderr
+from private_ci_agent.services import MultiDataPlaneServiceManager, ServiceManager, ServiceSetupError, safe_job_suffix, sanitize_service_stderr
 
 
 def test_job_suffix_is_safe_and_bounded():
@@ -94,6 +94,106 @@ def test_default_service_images_match_preloaded_rootless_images():
         "redis": "docker.io/library/redis:7-alpine",
         "rabbitmq": "docker.io/library/rabbitmq:3-management-alpine",
     }
+
+
+MULTI_SERVICES = [
+    "postgres-global", "postgres-regional-cn", "postgres-regional-de", "redis", "rabbitmq",
+]
+
+
+def _successful_service_run(commands):
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    return fake_run
+
+
+def test_multidataplane_prepare_provisions_three_independent_postgres_instances(monkeypatch, tmp_path):
+    commands = []
+    monkeypatch.setattr("private_ci_agent.services.subprocess.run", _successful_service_run(commands))
+    manager = MultiDataPlaneServiceManager("podman")
+    env = manager.prepare("job-multi", str(tmp_path), MULTI_SERVICES)
+
+    urls = [env.global_database_url, env.regional_cn_database_url, env.regional_de_database_url]
+    assert env.database_url == env.global_database_url
+    assert len(set(urls)) == 3
+    assert "@postgres:5432/" in env.global_database_url
+    assert "@postgres-regional-cn:5433/" in env.regional_cn_database_url
+    assert "@postgres-regional-de:5434/" in env.regional_de_database_url
+    assert env.service_evidence[:3] == (
+        "service:postgres:global", "service:postgres:regional-cn", "service:postgres:regional-de",
+    )
+    assert "postgres://" not in env.public_summary()
+    assert "service:postgres:global=ready" in env.public_summary()
+
+    postgres_runs = [
+        command for command in commands
+        if command[1] == "run" and "docker.io/library/postgres:16-alpine" in command
+    ]
+    assert len(postgres_runs) == 3
+    assert all("--memory=160m" in command and "--cpus=0.30" in command for command in postgres_runs)
+    assert any("port=5432" in command for command in postgres_runs)
+    assert any("port=5433" in command for command in postgres_runs)
+    assert any("port=5434" in command for command in postgres_runs)
+    volume_creates = [command for command in commands if command[1:3] == ["volume", "create"]]
+    assert len(volume_creates) == 3
+    assert len({command[-1] for command in volume_creates}) == 3
+    env_file = tmp_path / "runtime" / "services.env"
+    assert env_file.stat().st_mode & 0o777 == 0o600
+    contents = env_file.read_text(encoding="utf-8")
+    assert "CI_GLOBAL_DATABASE_URL=" in contents
+    assert "CI_REGIONAL_CN_DATABASE_URL=" in contents
+    assert "CI_REGIONAL_DE_DATABASE_URL=" in contents
+
+    manager.cleanup("job-multi", str(tmp_path))
+    volume_removes = [command for command in commands if command[1:4] == ["volume", "rm", "-f"]]
+    assert len(volume_removes) >= 3
+    assert not env_file.exists()
+
+
+def test_multidataplane_fixed_contract_rejects_partial_or_legacy_mixed_topology(tmp_path):
+    manager = MultiDataPlaneServiceManager("podman")
+    with pytest.raises(ServiceSetupError) as partial:
+        manager.prepare("job-partial", str(tmp_path), ["postgres-global", "postgres-regional-cn"])
+    assert partial.value.code == "SERVICE_CONFIGURATION_INVALID"
+    with pytest.raises(ServiceSetupError) as mixed:
+        manager.prepare("job-mixed", str(tmp_path), ["postgres", *MULTI_SERVICES[:3]])
+    assert mixed.value.code == "SERVICE_CONFIGURATION_INVALID"
+
+
+def test_multidataplane_health_failure_is_role_specific_and_cleans_current_job(monkeypatch, tmp_path):
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        if command[1:2] == ["exec"] and "postgres-regional-de" in command[2] and "pg_isready" in command:
+            return SimpleNamespace(returncode=1, stdout="", stderr="not ready")
+        if command[1:3] == ["inspect", "--format"]:
+            return SimpleNamespace(returncode=0, stdout="running|0||starting", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.services.subprocess.run", fake_run)
+    manager = MultiDataPlaneServiceManager("podman")
+    manager.timeout = 0.01
+    with pytest.raises(ServiceSetupError) as raised:
+        manager.prepare("job-failing", str(tmp_path), MULTI_SERVICES[:3])
+    assert raised.value.code == "CI_INFRA_POSTGRES_REGIONAL_DE_UNAVAILABLE"
+    flattened = [item for command in commands for item in command]
+    assert "ci-svc-wsl-ci-01-job_failing" in flattened
+    assert not any("job_other" in item for item in flattened)
+    assert any(command[1:4] == ["volume", "rm", "-f"] for command in commands)
+
+
+def test_multidataplane_cleanup_identity_does_not_cross_jobs(monkeypatch):
+    commands = []
+    monkeypatch.setattr(
+        "private_ci_agent.services.subprocess.run",
+        lambda command, **_: commands.append(command) or SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    MultiDataPlaneServiceManager("podman").cleanup("job-a")
+    flattened = [item for command in commands for item in command]
+    assert any("job_a" in item for item in flattened)
+    assert not any("job_b" in item for item in flattened)
 
 
 def test_service_run_failure_contains_safe_diagnostic(monkeypatch):
