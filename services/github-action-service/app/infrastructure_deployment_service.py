@@ -299,7 +299,7 @@ def plan_infrastructure_deployment(
         "execution_contract": (
             "fixed-executor/post-switch-recovery/fail-stop/no-auto-rollback"
             if recovery_id
-            else "fixed-executor/full/fail-stop/no-auto-rollback"
+            else "fixed-executor/fail-stop/no-auto-rollback"
         ),
     }
 
