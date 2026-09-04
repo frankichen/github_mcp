@@ -140,7 +140,7 @@ def _workspace_row(
         "chatgpt",
         now + lease_seconds,
         head,
-        json.dumps(scope or {"paths": ["allowed/**"]}, separators=(",", ":")),
+        json.dumps(scope if scope is not None else {"paths": ["allowed/**"]}, separators=(",", ":")),
         drift_reason,
         None,
         now,
@@ -326,12 +326,68 @@ def test_base_delta_outside_workspace_scope_is_not_a_scope_violation(tmp_path, m
     assert result["verification"]["scope"]["changed_paths"] == ["allowed/feature.py"]
 
 
-def test_t8_task_path_set_must_match_before_and_after_base_sync(tmp_path, monkeypatch):
+def test_t8_unexplained_task_path_change_fails_closed(tmp_path, monkeypatch):
     service, session, _ = _seed(tmp_path, monkeypatch)
     service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=["allowed/different.py"])
     with pytest.raises(recovery.MyGithub12Error) as exc:
         _call(service, session)
     assert exc.value.code == "RECOVERY_TASK_DIFF_MISMATCH"
+
+
+def test_combined_base_sync_and_forward_task_advance_allows_expanded_paths(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    expanded = ["allowed/feature.py", "allowed/new_test.py", "allowed/design.md"]
+    service.repo.set_compare(
+        OLD_HEAD,
+        CURRENT_HEAD,
+        paths=["base/region.py", *expanded],
+    )
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=expanded)
+
+    result = _call(service, session)
+
+    assert result["control_plane_recovery"] == "CONTROL_PLANE_BASE_SYNC_RECOVERY_SUCCESS"
+    assert result["audit"]["old_task_delta_paths"] == ["allowed/feature.py"]
+    assert result["audit"]["new_task_delta_paths"] == sorted(expanded)
+    assert result["audit"]["task_path_changes"] == ["allowed/design.md", "allowed/new_test.py"]
+    assert result["audit"]["unexplained_task_path_changes"] == []
+
+
+def test_forward_commit_may_modify_old_task_path_and_add_another_path(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    service.repo.set_compare(
+        OLD_HEAD,
+        CURRENT_HEAD,
+        paths=["base/region.py", "allowed/feature.py", "allowed/regression.py"],
+    )
+    service.repo.set_compare(
+        NEW_BASE,
+        CURRENT_HEAD,
+        paths=["allowed/feature.py", "allowed/regression.py"],
+    )
+
+    result = _call(service, session)
+
+    assert result["audit"]["forward_task_delta_paths"] == [
+        "allowed/feature.py",
+        "allowed/regression.py",
+        "base/region.py",
+    ]
+    assert result["audit"]["task_path_changes"] == ["allowed/regression.py"]
+
+
+def test_legacy_empty_scope_recovers_without_becoming_unrestricted_writer(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    with sessions._LOCK, sessions._db() as db:
+        db.execute("UPDATE workspaces SET scope_json='{}' WHERE workspace_id=?", (WORKSPACE_ID,))
+
+    result = _call(service, session)
+
+    assert result["workspace"]["status"] == "active"
+    assert result["workspace"]["scope"] == {}
+    assert result["scope_declaration_required"] is True
+    assert result["writer_ready"] is False
+    assert result["verification"]["scope"]["enforcement"] == "actual_changed_paths_overlap_only"
 
 
 def test_t9_workspace_revision_cas(tmp_path, monkeypatch):
@@ -346,6 +402,33 @@ def test_t10_session_revision_cas(tmp_path, monkeypatch):
     with pytest.raises(recovery.MyGithub12Error) as exc:
         _call(service, session, expected_session_revision=session["session_revision"] + 1)
     assert exc.value.code == "DEVELOPMENT_SESSION_REVISION_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"repository": "other/repo"},
+        {"branch": "ai/other-branch"},
+        {"expected_base_branch": "release"},
+    ],
+)
+def test_repository_branch_and_base_branch_identity_must_match(tmp_path, monkeypatch, overrides):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session, **overrides)
+    assert exc.value.code == "RECOVERY_IDENTITY_MISMATCH"
+
+
+def test_workspace_session_binding_mismatch_fails_closed(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            "UPDATE development_sessions SET branch='ai/other-branch' WHERE session_id=?",
+            (session["session_id"],),
+        )
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == "RECOVERY_IDENTITY_MISMATCH"
 
 
 @pytest.mark.parametrize(("kind", "error_code"), [("head", "RECOVERY_HEAD_MISMATCH"), ("tree", "RECOVERY_TREE_MISMATCH")])
@@ -388,6 +471,22 @@ def test_t13_idempotent_retry_does_not_repeat_revisions_or_side_effects(tmp_path
     assert second["workspace"]["revision"] == first["workspace"]["revision"]
     assert second["development_session"]["session_revision"] == first["development_session"]["session_revision"]
     assert len(index_requests) == 2  # same exact request identity; index layer is responsible for deduplication
+
+
+def test_idempotency_key_reuse_with_changed_payload_fails_closed(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _call(service, session)
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session, lease_seconds=7100)
+    assert exc.value.code == "IDEMPOTENCY_CONFLICT"
+
+
+def test_old_revisions_cannot_start_second_recovery_after_success(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _call(service, session)
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session, idempotency_key="second-recovery")
+    assert exc.value.code == "RECOVERY_DRIFT_REASON_UNSUPPORTED"
 
 
 def test_t14_transaction_failure_rolls_back_base_head_and_status_together(tmp_path, monkeypatch):
@@ -448,7 +547,7 @@ def test_t16_legacy_merged_workspace_high_overlap_is_ignored_only_with_exact_mer
         lambda *args, **kwargs: {
             "ok": True,
             "workspace_id": WORKSPACE_ID,
-            "items": [{"workspace_id": "ws_merged_a", "branch": "ai/merged-a", "level": "high", "evidence": [{"kind": "changed_paths", "items": ["base/region.py"]}]}],
+            "items": [{"workspace_id": "ws_merged_a", "branch": "ai/merged-a", "level": "high", "evidence": [{"kind": "changed_paths", "items": ["allowed/feature.py"]}]}],
         },
     )
     result = _call(service, session)
@@ -482,12 +581,37 @@ def test_t16_active_overlapping_writer_is_never_ignored_without_terminal_merged_
         lambda *args, **kwargs: {
             "ok": True,
             "workspace_id": WORKSPACE_ID,
-            "items": [{"workspace_id": "ws_active_a", "branch": "ai/merged-a", "level": "high", "evidence": []}],
+            "items": [{"workspace_id": "ws_active_a", "branch": "ai/merged-a", "level": "high", "evidence": [{"kind": "changed_paths", "items": ["allowed/feature.py"]}]}],
         },
     )
     with pytest.raises(recovery.MyGithub12Error) as exc:
         _call(service, session)
     assert exc.value.code == "RECOVERY_WORKSPACE_OVERLAP"
+
+
+def test_imported_base_path_does_not_create_false_current_task_overlap(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        recovery.mygithub12,
+        "workspace_overlap",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "workspace_id": WORKSPACE_ID,
+            "items": [{
+                "workspace_id": "ws_other",
+                "branch": "ai/other",
+                "level": "high",
+                "evidence": [{"kind": "changed_paths", "items": ["base/region.py"]}],
+            }],
+        },
+    )
+
+    result = _call(service, session)
+
+    overlap = result["verification"]["ownership"]["overlap"]
+    assert overlap["current_task_delta_paths"] == ["allowed/feature.py"]
+    assert overlap["items"][0]["level"] == "none"
+    assert overlap["items"][0]["evidence"] == []
 
 
 def test_managed_merge_finalization_atomically_closes_workspace_and_releases_writer(tmp_path, monkeypatch):
@@ -532,6 +656,30 @@ def test_resume_returns_explicit_base_sync_recovery_action_when_pinned_base_lags
     assert plan["recovery_tool"] == "recover_base_synced_development_task"
     assert plan["expected_old_base_sha"] == OLD_BASE
     assert plan["expected_new_base_sha"] == NEW_BASE
+    assert plan["preflight"]["verified"] is True
+
+
+def test_resume_requires_refresh_before_base_sync_recovery_when_workspace_identity_is_stale(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    workspace = mygithub12.get_workspace(service, WORKSPACE_ID)
+    workspace["head_sha"] = OLD_HEAD
+    workspace["tree_sha"] = OLD_TREE
+
+    plan = resume._workspace_recovery_plan(
+        workspace,
+        service=service,
+        session=session,
+        current_main={"branch": BASE_BRANCH, "commit_sha": NEW_BASE},
+        branch_state={"commit_sha": CURRENT_HEAD, "tree_sha": CURRENT_TREE},
+    )
+
+    assert plan["action"] == "refresh_development_workspace"
+    assert plan["next_action"] == "recover_base_synced_development_task"
+    assert plan["recovery_sequence"] == [
+        "refresh_development_workspace",
+        "recover_base_synced_development_task",
+    ]
+    assert plan["expected_workspace_revision"] == workspace["revision"]
     assert plan["preflight"]["verified"] is True
 
 
