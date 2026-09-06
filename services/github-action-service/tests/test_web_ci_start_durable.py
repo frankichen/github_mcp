@@ -197,6 +197,7 @@ async def test_same_key_same_request_reuses_one_request(start_mcp):
 @pytest.mark.parametrize(
     "mutation",
     [
+        {"commit_sha": "d" * 40},
         {"timeout_seconds": 899},
         {"priority": "high"},
         {"base_sha": BASE},
@@ -234,6 +235,7 @@ async def test_normalized_request_persists_execution_semantics(start_mcp):
     assert payload["branch"] == BRANCH
     assert payload["commit_sha"] == COMMIT
     assert payload["profile"] == "repo-auto-check"
+    assert payload["requested_timeout_seconds"] == 899
     assert payload["timeout_seconds"] == 899
     assert payload["requested_priority"] == "high"
     assert isinstance(payload["priority"], int)
@@ -241,6 +243,83 @@ async def test_normalized_request_persists_execution_semantics(start_mcp):
     assert payload["force_rerun"] is False
     assert payload["supersede_previous"] is True
     assert payload["effective_config_digest"] == result["effective_config_digest"]
+
+
+@pytest.mark.asyncio
+async def test_max_timeout_drift_replays_same_raw_request_without_false_conflict(
+    start_mcp, monkeypatch
+):
+    current_max = {"value": 900}
+    max_timeout_calls = []
+
+    def get_current_max_timeout(repository):
+        max_timeout_calls.append(current_max["value"])
+        return current_max["value"]
+
+    monkeypatch.setattr(ci_mcp, "get_max_timeout", get_current_max_timeout)
+    first = await _start(
+        start_mcp, idempotency_key="timeout-drift-key", timeout_seconds=1200
+    )
+    payload = requests.get_ci_request_payload(first["request_id"])
+    assert payload["requested_timeout_seconds"] == 1200
+    assert payload["timeout_seconds"] == 900
+
+    current_max["value"] = 600
+    replay = await _start(
+        start_mcp, idempotency_key="timeout-drift-key", timeout_seconds=1200
+    )
+    conflict = await _start(
+        start_mcp, idempotency_key="timeout-drift-key", timeout_seconds=900
+    )
+
+    assert replay["request_id"] == first["request_id"]
+    assert replay["normalized_request_hash"] == first["normalized_request_hash"]
+    assert conflict["ok"] is False
+    assert conflict["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert max_timeout_calls == [900]
+    assert requests.get_ci_request(first["request_id"])["revision"] == 0
+    assert _counts() == {"requests": 1, "jobs": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "gate_name,expected_code",
+    [
+        ("repository", "REPOSITORY_NOT_ALLOWED"),
+        ("private_ci", "REPOSITORY_OPERATION_DENIED"),
+        ("profile", "PRIVATE_CI_PROFILE_NOT_ALLOWED"),
+    ],
+)
+async def test_policy_tightening_preserves_existing_replay_but_blocks_new_request(
+    start_mcp, monkeypatch, gate_name, expected_code
+):
+    first = await _start(start_mcp, idempotency_key=f"policy-{gate_name}")
+    revision = first["revision"]
+
+    if gate_name == "repository":
+        monkeypatch.setattr(ci_mcp, "is_repository_allowed", lambda repository: False)
+    elif gate_name == "private_ci":
+        monkeypatch.setattr(ci_mcp, "is_private_ci_enabled", lambda repository: False)
+    else:
+        monkeypatch.setattr(ci_mcp, "is_profile_allowed", lambda repository, profile: False)
+    monkeypatch.setattr(
+        ci_mcp,
+        "effective_ci_config_digest",
+        lambda repository: (_ for _ in ()).throw(
+            AssertionError("existing replay must not read current config")
+        ),
+    )
+
+    replay = await _start(start_mcp, idempotency_key=f"policy-{gate_name}")
+    denied = await _start(start_mcp, idempotency_key=f"policy-{gate_name}-new")
+
+    assert replay["request_id"] == first["request_id"]
+    assert replay["revision"] == revision
+    assert denied["ok"] is False
+    assert denied["error"]["code"] == expected_code
+    assert requests.get_ci_request(first["request_id"])["revision"] == revision
+    assert len(requests.get_ci_request_events(first["request_id"])) == 1
+    assert _counts() == {"requests": 1, "jobs": 0}
 
 
 @pytest.mark.asyncio
@@ -461,6 +540,65 @@ def test_changed_config_identity_fails_before_worker_queue(isolated_db, monkeypa
     with pytest.raises(dispatch.CIPreflightFailure) as exc:
         dispatch._perform_ci_request_preflight(request)
     assert exc.value.code == "CI_PREFLIGHT_CONFIG_CHANGED"
+    assert _counts() == {"requests": 1, "jobs": 0}
+
+
+@pytest.mark.asyncio
+async def test_config_drift_terminal_failure_replays_same_durable_request(
+    start_mcp, monkeypatch
+):
+    current_config = {"digest": "config-d1"}
+    start_digest_calls = []
+
+    def start_digest(repository):
+        start_digest_calls.append(current_config["digest"])
+        return current_config["digest"]
+
+    monkeypatch.setattr(ci_mcp, "effective_ci_config_digest", start_digest)
+    monkeypatch.setattr(
+        dispatch, "effective_ci_config_digest", lambda repository: current_config["digest"]
+    )
+    monkeypatch.setattr(dispatch, "_get_github_service", lambda: object())
+    monkeypatch.setattr(
+        dispatch.mygithub12,
+        "plan_private_ci_job",
+        lambda *args, **kwargs: {
+            "applicable": True,
+            "commit_sha": COMMIT,
+            "tree_sha": TREE,
+            "policy_source": "test",
+            "detected_stacks": [],
+            "selected_profiles": ["repo-auto-check"],
+            "workspaces": [],
+        },
+    )
+    monkeypatch.setattr(
+        dispatch.mygithub12,
+        "resolve_identity",
+        lambda *args, **kwargs: {"commit_sha": COMMIT, "tree_sha": TREE},
+    )
+
+    started = await _start(start_mcp, idempotency_key="config-drift-replay")
+    current_config["digest"] = "config-d2"
+    terminal = dispatch.process_ci_request(started["request_id"])
+    terminal_revision = terminal["revision"]
+    terminal_events = len(requests.get_ci_request_events(started["request_id"]))
+
+    assert terminal["phase"] == "terminal"
+    assert terminal["status"] == "preflight_failed"
+    assert terminal["preflight_error_code"] == "CI_PREFLIGHT_CONFIG_CHANGED"
+    assert terminal["worker_job_id"] is None
+
+    replay = await _start(start_mcp, idempotency_key="config-drift-replay")
+
+    assert replay["request_id"] == started["request_id"]
+    assert replay["terminal"] is True
+    assert replay["continuation_required"] is False
+    assert replay["status"] == "preflight_failed"
+    assert replay["preflight_error"]["code"] == "CI_PREFLIGHT_CONFIG_CHANGED"
+    assert replay["revision"] == terminal_revision
+    assert start_digest_calls == ["config-d1"]
+    assert len(requests.get_ci_request_events(started["request_id"])) == terminal_events
     assert _counts() == {"requests": 1, "jobs": 0}
 
 

@@ -31,6 +31,9 @@ from app.ci_request_store import (
     CIRequestIdempotencyConflictError,
     compute_normalized_request_hash,
     create_or_get_ci_request,
+    get_ci_request,
+    get_ci_request_by_idempotency_key,
+    get_ci_request_payload,
 )
 from app.ci_repository_config import (
     is_repository_allowed,
@@ -44,6 +47,24 @@ logger = logging.getLogger(__name__)
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _TAIL_SECRET_RE = re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+|(?:token|password|secret|api[_-]?key)\s*[:=]\s*)([^\s,;]+)")
+_START_REPLAY_CALLER_FIELDS = (
+    "repository",
+    "branch",
+    "commit_sha",
+    "profile",
+    "requested_timeout_seconds",
+    "requested_priority",
+    "base_sha",
+    "force_rerun",
+    "supersede_previous",
+)
+
+
+def _accepted_start_replay_matches(accepted_payload: dict, caller_identity: dict) -> bool:
+    return all(
+        field in accepted_payload and accepted_payload[field] == caller_identity[field]
+        for field in _START_REPLAY_CALLER_FIELDS
+    )
 
 
 def _redact_log_line(line: str) -> str:
@@ -413,14 +434,48 @@ This is for the private WSL CI system. NOT for GitHub Actions dispatch (use star
                 return _error_response("INVALID_ARGUMENT", "base_sha must be empty or exactly 40 hex characters")
             if idempotency_key and (idempotency_key != idempotency_key.strip() or len(idempotency_key) > 200):
                 return _error_response("INVALID_ARGUMENT", "idempotency_key must be at most 200 characters with no surrounding whitespace")
+            if priority not in ALLOWED_PRIORITIES:
+                return _error_response("INVALID_ARGUMENT", "priority must be 'normal' or 'high'")
+
+            requested_timeout_seconds = timeout_seconds
+            caller_identity = {
+                "repository": repository,
+                "branch": branch,
+                "commit_sha": commit_sha,
+                "profile": profile,
+                "requested_timeout_seconds": requested_timeout_seconds,
+                "requested_priority": priority,
+                "base_sha": base_sha,
+                "force_rerun": bool(force_rerun),
+                "supersede_previous": bool(supersede_previous),
+            }
+            if idempotency_key:
+                existing = await asyncio.to_thread(
+                    get_ci_request_by_idempotency_key, idempotency_key
+                )
+                if existing:
+                    accepted_payload = await asyncio.to_thread(
+                        get_ci_request_payload, existing["request_id"]
+                    )
+                    if not _accepted_start_replay_matches(
+                        accepted_payload, caller_identity
+                    ):
+                        raise CIRequestIdempotencyConflictError(idempotency_key)
+                    request = await asyncio.to_thread(
+                        get_ci_request, existing["request_id"]
+                    ) or existing
+                    request["deduplicated"] = True
+                    snapshot = build_private_ci_start_response(request)
+                    if request["phase"] in {"accepted", "preparing"}:
+                        schedule_ci_request_preparation(request["request_id"])
+                    return json.dumps(snapshot, ensure_ascii=False)
+
             if not is_repository_allowed(repository):
                 return _error_response("REPOSITORY_NOT_ALLOWED", f"Repository '{repository}' is not in the CI allowed list")
             if not is_private_ci_enabled(repository):
                 return _error_response("REPOSITORY_OPERATION_DENIED", f"Private CI is disabled for '{repository}'")
             if not is_profile_allowed(repository, profile):
                 return _error_response("PRIVATE_CI_PROFILE_NOT_ALLOWED", f"Profile '{profile}' not allowed for '{repository}'")
-            if priority not in ALLOWED_PRIORITIES:
-                return _error_response("INVALID_ARGUMENT", "priority must be 'normal' or 'high'")
 
             max_timeout = get_max_timeout(repository)
             timeout_seconds = min(max(timeout_seconds, 60), max_timeout)
@@ -433,6 +488,7 @@ This is for the private WSL CI system. NOT for GitHub Actions dispatch (use star
                 "commit_sha": commit_sha,
                 "tree_sha": "derived_from_exact_commit_during_preflight",
                 "profile": profile,
+                "requested_timeout_seconds": requested_timeout_seconds,
                 "timeout_seconds": timeout_seconds,
                 "requested_priority": priority,
                 "priority": effective_queue_priority,

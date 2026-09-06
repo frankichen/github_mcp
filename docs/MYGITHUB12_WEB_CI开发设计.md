@@ -157,14 +157,15 @@ Legacy projection 使用原 `job_id` 作为 `request_id` 且 `worker_job_id=job_
 
 ### 5.4 DEV-003 短事务、dispatch 与 crash safety
 
-DEV-003 的 canonical start 先构造 normalized request hash，再用 durable create-or-get 建立 Request identity：
+DEV-003 FIX-001 将显式/stable key 的 existing replay 与新 Request control path 分开：
 
-- explicit same key + same hash：返回同一 `request_id`；
-- explicit same key + different hash：明确 `IDEMPOTENCY_CONFLICT`，不新增/修改 Request 或 Worker Job；
-- 兼容旧 caller 未传 key：普通调用使用 `auto:<normalized hash>` 保持旧 dedup；`force_rerun=true` 使用新的 auto-force key 保持旧强制重跑语义；
-- normalized hash 覆盖 repository、branch、exact commit、commit-derived Tree identity marker、profile、effective timeout、requested/effective priority、base SHA、force/supersede 与 effective config digest。
+- 非空显式 `idempotency_key` 在 bounded caller syntax validation 后先查询 durable Request；命中时不依赖当前 repository allowlist、private CI/profile policy、max-timeout normalization 或 effective config digest；
+- existing Request 的 replay 等价性以 rev-0 `event_data.request_payload` 中 accepted-time caller identity 为准，覆盖 repository、branch、commit、profile、raw requested timeout/priority、base SHA、force-rerun 与 supersede；caller identity 相同返回原 Request 当前 snapshot，不同则明确 `IDEMPOTENCY_CONFLICT`，且不修改 revision/events、不创建 Worker；
+- existing Request 仍处于 `accepted/preparing` 时，same-key replay 只允许幂等 schedule wakeup；`queued/running/terminal` 不重新进入 preparing；
+- 只有 key 未命中、确实要创建新 Request 时，才执行当前 repository/private-CI/profile gate、max-timeout/effective-priority normalization 与 effective config digest 计算，然后 durable create-or-get；因此 policy tightening 继续阻止新 execution，但不会封死旧 Request diagnostics；
+- 兼容旧 caller 未传 key：普通调用使用 `auto:<normalized hash>` 保持旧 dedup；`force_rerun=true` 使用新的 auto-force key 保持旧强制重跑语义；start 返回的 `auto:` key 后续被 caller 作为显式 key replay 时，同样走 existing durable Request path。
 
-Request rev-0 event 的 `event_data.request_payload` 持久化 queue 前仍需要的 timeout/priority/base/force/supersede/config identity，因此 Controller 重启后无需依赖进程内参数即可继续 `preparing`。本轮没有新增 Schema/ALTER migration。
+Request rev-0 event 的 `event_data.request_payload` 同时持久化 raw `requested_timeout_seconds` / `requested_priority` 与 accepted-time effective `timeout_seconds` / queue `priority` / config identity。raw fields 用于跨 config/normalization drift 验证 caller replay，effective fields 继续用于 Worker dispatch；当前 config 不参与已有 Request 的等价性判断。FIX-001 只增强 durable JSON payload，没有新增 Schema/ALTER migration。
 
 最危险的 Worker create/bind crash window 采用同一 SQLite transaction 消除：`BEGIN IMMEDIATE` 后调用可由 caller transaction 托管的 Worker create primitive，在同一事务内完成 `ci_jobs` INSERT/reuse、Request `worker_job_id`/real Tree bind、`preparing -> queued` revision event 与 SQL CAS，最后一次 commit。任何 bind/event 前异常整体 rollback，因此 startup legacy backfill 不可能观察到“DEV-003 Worker 已提交、对应 Request 尚未绑定”的中间状态；已 queued 的 Request 又通过 unique `worker_job_id` 与 phase/CAS 阻止二次 Worker 创建。
 
