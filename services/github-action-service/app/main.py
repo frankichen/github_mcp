@@ -105,6 +105,14 @@ async def lifespan(app: FastAPI):
     tg = None
     try:
         from app.mcp_server import mcp
+        if maintenance_leader.get("acquired"):
+            from app.ci_request_dispatch import recover_pending_ci_requests
+            recovered_ci_requests = recover_pending_ci_requests()
+            if recovered_ci_requests.get("scheduled"):
+                logger.warning(
+                    "Resumed durable CI Request preparation after Controller startup: %s",
+                    recovered_ci_requests,
+                )
         mcp_sm = mcp._session_manager
         if mcp_sm is not None:
             import anyio
