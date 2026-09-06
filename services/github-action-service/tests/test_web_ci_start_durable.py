@@ -282,6 +282,34 @@ async def test_max_timeout_drift_replays_same_raw_request_without_false_conflict
 
 
 @pytest.mark.asyncio
+async def test_returned_auto_key_explicit_replay_survives_config_drift(
+    start_mcp, monkeypatch
+):
+    current_config = {"digest": "auto-config-d1"}
+    digest_calls = []
+
+    def current_digest(repository):
+        digest_calls.append(current_config["digest"])
+        return current_config["digest"]
+
+    monkeypatch.setattr(ci_mcp, "effective_ci_config_digest", current_digest)
+    first = await _start(start_mcp, idempotency_key="")
+    assert first["idempotency_key"].startswith("auto:")
+
+    current_config["digest"] = "auto-config-d2"
+    replay = await _start(
+        start_mcp, idempotency_key=first["idempotency_key"]
+    )
+
+    assert replay["request_id"] == first["request_id"]
+    assert replay["normalized_request_hash"] == first["normalized_request_hash"]
+    assert replay["deduplicated"] is True
+    assert digest_calls == ["auto-config-d1"]
+    assert requests.get_ci_request(first["request_id"])["revision"] == 0
+    assert _counts() == {"requests": 1, "jobs": 0}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "gate_name,expected_code",
     [
