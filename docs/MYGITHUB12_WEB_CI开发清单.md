@@ -17,30 +17,30 @@
 
 ## 2. 开发前固定检查
 
-- [ ] **PRE-01** `get_mygithub_capabilities`，记录 version/build/schema identity。
-- [ ] **PRE-02** `get_repository_operation_policy(frankichen/github_mcp)`，确认 GitHub write/private CI 允许。
-- [ ] **PRE-03** fresh-read `main` HEAD/Tree；不得复用本文创建时 SHA。
-- [ ] **PRE-04** 读取 README、SECURITY、CI Manifest、DX-2、WEB-CI 三份文档。
-- [ ] **PRE-05** 建立/复用 exact main Repository Index。
-- [ ] **PRE-06** 创建独立 `ai/` branch + Workspace + Development Session + Lease。
-- [ ] **PRE-07** 检查 active Workspace overlap。
-- [ ] **PRE-08** 对目标模块完成 Change Context / Impact / Contract / Affected Tests 基线。
+- [x] **PRE-01** `get_mygithub_capabilities`，记录 version/build/schema identity。
+- [x] **PRE-02** `get_repository_operation_policy(frankichen/github_mcp)`，确认 GitHub write/private CI 允许。
+- [x] **PRE-03** fresh-read `main` HEAD/Tree；不得复用本文创建时 SHA。
+- [x] **PRE-04** 读取 README、SECURITY、CI Manifest、DX-2、WEB-CI 三份文档。
+- [x] **PRE-05** 建立/复用 exact main Repository Index。
+- [x] **PRE-06** 创建独立 `ai/` branch + Workspace + Development Session + Lease。
+- [x] **PRE-07** 检查 active Workspace overlap。
+- [x] **PRE-08** 对目标模块完成 Change Context / Impact / Contract / Affected Tests 基线。
 
-证据：`待开发者填写`
+证据：MyGithut12 `12.9.5` / build `0c13fcfae20534ca0be2c227c34c3f858f9077fa` / schema `4702e8c008d685fb0b328f32488eedcdf30a4f9d70569321512627e9f2b28b95`；base main `1a122fe6d2a05505d152d893355281bed90c2eac` / Tree `d2054afd02979ce54ba46387d8ca673e3351220d`；main Index Job `2ab22a6d-b05f-4134-8d12-7f26cd89763c` completed；branch `ai/web-ci-dev-001-baseline-20260906`；Workspace `ws_2c9f96d400644d99`；Development Session `dev_16c77cfc2b9e4f41a38a`；active Workspace overlap = none；pre-write Change Context / Impact / Contract / Affected Tests 已完成。
 
 ## 3. P0：Web-safe 控制面
 
 ### WEB-CI-DEV-001：建立回归基线测试
 
-- [ ] 固化当前 `wait_private_ci_job(55)` 行为测试。
-- [ ] 固化 `validate_development_task(wait_seconds=55)` 行为测试。
-- [ ] 固化 `converge_development_task(index_wait_seconds=55, wait_seconds=55)` 行为测试。
-- [ ] 增加 >=10 分钟 fake CI fixture，不实际 sleep 10 分钟，使用可控 clock/event 模拟长生命周期。
-- [ ] 测试能够证明旧代码存在等待路径，作为后续回归反例。
+- [x] 固化当前 `wait_private_ci_job(55)` 行为测试。
+- [x] 固化 `validate_development_task(wait_seconds=55)` 行为测试。
+- [x] 固化 `converge_development_task(index_wait_seconds=55, wait_seconds=55)` 行为测试。
+- [x] 增加 >=10 分钟 fake CI fixture，不实际 sleep 10 分钟，使用可控 clock/event 模拟长生命周期。
+- [x] 测试能够证明旧代码存在等待路径，作为后续回归反例。
 
 建议模块：`ci_mcp.py`、`development_orchestrator.py`、`development_converge.py` 及对应 tests。  
 映射验收：AC-WEB-CI-01/02/03/15。  
-证据：`待填写`
+证据：branch `ai/web-ci-dev-001-baseline-20260906`；测试实现 commit `dc8818b08bab6d286d5c32ba83aa1dfb6aada67e` / Tree `229e5ab6d0f44275d02c6ab5ded2a244a987b54d`；修改测试文件 `services/github-action-service/tests/conftest.py`、`services/github-action-service/tests/test_web_ci_wait_baseline.py`；tests：`test_wait_private_ci_job_defaults_to_55_and_delegates_to_wait_for_job_change`、`test_wait_for_job_change_caps_long_poll_at_55_without_real_sleep`、`test_validate_development_task_defaults_to_55_and_enters_wait_path`、`test_converge_development_task_defaults_to_55_plus_55`、`test_converge_development_task_waits_index_then_ci_in_order`、`test_fake_long_running_ci_fixture_models_ten_plus_minutes_without_sleep`；fixture `fake_long_running_ci`；`services/github-action-service` full pytest `686 passed in 6.82s`；Private CI `repo-auto-check` Job `c1da7b3da5184340` passed / exit 0 / 56.71s；`repo-fast-check` 因既有 `FAST_CHECK_ENTRYPOINT_MISSING` 在 pytest 前失败，不作为代码失败。AC-WEB-CI-01/02/03/15 保持未勾选。
 
 ### WEB-CI-DEV-002：Durable CI Request / phase model
 
