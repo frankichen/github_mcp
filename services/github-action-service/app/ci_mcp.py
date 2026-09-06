@@ -8,13 +8,13 @@ import json
 import asyncio
 import logging
 import re
+import uuid
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
 from app.config import settings as app_settings
 from app.ci_database import (
-    create_or_get_job,
     get_job,
     list_jobs as db_list_jobs,
     get_workers as db_get_workers,
@@ -25,7 +25,13 @@ from app.ci_database import (
     cancel_queued_job,
     request_cancel_job,
 )
-from app.ci_models import ALLOWED_PRIORITIES, effective_priority, make_idempotency_key
+from app.ci_models import ALLOWED_PRIORITIES, effective_priority
+from app.ci_request_dispatch import effective_ci_config_digest, schedule_ci_request_preparation
+from app.ci_request_store import (
+    CIRequestIdempotencyConflictError,
+    compute_normalized_request_hash,
+    create_or_get_ci_request,
+)
 from app.ci_repository_config import (
     is_repository_allowed,
     is_profile_allowed,
@@ -234,6 +240,61 @@ def build_private_ci_job_response(job: dict, persisted_steps: list[dict], detail
     return result
 
 
+def build_private_ci_start_response(request: dict) -> dict:
+    """Build a truthful Request continuation snapshot without inventing a Job."""
+    worker_job_id = request.get("worker_job_id")
+    terminal = bool(request.get("terminal"))
+    if terminal:
+        next_actions = []
+        continuation_hint = "request is terminal"
+    elif worker_job_id:
+        next_actions = [{"tool": "get_private_ci_job", "job_id": worker_job_id}]
+        continuation_hint = "Worker Job exists; continue with get_private_ci_job"
+    else:
+        next_actions = [{
+            "tool": "start_private_ci_job",
+            "action": "replay_same_request",
+            "idempotency_key": request.get("idempotency_key"),
+        }]
+        continuation_hint = (
+            "preflight is durable; replay start with the same idempotency_key "
+            "for a fresh Request snapshot"
+        )
+    preflight_error = None
+    if request.get("status") == "preflight_failed":
+        preflight_error = {
+            "error_id": request.get("preflight_error_id"),
+            "code": request.get("preflight_error_code"),
+            "reason": request.get("terminal_reason"),
+        }
+    return {
+        "ok": True,
+        "request_id": request["request_id"],
+        "job_id": worker_job_id,
+        "worker_job_id": worker_job_id,
+        "idempotency_key": request.get("idempotency_key"),
+        "normalized_request_hash": request.get("normalized_request_hash"),
+        "repository": request["repository"],
+        "branch": request["branch"],
+        "commit_sha": request["commit_sha"],
+        "tree_sha": request.get("tree_sha"),
+        "tree_pending": request.get("tree_sha") is None,
+        "profile": request["profile"],
+        "effective_config_digest": request.get("effective_config_digest"),
+        "phase": request["phase"],
+        "status": request["status"],
+        "revision": request["revision"],
+        "terminal": terminal,
+        "continuation_required": not terminal,
+        "continuation_hint": continuation_hint,
+        "next_actions": next_actions,
+        "deduplicated": bool(request.get("deduplicated")),
+        "reused": bool(request.get("deduplicated")),
+        "preflight_error": preflight_error,
+        "created_at": request.get("created_at"),
+    }
+
+
 def register_private_ci_mcp_tools(mcp: FastMCP):
     """Register private CI MCP tools on the FastMCP server."""
 
@@ -319,14 +380,13 @@ This is for the private CI system. NOT for GitHub Actions runs (use list_ci_jobs
 
     @mcp.tool(
         name="start_private_ci_job",
-        description="""Start a job in the private German-controller and WSL-Podman CI system for an exact Git commit SHA.
+        description="""Durably accept a private CI Request for an exact Git commit without waiting for Worker execution.
 
 CRITICAL WORKFLOW:
-1. After committing code via commit_github_files, save the commit_sha
-2. Call start_private_ci_job with the FULL 40-character commit_sha
-3. Save the returned job_id
-4. Use get_private_ci_job to check the job status
-5. Use get_private_ci_logs to read logs if the job failed
+1. Supply the FULL 40-character commit_sha and a stable idempotency_key
+2. Save request_id; worker_job_id/job_id may truthfully be null while preparing
+3. Replaying the same request/key is safe; a different request with the same key conflicts
+4. Once worker_job_id exists, existing get/wait/log tools continue to use that Worker Job ID
 
 This is for the private WSL CI system. NOT for GitHub Actions dispatch (use start_ci_job for that).""",
     )
@@ -340,12 +400,19 @@ This is for the private WSL CI system. NOT for GitHub Actions dispatch (use star
         force_rerun: bool = False,
         supersede_previous: bool = False,
         base_sha: str = "",
+        idempotency_key: str = "",
     ) -> str:
         try:
             if not repository or "/" not in repository:
                 return _error_response("INVALID_ARGUMENT", "repository must be in owner/repo format")
+            if not branch:
+                return _error_response("INVALID_ARGUMENT", "branch is required")
             if not SHA_RE.match(commit_sha):
                 return _error_response("INVALID_ARGUMENT", "commit_sha must be exactly 40 hex characters")
+            if base_sha and not SHA_RE.match(base_sha):
+                return _error_response("INVALID_ARGUMENT", "base_sha must be empty or exactly 40 hex characters")
+            if idempotency_key and (idempotency_key != idempotency_key.strip() or len(idempotency_key) > 200):
+                return _error_response("INVALID_ARGUMENT", "idempotency_key must be at most 200 characters with no surrounding whitespace")
             if not is_repository_allowed(repository):
                 return _error_response("REPOSITORY_NOT_ALLOWED", f"Repository '{repository}' is not in the CI allowed list")
             if not is_private_ci_enabled(repository):
@@ -357,29 +424,49 @@ This is for the private WSL CI system. NOT for GitHub Actions dispatch (use star
 
             max_timeout = get_max_timeout(repository)
             timeout_seconds = min(max(timeout_seconds, 60), max_timeout)
-
-            changed = {"changed_files": [], "total_count": 0, "truncated": False}
-            if profile in ("repo-auto-check", "repo-fast-check"):
-                from app.github_utils import get_github_changed_files_result
-                changed = await asyncio.to_thread(
-                    get_github_changed_files_result, repository, base_sha, commit_sha
-                )
-                if not changed.get("ok"):
-                    return _error_response(changed["error_code"], changed.get("message", "changed files compare failed"), details=changed.get("details", {}))
-
             effective_queue_priority = effective_priority(branch, profile, ALLOWED_PRIORITIES[priority])
-            result = await asyncio.to_thread(
-                create_or_get_job,
-                repository=repository, branch=branch, commit_sha=commit_sha,
-                profile=profile, priority=effective_queue_priority,
-                timeout_seconds=timeout_seconds, force_rerun=force_rerun,
-                supersede_previous=supersede_previous,
-                base_sha=base_sha, changed_files=changed["changed_files"],
-                changed_files_total=changed["total_count"],
-                changed_files_truncated=changed["truncated"],
+            config_digest = effective_ci_config_digest(repository)
+            normalized_payload = {
+                "schema": "private-ci-start-v2",
+                "repository": repository,
+                "branch": branch,
+                "commit_sha": commit_sha,
+                "tree_sha": "derived_from_exact_commit_during_preflight",
+                "profile": profile,
+                "timeout_seconds": timeout_seconds,
+                "requested_priority": priority,
+                "priority": effective_queue_priority,
+                "base_sha": base_sha,
+                "force_rerun": bool(force_rerun),
+                "supersede_previous": bool(supersede_previous),
+                "effective_config_digest": config_digest,
+            }
+            request_hash = compute_normalized_request_hash(normalized_payload)
+            effective_idempotency_key = idempotency_key or (
+                f"auto:{request_hash}" if not force_rerun else f"auto-force:{uuid.uuid4().hex}"
             )
-            result["ok"] = True
-            return json.dumps(result, ensure_ascii=False)
+            request = await asyncio.to_thread(
+                create_or_get_ci_request,
+                repository=repository,
+                branch=branch,
+                commit_sha=commit_sha,
+                tree_sha=None,
+                profile=profile,
+                effective_config_digest=config_digest,
+                idempotency_key=effective_idempotency_key,
+                normalized_request_hash=request_hash,
+                request_payload=normalized_payload,
+            )
+            snapshot = build_private_ci_start_response(request)
+            if request["phase"] in {"accepted", "preparing"}:
+                schedule_ci_request_preparation(request["request_id"])
+            return json.dumps(snapshot, ensure_ascii=False)
+        except CIRequestIdempotencyConflictError:
+            return _error_response(
+                "IDEMPOTENCY_CONFLICT",
+                "idempotency_key is already bound to a different normalized CI request",
+                details={"idempotency_key": idempotency_key},
+            )
         except Exception as e:
             return _error_response("INTERNAL_ERROR", str(e))
 
