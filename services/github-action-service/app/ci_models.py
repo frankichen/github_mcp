@@ -24,6 +24,33 @@ class CIJobStatus(str, Enum):
     SUPERSEDED = "superseded"
 
 
+class CIRequestPhase(str, Enum):
+    """Durable control-plane phase, separate from Worker execution substates."""
+
+    ACCEPTED = "accepted"
+    PREPARING = "preparing"
+    QUEUED = "queued"
+    RUNNING = "running"
+    TERMINAL = "terminal"
+
+
+class CIRequestStatus(str, Enum):
+    """Durable CI request status exposed by future Web-safe orchestration."""
+
+    ACCEPTED = "accepted"
+    PREPARING = "preparing"
+    QUEUED = "queued"
+    RUNNING = "running"
+    PASSED = "passed"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+    SUPERSEDED = "superseded"
+    WORKER_LOST = "worker_lost"
+    INTERNAL_ERROR = "internal_error"
+    PREFLIGHT_FAILED = "preflight_failed"
+
+
 ALLOWED_PRIORITIES = {"normal": 50, "high": 40}
 
 

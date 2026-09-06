@@ -57,43 +57,112 @@ Web 连接是否存在，不参与 CI 生命周期正确性。
 
 ## 4. Durable CI Request 状态机
 
-建议把“请求被接受”和“Worker 已排队”拆开：
+DEV-002 将 Request 生命周期与 Worker execution 生命周期明确拆开。Request 的 canonical phase/status 组合为：
 
 ```text
-accepted
-  -> preparing
-       -> preflight_failed (terminal)
-       -> queued
-            -> running
-                 -> passed
-                 -> failed
-                 -> timed_out
-                 -> cancelled
-                 -> superseded
-                 -> worker_lost
-                 -> internal_error
+phase=accepted   status=accepted
+  -> phase=preparing status=preparing
+       -> phase=terminal status=preflight_failed
+       -> phase=queued status=queued
+            -> phase=running status=running
+                 -> phase=terminal status=passed
+                 -> phase=terminal status=failed
+                 -> phase=terminal status=timed_out
+                 -> phase=terminal status=cancelled
+                 -> phase=terminal status=superseded
+                 -> phase=terminal status=worker_lost
+                 -> phase=terminal status=internal_error
 ```
 
-`start_private_ci_job` 只负责完成一个短的 durable accept transaction，并返回 Request/Job identity。昂贵的 GitHub compare、workspace discovery、dependency preparation 等如果无法稳定保持短时，应进入 `preparing` 后台阶段。
+`phase` 表示控制面生命周期大阶段；`status` 在非终态与 phase 同名，在 `phase=terminal` 时表示具体终态原因。`preflight_failed` 是 Request 终态，不是 Worker CI 的 `failed`。
 
-安全要求：异步化只改变“在哪里等待”，不改变“执行前必须验证什么”。在进入 `queued/running` 前仍必须完成 repository policy、exact commit/tree、profile applicability、workspace/config 等现有门禁。
+DEV-002 只提供持久模型和 transition primitive，**没有**把当前 `start_private_ci_job` 接到 `accepted/preparing`。未来 DEV-003 才把 start 改成短的 durable accept/create-or-get transaction。昂贵的 GitHub compare、workspace discovery、dependency preparation 等如果无法稳定保持短时，应在 DEV-003 之后进入 Request `preparing` 阶段。
 
-## 5. 推荐数据模型
+安全要求：异步化只改变“在哪里等待”，不改变“执行前必须验证什么”。在进入 Request `queued/running` 前仍必须完成 repository policy、exact commit/tree、profile applicability、workspace/config 等现有门禁。
 
-若现有 `ci_jobs` 足够承载，可扩展而不是复制表；若语义冲突，新增 request 表。至少需要：
+### 4.1 Transition 与 CAS
 
-- `request_id/job_id`；
-- repository / branch / commit_sha / tree_sha；
-- profile / effective config digest；
-- status / phase / revision；
-- idempotency key + normalized request hash；
-- worker job identity；
-- preflight error code；
-- created/updated/queued/started/finished timestamps；
-- terminal reason；
-- failure_pack_id；
-- attestation_id；
-- last durable event revision。
+DEV-002 的 transition primitive 使用数据库作为 truth source：
+
+- 新 Request 初始 `revision=0`，并写 revision 0 的 durable event；
+- 每次成功 transition 必须把 `revision` 精确增加 1；
+- transaction 使用 SQLite `BEGIN IMMEDIATE`；
+- 最终更新使用 `WHERE request_id=? AND revision=? AND phase=? AND status=?` 的数据库 CAS；
+- CAS 更新 `rowcount != 1` 时明确返回 stale revision conflict；
+- illegal transition、identity mismatch、非法 phase/status 组合均 fail-stop；
+- event 与 Request CAS 更新位于同一 transaction，CAS 失败会整体 rollback；
+- terminal Request 没有重新进入 queued/running 的合法边。
+
+因此禁止的实现模式 `SELECT -> Python 判断 -> unconditional UPDATE` 未被采用。Controller 的进程内 lock 只用于本进程写入协调，不是正确性的唯一来源；持久 revision + SQL CAS + transaction 才是并发真相。
+
+## 5. DEV-002 数据模型决策
+
+### 5.1 最终选择：新增 durable `ci_requests`
+
+DEV-002 选择 **方案 B：新增 durable CI Request 表，并通过 `worker_job_id` 与现有 `ci_jobs` 关联**，不扩展 `ci_jobs` 去承载 Request 的 `accepted/preparing`。
+
+选择理由：
+
+1. 当前 `ci_jobs` 是 Worker execution 表；现有 `create_or_get_job` 创建成功后立即进入 `queued`，没有 Worker 排队前的 stable durable request identity。
+2. 当前 `ci_jobs.status=preparing` 是 Worker 已 lease/download 后的 execution substate；Request 的 `preparing` 是 Worker 排队前的控制面 preflight。把二者塞进同一 status 会造成语义冲突。
+3. Request 生命周期必须能在 Worker Job 尚不存在时持久化 `accepted/preparing/preflight_failed`，因此 Request identity 必须早于 execution job identity。
+4. Request restart/reopen 应从 `ci_requests + ci_request_events` 恢复；Worker execution 的 lease、attempt、runtime substate 继续由 `ci_jobs` 恢复。两者分别是各自生命周期的 truth source。
+5. idempotency key + normalized request hash 绑定 Request，而不是 execution job，因为重复调用需要在 preflight/queue 之前就稳定解析到同一 durable identity。
+6. 新表是 additive Migration，不需要改写现有 `ci_jobs` status/reader/worker transition，因此 migration risk 和 compatibility risk 都低于方案 A。
+
+放弃方案 A 的原因：扩展 `ci_jobs` 会让 `accepted/preparing` 同时表示 Request preflight 和 Worker execution substate，并要求修改当前 Job 创建、读取、Worker claim/recovery 或 legacy status 语义；这既提高旧数据库兼容风险，也容易越界进入 DEV-003/005。
+
+### 5.2 Schema / relationship
+
+`ci_requests` 持久字段：
+
+- `request_id`：stable Request identity；
+- `repository`、`branch`、`commit_sha`、`tree_sha`；
+- `profile`、`effective_config_digest`；
+- `phase`、`status`、`revision`；
+- `idempotency_key`、`normalized_request_hash`；
+- `worker_job_id`：nullable/unique FK 到 `ci_jobs(job_id)`；
+- `preflight_error_id`、`preflight_error_code`；
+- `terminal_reason`；
+- `failure_pack_id`、`attestation_id`；
+- `created_at`、`updated_at`；
+- `last_event_id`。
+
+`ci_request_events` 持久每个 revision 的 event identity、from/to phase/status、event data 与时间；`UNIQUE(request_id, revision)` 防止同一 revision 重复事件。
+
+索引/约束：
+
+- `idempotency_key` 非 NULL 时唯一；
+- `worker_job_id` 唯一；
+- repository/commit/profile、phase/status、worker job 读取索引；
+- DB CHECK 直接限制合法 phase/status 组合；
+- `revision >= 0`。
+
+已有 `ci_jobs` 的 repository/branch/commit/profile/status/worker lease/attempt/执行时间/日志字段继续复用为 execution evidence，不在 Request 表机械复制 Worker-only 字段。
+
+### 5.3 Legacy Migration
+
+Migration 通过当前 `ci_database.init_db()` 的 additive 初始化路径创建新表/索引，并对已有 `ci_jobs` 做幂等 projection；**不会 UPDATE、DELETE、requeue 或重新执行 legacy `ci_jobs`**。
+
+映射：
+
+- `queued -> request queued/queued`；
+- `leased/downloading/preparing -> request queued/queued`，因为这些已是 Worker execution substate；
+- `running/cancel_requested -> request running/running`；
+- `passed/failed/timed_out/cancelled/superseded/worker_lost/internal_error -> request terminal/<same status>`。
+
+Legacy projection 使用原 `job_id` 作为 `request_id` 且 `worker_job_id=job_id`，从而不改变历史 Job identity。旧 schema 无法证明的 `tree_sha`、effective config digest、Request idempotency key、normalized request hash 保持 `NULL`，禁止猜造。重复 `init_db()` 通过唯一约束与 `INSERT OR IGNORE` 保持幂等；terminal Job 不会被 reopen。
+
+### 5.4 DEV-003 接入点
+
+DEV-003 应在 canonical start 中先构造 normalized request hash，并在一个短 transaction 内调用 durable create-or-get：
+
+- same key + same hash：返回同一 `request_id`；
+- same key + different hash：明确 `IDEMPOTENCY_CONFLICT`；
+- 新请求：持久化 `accepted/revision=0` 后立即返回/继续短阶段；
+- preflight 后创建/复用 Worker Job，验证 repository/branch/commit/profile identity，再以 CAS 把 Request 从 `preparing -> queued` 并持久化 `worker_job_id`。
+
+DEV-002 **尚未**修改 canonical `start_private_ci_job` 参数、Schema 或外部行为，也没有修改 `get_private_ci_job`、`wait_private_ci_job`、validate/converge wait 路径。
 
 任何 continuation 必须只依赖数据库持久状态，不能只依赖 Controller 进程内 `Condition`。
 

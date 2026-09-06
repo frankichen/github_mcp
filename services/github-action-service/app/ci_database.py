@@ -169,6 +169,11 @@ def init_db():
         db.execute("ALTER TABLE ci_jobs ADD COLUMN performance_json TEXT NOT NULL DEFAULT '{}'")
     db.commit()
 
+    # DEV-002 adds a separate durable request lifecycle without changing the
+    # legacy Worker execution schema or its public start/get/wait behavior.
+    from app.ci_request_store import init_ci_request_schema
+    init_ci_request_schema(db)
+
 
 def now_ts() -> float:
     return time.time()

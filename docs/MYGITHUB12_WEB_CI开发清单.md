@@ -44,15 +44,15 @@
 
 ### WEB-CI-DEV-002：Durable CI Request / phase model
 
-- [ ] 评审复用 `ci_jobs` 还是新增 request 表，并在设计记录选择理由。
-- [ ] 增加 `phase/revision/idempotency identity/preflight error/failure_pack_id` 等必要持久字段。
-- [ ] Migration 向前兼容已有 Job 数据。
-- [ ] 旧 running/terminal Job 升级后仍可读取。
-- [ ] 所有状态迁移使用明确 CAS/事务，禁止进程内状态成为唯一真相。
-- [ ] 写状态机非法 transition 单测。
+- [x] 评审复用 `ci_jobs` 还是新增 request 表，并在设计记录选择理由。
+- [x] 增加 `phase/revision/idempotency identity/preflight error/failure_pack_id` 等必要持久字段。
+- [x] Migration 向前兼容已有 Job 数据。
+- [x] 旧 running/terminal Job 升级后仍可读取。
+- [x] 所有状态迁移使用明确 CAS/事务，禁止进程内状态成为唯一真相。
+- [x] 写状态机非法 transition 单测。
 
 映射验收：AC-WEB-CI-03/04/05。  
-证据：`待填写`
+证据：实现 commit `d1a8825eff74b7b351443b61220d197564c8b54c` / Tree `f74a77c8eebf80fa521eabb9ff780a37c6cc4b2f`；设计决策 commit `935288736d54e90b225b54498da028fe783db7a9`；新增 `ci_requests` / `ci_request_events` 与 request `phase/status/revision`、idempotency key + normalized hash、worker job relation、preflight error、terminal/failure/attestation reference；`transition_ci_request` 使用 `BEGIN IMMEDIATE` + expected revision/phase/status SQL CAS；`test_ci_request_store.py` 覆盖 accepted→preparing→queued→running→terminal、preflight_failed、passed/failed/timeout/cancel/supersede/worker_lost/internal_error、stale revision、identity mismatch、invalid phase/status、terminal reopen rejection、并发 CAS、并发 idempotent create、same key/different hash conflict、pre-DEV-002 queued/running/passed/failed DB upgrade、re-init 幂等与 reopen persistence；`services/github-action-service` full pytest `708 passed`、ruff passed、compileall passed；Private CI `repo-auto-check` Job `3db8458b53b94352` passed / exit 0。该 reopen test 仅作为 DEV-002 persistence evidence，不单独勾选 AC-WEB-CI-04；AC-WEB-CI-03/04/05 保持未勾选。
 
 ### WEB-CI-DEV-003：`start_private_ci_job` 改为短事务
 
