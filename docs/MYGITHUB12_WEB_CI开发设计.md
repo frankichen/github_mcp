@@ -76,7 +76,9 @@ phase=accepted   status=accepted
 
 `phase` 表示控制面生命周期大阶段；`status` 在非终态与 phase 同名，在 `phase=terminal` 时表示具体终态原因。`preflight_failed` 是 Request 终态，不是 Worker CI 的 `failed`。
 
-DEV-002 只提供持久模型和 transition primitive，**没有**把当前 `start_private_ci_job` 接到 `accepted/preparing`。未来 DEV-003 才把 start 改成短的 durable accept/create-or-get transaction。昂贵的 GitHub compare、workspace discovery、dependency preparation 等如果无法稳定保持短时，应在 DEV-003 之后进入 Request `preparing` 阶段。
+DEV-003 已把 canonical `start_private_ci_job` 接入 durable Request：start 只做 bounded 本地参数/allowlist/config 校验、normalized request identity/hash 与 `create_or_get_ci_request`，持久化 `accepted/revision=0` 后先构造并返回 Request snapshot，再仅安排后台 `preparing`。GitHub exact identity、manifest/workspace planning、branch/base identity、config revalidation 与 changed-files compare 已移出同步 start 路径。
+
+`tree_sha` 在 start snapshot 中允许为 `NULL`，因为 exact Tree 必须由 exact commit 在后台 preflight 中取得；normalized hash 使用明确的 `tree_sha=derived_from_exact_commit_during_preflight` 语义标记并同时覆盖 exact `commit_sha`，因此不会为了取 Tree 而把 GitHub/network I/O 拉回 start。preflight 成功后才把真实 Tree 写回 Request。
 
 安全要求：异步化只改变“在哪里等待”，不改变“执行前必须验证什么”。在进入 Request `queued/running` 前仍必须完成 repository policy、exact commit/tree、profile applicability、workspace/config 等现有门禁。
 
@@ -153,16 +155,20 @@ Migration 通过当前 `ci_database.init_db()` 的 additive 初始化路径创�
 
 Legacy projection 使用原 `job_id` 作为 `request_id` 且 `worker_job_id=job_id`，从而不改变历史 Job identity。旧 schema 无法证明的 `tree_sha`、effective config digest、Request idempotency key、normalized request hash 保持 `NULL`，禁止猜造。重复 `init_db()` 通过唯一约束与 `INSERT OR IGNORE` 保持幂等；terminal Job 不会被 reopen。
 
-### 5.4 DEV-003 接入点
+### 5.4 DEV-003 短事务、dispatch 与 crash safety
 
-DEV-003 应在 canonical start 中先构造 normalized request hash，并在一个短 transaction 内调用 durable create-or-get：
+DEV-003 的 canonical start 先构造 normalized request hash，再用 durable create-or-get 建立 Request identity：
 
-- same key + same hash：返回同一 `request_id`；
-- same key + different hash：明确 `IDEMPOTENCY_CONFLICT`；
-- 新请求：持久化 `accepted/revision=0` 后立即返回/继续短阶段；
-- preflight 后创建/复用 Worker Job，验证 repository/branch/commit/profile identity，再以 CAS 把 Request 从 `preparing -> queued` 并持久化 `worker_job_id`。
+- explicit same key + same hash：返回同一 `request_id`；
+- explicit same key + different hash：明确 `IDEMPOTENCY_CONFLICT`，不新增/修改 Request 或 Worker Job；
+- 兼容旧 caller 未传 key：普通调用使用 `auto:<normalized hash>` 保持旧 dedup；`force_rerun=true` 使用新的 auto-force key 保持旧强制重跑语义；
+- normalized hash 覆盖 repository、branch、exact commit、commit-derived Tree identity marker、profile、effective timeout、requested/effective priority、base SHA、force/supersede 与 effective config digest。
 
-DEV-002 **尚未**修改 canonical `start_private_ci_job` 参数、Schema 或外部行为，也没有修改 `get_private_ci_job`、`wait_private_ci_job`、validate/converge wait 路径。
+Request rev-0 event 的 `event_data.request_payload` 持久化 queue 前仍需要的 timeout/priority/base/force/supersede/config identity，因此 Controller 重启后无需依赖进程内参数即可继续 `preparing`。本轮没有新增 Schema/ALTER migration。
+
+最危险的 Worker create/bind crash window 采用同一 SQLite transaction 消除：`BEGIN IMMEDIATE` 后调用可由 caller transaction 托管的 Worker create primitive，在同一事务内完成 `ci_jobs` INSERT/reuse、Request `worker_job_id`/real Tree bind、`preparing -> queued` revision event 与 SQL CAS，最后一次 commit。任何 bind/event 前异常整体 rollback，因此 startup legacy backfill 不可能观察到“DEV-003 Worker 已提交、对应 Request 尚未绑定”的中间状态；已 queued 的 Request 又通过 unique `worker_job_id` 与 phase/CAS 阻止二次 Worker 创建。
+
+`get_private_ci_job`、`wait_private_ci_job`、validate/converge 的现有语义在 DEV-003 保持不变；Request 尚无 Worker 时 continuation 通过 same-key replay canonical start 取得 fresh Request snapshot，DEV-004 才负责把 get 全面改为 request-aware snapshot。
 
 任何 continuation 必须只依赖数据库持久状态，不能只依赖 Controller 进程内 `Condition`。
 
@@ -174,16 +180,16 @@ DEV-002 **尚未**修改 canonical `start_private_ci_job` 参数、Schema 或外
 
 ### 6.2 `start_private_ci_job`
 
-改为短调用语义：
+DEV-003 实现为短调用语义：
 
-- 参数语法、allowlist、基础 policy 做同步校验；
-- durable create-or-get；
-- 返回 `accepted/preparing/queued/...`；
-- 不等待 running/terminal；
-- 增加一等 `idempotency_key`；
-- 返回稳定 `job_id/request_id + revision + continuation_required`。
+- canonical schema 增加一等、可显式传入的 `idempotency_key`，同时保留未传 key 的兼容行为；
+- 同步路径只做 bounded input/allowlist/profile/priority/timeout normalization、本地 effective config digest、normalized hash 与 durable Request create-or-get；
+- 不调用 changed-files GitHub compare、`wait_for_job_change`、`wait_private_ci_job`、sleep，也不等待 Worker claim/running/terminal；
+- 新 Request 返回 truthful `accepted/revision=0` snapshot，`worker_job_id/job_id/tree_sha` 在尚未产生时均为 `null`，禁止伪造 Worker identity；
+- 返回 `request_id`、nullable Worker identity、repository/branch/commit/tree/profile/config identity、phase/status/revision、terminal、`continuation_required`、`next_actions`、deduplicated/reused 与 structured preflight error；
+- same-key replay 可在 preflight/running 前后安全取得同一 Request identity；Worker 已建立后现有 get/wait/log 继续使用真实 Worker job_id。
 
-如果某个 fresh GitHub 检查不可在短时间可靠完成，把它放入后台 preflight，而不是阻塞 Web；preflight 失败要以结构化 terminal error 返回。
+后台 `preparing` 在 queue 前调用既有 exact-commit CI planning 与 identity resolver，验证 repository policy、exact repository/commit/tree、profile applicability、manifest/workspaces、branch exact identity、base identity、effective config identity，并在需要时执行 changed-files compare。preflight 失败写 `terminal/preflight_failed`、error id/code/reason，不创建假的 failed Worker Job；dispatch infrastructure failure 保持 `preparing` 供 restart/replay 重试。startup maintenance leader 会重新安排 durable `accepted/preparing` Request。
 
 ### 6.3 `get_private_ci_job`
 

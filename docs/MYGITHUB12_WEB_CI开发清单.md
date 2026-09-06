@@ -56,18 +56,18 @@
 
 ### WEB-CI-DEV-003：`start_private_ci_job` 改为短事务
 
-- [ ] 增加 canonical 一等 `idempotency_key`。
-- [ ] start 只完成短同步校验 + durable create-or-get。
-- [ ] 不等待 Worker running/terminal。
-- [ ] 昂贵 preflight 如果可能长阻塞，移入 `preparing` 后台阶段。
-- [ ] preflight 进入 queue 前仍验证 exact commit/tree/profile/policy/workspace/config。
-- [ ] start 返回 job/request identity、phase、revision、terminal、continuation_required、next actions。
-- [ ] 失败 preflight 返回结构化 terminal error，不能伪装成 CI failed。
-- [ ] 并发相同 key 不重复创建 Job。
-- [ ] 相同 key 不同 request hash 返回冲突。
+- [x] 增加 canonical 一等 `idempotency_key`。
+- [x] start 只完成短同步校验 + durable create-or-get。
+- [x] 不等待 Worker running/terminal。
+- [x] 昂贵 preflight 如果可能长阻塞，移入 `preparing` 后台阶段。
+- [x] preflight 进入 queue 前仍验证 exact commit/tree/profile/policy/workspace/config。
+- [x] start 返回 job/request identity、phase、revision、terminal、continuation_required、next actions。
+- [x] 失败 preflight 返回结构化 terminal error，不能伪装成 CI failed。
+- [x] 并发相同 key 不重复创建 Job。
+- [x] 相同 key 不同 request hash 返回冲突。
 
 映射验收：AC-WEB-CI-01/05/12。  
-证据：`待填写`
+证据：DEV-003 implementation candidate `d27849c5112a792bde04d6061b53038f761b0035` / Tree `26abaab9eee2bd4aa70210e35f0a799f28b77d01`；新增 `test_web_ci_start_durable.py` 覆盖 canonical first-class key/schema、same key/same hash reuse、same key/different execution identity conflict、8 路 concurrent start、2 路 concurrent dispatch、no wait/network/sleep、601 秒 fake lifecycle、preflight success/config/tree failure、terminal `preflight_failed` replay/reopen、crash before Worker create、Worker INSERT 后 bind/event 前 rollback+reopen、queued 后 crash/reopen 与 legacy backfill 不误投影；`test_ci_request_store.py` 与未修改的 `test_web_ci_wait_baseline.py` 均包含在 `services/github-action-service` full pytest；candidate full pytest/ruff/compileall 由 Private CI `repo-auto-check` Job `22679fc08b864415` 通过（exit 0，15 steps，failed/skipped=0）。`repo-fast-check` Job `227b0a130b8e4d0b` 仍在 pytest 前因既有 `FAST_CHECK_ENTRYPOINT_MISSING` exit 42，未在本项修复。AC-WEB-CI-01/05/12 保持未勾选。
 
 ### WEB-CI-DEV-004：`get_private_ci_job` 纯 snapshot 化
 
