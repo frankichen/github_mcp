@@ -1,8 +1,8 @@
 """Durable CI Request persistence and transition primitives.
 
-This module deliberately does not change the public Private CI start/get/wait
-paths. It establishes the durable request model used by later Web-safe CI
-work while leaving ``ci_jobs`` as the Worker execution truth source.
+DEV-003 keeps Request identity ahead of Worker execution and provides the
+atomic Request-to-Worker dispatch boundary required by startup recovery while
+leaving ``ci_jobs`` as the Worker execution truth source.
 """
 
 import hashlib
@@ -273,11 +273,12 @@ def create_or_get_ci_request(
     repository: str,
     branch: str,
     commit_sha: str,
-    tree_sha: str,
+    tree_sha: Optional[str],
     profile: str,
     effective_config_digest: str,
     idempotency_key: str,
     normalized_request_hash: str,
+    request_payload: Optional[Mapping] = None,
 ) -> dict:
     """Durably create one accepted request or resolve an idempotent replay."""
     _validate_new_request_identity(
@@ -310,6 +311,8 @@ def create_or_get_ci_request(
                     "profile": profile,
                     "effective_config_digest": effective_config_digest,
                 }
+                if tree_sha is None:
+                    expected.pop("tree_sha")
                 _assert_identity(existing, expected)
                 result = _request_row_to_dict(existing)
                 db.commit()
@@ -348,7 +351,7 @@ def create_or_get_ci_request(
                 from_status=None,
                 to_phase="accepted",
                 to_status="accepted",
-                event_data={},
+                event_data={"request_payload": dict(request_payload or {})},
             )
             db.execute(
                 "UPDATE ci_requests SET last_event_id = ? WHERE request_id = ? AND revision = 0",
@@ -414,6 +417,134 @@ def get_ci_request_events(request_id: str) -> list[dict]:
         }
         for row in rows
     ]
+
+
+def _get_ci_request_payload_in_db(db, request_id: str) -> dict:
+    row = db.execute(
+        "SELECT event_data FROM ci_request_events WHERE request_id = ? AND revision = 0",
+        (request_id,),
+    ).fetchone()
+    if not row:
+        return {}
+    try:
+        event_data = json.loads(row["event_data"] or "{}")
+    except (TypeError, ValueError):
+        return {}
+    payload = event_data.get("request_payload") if isinstance(event_data, dict) else None
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def get_ci_request_payload(request_id: str) -> dict:
+    return _get_ci_request_payload_in_db(db_core._get_db(), request_id)
+
+
+def list_pending_ci_requests(limit: int = 100) -> list[dict]:
+    db = db_core._get_db()
+    rows = db.execute(
+        """SELECT * FROM ci_requests
+           WHERE phase IN ('accepted', 'preparing')
+           ORDER BY created_at, request_id LIMIT ?""",
+        (min(max(int(limit), 1), 1000),),
+    ).fetchall()
+    return [_request_row_to_dict(row) for row in rows]
+
+
+def dispatch_ci_request(
+    request_id: str,
+    *,
+    expected_revision: int,
+    tree_sha: str,
+    changed_files: list[str],
+    changed_files_total: int,
+    changed_files_truncated: bool,
+    event_data: Optional[Mapping] = None,
+) -> dict:
+    """Atomically create/bind the Worker Job and advance preparing -> queued."""
+    if not _SHA_RE.fullmatch(tree_sha or ""):
+        raise ValueError("tree_sha must be a lowercase 40-character SHA")
+    db = db_core._get_db()
+    with db_core._db_write_lock:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            row = db.execute(
+                "SELECT * FROM ci_requests WHERE request_id = ?", (request_id,)
+            ).fetchone()
+            if not row:
+                raise CIRequestNotFoundError(request_id)
+            if row["phase"] in {"queued", "running", "terminal"}:
+                result = _request_row_to_dict(row)
+                db.commit()
+                result["deduplicated"] = True
+                return result
+            if (row["phase"], row["status"]) != ("preparing", "preparing"):
+                raise CIRequestTransitionError(
+                    f"dispatch requires preparing request, got {(row['phase'], row['status'])}"
+                )
+            if int(row["revision"]) != int(expected_revision):
+                raise CIRequestRevisionConflictError(
+                    f"expected={expected_revision} actual={row['revision']}"
+                )
+            if row["tree_sha"] and row["tree_sha"] != tree_sha:
+                raise CIRequestIdentityMismatchError("tree_sha")
+            payload = _get_ci_request_payload_in_db(db, request_id)
+            required = {"priority", "timeout_seconds", "base_sha", "supersede_previous"}
+            if not required.issubset(payload):
+                raise CIRequestTransitionError("durable request payload is incomplete")
+            worker_job = db_core.create_ci_request_job_in_transaction(
+                db,
+                request_id=request_id,
+                repository=row["repository"],
+                branch=row["branch"],
+                commit_sha=row["commit_sha"],
+                profile=row["profile"],
+                priority=int(payload["priority"]),
+                timeout_seconds=int(payload["timeout_seconds"]),
+                base_sha=str(payload.get("base_sha") or ""),
+                changed_files=list(changed_files),
+                changed_files_total=int(changed_files_total),
+                changed_files_truncated=bool(changed_files_truncated),
+                supersede_previous=bool(payload.get("supersede_previous")),
+            )
+            worker_job_id = worker_job["job_id"]
+            _assert_worker_job_identity(db, row, worker_job_id)
+            new_revision = int(expected_revision) + 1
+            event_id = _insert_event(
+                db,
+                request_id=request_id,
+                revision=new_revision,
+                event_type="worker_queued",
+                from_phase="preparing",
+                from_status="preparing",
+                to_phase="queued",
+                to_status="queued",
+                event_data={
+                    "worker_job_id": worker_job_id,
+                    "git_tree_sha": tree_sha,
+                    **dict(event_data or {}),
+                },
+            )
+            cursor = db.execute(
+                """UPDATE ci_requests
+                   SET tree_sha = ?, worker_job_id = ?, phase = 'queued', status = 'queued',
+                       revision = revision + 1, updated_at = ?, last_event_id = ?
+                   WHERE request_id = ? AND revision = ?
+                     AND phase = 'preparing' AND status = 'preparing'""",
+                (tree_sha, worker_job_id, db_core.now_ts(), event_id,
+                 request_id, int(expected_revision)),
+            )
+            if cursor.rowcount != 1:
+                raise CIRequestRevisionConflictError(request_id)
+            persisted = db.execute(
+                "SELECT * FROM ci_requests WHERE request_id = ?", (request_id,)
+            ).fetchone()
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+    result = _request_row_to_dict(persisted)
+    result["deduplicated"] = False
+    result["worker_job"] = worker_job
+    return result
 
 
 def transition_ci_request(
@@ -533,7 +664,7 @@ def transition_ci_request(
 def _validate_new_request_identity(
     repository: str,
     commit_sha: str,
-    tree_sha: str,
+    tree_sha: Optional[str],
     profile: str,
     effective_config_digest: str,
     idempotency_key: str,
@@ -543,7 +674,7 @@ def _validate_new_request_identity(
         raise ValueError("repository must be owner/repo")
     if not _SHA_RE.fullmatch(commit_sha or ""):
         raise ValueError("commit_sha must be a lowercase 40-character SHA")
-    if not _SHA_RE.fullmatch(tree_sha or ""):
+    if tree_sha is not None and not _SHA_RE.fullmatch(tree_sha):
         raise ValueError("tree_sha must be a lowercase 40-character SHA")
     if not profile:
         raise ValueError("profile is required")
