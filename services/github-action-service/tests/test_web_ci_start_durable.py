@@ -197,7 +197,7 @@ async def test_same_key_same_request_reuses_one_request(start_mcp):
 @pytest.mark.parametrize(
     "mutation",
     [
-        {"timeout_seconds": 901},
+        {"timeout_seconds": 899},
         {"priority": "high"},
         {"base_sha": BASE},
         {"force_rerun": True},
@@ -223,7 +223,7 @@ async def test_normalized_request_persists_execution_semantics(start_mcp):
     result = await _start(
         start_mcp,
         idempotency_key="payload-key",
-        timeout_seconds=901,
+        timeout_seconds=899,
         priority="high",
         base_sha=BASE,
         supersede_previous=True,
@@ -234,7 +234,7 @@ async def test_normalized_request_persists_execution_semantics(start_mcp):
     assert payload["branch"] == BRANCH
     assert payload["commit_sha"] == COMMIT
     assert payload["profile"] == "repo-auto-check"
-    assert payload["timeout_seconds"] == 901
+    assert payload["timeout_seconds"] == 899
     assert payload["requested_priority"] == "high"
     assert isinstance(payload["priority"], int)
     assert payload["base_sha"] == BASE
