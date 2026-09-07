@@ -1,4 +1,5 @@
 import inspect
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -281,7 +282,7 @@ async def test_converge_development_task_defaults_to_55_plus_55(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_converge_development_task_waits_index_then_ci_in_order(monkeypatch):
+async def test_converge_development_task_never_waits_index_or_ci(monkeypatch):
     session = _session()
     wait_order = []
     status_reads = []
@@ -413,6 +414,7 @@ async def test_converge_development_task_waits_index_then_ci_in_order(monkeypatc
             "terminal": False,
         },
     )
+    monkeypatch.setattr(converge, "schedule_ci_request_preparation", lambda _request_id: True)
     monkeypatch.setattr(
         converge,
         "wait_worker_final_state",
@@ -432,10 +434,19 @@ async def test_converge_development_task_waits_index_then_ci_in_order(monkeypatc
         session["session_id"],
         session["session_revision"],
         mode="full",
+        idempotency_key=f"no-wait-{uuid.uuid4().hex}",
     )
 
-    assert wait_order == [("index", 55), ("ci", 55)]
-    assert result["validation"]["job"]["status"] == "running"
+    assert wait_order == []
+    assert status_reads == [SHA_B]
+    assert result["validation"]["status"] in {
+        "accepted",
+        "preparing",
+        "queued",
+        "running",
+        "preflight_failed",
+    }
+    assert result["ci_request"]["request_id"]
     assert result["converged"] is False
 
 
