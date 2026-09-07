@@ -51,7 +51,11 @@ from app.development_failure_pack import redact_text
 logger = logging.getLogger(__name__)
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-_TAIL_SECRET_RE = re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+|(?:token|password|secret|api[_-]?key)\s*[:=]\s*)([^\s,;]+)")
+_PRIVATE_CI_SECRET_FIELD_RE = re.compile(
+    r"(?i)(?:^|[_-])(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|"
+    r"credential|authorization|private[_-]?key|headers?|dsn|database[_-]?url|"
+    r"connection[_-]?(?:string|url))(?:$|[_-])"
+)
 _START_REPLAY_CALLER_FIELDS = (
     "repository",
     "branch",
@@ -73,11 +77,31 @@ def _accepted_start_replay_matches(accepted_payload: dict, caller_identity: dict
 
 
 def _redact_log_line(line: str) -> str:
-    return _TAIL_SECRET_RE.sub(lambda match: match.group(1) + "[REDACTED]", line)
+    return redact_text(line)
+
+
+def _redact_private_ci_value(value):
+    """Recursively redact JSON-like Private CI payloads without dropping diagnostics."""
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, (bytes, bytearray)):
+        return "[BINARY_REDACTED]"
+    if isinstance(value, dict):
+        output = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key)
+            output[key] = (
+                "[REDACTED]" if _PRIVATE_CI_SECRET_FIELD_RE.search(key)
+                else _redact_private_ci_value(raw_value)
+            )
+        return output
+    if isinstance(value, (list, tuple, set)):
+        return [_redact_private_ci_value(item) for item in value]
+    return value
 
 
 def _error_response(code: str, message: str, retryable: bool = False, details: dict = None) -> str:
-    return json.dumps({
+    return json.dumps(_redact_private_ci_value({
         "ok": False,
         "error": {
             "code": code,
@@ -85,7 +109,7 @@ def _error_response(code: str, message: str, retryable: bool = False, details: d
             "retryable": retryable,
             "details": details or {},
         },
-    }, ensure_ascii=False)
+    }), ensure_ascii=False)
 
 
 def _step_selector_details(step: dict) -> dict:
@@ -254,7 +278,7 @@ def build_private_ci_job_response(job: dict, persisted_steps: list[dict], detail
         result["steps_truncated"] = False
         result["ok"] = True
         result["_mcp_response_mode"] = "full"
-        return result
+        return _redact_private_ci_value(result)
 
     result = {key: job.get(key) for key in _PRIVATE_CI_SUMMARY_FIELDS}
     for optional_key in (
@@ -306,7 +330,7 @@ def build_private_ci_job_response(job: dict, persisted_steps: list[dict], detail
 
     result["ok"] = True
     result["_mcp_response_mode"] = "summary"
-    return result
+    return _redact_private_ci_value(result)
 
 
 def _private_ci_preflight_error(request: Optional[dict]) -> Optional[dict]:
@@ -469,7 +493,7 @@ def build_private_ci_snapshot_response(
     })
     if detail_level == "full" and request:
         result["request"] = dict(request)
-    return result
+    return _redact_private_ci_value(result)
 
 
 def build_private_ci_start_response(request: dict) -> dict:
