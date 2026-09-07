@@ -628,7 +628,7 @@ def register_dx_tools(
             phase="validating_fast" if mode=="fast" else "validating_full"
             phase_session=await github_call(sessions.transition,development_session_id,effective_session_revision,phase,event_type="validation_started",allowed_from={"active","pr_ready","validating_fast","validating_full"})
             try:
-                job,selection=await github_call(dx.start_validation_job,service,phase_session,mode,resolved_base,force_rerun,supersede_previous,prepared)
+                request,selection=await github_call(dx.start_validation_request,service,phase_session,mode,resolved_base,force_rerun,supersede_previous,idempotency_key,prepared)
             except Exception as start_exc:
                 rollback=None; rollback_error=None
                 try:
