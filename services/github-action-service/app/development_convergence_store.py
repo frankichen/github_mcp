@@ -550,6 +550,42 @@ def find_active_convergence(
         return _public(db, row) if row else None
 
 
+def list_convergences_for_session(
+    *,
+    repository: str,
+    branch: str,
+    development_session_id: str,
+    base_branch: str,
+    base_sha: str,
+    modes: tuple[str, ...] = ("full", "fast"),
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Return bounded convergence history for one Session/base identity."""
+    normalized_modes = tuple(dict.fromkeys(str(mode) for mode in modes))
+    if not normalized_modes or any(mode not in VALID_MODES for mode in normalized_modes):
+        raise ValueError("modes must contain only fast/full")
+    limit = max(1, min(int(limit or 50), 100))
+    placeholders = ",".join("?" for _ in normalized_modes)
+    init_convergence_db()
+    with _db() as db:
+        rows = db.execute(
+            f"""SELECT * FROM development_convergences
+                WHERE repository=? AND branch=? AND development_session_id=?
+                  AND base_branch=? AND base_sha=? AND mode IN ({placeholders})
+                ORDER BY updated_at DESC, created_at DESC LIMIT ?""",
+            (
+                repository,
+                branch,
+                development_session_id,
+                base_branch,
+                base_sha,
+                *normalized_modes,
+                limit,
+            ),
+        ).fetchall()
+        return [_public(db, row) for row in rows]
+
+
 def transition_convergence(
     convergence_id: str,
     expected_revision: int,

@@ -245,6 +245,48 @@ def test_active_identity_prevents_second_window_but_terminal_allows_rerun(
     assert old_key_replay["terminal"] is True
 
 
+def test_list_convergences_for_session_returns_history_after_store_reopen(
+    monkeypatch, tmp_path
+):
+    _reset_store_db(monkeypatch, tmp_path)
+    terminal = _create(idempotency_key="history-terminal")
+    terminal = store.transition_convergence(
+        terminal["convergence_id"], terminal["revision"], "passed", status="passed"
+    )
+    active = _create(idempotency_key="history-active")
+    fast = _create(mode="fast", idempotency_key="history-fast")
+    _create(
+        repository="owner/other",
+        branch="ai/other",
+        development_session_id="dev_session_other",
+        workspace_id="ws_other",
+        head_sha=OTHER_HEAD,
+        idempotency_key="history-other",
+    )
+
+    reloaded = importlib.reload(store)
+    reloaded.init_convergence_db()
+    history = reloaded.list_convergences_for_session(
+        repository="owner/repo",
+        branch="ai/dev-006",
+        development_session_id="dev_session_1",
+        base_branch="main",
+        base_sha=BASE,
+        modes=("full", "fast"),
+        limit=50,
+    )
+
+    assert {item["convergence_id"] for item in history} == {
+        terminal["convergence_id"],
+        active["convergence_id"],
+        fast["convergence_id"],
+    }
+    assert any(item["terminal"] is True for item in history)
+    assert any(item["terminal"] is False for item in history)
+    assert all(item["repository"] == "owner/repo" for item in history)
+    assert all(item["branch"] == "ai/dev-006" for item in history)
+
+
 def test_schema_initialization_is_idempotent_and_does_not_touch_existing_tables(
     monkeypatch, tmp_path
 ):
