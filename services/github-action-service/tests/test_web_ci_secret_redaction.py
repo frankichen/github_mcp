@@ -1,11 +1,14 @@
 import json
+from pathlib import Path
 
 import pytest
 
 from app import ci_database as db
 from app import ci_mcp
 from app import development_failure_pack as failure_pack
+from app import development_failure_pack_store as failure_pack_store
 from app import mcp_response
+from app import mygithub12
 from app.mcp_response import StructuredFastMCP
 
 
@@ -88,12 +91,26 @@ def _fixture_log():
     ) + "\n"
 
 
-def _assert_redacted(payload):
-    serialized = json.dumps(payload, ensure_ascii=False)
+def _assert_no_fixture_secrets(payload):
+    serialized = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
     for secret in (TOKEN, PASSWORD, DSN_PASSWORD, AUTH_VALUE):
         assert secret not in serialized
+    return serialized
+
+
+def _assert_redacted(payload):
+    serialized = _assert_no_fixture_secrets(payload)
     assert "[REDACTED]" in serialized
     return serialized
+
+
+def _mark_job_failed(job_id):
+    connection = db._get_db()
+    connection.execute(
+        "UPDATE ci_jobs SET status='failed', exit_code=?, error_code='CI_STEP_FAILED' WHERE job_id=?",
+        (EXIT_CODE, job_id),
+    )
+    connection.commit()
 
 
 def _seed_failed_step():
@@ -101,13 +118,21 @@ def _seed_failed_step():
     step_id = db.add_step(job["job_id"], STEP_NAME, status="running")
     log_end = db.append_log_chunk(job["job_id"], _fixture_log())
     assert db.finish_step(step_id, "failed", exit_code=EXIT_CODE, log_end_offset=log_end)
-    connection = db._get_db()
-    connection.execute(
-        "UPDATE ci_jobs SET status='failed', exit_code=?, error_code='CI_STEP_FAILED' WHERE job_id=?",
-        (EXIT_CODE, job["job_id"]),
-    )
-    connection.commit()
+    _mark_job_failed(job["job_id"])
     return db.get_job(job["job_id"]), step_id
+
+
+def _seed_paginated_failed_step(page_count=4):
+    job = _new_job()
+    step_id = db.add_step(job["job_id"], STEP_NAME, status="running")
+    raw_pages = []
+    for index in range(page_count):
+        page = f"page={index}\n" + _fixture_log()
+        raw_pages.append(page)
+        log_end = db.append_log_chunk(job["job_id"], page)
+    assert db.finish_step(step_id, "failed", exit_code=EXIT_CODE, log_end_offset=log_end)
+    _mark_job_failed(job["job_id"])
+    return db.get_job(job["job_id"]), step_id, raw_pages
 
 
 @pytest.mark.asyncio
@@ -132,6 +157,147 @@ async def test_tail_job_and_step_log_redact_secret_fixtures_without_losing_step_
     assert step_log["step"]["status"] == "failed"
     assert step_log["step"]["exit_code"] == EXIT_CODE
     assert step_log["step_selector"] == {"step_id": step_id}
+
+
+@pytest.mark.asyncio
+async def test_precise_step_log_pagination_redacts_every_page_and_keeps_diagnostics(get_mcp):
+    job, step_id, raw_pages = _seed_paginated_failed_step()
+
+    first = await _call(
+        get_mcp,
+        "get_private_ci_logs",
+        job_id=job["job_id"],
+        step_id=step_id,
+        limit=1,
+    )
+    assert first["cursor"] is None
+    assert first["has_more"] is True
+    assert first["next_cursor"]
+
+    continuation = await _call(
+        get_mcp,
+        "get_private_ci_logs",
+        job_id=job["job_id"],
+        step_id=step_id,
+        cursor=first["next_cursor"],
+        limit=1,
+    )
+    assert continuation["cursor"] == first["next_cursor"]
+    assert continuation["has_more"] is True
+    assert continuation["next_cursor"]
+
+    cursor_only = await _call(
+        get_mcp,
+        "get_private_ci_logs",
+        cursor=continuation["next_cursor"],
+        limit=1,
+    )
+    assert cursor_only["cursor"] == continuation["next_cursor"]
+
+    pages = [first, continuation, cursor_only]
+    while pages[-1]["has_more"]:
+        previous = pages[-1]
+        page = await _call(
+            get_mcp,
+            "get_private_ci_logs",
+            cursor=previous["next_cursor"],
+            limit=1,
+        )
+        assert page["cursor"] == previous["next_cursor"]
+        pages.append(page)
+
+    assert len(pages) == len(raw_pages)
+    previous_end = pages[0]["step_log_range"]["start_offset"]
+    reconstructed = ""
+    for index, page in enumerate(pages):
+        serialized = _assert_redacted(page)
+        assert page["ok"] is True
+        assert page["mode"] == "step"
+        assert page["step_selector"] == {"step_id": step_id}
+        assert page["step"]["step_id"] == step_id
+        assert page["step"]["step_name"] == STEP_NAME
+        assert page["step"]["status"] == "failed"
+        assert page["step"]["exit_code"] == EXIT_CODE
+        assert TEST_FILE in serialized
+        assert TEST_NAME in serialized
+        assert f"{TEST_FILE}:37:5" in serialized
+        assert len(page["chunks"]) == 1
+        chunk = page["chunks"][0]
+        assert chunk["offset_from"] == previous_end
+        assert chunk["offset_to"] > chunk["offset_from"]
+        reconstructed += chunk["content"]
+        previous_end = chunk["offset_to"]
+        if index:
+            assert page["cursor"] == pages[index - 1]["next_cursor"]
+
+    expected_redacted = "".join(failure_pack.redact_text(raw) for raw in raw_pages)
+    assert reconstructed == expected_redacted
+    assert previous_end == pages[-1]["step_log_range"]["end_offset"]
+    assert pages[-1]["has_more"] is False
+    assert pages[-1]["next_cursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_job_wide_resource_and_chunk_paging_redact_secrets_without_losing_diagnostics(
+    get_mcp,
+):
+    job = _new_job()
+    raw_pages = []
+    for index in range(80):
+        page = (
+            f"job-page={index:03d} "
+            + ("safe-diagnostic-context " * 24)
+            + "\n"
+            + _fixture_log()
+        )
+        raw_pages.append(page)
+        db.append_log_chunk(job["job_id"], page)
+    _mark_job_failed(job["job_id"])
+
+    inline = await _call(
+        get_mcp,
+        "get_private_ci_logs",
+        job_id=job["job_id"],
+        offset=0,
+        limit=200,
+    )
+    _assert_no_fixture_secrets(inline)
+    meta = inline["response_meta"]
+    assert meta["mode"] == "resource"
+    assert meta["truncated"] is True
+    assert meta["has_more"] is True
+
+    resource_text = mcp_response.read_response_resource_text(meta["resource_uri"])
+    resource = json.loads(resource_text)
+    resource_serialized = _assert_redacted(resource)
+    assert TEST_FILE in resource_serialized
+    assert TEST_NAME in resource_serialized
+    assert f"{TEST_FILE}:37:5" in resource_serialized
+    assert f"exit_code={EXIT_CODE}" in resource_serialized
+
+    parts = []
+    offset = 0
+    page_count = 0
+    while True:
+        page = mcp_response.read_response_resource_chunk(
+            meta["resource_uri"], offset_bytes=offset, limit_bytes=1024
+        )
+        page_count += 1
+        chunk_text = _assert_no_fixture_secrets(page["content"])
+        parts.append(chunk_text)
+        assert page["offset_from"] == offset
+        if page["has_more"]:
+            assert page["next_offset"] is not None
+            assert page["next_offset"] > offset
+            offset = page["next_offset"]
+            continue
+        assert page["next_offset"] is None
+        assert page["has_more"] is False
+        break
+
+    assert page_count > 1
+    assert "".join(parts) == resource_text
+    assert json.loads("".join(parts)) == resource
 
 
 def test_failure_pack_and_its_resource_redact_secrets_but_keep_test_file_line_and_exit_code(
@@ -195,15 +361,77 @@ def test_failure_pack_and_its_resource_redact_secrets_but_keep_test_file_line_an
     assert TEST_FILE in serialized
 
     durable = failure_pack.read_failure_pack(result["failure_pack_id"])
-    _assert_redacted(durable)
-    resource = json.loads(
-        mcp_response.read_response_resource_text(result["resource_uri"])
-    )
-    _assert_redacted(resource)
-    assert resource["failed_step"]["exit_code"] == EXIT_CODE
+    durable_serialized = _assert_redacted(durable)
+    assert TEST_FILE in durable_serialized
+    assert TEST_NAME in durable_serialized
+    assert f"{TEST_FILE}:37:5" in durable_serialized
+
+    failure_pack_store.init_failure_pack_db()
+    with mygithub12._db() as controller_db:
+        row = controller_db.execute(
+            "SELECT payload_json FROM development_failure_packs WHERE failure_pack_id=?",
+            (result["failure_pack_id"],),
+        ).fetchone()
+    assert row is not None
+    raw_persisted_json = row["payload_json"]
+    _assert_redacted(raw_persisted_json)
+    assert TEST_FILE in raw_persisted_json
+    assert TEST_NAME in raw_persisted_json
+    assert f"{TEST_FILE}:37:5" in raw_persisted_json
+
+    original_resource_uri = result["resource_uri"]
+    original_resource_text = mcp_response.read_response_resource_text(original_resource_uri)
+    original_resource = json.loads(original_resource_text)
+    _assert_redacted(original_resource)
+    assert original_resource["failed_step"]["exit_code"] == EXIT_CODE
     assert any(
-        item["file"] == TEST_FILE and item["line"] == 37
-        for item in resource["failed_tests"]
+        item["file"] == TEST_FILE
+        and item["name"] == TEST_NAME
+        and item["line"] == 37
+        and item["column"] == 5
+        for item in original_resource["failed_tests"]
+    )
+
+    resource_meta = Path(
+        isolated_db
+        / "resources"
+        / f"{original_resource_uri.rsplit('/', 1)[-1]}.meta.json"
+    )
+    expired = json.loads(resource_meta.read_text(encoding="utf-8"))
+    expired["expires_at"] = 0
+    resource_meta.write_text(json.dumps(expired), encoding="utf-8")
+    with pytest.raises(FileNotFoundError):
+        mcp_response.read_response_resource_text(original_resource_uri)
+
+    def _forbid_ci_read(*args, **kwargs):
+        raise AssertionError("failure-pack rematerialization must not reread CI/log evidence")
+
+    monkeypatch.setattr(failure_pack, "get_log_tail", _forbid_ci_read)
+    monkeypatch.setattr(failure_pack, "get_steps", _forbid_ci_read)
+
+    rematerialized = failure_pack.materialize_failure_pack(result["failure_pack_id"])
+    assert rematerialized["failure_pack_id"] == result["failure_pack_id"]
+    assert rematerialized["resource_uri"] != original_resource_uri
+    assert rematerialized["rematerialize"]["rerun_ci"] is False
+    _assert_redacted(rematerialized)
+
+    rematerialized_resource_text = mcp_response.read_response_resource_text(
+        rematerialized["resource_uri"]
+    )
+    rematerialized_resource = json.loads(rematerialized_resource_text)
+    rematerialized_serialized = _assert_redacted(rematerialized_resource)
+    assert rematerialized_resource == durable
+    assert TEST_FILE in rematerialized_serialized
+    assert TEST_NAME in rematerialized_serialized
+    assert f"{TEST_FILE}:37:5" in rematerialized_serialized
+    assert rematerialized_resource["failed_step"]["step_name"] == STEP_NAME
+    assert rematerialized_resource["failed_step"]["exit_code"] == EXIT_CODE
+    assert any(
+        item["file"] == TEST_FILE
+        and item["name"] == TEST_NAME
+        and item["line"] == 37
+        and item["column"] == 5
+        for item in rematerialized_resource["failed_tests"]
     )
 
 
