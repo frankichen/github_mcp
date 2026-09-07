@@ -552,6 +552,107 @@ def start_validation_job(
     return job,prepared["selection"]
 
 
+def start_validation_request(
+    service: Any, session: dict[str,Any], mode: str, base_sha: str,
+    force_rerun: bool, supersede_previous: bool, idempotency_key: str="",
+    prepared: dict[str,Any] | None=None,
+) -> tuple[dict[str,Any],dict[str,Any]]:
+    """Create or reuse the durable CI Request for validate without waiting for CI."""
+    prepared=prepared or validation_preflight(service,session,mode,base_sha)
+    profile=prepared["profile"]; selection=prepared["selection"]
+    tree_sha=str(session.get("tree_sha") or "")
+    if not tree_sha:
+        identity=mygithub12.resolve_identity(service,session["repository"],commit_sha=session["head_commit_sha"])
+        tree_sha=identity["tree_sha"]
+    timeout_seconds=int(prepared["timeout_seconds"])
+    priority=int(prepared["priority"])
+    config_digest=effective_ci_config_digest(session["repository"])
+    normalized_payload={
+        "schema":"development-validation-v1",
+        "development_session_id":session["session_id"],
+        "expected_session_revision":int(session["session_revision"]),
+        "workspace_id":session.get("workspace_id",""),
+        "workspace_revision":int(session.get("workspace_revision") or 0),
+        "repository":session["repository"],
+        "branch":session["branch"],
+        "commit_sha":session["head_commit_sha"],
+        "tree_sha":tree_sha,
+        "profile":profile,
+        "mode":mode,
+        "requested_timeout_seconds":timeout_seconds,
+        "timeout_seconds":timeout_seconds,
+        "requested_priority":"normal",
+        "priority":priority,
+        "base_sha":prepared["base_sha"],
+        "force_rerun":bool(force_rerun),
+        "supersede_previous":bool(supersede_previous),
+        "effective_config_digest":config_digest,
+    }
+    request_hash=compute_normalized_request_hash(normalized_payload)
+    effective_idempotency_key=idempotency_key or (
+        f"dx-validate:{request_hash}" if not force_rerun else f"dx-validate-force:{uuid.uuid4().hex}"
+    )
+    try:
+        request=create_or_get_ci_request(
+            repository=session["repository"],branch=session["branch"],
+            commit_sha=session["head_commit_sha"],tree_sha=tree_sha,profile=profile,
+            effective_config_digest=config_digest,idempotency_key=effective_idempotency_key,
+            normalized_request_hash=request_hash,request_payload=normalized_payload,
+        )
+    except CIRequestIdempotencyConflictError as exc:
+        raise MyGithub12Error(
+            "IDEMPOTENCY_CONFLICT",
+            "idempotency_key is already bound to a different validation request",
+            {"idempotency_key":effective_idempotency_key},
+        ) from exc
+    if request["phase"] in {"accepted","preparing"}:
+        schedule_ci_request_preparation(request["request_id"])
+    return request,selection
+
+
+def validation_request_snapshot(request: dict[str,Any]) -> tuple[dict[str,Any],dict[str,Any] | None,dict[str,Any]]:
+    current=get_ci_request(request["request_id"]) or request
+    job=get_job(current["worker_job_id"]) if current.get("worker_job_id") else None
+    persisted_steps=get_steps(job["job_id"]) if job else []
+    worker=get_worker(job["worker_id"]) if job and job.get("worker_id") else None
+    return build_private_ci_snapshot_response(current,job,persisted_steps,"summary",worker),job,current
+
+
+def wait_validation_request(request: dict[str,Any], wait_seconds: int) -> tuple[dict[str,Any],dict[str,Any] | None,dict[str,Any]]:
+    wait=max(0,min(int(wait_seconds),55))
+    current=get_ci_request(request["request_id"]) or request
+    if wait and current.get("worker_job_id"):
+        wait_validation(current["worker_job_id"],wait)
+    return validation_request_snapshot(current)
+
+
+def validation_observation(
+    session_id: str, session_revision: int, mode: str, request: dict[str,Any],
+    selection: dict[str,Any], include_failure_pack: bool=True,
+) -> dict[str,Any]:
+    snapshot,job,current=validation_request_snapshot(request)
+    terminal=bool(snapshot.get("terminal"))
+    if terminal and job:
+        result=validation_result(session_id,session_revision,mode,job,selection,include_failure_pack)
+    else:
+        result={
+            "job":{"job_id":snapshot.get("job_id"),"status":snapshot.get("worker_status"),"profile":snapshot.get("profile"),"commit_sha":snapshot.get("commit_sha"),"current_step":snapshot.get("current_step"),"exit_code":snapshot.get("exit_code")},
+            "affected":selection,"merge_eligible":False,"attestation":None,"failure_pack":None,"terminal":terminal,
+        }
+    attestation=result.get("attestation") if isinstance(result.get("attestation"),dict) else None
+    failure=result.get("failure_pack") if isinstance(result.get("failure_pack"),dict) else None
+    attestation_id=(attestation or {}).get("attestation_id")
+    failure_pack_id=(failure or {}).get("failure_pack_id") or (failure or {}).get("content_sha256")
+    result.update({
+        "request":{"request_id":current["request_id"],"phase":current.get("phase"),"status":current.get("status"),"revision":current.get("revision"),"worker_job_id":current.get("worker_job_id")},
+        "request_id":current["request_id"],"phase":snapshot.get("phase"),"status":snapshot.get("status"),"revision":snapshot.get("revision"),
+        "continuation_required":not terminal,"durable_status":snapshot,"next_actions":snapshot.get("next_actions",[]),
+        "attestation_id":attestation_id,"attestation_available":bool(attestation_id),
+        "failure_pack_id":failure_pack_id,"failure_pack_available":bool(failure_pack_id or snapshot.get("failure_pack_available")),
+    })
+    return result
+
+
 def wait_validation(job_id: str, wait_seconds: int) -> dict[str,Any]:
     wait=max(0,min(int(wait_seconds),55))
     if wait:
