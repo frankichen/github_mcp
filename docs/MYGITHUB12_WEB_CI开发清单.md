@@ -83,14 +83,14 @@
 
 ### WEB-CI-DEV-005：Long-poll 退出 Web 默认路径
 
-- [ ] 决定 `wait_private_ci_job` 为 compatibility-only 或显式短 wait。
-- [ ] canonical Schema 不再描述其为正常 CI 跟踪首选。
-- [ ] 不再让 AI instructions 要求“wait 到 terminal”。
-- [ ] compatibility 行为有测试。
-- [ ] Manifest/deprecation/capability 与实际暴露一致。
+- [x] 决定 `wait_private_ci_job` 为 compatibility-only 或显式短 wait。
+- [x] canonical Schema 不再描述其为正常 CI 跟踪首选。
+- [x] 不再让 AI instructions 要求“wait 到 terminal”。
+- [x] compatibility 行为有测试。
+- [x] Manifest/deprecation/capability 与实际暴露一致。
 
 映射验收：AC-WEB-CI-02/13/15。  
-证据：`待填写`
+证据：implementation commit `8c2adaf2cee9b0c2ae789d4019ef7c070bdbf976`，test-repair candidate `14716317a5795e3408543f9b1c5d90ff21f94f47` / Tree `8ae1eef3b433b2125755b2e0730ede9e99015e19`；production canonical 164 tools、compatibility registration 175 tools、hidden deprecated 11（含 `wait_private_ci_job`），replacement=`get_private_ci_job`；`test_web_ci_wait_compatibility.py` 覆盖 production hidden、compatibility exposure、legacy 55/default+last-known delegation、hidden-but-registered direct call、schema identity、capabilities、Manifest 与 current Web instructions；历史 `test_web_ci_wait_baseline.py` 6 tests 保持未修改并包含于 full service pytest。Private CI `repo-auto-check` Job `23e49cd87177485e` passed / exit 0 / 15 steps / failed 0；`github-action-service` 767 passed、`private-ci-agent` 230 passed、`private-deploy-agent` 5 passed，三套 ruff/compileall passed。前一 Job `af65156a320943eb` 中全部测试输出已通过但 Worker 将 private-ci-agent pytest 记为 exit 127，fresh rerun 后消失，按 CI 执行层瞬态异常记录。`repo-fast-check` 仍为 `fast_check_makefile_missing` / `FAST_CHECK_ENTRYPOINT_MISSING` 既有基础设施债务，不在本轮修复。AC-WEB-CI-02/13/15 保持未签字，DEV-006+ 保持未开始。
 
 ## 4. P0：Durable validate / converge
 
