@@ -1151,3 +1151,651 @@ def _response(
             "branch_moved": False,
         },
     }
+    if schedule_error:
+        result["ci_request_schedule_error"] = dict(schedule_error)
+    return result
+
+
+async def _advance_index_and_analysis(
+    github_call: Callable[..., Awaitable[Any]],
+    service: Any,
+    snapshot: dict[str, Any],
+    session: Mapping[str, Any],
+    *,
+    base_sha: str,
+    idempotency_key: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    head_sha = str(snapshot["head_sha"])
+    tree_sha = str(snapshot["tree_sha"])
+    index_error = None
+    try:
+        index_status = await _invoke(
+            github_call,
+            mygithub12.get_index_status,
+            service,
+            snapshot["repository"],
+            head_sha,
+        )
+    except Exception as exc:
+        index_status = {
+            "status": "unknown",
+            "repository": snapshot["repository"],
+            "commit_sha": head_sha,
+            "tree_sha": None,
+        }
+        index_error = _error_evidence("index_status", exc)
+    if not isinstance(index_status, dict):
+        index_status = {
+            "status": "unknown",
+            "repository": snapshot["repository"],
+            "commit_sha": head_sha,
+            "tree_sha": None,
+        }
+    index_request = None
+    if not _index_is_exact_ready(index_status, head_sha, tree_sha):
+        if snapshot.get("index_job_id"):
+            index_error = (
+                {
+                    "stage": "index",
+                    "code": "INDEX_NOT_READY",
+                    "message": "exact HEAD Index remains pending",
+                }
+                if index_status.get("status") not in {"failed", "cancelled"}
+                else {
+                    "stage": "index",
+                    "code": str(index_status.get("error_code") or "INDEX_BUILD_FAILED"),
+                    "message": str(index_status.get("error_message") or "Index build failed"),
+                }
+            )
+        else:
+            try:
+                index_request = await _invoke(
+                    github_call,
+                    mygithub12.request_index_build,
+                    service,
+                    snapshot["repository"],
+                    head_sha,
+                    "auto",
+                    base_sha,
+                    "interactive",
+                    f"converge-index:{snapshot['development_session_id']}:{head_sha}:{idempotency_key or 'default'}",
+                    False,
+                )
+            except Exception as exc:
+                index_error = _error_evidence("index", exc)
+            if isinstance(index_request, dict):
+                index_job_id = index_request.get("job_id")
+                if index_job_id:
+                    snapshot = _bind_with_replay(
+                        snapshot,
+                        convergence_store.bind_index_job,
+                        str(index_job_id),
+                    )
+                if _index_is_exact_ready(index_request, head_sha, tree_sha):
+                    index_status = index_request
+                elif index_request.get("status") in {"failed", "cancelled"}:
+                    index_error = {
+                        "stage": "index",
+                        "code": str(index_request.get("error_code") or "INDEX_BUILD_FAILED"),
+                        "message": str(index_request.get("error_message") or "Index build failed"),
+                    }
+                elif index_request.get("status"):
+                    # The request snapshot is the best immediate fact when
+                    # the previous status read failed; keep it pending rather
+                    # than falsely recording an Index failure.
+                    index_status = index_request
+                    index_error = None
+    exact_ready = _index_is_exact_ready(index_status, head_sha, tree_sha)
+    if exact_ready:
+        snapshot = _record_analysis_with_replay(
+            snapshot,
+            stage="index",
+            state="ready",
+            resource_identity=_canonical_digest(
+                {
+                    "repository": snapshot["repository"],
+                    "commit_sha": head_sha,
+                    "tree_sha": tree_sha,
+                    "index_version": index_status.get("index_version"),
+                }
+            ),
+        )
+    elif index_error and index_error.get("code") != "INDEX_NOT_READY":
+        snapshot = _record_analysis_with_replay(
+            snapshot,
+            stage="index",
+            state="failed",
+            error_code=str(index_error.get("code") or "INDEX_BUILD_FAILED"),
+            error_message=str(index_error.get("message") or "Index build failed"),
+        )
+
+    if not exact_ready:
+        if _phase_rank(str(snapshot.get("phase") or "")) < _phase_rank("index_requested"):
+            snapshot = _transition_if_needed(
+                snapshot,
+                "index_requested",
+                status="pending",
+                event_type="index_requested" if index_request else "index_pending",
+                metadata={
+                    "index_job_id": snapshot.get("index_job_id"),
+                    "index_status": index_status.get("status"),
+                },
+            )
+        pending = [
+            {
+                "stage": "index",
+                "code": "INDEX_NOT_READY",
+                "message": "exact HEAD Repository Index is not ready; analysis remains pending",
+            }
+        ]
+        degraded = (
+            [index_error]
+            if index_error and index_error.get("code") != "INDEX_NOT_READY"
+            else []
+        )
+        if _phase_rank(str(snapshot.get("phase") or "")) < _phase_rank("analysis_pending"):
+            snapshot = _transition_if_needed(
+                snapshot,
+                "analysis_pending",
+                status="degraded" if degraded else "pending",
+                event_type="analysis_pending",
+                metadata={"index_status": index_status.get("status")},
+            )
+        analysis = _analysis_result_details(
+            {},
+            repository=str(snapshot["repository"]),
+            index_status=index_status,
+            index_request=index_request,
+            head_sha=head_sha,
+            tree_sha=tree_sha,
+            base_sha=base_sha,
+            degraded_reasons=degraded,
+            pending_reasons=pending,
+            analysis_resource=None,
+            analysis_states=snapshot.get("analysis") or {},
+        )
+        index = {
+            "ready": False,
+            "status": index_status.get("status"),
+            "job_id": snapshot.get("index_job_id"),
+            "commit_sha": index_status.get("commit_sha"),
+            "tree_sha": index_status.get("tree_sha"),
+            "request": index_request,
+        }
+        return snapshot, index, analysis
+
+    existing_states = snapshot.get("analysis") or {}
+    details, degraded_reasons = _run_analysis_callbacks(
+        service,
+        session,
+        base_sha,
+        existing_states=existing_states,
+    )
+    resource = _analysis_resource(
+        session=session,
+        base_sha=base_sha,
+        index_status=index_status,
+        index_request=index_request,
+        details=details,
+        degraded_reasons=degraded_reasons,
+    )
+    for stage, public_key in _ANALYSIS_CALLBACKS:
+        if public_key not in details:
+            continue
+        stage_result = details.get(public_key)
+        if not isinstance(stage_result, dict):
+            stage_result = {"ok": True, "value": stage_result}
+        state = _analysis_failure_state(stage_result)
+        error = (
+            stage_result.get("error")
+            if isinstance(stage_result.get("error"), dict)
+            else {}
+        )
+        snapshot = _record_analysis_with_replay(
+            snapshot,
+            stage=stage,
+            state=state,
+            resource_uri=(resource or {}).get("resource_uri") if resource else None,
+            resource_identity=_canonical_digest(stage_result),
+            error_code=(
+                str(error.get("code"))
+                if state == "failed" and error.get("code")
+                else None
+            ),
+            error_message=(
+                str(error.get("message"))
+                if state == "failed" and error.get("message")
+                else None
+            ),
+        )
+    all_analysis_ready = all(
+        (snapshot.get("analysis") or {}).get(stage, {}).get("state") == "ready"
+        for stage in convergence_store.ANALYSIS_STAGES
+    )
+    # Once the validation track has its own phase, keep ``status`` truthful to
+    # the durable CI Request lifecycle. Analysis readiness remains in its
+    # per-stage durable rows and the public analysis snapshot; it must not
+    # briefly overwrite ``accepted``/``running`` and then be reset by CI
+    # observation in the same call.
+    if _phase_rank(str(snapshot.get("phase") or "")) < _phase_rank("ci_requested"):
+        snapshot = _transition_if_needed(
+            snapshot,
+            "analysis_pending",
+            status="ready" if all_analysis_ready else (
+                "degraded" if degraded_reasons else "pending"
+            ),
+            event_type="analysis_ready" if all_analysis_ready else "analysis_pending",
+            metadata={"required_stages": list(convergence_store.ANALYSIS_STAGES)},
+        )
+    current_pending, durable_degraded = _analysis_readiness_reasons(snapshot)
+    for reason in durable_degraded:
+        if reason not in degraded_reasons:
+            degraded_reasons.append(reason)
+    analysis = _analysis_result_details(
+        details,
+        repository=str(snapshot["repository"]),
+        index_status=index_status,
+        index_request=index_request,
+        head_sha=head_sha,
+        tree_sha=tree_sha,
+        base_sha=base_sha,
+        degraded_reasons=degraded_reasons,
+        pending_reasons=current_pending,
+        analysis_resource=resource,
+        analysis_states=snapshot.get("analysis") or {},
+    )
+    index = {
+        "ready": True,
+        "status": index_status.get("status"),
+        "job_id": snapshot.get("index_job_id"),
+        "commit_sha": index_status.get("commit_sha"),
+        "tree_sha": index_status.get("tree_sha"),
+        "index_version": index_status.get("index_version"),
+        "request": index_request,
+    }
+    return snapshot, index, analysis
+
+
+async def _finalize_ci_state(
+    snapshot: dict[str, Any],
+    session: Mapping[str, Any],
+    mode: str,
+    request: Mapping[str, Any],
+    validation: dict[str, Any],
+    analysis: Mapping[str, Any],
+    *,
+    include_failure_pack: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    del session, include_failure_pack
+    status = _ci_request_status(request)
+    if not _ci_request_terminal(request):
+        target = "ci_running" if status == "running" else "ci_requested"
+        snapshot = _transition_if_needed(
+            snapshot,
+            target,
+            status=status,
+            event_type="ci_request_observed",
+            metadata={
+                "ci_request_id": request.get("request_id"),
+                "ci_request_phase": request.get("phase"),
+                "ci_request_revision": request.get("revision"),
+            },
+        )
+        validation = _validation_snapshot(
+            request,
+            ci_job_id=snapshot.get("ci_job_id"),
+            attestation_id=None,
+            failure_pack_id=None,
+        )
+        return snapshot, validation
+
+    attestation_id, failure_pack_id = _extract_evidence(request)
+    if status == "passed" and mode == "full" and not attestation_id:
+        # A terminal Request without its required full-gate attestation is a
+        # terminal CI fact, not a convergence success. The next call can
+        # consume a controller retry/materialized evidence without rerunning CI.
+        snapshot = _transition_if_needed(
+            snapshot,
+            "post_ci_finalize",
+            status="pending",
+            event_type="post_ci_evidence_pending",
+            metadata={"reason": "FULL_ATTESTATION_REQUIRED"},
+        )
+        validation = _validation_snapshot(
+            request,
+            ci_job_id=snapshot.get("ci_job_id"),
+            attestation_id=None,
+            failure_pack_id=failure_pack_id,
+        )
+        return snapshot, validation
+
+    if status != "passed":
+        if failure_pack_id:
+            snapshot = _record_terminal_evidence_if_needed(
+                snapshot,
+                attestation_id=None,
+                failure_pack_id=failure_pack_id,
+            )
+        snapshot = _transition_if_needed(
+            snapshot,
+            "failed",
+            status="failed",
+            error_code=str(request.get("preflight_error_code") or "CI_FAILED"),
+            error_message=str(
+                request.get("terminal_reason")
+                or f"CI Request reached terminal status {status}"
+            ),
+            event_type="ci_failed",
+            metadata={
+                "ci_request_id": request.get("request_id"),
+                "ci_status": status,
+            },
+        )
+        validation = _validation_snapshot(
+            request,
+            ci_job_id=snapshot.get("ci_job_id"),
+            attestation_id=None,
+            failure_pack_id=failure_pack_id,
+        )
+        return snapshot, validation
+
+    # A passed fast CI needs no attestation; full CI does, and the branch above
+    # has already fail-closed if it is absent.
+    snapshot = _record_terminal_evidence_if_needed(
+        snapshot,
+        attestation_id=attestation_id,
+        failure_pack_id=failure_pack_id,
+    )
+    analysis_complete = bool(
+        analysis.get("index", {}).get("ready")
+        and not analysis.get("pending")
+        and not analysis.get("degraded")
+        and all(
+            (snapshot.get("analysis") or {}).get(stage, {}).get("state") == "ready"
+            for stage in convergence_store.ANALYSIS_STAGES
+        )
+    )
+    if not analysis_complete:
+        snapshot = _transition_if_needed(
+            snapshot,
+            "post_ci_finalize",
+            status="degraded" if analysis.get("degraded") else "pending",
+            event_type="post_ci_analysis_pending",
+            metadata={
+                "analysis_pending": bool(analysis.get("pending")),
+                "analysis_degraded": bool(analysis.get("degraded")),
+            },
+        )
+    else:
+        snapshot = _transition_if_needed(
+            snapshot,
+            "post_ci_finalize",
+            status="finalizing",
+            event_type="post_ci_finalize",
+            metadata={"ci_request_id": request.get("request_id")},
+        )
+        snapshot = _transition_if_needed(
+            snapshot,
+            "passed",
+            status="passed",
+            event_type="convergence_passed",
+            metadata={
+                "ci_request_id": request.get("request_id"),
+                "attestation_id": attestation_id,
+            },
+        )
+    validation = _validation_snapshot(
+        request,
+        ci_job_id=snapshot.get("ci_job_id"),
+        attestation_id=attestation_id,
+        failure_pack_id=failure_pack_id,
+    )
+    return snapshot, validation
+
+
+async def converge_task(
+    github_call: Callable[..., Awaitable[Any]],
+    service: Any,
+    development_session_id: str,
+    expected_session_revision: int,
+    mode: str = "full",
+    base_sha: str = "",
+    index_wait_seconds: int = 55,
+    wait_seconds: int = 55,
+    force_rerun: bool = False,
+    supersede_previous: bool = True,
+    include_failure_pack: bool = True,
+    idempotency_key: str = "",
+    convergence_id: str = "",
+) -> dict[str, Any]:
+    """Advance one durable convergence without waiting for external work."""
+    del index_wait_seconds, wait_seconds, force_rerun
+    if mode not in convergence_store.VALID_MODES:
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_STATE_INVALID",
+            "convergence mode must be fast or full",
+            {"mode": mode},
+        )
+
+    # Preserve the explicit Session CAS gate. A stale caller must not create
+    # or mutate a convergence under a newer Session revision.
+    sessions._require_revision(development_session_id, expected_session_revision)
+    session = sessions.get_session(development_session_id)
+    resolved_base = base_sha or session["base_commit_sha"]
+    # The public wrapper makes the caller key optional. A deterministic
+    # session/mode key keeps ordinary cross-window retries on one Run while
+    # making a new HEAD/Tree or Session/Workspace identity an explicit
+    # idempotency conflict that can block the old Run for recovery.
+    convergence_key = idempotency_key or f"session:{development_session_id}:{mode}"
+
+    if convergence_id:
+        snapshot = convergence_store.get_convergence(convergence_id)
+    else:
+        try:
+            snapshot = convergence_store.create_or_get_convergence(
+                repository=session["repository"],
+                branch=session["branch"],
+                development_session_id=development_session_id,
+                workspace_id=session["workspace_id"],
+                session_revision=int(session["session_revision"]),
+                workspace_revision=int(session["workspace_revision"]),
+                head_sha=session["head_commit_sha"],
+                tree_sha=session["tree_sha"],
+                base_branch=session["base_branch"],
+                base_sha=resolved_base,
+                mode=mode,
+                idempotency_key=convergence_key,
+            )
+        except MyGithub12Error as exc:
+            # An identity conflict can be the old active run after a branch or
+            # Session drift. Mark that old run blocked when its identity is
+            # available instead of silently starting a new run under the key.
+            old_id = (exc.details or {}).get("convergence_id")
+            if old_id and exc.code in {
+                "DEVELOPMENT_CONVERGENCE_IDENTITY_MISMATCH",
+                "IDEMPOTENCY_CONFLICT",
+            }:
+                snapshot = convergence_store.get_convergence(str(old_id))
+                if not snapshot.get("terminal"):
+                    snapshot = _transition_if_needed(
+                        snapshot,
+                        "blocked",
+                        status="blocked",
+                        error_code="DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                        error_message="convergence request identity drifted",
+                        event_type="convergence_blocked_drift",
+                        metadata={"cause_code": exc.code, "cause_details": exc.details},
+                    )
+                return _response(
+                    snapshot,
+                    session,
+                    mode=mode,
+                    index={},
+                    analysis={"pending": True, "degraded": False},
+                    request=None,
+                    validation=_validation_snapshot(
+                        None,
+                        ci_job_id=snapshot.get("ci_job_id"),
+                        attestation_id=snapshot.get("attestation_id"),
+                        failure_pack_id=snapshot.get("failure_pack_id"),
+                    ),
+                    recovery_required=True,
+                )
+            raise
+
+    if snapshot.get("development_session_id") != development_session_id:
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+            "convergence belongs to a different Development Session",
+            {"recovery_required": True},
+        )
+    # Once a Run exists, its durable base is authoritative for every replay;
+    # a later caller cannot silently analyze or validate against another base.
+    resolved_base = str(snapshot.get("base_sha") or resolved_base)
+    if snapshot.get("terminal"):
+        request = (
+            ci_request_store.get_ci_request(str(snapshot["ci_request_id"]))
+            if snapshot.get("ci_request_id")
+            else None
+        )
+        validation = _validation_snapshot(
+            request,
+            ci_job_id=snapshot.get("ci_job_id"),
+            attestation_id=snapshot.get("attestation_id"),
+            failure_pack_id=snapshot.get("failure_pack_id"),
+        )
+        return _response(
+            snapshot,
+            session,
+            mode=mode,
+            index={"job_id": snapshot.get("index_job_id")},
+            analysis={"readiness": snapshot.get("analysis", {})},
+            request=request,
+            validation=validation,
+        )
+
+    try:
+        await _verify_current_identity(github_call, service, session, snapshot)
+    except MyGithub12Error as exc:
+        if not snapshot.get("terminal"):
+            snapshot = _transition_if_needed(
+                snapshot,
+                "blocked",
+                status="blocked",
+                error_code=exc.code,
+                error_message=exc.message,
+                event_type="convergence_blocked_drift",
+                metadata={"details": exc.details},
+            )
+        return _response(
+            snapshot,
+            session,
+            mode=mode,
+            index={"job_id": snapshot.get("index_job_id")},
+            analysis={"pending": True, "degraded": False},
+            request=None,
+            validation=_validation_snapshot(
+                None,
+                ci_job_id=snapshot.get("ci_job_id"),
+                attestation_id=snapshot.get("attestation_id"),
+                failure_pack_id=snapshot.get("failure_pack_id"),
+            ),
+            recovery_required=True,
+        )
+
+    snapshot, index, analysis = await _advance_index_and_analysis(
+        github_call,
+        service,
+        snapshot,
+        session,
+        base_sha=resolved_base,
+        idempotency_key=convergence_key,
+    )
+    try:
+        snapshot, request, schedule_error, ci_job_id, _ = await _advance_ci_track(
+            github_call,
+            snapshot,
+            session,
+            mode,
+            supersede_previous=supersede_previous,
+        )
+    except MyGithub12Error as exc:
+        if exc.code == "DEVELOPMENT_SESSION_RECOVERY_REQUIRED":
+            snapshot = _transition_if_needed(
+                snapshot,
+                "blocked",
+                status="blocked",
+                error_code=exc.code,
+                error_message=exc.message,
+                event_type="convergence_blocked_ci_identity",
+                metadata={"details": exc.details},
+            )
+            return _response(
+                snapshot,
+                session,
+                mode=mode,
+                index=index,
+                analysis=analysis,
+                request=None,
+                validation=_validation_snapshot(
+                    None,
+                    ci_job_id=snapshot.get("ci_job_id"),
+                    attestation_id=snapshot.get("attestation_id"),
+                    failure_pack_id=snapshot.get("failure_pack_id"),
+                ),
+                recovery_required=True,
+            )
+        snapshot = _transition_if_needed(
+            snapshot,
+            "failed",
+            status="failed",
+            error_code=str(getattr(exc, "code", "CI_REQUEST_CREATE_FAILED")),
+            error_message=str(getattr(exc, "message", str(exc))),
+            event_type="ci_request_failed",
+            metadata={"cause_type": type(exc).__name__},
+        )
+        return _response(
+            snapshot,
+            session,
+            mode=mode,
+            index=index,
+            analysis=analysis,
+            request=None,
+            validation=_validation_snapshot(
+                None,
+                ci_job_id=snapshot.get("ci_job_id"),
+                attestation_id=None,
+                failure_pack_id=None,
+            ),
+        )
+    if ci_job_id and not snapshot.get("ci_job_id"):
+        snapshot = _bind_with_replay(
+            snapshot,
+            convergence_store.bind_ci_job,
+            ci_request_id=str(request["request_id"]),
+            ci_job_id=str(ci_job_id),
+        )
+    snapshot, validation = await _finalize_ci_state(
+        snapshot,
+        session,
+        mode,
+        request,
+        _validation_snapshot(
+            request,
+            ci_job_id=snapshot.get("ci_job_id") or ci_job_id,
+            attestation_id=_extract_evidence(request)[0],
+            failure_pack_id=_extract_evidence(request)[1],
+        ),
+        analysis,
+        include_failure_pack=include_failure_pack,
+    )
+    return _response(
+        snapshot,
+        session,
+        mode=mode,
+        index=index,
+        analysis=analysis,
+        request=request,
+        validation=validation,
+        schedule_error=schedule_error,
+    )
