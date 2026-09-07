@@ -239,8 +239,9 @@ async def test_precise_step_log_pagination_redacts_every_page_and_keeps_diagnost
 
 @pytest.mark.asyncio
 async def test_job_wide_resource_and_chunk_paging_redact_secrets_without_losing_diagnostics(
-    get_mcp,
+    get_mcp, isolated_db, monkeypatch,
 ):
+    monkeypatch.setenv("MCP_RESPONSE_RESOURCE_DIR", str(isolated_db / "resources"))
     job = _new_job()
     raw_pages = []
     for index in range(80):
