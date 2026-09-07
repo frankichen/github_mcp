@@ -174,15 +174,15 @@
 
 ### WEB-CI-DEV-012：Secret redaction 验真
 
-- [ ] Token fixture。
-- [ ] password fixture。
-- [ ] DSN fixture。
-- [ ] Authorization header fixture。
-- [ ] Failure Pack、tail、step log、full Resource 全链路验证脱敏。
-- [ ] 脱敏不能删除 file/test/line/exit-code 等定位信息。
+- [x] Token fixture。
+- [x] password fixture。
+- [x] DSN fixture。
+- [x] Authorization header fixture。
+- [x] Failure Pack、tail、step log、full Resource 全链路验证脱敏。
+- [x] 脱敏不能删除 file/test/line/exit-code 等定位信息。
 
 映射验收：AC-WEB-CI-16。  
-证据：`待填写`
+证据：基于 fresh current-main `0c8b597b28d8a8307fd24256f28e14c382e4f783` 按 DEV-012 当前契约执行 semantic replay，未 cherry-pick stacked history，未整合 DEV-013/DEV-014。新增 `test_web_ci_secret_redaction.py` 覆盖 Token/password/DSN/Authorization header，并验证 Failure Pack、`get_private_ci_log_tail`、Job/step `get_private_ci_logs` 与 full Resource 的脱敏，同时保留 `tests/test_redaction.py:37:5`、step 与 `exit_code=23`。代码候选 `96dc356cb50654017753e2d245fdaff1a62b0de8` 的 `repo-auto-check` Job `11ad5ea95e5c4fd7` passed / exit 0；github-action-service `830 passed`、private-ci-agent `230 passed`、private-deploy-agent `5 passed`。
 
 ## 6. P0：MCP Schema / 幂等 / 安全
 
