@@ -810,7 +810,7 @@ async def test_validate_job_start_failure_rolls_session_back(monkeypatch):
     monkeypatch.setattr(dx, "validation_preflight", lambda *args, **kwargs: {"profile": "repo-fast-check"})
     monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: _no_renewal(session))
     monkeypatch.setattr(
-        dx, "start_validation_job",
+        dx, "start_validation_request",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             mygithub12.MyGithub12Error("PRIVATE_CI_UNAVAILABLE", "CI unavailable", {"retryable": True})
         ),
