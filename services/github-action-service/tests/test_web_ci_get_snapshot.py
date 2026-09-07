@@ -1,3 +1,4 @@
+import inspect
 import json
 import time
 
@@ -333,6 +334,19 @@ async def test_pre_dev002_legacy_job_projection_remains_readable_by_job_id(
 async def test_summary_never_waits_sleeps_calls_network_or_schedules_work(get_mcp, monkeypatch):
     request, job_id = _link_worker()
     _set_worker_status(job_id, "running")
+
+    tool = get_mcp._tool_manager.get_tool("get_private_ci_job")
+    source = inspect.getsource(tool.fn)
+    for forbidden_name in (
+        "wait_for_job_change",
+        "wait_private_ci_job",
+        "sleep(",
+        "get_private_ci_logs",
+        "get_log_tail",
+        "get_log_chunks",
+        "get_github_changed_files_result",
+    ):
+        assert forbidden_name not in source
 
     def forbidden(*args, **kwargs):
         raise AssertionError("summary snapshot must remain a pure non-blocking local read")
