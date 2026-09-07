@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import secrets
 import sqlite3
@@ -50,11 +51,23 @@ def init_prepared_change_set_db() -> None:
               failure_code TEXT,
               executing_at REAL,
               committed_at REAL,
-              terminal_at REAL
+              terminal_at REAL,
+              prepare_idempotency_key TEXT,
+              prepare_fingerprint TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_prepared_change_sets_expiry
               ON prepared_change_sets(status,expires_at);
             """
+        )
+        columns={str(row[1]) for row in db.execute("PRAGMA table_info(prepared_change_sets)").fetchall()}
+        if "prepare_idempotency_key" not in columns:
+            db.execute("ALTER TABLE prepared_change_sets ADD COLUMN prepare_idempotency_key TEXT")
+        if "prepare_fingerprint" not in columns:
+            db.execute("ALTER TABLE prepared_change_sets ADD COLUMN prepare_fingerprint TEXT")
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_prepared_change_set_prepare_idempotency "
+            "ON prepared_change_sets(development_session_id,prepare_idempotency_key) "
+            "WHERE prepare_idempotency_key IS NOT NULL"
         )
 
 
@@ -91,6 +104,8 @@ def _public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         "execution_idempotency_key",
         "committed_result_json",
         "post_write_identity_json",
+        "prepare_idempotency_key",
+        "prepare_fingerprint",
     ):
         value.pop(key, None)
     return value
@@ -158,6 +173,7 @@ def create_prepared_change_set(
     workspace: dict[str, Any],
     *,
     expected_head_sha: str,
+    idempotency_key: str = "",
     ttl_seconds: int = PREPARED_CHANGE_SET_TTL_SECONDS,
 ) -> dict[str, Any]:
     init_prepared_change_set_db()
@@ -172,6 +188,37 @@ def create_prepared_change_set(
     bounded_ttl = max(60, min(int(ttl_seconds), PREPARED_CHANGE_SET_TTL_SECONDS))
     expires_at = min(now + bounded_ttl, artifact.expires_at)
     affected_paths, expected_blobs = _expected_blobs(parsed, dry_run_result)
+    prepare_fingerprint=hashlib.sha256(json.dumps({
+        "repository":session["repository"],"branch":session["branch"],
+        "development_session_id":session["session_id"],
+        "session_revision":int(session["session_revision"]),
+        "workspace_id":workspace["workspace_id"],"workspace_revision":int(workspace["revision"]),
+        "expected_head_sha":expected_head_sha,"raw_size_bytes":artifact.size_bytes,
+        "raw_sha256":artifact.sha256,"raw_git_blob_sha":artifact.git_blob_sha,
+        "canonical_change_set_hash":parsed["canonical_hash"],
+        "affected_paths":affected_paths,"expected_blob_identities":expected_blobs,
+    },ensure_ascii=False,sort_keys=True,separators=(",",":")).encode("utf-8")).hexdigest()
+    if idempotency_key:
+        with core._db() as db:
+            existing=db.execute(
+                "SELECT * FROM prepared_change_sets WHERE development_session_id=? AND prepare_idempotency_key=?",
+                (session["session_id"],idempotency_key),
+            ).fetchone()
+        if existing:
+            if str(existing["prepare_fingerprint"] or "")!=prepare_fingerprint:
+                raise MyGithub12Error(
+                    "IDEMPOTENCY_CONFLICT","prepare idempotency key was used for another ChangeSet",
+                    {"development_session_id":session["session_id"]},
+                )
+            if existing["status"]!="PREPARED" or float(existing["expires_at"])<=now:
+                raise MyGithub12Error(
+                    "PREPARED_CHANGE_SET_ALREADY_CONSUMED",
+                    "idempotent prepared change set is no longer available",
+                    {"prepared_change_set_id":existing["prepared_change_set_id"],"status":existing["status"]},
+                )
+            artifact_store.consume_artifact(artifact.artifact_id)
+            replayed=_public(existing); replayed["replayed"]=True
+            return replayed
     with core._LOCK, core._db() as db:
         db.execute(
             """INSERT INTO prepared_change_sets(
@@ -181,8 +228,9 @@ def create_prepared_change_set(
             expected_head_sha,affected_paths_json,expected_blob_identities_json,
             created_at,expires_at,status,execution_idempotency_key,
             execution_fingerprint,committed_result_json,post_write_identity_json,
-            failure_code,executing_at,committed_at,terminal_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PREPARED',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)""",
+            failure_code,executing_at,committed_at,terminal_at,
+            prepare_idempotency_key,prepare_fingerprint)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PREPARED',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?,?)""",
             (
                 prepared_id,
                 artifact.artifact_id,
@@ -206,6 +254,8 @@ def create_prepared_change_set(
                 ),
                 now,
                 expires_at,
+                idempotency_key or None,
+                prepare_fingerprint,
             ),
         )
     try:

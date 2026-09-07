@@ -9,6 +9,7 @@ import pytest
 from app import development_orchestrator as dx
 from app import development_session_store as sessions
 from app import local_git_mirror as mirror
+from app import mygithub10
 from app import mygithub12
 from app import mygithub12_dx_mcp as dx_mcp
 from app import runtime_generation
@@ -58,6 +59,25 @@ def _no_renewal(session, workspace_revision=3):
         "remaining_seconds": 4000.0,
         "audit": None,
     }
+
+
+def _apply_state(*, session_revision=1, workspace_revision=3):
+    session = {
+        "session_id": "dev_test", "workspace_id": "ws_test",
+        "session_revision": session_revision, "workspace_revision": workspace_revision,
+        "repository": "owner/repo", "branch": "ai/task", "base_branch": "main",
+        "base_commit_sha": SHA_A, "head_commit_sha": SHA_B, "tree_sha": SHA_C,
+        "status": "active", "lease_expires_at": 10_000.0, "lease_valid": True,
+    }
+    workspace = {
+        **_workspace(revision=workspace_revision), "workspace_id": "ws_test",
+        "lease_valid": True, "drift_reason": None,
+    }
+    return session, workspace
+
+
+async def _direct_github_call(fn, *args, **kwargs):
+    return fn(*args, **kwargs)
 
 
 def test_development_session_cas_events_and_idempotency(tmp_path, monkeypatch):
@@ -202,6 +222,46 @@ def test_auto_renew_orchestrator_skips_long_lease_and_rejects_github_drift(monke
         dx.maybe_auto_renew_session_workspace(drift_service,"dev_test",1,3,SHA_B,"renew-drift")
     assert exc.value.code == "WORKSPACE_BRANCH_DRIFTED"
     assert called == []
+
+
+def test_auto_renew_orchestrator_replays_only_owned_renewal_revision(monkeypatch):
+    session, workspace = _apply_state(session_revision=2, workspace_revision=4)
+    monkeypatch.setattr(sessions, "get_session", lambda *args, **kwargs: session)
+    monkeypatch.setattr(mygithub12, "get_workspace", lambda *args, **kwargs: workspace)
+    monkeypatch.setattr(mygithub12, "_now", lambda: 1000.0)
+    monkeypatch.setattr(sessions, "list_events", lambda *args, **kwargs: [{
+        "event_type": "workspace_lease_auto_renewed", "session_revision": 2,
+        "data": {
+            "idempotency_key": "same-call", "before_workspace_revision": 3,
+            "after_workspace_revision": 4,
+        },
+    }])
+    monkeypatch.setattr(sessions, "_require_revision", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("owned maintenance replay must continue from its fresh revisions")
+    ))
+    result = dx.maybe_auto_renew_session_workspace(
+        SimpleNamespace(), "dev_test", 1, 3, SHA_B, "same-call"
+    )
+    assert result["session"]["session_revision"] == 2
+    assert result["workspace"]["revision"] == 4
+    assert result["replayed_internal_maintenance"] is True
+
+    advanced = {**session, "session_revision": 3}
+    monkeypatch.setattr(sessions, "get_session", lambda *args, **kwargs: advanced)
+    monkeypatch.setattr(
+        sessions, "_require_revision",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            mygithub12.MyGithub12Error(
+                "DEVELOPMENT_SESSION_REVISION_MISMATCH", "external session race",
+                {"expected": 1, "actual": 3},
+            )
+        ),
+    )
+    with pytest.raises(mygithub12.MyGithub12Error) as exc:
+        dx.maybe_auto_renew_session_workspace(
+            SimpleNamespace(), "dev_test", 1, 3, SHA_B, "same-call"
+        )
+    assert exc.value.code == "DEVELOPMENT_SESSION_REVISION_MISMATCH"
 
 
 def test_session_recovery_cas_clears_stale_evidence_and_replays_idempotently(tmp_path, monkeypatch):
@@ -383,6 +443,187 @@ def test_prepare_task_failure_closes_workspace_and_persists_terminal_session(tmp
     assert [event["event_type"] for event in sessions.list_events(current["session_id"])] == [
         "session_created", "preparation_failed"
     ]
+
+
+@pytest.mark.asyncio
+async def test_apply_change_set_raw_dry_run_continues_after_internal_session_recovery(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "recovery.db"))
+    monkeypatch.setenv("MYGITHUB12_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    mcp = StructuredFastMCP("dx-recovery-continuation")
+    session, workspace = _apply_state(session_revision=2, workspace_revision=4)
+    observed = []
+    monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: {
+        "renewed": False, "session": session, "workspace": workspace,
+        "remaining_seconds": 4000.0, "audit": None,
+        "recovery": {"recovered": True, "before": {"session_revision": 1}, "after": {"session_revision": 2}},
+    })
+
+    def require(*args):
+        observed.append((args[2], args[3]))
+        return session, workspace
+
+    monkeypatch.setattr(dx, "require_session_workspace", require)
+    monkeypatch.setattr(dx, "execute_change_set", lambda *args, **kwargs: {
+        "ok": True, "dry_run": True, "changed_files": [{"path": "a.txt", "old_blob_sha": SHA_A}],
+    })
+    dx_mcp.register_dx_tools(mcp, _direct_github_call, SimpleNamespace(), lambda *args: None)
+    result = _structured_result(await mcp.call_tool("apply_development_change_set", {
+        "development_session_id": "dev_test", "expected_session_revision": 1,
+        "expected_workspace_revision": 3, "expected_head_sha": SHA_B,
+        "change_set_json": json.dumps({"schema_version": 1, "mode": "patch", "patch": "x"}),
+        "commit_message": "test", "dry_run": True, "idempotency_key": "recover-prepare",
+    }))
+    assert result["ok"] is True
+    assert result["prepared_change_set_id"].startswith("pcs_")
+    assert result["session_revision"] == 2 and result["workspace_revision"] == 4
+    assert observed == [(2, 4)]
+
+
+@pytest.mark.asyncio
+async def test_apply_change_set_raw_dry_run_continues_after_internal_lease_renew(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "renew.db"))
+    monkeypatch.setenv("MYGITHUB12_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    mcp = StructuredFastMCP("dx-renew-continuation")
+    session, workspace = _apply_state(session_revision=2, workspace_revision=4)
+    calls = []
+    monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: {
+        "renewed": True, "session": session, "workspace": workspace,
+        "remaining_seconds": 100.0, "audit": {"before_workspace_revision": 3, "after_workspace_revision": 4},
+        "recovery": None,
+    })
+
+    def require(*args):
+        calls.append((args[2], args[3]))
+        return session, workspace
+
+    monkeypatch.setattr(dx, "require_session_workspace", require)
+    monkeypatch.setattr(dx, "execute_change_set", lambda *args, **kwargs: {
+        "ok": True, "dry_run": True, "changed_files": [{"path": "a.txt", "old_blob_sha": SHA_A}],
+    })
+    dx_mcp.register_dx_tools(mcp, _direct_github_call, SimpleNamespace(), lambda *args: None)
+    result = _structured_result(await mcp.call_tool("apply_development_change_set", {
+        "development_session_id": "dev_test", "expected_session_revision": 1,
+        "expected_workspace_revision": 3, "expected_head_sha": SHA_B,
+        "change_set_json": json.dumps({"schema_version": 1, "mode": "patch", "patch": "x"}),
+        "commit_message": "test", "dry_run": True, "idempotency_key": "renew-prepare",
+    }))
+    assert result["ok"] is True and result["prepared_change_set_id"].startswith("pcs_")
+    assert result["session_revision"] == 2 and result["workspace_revision"] == 4
+    assert result["lease_maintenance"]["renewed"] is True
+    assert calls == [(2, 4)]
+    replayed = _structured_result(await mcp.call_tool("apply_development_change_set", {
+        "development_session_id": "dev_test", "expected_session_revision": 1,
+        "expected_workspace_revision": 3, "expected_head_sha": SHA_B,
+        "change_set_json": json.dumps({"schema_version": 1, "mode": "patch", "patch": "x"}),
+        "commit_message": "test", "dry_run": True, "idempotency_key": "renew-prepare",
+    }))
+    assert replayed["prepared_change_set_id"] == result["prepared_change_set_id"]
+
+
+@pytest.mark.asyncio
+async def test_apply_change_set_raw_dry_run_rejects_external_revision_race(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "race.db"))
+    monkeypatch.setenv("MYGITHUB12_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    mcp = StructuredFastMCP("dx-external-race")
+    session, workspace = _apply_state(session_revision=2, workspace_revision=4)
+    monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: {
+        "renewed": True, "session": session, "workspace": workspace,
+        "remaining_seconds": 100.0, "audit": {}, "recovery": None,
+    })
+    monkeypatch.setattr(dx, "require_session_workspace", lambda *args, **kwargs: (_ for _ in ()).throw(
+        mygithub12.MyGithub12Error(
+            "DEVELOPMENT_SESSION_REVISION_MISMATCH", "external session race",
+            {"expected": 2, "actual": 3},
+        )
+    ))
+    monkeypatch.setattr(dx, "execute_change_set", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("execution must not start after an external race")
+    ))
+    dx_mcp.register_dx_tools(mcp, _direct_github_call, SimpleNamespace(), lambda *args: None)
+    result = _structured_result(await mcp.call_tool("apply_development_change_set", {
+        "development_session_id": "dev_test", "expected_session_revision": 1,
+        "expected_workspace_revision": 3, "expected_head_sha": SHA_B,
+        "change_set_json": json.dumps({"schema_version": 1, "mode": "patch", "patch": "x"}),
+        "commit_message": "test", "dry_run": True, "idempotency_key": "race-prepare",
+    }))
+    assert result["ok"] is False
+    assert result["error"]["code"] == "DEVELOPMENT_SESSION_REVISION_MISMATCH"
+    assert "prepared_change_set_id" not in result
+
+
+@pytest.mark.asyncio
+async def test_apply_change_set_prepared_apply_consumes_returned_revisions(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "prepared-apply.db"))
+    monkeypatch.setenv("MYGITHUB12_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("IDEMPOTENCY_DB_PATH", str(tmp_path / "idempotency.db"))
+    mcp = StructuredFastMCP("dx-prepared-revisions")
+    session, workspace = _apply_state(session_revision=2, workspace_revision=4)
+    monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: {
+        "renewed": True, "session": session, "workspace": workspace,
+        "remaining_seconds": 100.0, "audit": {}, "recovery": None,
+    })
+    revisions = []
+
+    def require(*args):
+        revisions.append((args[2], args[3]))
+        return session, workspace
+
+    monkeypatch.setattr(dx, "require_session_workspace", require)
+
+    def execute(*args, **kwargs):
+        if args[7]:
+            return {"ok": True, "dry_run": True, "changed_files": [{"path": "a.txt", "old_blob_sha": SHA_A}]}
+        return {"ok": True, "write_verified": True, "commit_sha": SHA_C, "tree_sha": SHA_A, "changed_files": [{"path": "a.txt", "old_blob_sha": SHA_A}]}
+
+    monkeypatch.setattr(dx, "execute_change_set", execute)
+    monkeypatch.setattr(dx, "after_verified_change", lambda *args, **kwargs: {
+        "session": {**session, "session_revision": 3, "head_commit_sha": SHA_C, "tree_sha": SHA_A},
+        "index": {"status": "queued"}, "index_error": None,
+    })
+
+    async def finalize_write(result, workspace_id, workspace_revision):
+        return {**result, "workspace": {**workspace, "revision": 5, "head_sha": SHA_C, "tree_sha": SHA_A}}
+
+    dx_mcp.register_dx_tools(mcp, _direct_github_call, SimpleNamespace(), finalize_write)
+    prepared = _structured_result(await mcp.call_tool("apply_development_change_set", {
+        "development_session_id": "dev_test", "expected_session_revision": 1,
+        "expected_workspace_revision": 3, "expected_head_sha": SHA_B,
+        "change_set_json": json.dumps({"schema_version": 1, "mode": "patch", "patch": "x"}),
+        "commit_message": "test", "dry_run": True, "idempotency_key": "prepare-write",
+    }))
+    result = _structured_result(await mcp.call_tool("apply_development_change_set", {
+        "development_session_id": "dev_test", "expected_session_revision": prepared["session_revision"],
+        "expected_workspace_revision": prepared["workspace_revision"],
+        "expected_head_sha": prepared["expected_head_sha"],
+        "prepared_change_set_id": prepared["prepared_change_set_id"],
+        "commit_message": "test", "dry_run": False, "idempotency_key": "consume-write",
+    }))
+    assert result["ok"] is True and result["write_verified"] is True
+    assert result["commit_sha"] == SHA_C
+    assert revisions == [(2, 4), (2, 4)]
+
+
+@pytest.mark.asyncio
+async def test_apply_change_set_does_not_wrap_range_errors_as_internal_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "range-error.db"))
+    monkeypatch.setenv("MYGITHUB12_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    mcp = StructuredFastMCP("dx-range-error")
+    session, workspace = _apply_state()
+    monkeypatch.setattr(dx, "maybe_auto_renew_session_workspace", lambda *args, **kwargs: _no_renewal(session))
+    monkeypatch.setattr(dx, "require_session_workspace", lambda *args, **kwargs: (session, workspace))
+    monkeypatch.setattr(dx, "execute_change_set", lambda *args, **kwargs: (_ for _ in ()).throw(
+        mygithub10.MyGithub10Error("PATCH_TEXT_MISMATCH", "old range hash does not match", {"path": "a.txt"})
+    ))
+    dx_mcp.register_dx_tools(mcp, _direct_github_call, SimpleNamespace(), lambda *args: None)
+    result = _structured_result(await mcp.call_tool("apply_development_change_set", {
+        "development_session_id": "dev_test", "expected_session_revision": 1,
+        "expected_workspace_revision": 3, "expected_head_sha": SHA_B,
+        "change_set_json": json.dumps({"schema_version": 1, "mode": "range", "range_operations": []}),
+        "commit_message": "test", "dry_run": True,
+    }))
+    assert result["ok"] is False
+    assert result["error"]["code"] == "PATCH_TEXT_MISMATCH"
+    assert result["error"]["details"] == {"path": "a.txt"}
 
 
 @pytest.mark.asyncio
