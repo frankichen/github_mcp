@@ -125,8 +125,8 @@ def _set_job_status(job_id, status, *, exit_code=None, current_step=None):
         "git_tree_sha": TREE_B,
     }
     connection.execute(
-        "UPDATE ci_jobs SET status=?, exit_code=?, current_step=?, summary_json=? WHERE job_id=?",
-        (status, exit_code, current_step, json.dumps(summary), job_id),
+        "UPDATE ci_jobs SET status=?, exit_code=?, summary_json=? WHERE job_id=?",
+        (status, exit_code, json.dumps(summary), job_id),
     )
     connection.commit()
 
