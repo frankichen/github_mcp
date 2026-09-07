@@ -388,6 +388,7 @@ class StructuredFastMCP(FastMCP):
         "put_github_file",
         "put_github_files",
         "put_github_file_from_local_candidate",
+        "wait_private_ci_job",
     })
 
     @staticmethod

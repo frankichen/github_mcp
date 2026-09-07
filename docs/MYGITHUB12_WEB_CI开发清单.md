@@ -83,14 +83,14 @@
 
 ### WEB-CI-DEV-005：Long-poll 退出 Web 默认路径
 
-- [ ] 决定 `wait_private_ci_job` 为 compatibility-only 或显式短 wait。
-- [ ] canonical Schema 不再描述其为正常 CI 跟踪首选。
-- [ ] 不再让 AI instructions 要求“wait 到 terminal”。
-- [ ] compatibility 行为有测试。
-- [ ] Manifest/deprecation/capability 与实际暴露一致。
+- [x] 决定 `wait_private_ci_job` 为 compatibility-only 或显式短 wait。
+- [x] canonical Schema 不再描述其为正常 CI 跟踪首选。
+- [x] 不再让 AI instructions 要求“wait 到 terminal”。
+- [x] compatibility 行为有测试。
+- [x] Manifest/deprecation/capability 与实际暴露一致。
 
 映射验收：AC-WEB-CI-02/13/15。  
-证据：`待填写`
+证据（历史 Task Delta，仅用于重放 DEV-005 语义，不替代本分支最终验证）：old branch `d5ef9d3fe9f35b003604d79532112faee1349f0f`；implementation `8c2adaf2cee9b0c2ae789d4019ef7c070bdbf976`、test repair `14716317a5795e3408543f9b1c5d90ff21f94f47`、checklist `b700347ec039ce94cfd4d55fb00fdc22d0b1a3fa`；当时 task semantics 为 production canonical 164、compatibility 175、hidden deprecated 11（含 `wait_private_ci_job`），replacement=`get_private_ci_job`。FIX-002 reprepare 从 fresh current main 创建；本分支最终 exact-head Index/CI/PR 证据以本轮交付报告为准，DEV-006+ 未开始。
 
 ## 4. P0：Durable validate / converge
 

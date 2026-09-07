@@ -5,7 +5,7 @@
   "legacy_manifest": "MYGITHUB10_TOOL_MANIFEST.json",
   "legacy_tool_count": 120,
   "new_tool_count": 55,
-  "tool_count": 165,
+  "tool_count": 164,
   "compatibility_tool_count": 175,
   "hidden_deprecated_tools": [
     "get_github_file",
@@ -17,7 +17,8 @@
     "commit_github_uploaded_files",
     "put_github_file",
     "put_github_files",
-    "put_github_file_from_local_candidate"
+    "put_github_file_from_local_candidate",
+    "wait_private_ci_job"
   ],
   "schema_identity_algorithm": "sha256-canonical-mcp-tools-v1",
   "new_tools": [
