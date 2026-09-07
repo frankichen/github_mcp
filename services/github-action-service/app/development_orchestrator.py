@@ -4,12 +4,23 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import uuid
 from typing import Any
 
 from app import attestation_registry, github_utils, mygithub10, mygithub12
 from app import development_session_store as sessions
-from app.ci_database import create_or_get_job, get_job, wait_for_job_change, _job_snapshot
+from app.ci_database import (
+    create_or_get_job, get_job, get_steps, get_worker, wait_for_job_change, _job_snapshot,
+)
+from app.ci_mcp import build_private_ci_snapshot_response
 from app.ci_models import ALLOWED_PRIORITIES, effective_priority
+from app.ci_request_dispatch import effective_ci_config_digest, schedule_ci_request_preparation
+from app.ci_request_store import (
+    CIRequestIdempotencyConflictError,
+    compute_normalized_request_hash,
+    create_or_get_ci_request,
+    get_ci_request,
+)
 from app.ci_repository_config import (
     get_allowed_profiles, get_max_timeout, is_private_ci_enabled, is_profile_allowed,
     is_self_deploy_enabled, is_test_deploy_enabled,
@@ -499,10 +510,14 @@ def affected_selection(service: Any, session: dict[str,Any], base_sha: str) -> d
         return {"complete":False,"changed_paths":[],"selected_workspaces":["."],"selected_tests":[],"contract_changes":[],"reasons":["analysis_unavailable_fallback_full"],"error_type":type(exc).__name__}
 
 
-def validation_preflight(service: Any, session: dict[str,Any], mode: str, base_sha: str) -> dict[str,Any]:
+def validation_profile(mode: str) -> str:
     if mode not in {"fast","full","reuse_or_full"}:
         raise MyGithub12Error("DEVELOPMENT_SESSION_STATE_INVALID","validation mode must be fast, full, or reuse_or_full")
-    profile="repo-fast-check" if mode=="fast" else "repo-auto-check"
+    return "repo-fast-check" if mode=="fast" else "repo-auto-check"
+
+
+def validation_preflight(service: Any, session: dict[str,Any], mode: str, base_sha: str) -> dict[str,Any]:
+    profile=validation_profile(mode)
     if not is_profile_allowed(session["repository"],profile):
         raise MyGithub12Error(
             "CI_PROFILE_DISCOVERY_MISMATCH",f"{profile} is not discoverable for repository",
