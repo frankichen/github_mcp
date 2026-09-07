@@ -666,9 +666,11 @@ def register_dx_tools(
                 },ensure_ascii=False)
             result=None
             try:
-                job=await github_call(dx.wait_validation,job["job_id"],wait_seconds)
-                result=await github_call(dx.validation_result,development_session_id,phase_session["session_revision"],mode,job,selection,include_failure_pack)
-                fields={"last_fast_ci_job_id" if mode=="fast" else "last_full_ci_job_id":job["job_id"]}
+                if int(wait_seconds or 0)>0:
+                    _,_,request=await github_call(dx.wait_validation_request,request,wait_seconds)
+                result=await github_call(dx.validation_observation,development_session_id,phase_session["session_revision"],mode,request,selection,include_failure_pack)
+                fields={}
+                if result.get("job",{}).get("job_id"): fields["last_fast_ci_job_id" if mode=="fast" else "last_full_ci_job_id"]=result["job"]["job_id"]
                 if isinstance(result.get("attestation"),dict) and result["attestation"].get("attestation_id"): fields["last_attestation_id"]=result["attestation"]["attestation_id"]
                 if isinstance(result.get("failure_pack"),dict) and result["failure_pack"].get("resource_uri"): fields["last_failure_resource_uri"]=result["failure_pack"]["resource_uri"]
                 next_status=("pr_ready" if result.get("merge_eligible") else "active") if result.get("terminal") else phase
@@ -678,7 +680,8 @@ def register_dx_tools(
                 return json.dumps({
                     "ok":False,"development_session":phase_session,"mode":mode,
                     "validation_started":True,"recovery_required":True,
-                    "job":{"job_id":job.get("job_id"),"status":job.get("status"),"profile":job.get("profile"),"commit_sha":job.get("commit_sha")},
+                    "request":{"request_id":request.get("request_id"),"phase":request.get("phase"),"status":request.get("status"),"worker_job_id":request.get("worker_job_id")},
+                    "job":{"job_id":request.get("worker_job_id"),"status":None,"profile":request.get("profile"),"commit_sha":request.get("commit_sha")},
                     "validation_result":result,"failed_stage":"validation_observe",
                     "orchestration_error":observe_error["error"],
                 },ensure_ascii=False)
