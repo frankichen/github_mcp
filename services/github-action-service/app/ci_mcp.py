@@ -16,6 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from app.config import settings as app_settings
 from app.ci_database import (
     get_job,
+    get_worker,
     list_jobs as db_list_jobs,
     get_workers as db_get_workers,
     get_log_chunks,
@@ -33,6 +34,7 @@ from app.ci_request_store import (
     create_or_get_ci_request,
     get_ci_request,
     get_ci_request_by_idempotency_key,
+    get_ci_request_by_worker_job_id,
     get_ci_request_payload,
 )
 from app.ci_repository_config import (
@@ -95,6 +97,15 @@ _PRIVATE_CI_STEP_SUMMARY_FIELDS = ("step_name", "status", "exit_code", "duration
 _PRIVATE_CI_WORKSPACE_FIELDS = ("path", "stack", "framework", "package_manager")
 _MAX_SUMMARY_STEPS = 100
 _MAX_SUMMARY_WORKSPACES = 100
+_PRIVATE_CI_COMPLETED_STEP_STATUSES = {
+    "passed", "failed", "timed_out", "cancelled", "completed", "skipped", "autofixed",
+}
+_PRIVATE_CI_FAILED_STEP_STATUSES = {"failed", "timed_out", "cancelled"}
+_PRIVATE_CI_WORKER_TERMINAL_STATUSES = {
+    "passed", "failed", "timed_out", "cancelled", "superseded", "worker_lost", "internal_error",
+}
+_PRIVATE_CI_WORKER_RUNNING_STATUSES = {"running", "cancel_requested"}
+_PRIVATE_CI_WORKER_QUEUED_STATUSES = {"queued", "leased", "downloading", "preparing"}
 
 
 def _bounded_status_value(value, max_items: int = 20, max_chars: int = 2048):
@@ -243,6 +254,12 @@ def build_private_ci_job_response(job: dict, persisted_steps: list[dict], detail
     ]
     result["steps"] = compact_steps[:_MAX_SUMMARY_STEPS]
     result["steps_total"] = len(compact_steps)
+    result["completed_steps_count"] = sum(
+        step.get("status") in _PRIVATE_CI_COMPLETED_STEP_STATUSES for step in logical_steps
+    )
+    result["failed_steps_count"] = sum(
+        step.get("status") in _PRIVATE_CI_FAILED_STEP_STATUSES for step in logical_steps
+    )
     result["steps_truncated"] = len(compact_steps) > _MAX_SUMMARY_STEPS
     result["steps_next_cursor"] = str(_MAX_SUMMARY_STEPS) if result["steps_truncated"] else None
 
@@ -261,6 +278,169 @@ def build_private_ci_job_response(job: dict, persisted_steps: list[dict], detail
     return result
 
 
+def _private_ci_preflight_error(request: Optional[dict]) -> Optional[dict]:
+    if not request or request.get("status") != "preflight_failed":
+        return None
+    return {
+        "error_id": request.get("preflight_error_id"),
+        "code": request.get("preflight_error_code"),
+        "reason": request.get("terminal_reason"),
+    }
+
+
+def _private_ci_request_worker_mismatch(request: dict, job: dict) -> Optional[str]:
+    if request.get("worker_job_id") != job.get("job_id"):
+        return "worker_job_id"
+    for field in ("repository", "branch", "commit_sha", "profile"):
+        if request.get(field) != job.get(field):
+            return field
+    worker_summary = job.get("summary") if isinstance(job.get("summary"), dict) else {}
+    worker_tree_sha = worker_summary.get("git_tree_sha")
+    if request.get("tree_sha") and worker_tree_sha and request["tree_sha"] != worker_tree_sha:
+        return "tree_sha"
+    return None
+
+
+def _private_ci_effective_state(
+    request: Optional[dict], job: Optional[dict],
+) -> tuple[Optional[str], Optional[str], bool]:
+    """Compose truthful top-level state without mutating either durable row."""
+    if not job:
+        if not request:
+            return None, None, False
+        return request.get("phase"), request.get("status"), bool(request.get("terminal"))
+
+    worker_status = str(job.get("status") or "")
+    if worker_status in _PRIVATE_CI_WORKER_TERMINAL_STATUSES:
+        return "terminal", worker_status, True
+    if worker_status in _PRIVATE_CI_WORKER_RUNNING_STATUSES:
+        return "running", worker_status, False
+    if worker_status in _PRIVATE_CI_WORKER_QUEUED_STATUSES:
+        return "queued", worker_status, False
+    return (request.get("phase") if request else None), worker_status or None, False
+
+
+def _private_ci_snapshot_next_actions(
+    request_id: Optional[str], worker_job_id: Optional[str], terminal: bool,
+) -> list[dict]:
+    if terminal:
+        return []
+    action = {"tool": "get_private_ci_job"}
+    if request_id:
+        action["request_id"] = request_id
+    if worker_job_id:
+        action["job_id"] = worker_job_id
+    return [action]
+
+
+def build_private_ci_snapshot_response(
+    request: Optional[dict],
+    job: Optional[dict],
+    persisted_steps: list[dict],
+    detail_level: str = "summary",
+    worker: Optional[dict] = None,
+) -> dict:
+    """Build one pure read snapshot from Request control-plane + Worker execution facts."""
+    if detail_level not in {"summary", "full"}:
+        raise ValueError("detail_level must be 'summary' or 'full'")
+
+    if job:
+        result = build_private_ci_job_response(job, persisted_steps, detail_level)
+    else:
+        result = {
+            "ok": True,
+            "job_id": None,
+            "repository": request.get("repository") if request else None,
+            "branch": request.get("branch") if request else None,
+            "commit_sha": request.get("commit_sha") if request else None,
+            "base_sha": None,
+            "profile": request.get("profile") if request else None,
+            "exit_code": None,
+            "priority": None,
+            "worker_id": None,
+            "queue_position": None,
+            "eligible_workers": None,
+            "unschedulable_reason": None,
+            "current_step": None,
+            "git_tree_sha": None,
+            "detected_stacks": [],
+            "selected_profiles": [],
+            "workspaces": [],
+            "workspaces_total": 0,
+            "workspaces_truncated": False,
+            "workspaces_next_cursor": None,
+            "steps": [],
+            "steps_total": 0,
+            "completed_steps_count": 0,
+            "failed_steps_count": 0,
+            "steps_truncated": False,
+            "steps_next_cursor": None,
+            "_mcp_response_mode": detail_level,
+        }
+
+    request_id = request.get("request_id") if request else None
+    worker_job_id = job.get("job_id") if job else (request.get("worker_job_id") if request else None)
+    phase, status, terminal = _private_ci_effective_state(request, job)
+    request_phase = request.get("phase") if request else None
+    request_status = request.get("status") if request else None
+    request_revision = request.get("revision") if request else None
+    tree_sha = request.get("tree_sha") if request else None
+    worker_status = job.get("status") if job else None
+    worker_id = job.get("worker_id") if job else None
+    eligible_workers = job.get("eligible_workers") if job else None
+    worker_online = worker.get("online") if worker else None
+    if job and worker_status == "queued" and eligible_workers is not None:
+        worker_available = bool(eligible_workers)
+    elif worker is not None:
+        worker_available = bool(worker_online)
+    else:
+        worker_available = None
+
+    result.update({
+        "request_id": request_id,
+        "job_id": worker_job_id,
+        "worker_job_id": worker_job_id,
+        "tree_sha": tree_sha,
+        "tree_pending": bool(
+            request and tree_sha is None and request_phase in {"accepted", "preparing"}
+        ),
+        "request_phase": request_phase,
+        "request_status": request_status,
+        "request_revision": request_revision,
+        "request_updated_at": request.get("updated_at") if request else None,
+        "request_stage": request_phase,
+        "worker_status": worker_status,
+        "phase": phase,
+        "status": status,
+        "revision": request_revision,
+        "terminal": terminal,
+        "continuation_required": not terminal,
+        "current_step": result.get("current_step") if job else None,
+        "priority": job.get("priority") if job else None,
+        "queue_position": job.get("queue_position") if job else None,
+        "eligible_workers": eligible_workers,
+        "unschedulable_reason": job.get("unschedulable_reason") if job else None,
+        "queue_state": "not_created" if not job else (
+            "queued" if worker_status == "queued" else "not_queued"
+        ),
+        "worker_id": worker_id,
+        "worker_assigned": bool(worker_id),
+        "worker_online": worker_online,
+        "worker_available": worker_available,
+        "worker_agent_status": worker.get("status") if worker else None,
+        "worker_current_job": worker.get("current_job") if worker else None,
+        "failure_pack_id": request.get("failure_pack_id") if request else None,
+        "failure_pack_available": bool(request and request.get("failure_pack_id")),
+        "attestation_id": request.get("attestation_id") if request else None,
+        "attestation_available": bool(request and request.get("attestation_id")),
+        "preflight_error": _private_ci_preflight_error(request),
+        "next_actions": _private_ci_snapshot_next_actions(request_id, worker_job_id, terminal),
+    })
+    if detail_level == "full" and request:
+        result["request"] = dict(request)
+    return result
+
+
 def build_private_ci_start_response(request: dict) -> dict:
     """Build a truthful Request continuation snapshot without inventing a Job."""
     worker_job_id = request.get("worker_job_id")
@@ -269,18 +449,18 @@ def build_private_ci_start_response(request: dict) -> dict:
         next_actions = []
         continuation_hint = "request is terminal"
     elif worker_job_id:
-        next_actions = [{"tool": "get_private_ci_job", "job_id": worker_job_id}]
-        continuation_hint = "Worker Job exists; continue with get_private_ci_job"
+        next_actions = [{
+            "tool": "get_private_ci_job",
+            "request_id": request.get("request_id"),
+            "job_id": worker_job_id,
+        }]
+        continuation_hint = "Worker Job exists; continue with request-aware get_private_ci_job"
     else:
         next_actions = [{
-            "tool": "start_private_ci_job",
-            "action": "replay_same_request",
-            "idempotency_key": request.get("idempotency_key"),
+            "tool": "get_private_ci_job",
+            "request_id": request.get("request_id"),
         }]
-        continuation_hint = (
-            "preflight is durable; replay start with the same idempotency_key "
-            "for a fresh Request snapshot"
-        )
+        continuation_hint = "Request is durable; continue with get_private_ci_job(request_id=...)"
     preflight_error = None
     if request.get("status") == "preflight_failed":
         preflight_error = {
@@ -528,23 +708,83 @@ This is for the private WSL CI system. NOT for GitHub Actions dispatch (use star
 
     @mcp.tool(
         name="get_private_ci_job",
-        description="""Get one private CI job. Defaults to a compact gate-safe summary.
+        description="""Get one private CI Request/Worker snapshot. Defaults to a compact gate-safe summary.
 
-summary keeps exact repository/branch/commit/tree identity, gate status, worker/queue state,
+Provide request_id and/or job_id; at least one is required. request_id works before a Worker Job exists.
+When both are supplied they must be the exact persisted Request/Worker pair or the call fails closed.
+summary is a pure read of current durable state: it never waits, polls, calls GitHub/network, or loads logs.
+It keeps exact identity, Request revision, truthful Worker execution status, queue/worker state,
 normalized workspaces, and bounded step status without commands, offsets, evidence, or changed files.
 Use detail_level='full' only for debugging; oversized full results are returned through a response resource.
 
 This is for the private CI system. NOT for GitHub Actions runs (use get_ci_job for that).""",
     )
-    async def get_private_ci_job(job_id: str, detail_level: str = "summary") -> str:
+    async def get_private_ci_job(
+        job_id: str = "", detail_level: str = "summary", request_id: str = "",
+    ) -> str:
         try:
-            job = await asyncio.to_thread(get_job, job_id)
-            if not job:
-                return _error_response("PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found")
             if detail_level not in {"summary", "full"}:
                 return _error_response("INVALID_ARGUMENT", "detail_level must be 'summary' or 'full'")
-            persisted_steps = await asyncio.to_thread(get_steps, job_id)
-            result = build_private_ci_job_response(job, persisted_steps, detail_level)
+            if not job_id and not request_id:
+                return _error_response(
+                    "INVALID_ARGUMENT", "at least one of request_id or job_id is required"
+                )
+
+            request = None
+            job = None
+            if request_id:
+                request = await asyncio.to_thread(get_ci_request, request_id)
+                if not request:
+                    return _error_response(
+                        "CI_REQUEST_NOT_FOUND", f"CI Request '{request_id}' not found"
+                    )
+            if job_id:
+                job = await asyncio.to_thread(get_job, job_id)
+                if not job:
+                    return _error_response(
+                        "PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found"
+                    )
+
+            if request and not job and request.get("worker_job_id"):
+                linked_job_id = request["worker_job_id"]
+                job = await asyncio.to_thread(get_job, linked_job_id)
+                if not job:
+                    return _error_response(
+                        "CI_REQUEST_IDENTITY_MISMATCH",
+                        "CI Request references a Worker Job that is not present",
+                        details={
+                            "request_id": request_id,
+                            "job_id": linked_job_id,
+                            "field": "worker_job_id",
+                        },
+                    )
+            elif job and not request:
+                request = await asyncio.to_thread(
+                    get_ci_request_by_worker_job_id, job["job_id"]
+                )
+
+            if request and job:
+                mismatch = _private_ci_request_worker_mismatch(request, job)
+                if mismatch:
+                    return _error_response(
+                        "CI_REQUEST_IDENTITY_MISMATCH",
+                        "CI Request and Worker Job identity do not match",
+                        details={
+                            "request_id": request.get("request_id"),
+                            "job_id": job.get("job_id"),
+                            "field": mismatch,
+                        },
+                    )
+
+            persisted_steps = (
+                await asyncio.to_thread(get_steps, job["job_id"]) if job else []
+            )
+            worker = None
+            if job and job.get("worker_id"):
+                worker = await asyncio.to_thread(get_worker, job["worker_id"])
+            result = build_private_ci_snapshot_response(
+                request, job, persisted_steps, detail_level, worker
+            )
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:
             return _error_response("INTERNAL_ERROR", str(e))

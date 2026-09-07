@@ -71,15 +71,15 @@
 
 ### WEB-CI-DEV-004：`get_private_ci_job` 纯 snapshot 化
 
-- [ ] summary 默认不 wait。
-- [ ] summary 不隐式读取完整日志。
-- [ ] 返回 current step、queue/worker、phase/revision、terminal、failure_pack_available、attestation 等必要字段。
-- [ ] full 模式仍保留调试证据。
-- [ ] 大 full response 继续 Resource fallback。
-- [ ] 单测确认调用路径不进入 `wait_for_job_change`。
+- [x] summary 默认不 wait。
+- [x] summary 不隐式读取完整日志。
+- [x] 返回 current step、queue/worker、phase/revision、terminal、failure_pack_available、attestation 等必要字段。
+- [x] full 模式仍保留调试证据。
+- [x] 大 full response 继续 Resource fallback。
+- [x] 单测确认调用路径不进入 `wait_for_job_change`。
 
 映射验收：AC-WEB-CI-02/09。  
-证据：`待填写`
+证据：DEV-004 implementation candidate `f966329d8c7ae9bdd6323c57c0a9b53639a60039` / Tree `fa7f9420992e09ecc02eb8cae2b0276f0be2e0ea`；`test_web_ci_get_snapshot.py` 覆盖 Request-only accepted/preparing/preflight_failed、Request queued + Worker queued/running/全部 terminal execution status 的 truthful composition、request/job exact identity 与 mismatch fail-stop、legacy Job、no wait/sleep/Condition/network、no log tail/chunks、read-only、oversized full Resource fallback、summary inline 与 SQLite reopen durability。Private CI `repo-auto-check` Job `8a220c8afc364ee9` passed / exit 0；`services/github-action-service` full pytest `762 passed`，ruff/compileall passed；既有 `aiosqlite Event loop is closed` warning 仅记 NOTE。`repo-fast-check` Job `04f440cb9ddb4064` 仍在 pytest 前以 exit 42 / `FAST_CHECK_ENTRYPOINT_MISSING` 结束，保持既有基础设施债务不修。AC-WEB-CI-02/09 与 DEV-005+ 保持未勾选。
 
 ### WEB-CI-DEV-005：Long-poll 退出 Web 默认路径
 

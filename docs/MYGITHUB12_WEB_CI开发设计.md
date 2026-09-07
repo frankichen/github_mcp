@@ -169,7 +169,7 @@ Request rev-0 event 的 `event_data.request_payload` 同时持久化 raw `reques
 
 最危险的 Worker create/bind crash window 采用同一 SQLite transaction 消除：`BEGIN IMMEDIATE` 后调用可由 caller transaction 托管的 Worker create primitive，在同一事务内完成 `ci_jobs` INSERT/reuse、Request `worker_job_id`/real Tree bind、`preparing -> queued` revision event 与 SQL CAS，最后一次 commit。任何 bind/event 前异常整体 rollback，因此 startup legacy backfill 不可能观察到“DEV-003 Worker 已提交、对应 Request 尚未绑定”的中间状态；已 queued 的 Request 又通过 unique `worker_job_id` 与 phase/CAS 阻止二次 Worker 创建。
 
-`get_private_ci_job`、`wait_private_ci_job`、validate/converge 的现有语义在 DEV-003 保持不变；Request 尚无 Worker 时 continuation 通过 same-key replay canonical start 取得 fresh Request snapshot，DEV-004 才负责把 get 全面改为 request-aware snapshot。
+`get_private_ci_job`、`wait_private_ci_job`、validate/converge 的现有语义在 DEV-003 保持不变；DEV-004 起 `get_private_ci_job` 成为 Request-aware 正常 continuation，same-key replay start 仍保持兼容，但不再是 Request 尚无 Worker 时读取状态的必要路径。`wait_private_ci_job` 与 log 工具仍只接受真实 Worker job_id，后续兼容迁移由 DEV-005 处理。
 
 任何 continuation 必须只依赖数据库持久状态，不能只依赖 Controller 进程内 `Condition`。
 
@@ -188,21 +188,30 @@ DEV-003 实现为短调用语义：
 - 不调用 changed-files GitHub compare、`wait_for_job_change`、`wait_private_ci_job`、sleep，也不等待 Worker claim/running/terminal；
 - 新 Request 返回 truthful `accepted/revision=0` snapshot，`worker_job_id/job_id/tree_sha` 在尚未产生时均为 `null`，禁止伪造 Worker identity；
 - 返回 `request_id`、nullable Worker identity、repository/branch/commit/tree/profile/config identity、phase/status/revision、terminal、`continuation_required`、`next_actions`、deduplicated/reused 与 structured preflight error；
-- same-key replay 可在 preflight/running 前后安全取得同一 Request identity；Worker 已建立后现有 get/wait/log 继续使用真实 Worker job_id。
+- same-key replay 可在 preflight/running 前后安全取得同一 Request identity；DEV-004 后 get 可直接用 `request_id` 读取尚无 Worker 的 durable Request，Worker 建立后也兼容旧 `job_id`；wait/log 继续只使用真实 Worker job_id。
 
 后台 `preparing` 在 queue 前调用既有 exact-commit CI planning 与 identity resolver，验证 repository policy、exact repository/commit/tree、profile applicability、manifest/workspaces、branch exact identity、base identity、effective config identity，并在需要时执行 changed-files compare。preflight 失败写 `terminal/preflight_failed`、error id/code/reason，不创建假的 failed Worker Job；dispatch infrastructure failure 保持 `preparing` 供 restart/replay 重试。startup maintenance leader 会重新安排 durable `accepted/preparing` Request。
 
 ### 6.3 `get_private_ci_job`
 
-默认：
+DEV-004 的输入 identity 为：
 
-- 立即 snapshot；
-- `detail_level=summary`；
-- 不 wait；
-- 不自动加载日志；
-- 返回 current step、queue/worker、terminal、revision、failure/attestation availability。
+- `request_id` / `job_id` 均为可选参数，但至少提供一个；
+- 只传 `request_id`：读取对应 durable Request；即使 `worker_job_id=null` 的 `accepted/preparing/preflight_failed` 也必须可查；
+- 只传 `job_id`：保持历史客户端兼容，并在存在 Request mapping 时组合 Request + Worker；
+- 同时传两者：必须严格验证 persisted `worker_job_id` 关系，以及 repository/branch/commit/profile（有双方 Tree 证据时也校验 Tree）；任何不一致都 fail-stop 为 identity mismatch，禁止最近 Job、repository+commit 模糊匹配或伪造 Worker ID。
 
-`detail_level=full` 仍可保留，超预算必须 Resource fallback。
+Snapshot 是纯 read：只读取 `ci_requests`、`ci_jobs`、bounded `ci_job_steps` 和必要的 `ci_workers` durable row，不做 transition/CAS/requeue/retry/cancel/supersede，也不创建 Failure Pack 或 attestation。默认 `detail_level=summary` 不调用 `wait_for_job_change` / `wait_private_ci_job` / Condition wait / sleep / polling，不发 GitHub/network 请求，不读取 full logs、tail 或 chunks。
+
+Truth model 明确保留两层事实：
+
+- `request_phase/request_status/request_revision` 永远来自 Request control-plane durable row；top-level `revision` 也明确表示 Request revision；
+- `worker_status` 来自 Worker Job execution durable row；一旦 Worker 已存在，top-level `status` 使用当前 Worker execution status，`phase` 按 Worker execution 映射为 queued/running/terminal，`terminal` 由 Worker terminal status 决定。这样即使 Request row 仍 `queued`，Worker 已 `running/passed/failed/timed_out/cancelled/superseded/worker_lost/internal_error`，Snapshot 也不会谎报 queued/non-terminal；
+- Worker 尚不存在时，top-level `phase/status/terminal` 才直接使用 Request 事实；`current_step=null`，`queue_state=not_created`，不得把 Request preflight 伪造成 Worker CI step。
+
+summary 返回 exact identity、current step、bounded step metadata/count、queue position/priority/eligible workers/unschedulable reason、当前 assigned Worker 的 durable online/agent state（可证明时）、Request/Worker 两层状态、continuation、structured preflight error，以及已有 `failure_pack_id/attestation_id` 和 availability；不包含 command、full evidence、changed-files 大数组、raw logs、log offsets 或 full diagnostics。
+
+`detail_level=full` 保留现有 Worker diagnostic metadata，并附带 Request durable facts；统一 32 KiB response budget 继续自动将 oversized full payload 放入 `mygithub12://response/...` Resource，summary 本身保持 bounded inline，不为 Resource fallback 读取或物化日志。
 
 ### 6.4 `wait_private_ci_job`
 
