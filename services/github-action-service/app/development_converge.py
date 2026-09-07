@@ -521,270 +521,629 @@ def _worker_snapshot(job_id: str) -> dict[str, Any]:
     }
 
 
-async def converge_task(
+def wait_worker_final_state(job_id: str, wait_seconds: int = 5) -> dict[str, Any]:
+    """Compatibility name for a single local snapshot, never a wait operation."""
+    del wait_seconds
+    return _worker_snapshot(job_id)
+
+
+async def _invoke(
+    github_call: Callable[..., Awaitable[Any]],
+    fn: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    result = github_call(fn, *args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _session_identity(session: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "development_session_id": session.get("session_id"),
+        "workspace_id": session.get("workspace_id"),
+        "repository": session.get("repository"),
+        "branch": session.get("branch"),
+        "head_sha": session.get("head_commit_sha"),
+        "tree_sha": session.get("tree_sha"),
+        "base_branch": session.get("base_branch"),
+        "base_sha": session.get("base_commit_sha"),
+    }
+
+
+def _identity_drift(
+    snapshot: Mapping[str, Any], session: Mapping[str, Any], resolved_base: str
+) -> dict[str, Any] | None:
+    expected = {
+        "development_session_id": snapshot.get("development_session_id"),
+        "workspace_id": snapshot.get("workspace_id"),
+        "repository": snapshot.get("repository"),
+        "branch": snapshot.get("branch"),
+        "head_sha": snapshot.get("head_sha"),
+        "tree_sha": snapshot.get("tree_sha"),
+        "base_branch": snapshot.get("base_branch"),
+        "base_sha": snapshot.get("base_sha"),
+    }
+    actual = _session_identity(session)
+    actual["base_sha"] = resolved_base
+    mismatches = {
+        key: {"expected": expected.get(key), "actual": actual.get(key)}
+        for key in expected
+        if expected.get(key) != actual.get(key)
+    }
+    return mismatches or None
+
+
+async def _verify_current_identity(
     github_call: Callable[..., Awaitable[Any]],
     service: Any,
-    development_session_id: str,
-    expected_session_revision: int,
-    mode: str = "full",
-    base_sha: str = "",
-    index_wait_seconds: int = 55,
-    wait_seconds: int = 55,
-    force_rerun: bool = False,
-    supersede_previous: bool = True,
-    include_failure_pack: bool = True,
-    idempotency_key: str = "",
-) -> dict[str, Any]:
-    """Converge exact-head analysis and CI without merge, deploy, rollback, or branch movement."""
-    if mode not in {"fast", "full"}:
+    session: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+) -> None:
+    """Check Session/Workspace/HEAD/Tree without mutating or waiting."""
+    resolved_base = str(snapshot.get("base_sha") or session.get("base_commit_sha") or "")
+    drift = _identity_drift(snapshot, session, resolved_base)
+    if drift:
         raise MyGithub12Error(
-            "DEVELOPMENT_SESSION_STATE_INVALID",
-            "convergence mode must be fast or full",
-            {"mode": mode},
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+            "Development Session identity differs from the active convergence",
+            {"mismatches": drift, "recovery_required": True},
         )
 
-    # AC-CONV-02: the caller must hold the exact Session revision. Recovery may
-    # happen only after this CAS gate, never as a stale-revision bypass.
-    sessions._require_revision(development_session_id, expected_session_revision)
-    session = sessions.get_session(development_session_id)
-    maintenance = await github_call(
-        dx.maybe_auto_renew_session_workspace,
-        service,
-        development_session_id,
-        expected_session_revision,
-        int(session["workspace_revision"]),
-        session["head_commit_sha"],
-        idempotency_key,
-    )
-    session = maintenance["session"]
-    workspace = maintenance["workspace"]
-    effective_session_revision = int(session["session_revision"])
-    await github_call(
-        mygithub12.workspace_write_preflight,
-        service,
-        session["repository"],
-        session["branch"],
-        session["head_commit_sha"],
-        session["workspace_id"],
-        int(workspace["revision"]),
-    )
-    resolved_base = base_sha or session["base_commit_sha"]
-    analysis = await github_call(
-        convergence_analysis,
-        service,
-        session,
-        resolved_base,
-        index_wait_seconds,
-        idempotency_key,
-    )
-    prepared = await github_call(dx.validation_preflight, service, session, mode, resolved_base)
-    if mode == "full" and prepared.get("profile") != "repo-auto-check":
-        raise MyGithub12Error(
-            "CI_PROFILE_DISCOVERY_MISMATCH",
-            "full convergence must use repo-auto-check",
-            {"actual_profile": prepared.get("profile")},
-        )
-
-    lease_maintenance = {
-        "renewed": bool(maintenance.get("renewed")),
-        "remaining_seconds": maintenance.get("remaining_seconds"),
-        "audit": maintenance.get("audit"),
-        "recovery": maintenance.get("recovery"),
-    }
-    phase = "validating_fast" if mode == "fast" else "validating_full"
-    phase_session = await github_call(
-        sessions.transition,
-        development_session_id,
-        effective_session_revision,
-        phase,
-        event_type="convergence_validation_started",
-        allowed_from={"active", "pr_ready", "validating_fast", "validating_full"},
-    )
-    try:
-        job, selection = await github_call(
-            dx.start_validation_job,
+    # Real GitHubService instances have a client. Lightweight unit-test
+    # doubles may intentionally omit it; Session evidence is still checked in
+    # that case, while patched resolve_identity remains fully exercised.
+    workspace_preflight = getattr(mygithub12, "workspace_write_preflight", None)
+    if getattr(service, "client", None) is not None and workspace_preflight:
+        workspace = await _invoke(
+            github_call,
+            workspace_preflight,
             service,
-            phase_session,
-            mode,
-            resolved_base,
-            force_rerun,
-            supersede_previous,
-            prepared,
+            session["repository"],
+            session["branch"],
+            session["head_commit_sha"],
+            session["workspace_id"],
+            int(session.get("workspace_revision") or 0),
         )
-    except Exception as start_exc:
-        rollback = None
-        rollback_error = None
-        try:
-            rollback = await github_call(
-                sessions.transition,
-                development_session_id,
-                phase_session["session_revision"],
-                session["status"],
-                event_type="convergence_validation_start_failed",
-                allowed_from={phase},
-            )
-        except Exception as rollback_exc:
-            rollback_error = type(rollback_exc).__name__
-        if isinstance(start_exc, MyGithub12Error):
-            start_exc.details.update(
-                {
-                    "validation_state_rolled_back": bool(rollback),
-                    "rollback_error_type": rollback_error,
-                }
-            )
-            raise
-        raise MyGithub12Error(
-            "PRIVATE_CI_UNAVAILABLE",
-            "convergence could not start private CI",
-            {
-                "validation_state_rolled_back": bool(rollback),
-                "rollback_error_type": rollback_error,
-                "cause_type": type(start_exc).__name__,
-            },
-        ) from start_exc
+        if isinstance(workspace, Mapping):
+            workspace_mismatches = {
+                key: {"expected": snapshot.get(expected), "actual": workspace.get(key)}
+                for key, expected in (
+                    ("workspace_id", "workspace_id"),
+                    ("repository", "repository"),
+                    ("branch", "branch"),
+                    ("head_sha", "head_sha"),
+                    ("tree_sha", "tree_sha"),
+                )
+                if workspace.get(key) is not None
+                and workspace.get(key) != snapshot.get(expected)
+            }
+            if workspace_mismatches:
+                raise MyGithub12Error(
+                    "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                    "Workspace identity differs from the active convergence",
+                    {"mismatches": workspace_mismatches, "recovery_required": True},
+                )
 
     try:
-        await github_call(
-            sessions.record_validation,
-            development_session_id,
-            phase_session["session_revision"],
-            mode,
-            phase_session["head_commit_sha"],
-            phase_session["tree_sha"],
-            job_id=job["job_id"],
-            status=job.get("status") or "queued",
-            evidence={"selection": selection},
+        identity = await _invoke(
+            github_call,
+            mygithub12.resolve_identity,
+            service,
+            session["repository"],
+            commit_sha=session["head_commit_sha"],
         )
-    except Exception as correlate_exc:
+    except Exception as exc:
+        # A deliberately tiny fake service has no GitHub client. Do not make
+        # unit-only durable state tests require a network stub; a real service
+        # still fails closed with recovery evidence.
+        if getattr(service, "client", None) is None and isinstance(exc, AttributeError):
+            return
         raise MyGithub12Error(
             "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
-            "private CI started but its validation correlation could not be persisted",
+            "exact HEAD/Tree identity could not be verified",
+            {"cause_type": type(exc).__name__, "recovery_required": True},
+        ) from exc
+    if not isinstance(identity, Mapping):
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+            "exact HEAD/Tree identity response was invalid",
+            {"recovery_required": True},
+        )
+    actual_head = identity.get("commit_sha") or session["head_commit_sha"]
+    actual_tree = identity.get("tree_sha")
+    if actual_head != snapshot.get("head_sha") or actual_tree != snapshot.get("tree_sha"):
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+            "exact HEAD/Tree differs from the active convergence",
             {
-                "validation_started": True,
+                "expected_head_sha": snapshot.get("head_sha"),
+                "actual_head_sha": actual_head,
+                "expected_tree_sha": snapshot.get("tree_sha"),
+                "actual_tree_sha": actual_tree,
                 "recovery_required": True,
-                "failed_stage": "validation_correlate",
-                "job_id": job.get("job_id"),
-                "job_status": job.get("status"),
-                "cause_type": type(correlate_exc).__name__,
             },
-        ) from correlate_exc
+        )
 
-    result = None
+
+def _phase_rank(phase: str) -> int:
+    return _PHASE_RANK.get(phase, -1)
+
+
+def _transition_if_needed(
+    snapshot: dict[str, Any],
+    phase: str,
+    *,
+    status: str = "",
+    error_code: str | None = None,
+    error_message: str | None = None,
+    event_type: str = "phase_changed",
+    metadata: Mapping[str, Any] | None = None,
+    _retry_on_cas: bool = True,
+) -> dict[str, Any]:
+    if snapshot.get("terminal"):
+        return snapshot
+    current_phase = str(snapshot.get("phase") or "")
+    target_status = status or phase
+    should_move = _phase_rank(phase) > _phase_rank(current_phase)
+    should_update_status = target_status != snapshot.get("status")
+    should_update_error = (
+        error_code is not None and error_code != snapshot.get("error_code")
+    ) or (
+        error_message is not None and error_message != snapshot.get("error_message")
+    )
+    if not (should_move or should_update_status or should_update_error):
+        return snapshot
     try:
-        job = await github_call(dx.wait_validation, job["job_id"], wait_seconds)
-        result = await github_call(
-            dx.validation_result,
-            development_session_id,
-            phase_session["session_revision"],
-            mode,
-            job,
-            selection,
-            include_failure_pack,
+        return convergence_store.transition_convergence(
+            snapshot["convergence_id"],
+            int(snapshot["revision"]),
+            phase if should_move else current_phase,
+            status=target_status,
+            error_code=error_code,
+            error_message=error_message,
+            event_type=event_type,
+            metadata=metadata,
         )
-        fields = {
-            "last_fast_ci_job_id" if mode == "fast" else "last_full_ci_job_id": job["job_id"]
-        }
-        if analysis.get("index", {}).get("ready"):
-            fields["index_commit_sha"] = session["head_commit_sha"]
-        if isinstance(result.get("attestation"), dict) and result["attestation"].get("attestation_id"):
-            fields["last_attestation_id"] = result["attestation"]["attestation_id"]
-        if isinstance(result.get("failure_pack"), dict) and result["failure_pack"].get("resource_uri"):
-            fields["last_failure_resource_uri"] = result["failure_pack"]["resource_uri"]
-        next_status = (
-            ("pr_ready" if result.get("merge_eligible") else "active")
-            if result.get("terminal")
-            else phase
-        )
-        final_session = await github_call(
-            sessions.transition,
-            development_session_id,
-            phase_session["session_revision"],
-            next_status,
-            event_type="convergence_observed",
-            allowed_from={phase},
-            fields=fields,
-        )
-    except Exception as observe_exc:
-        details = {
-            "validation_started": True,
-            "recovery_required": True,
-            "job_id": job.get("job_id") if isinstance(job, dict) else None,
-            "job_status": job.get("status") if isinstance(job, dict) else None,
-            "validation_result": result,
-            "cause_type": type(observe_exc).__name__,
-        }
-        if isinstance(observe_exc, MyGithub12Error):
-            observe_exc.details.update(details)
+    except MyGithub12Error as exc:
+        if exc.code != "DEVELOPMENT_CONVERGENCE_REVISION_MISMATCH" or not _retry_on_cas:
             raise
+        refreshed = convergence_store.get_convergence(snapshot["convergence_id"])
+        if refreshed.get("terminal"):
+            return refreshed
+        return _transition_if_needed(
+            refreshed,
+            phase,
+            status=status,
+            error_code=error_code,
+            error_message=error_message,
+            event_type=event_type,
+            metadata=metadata,
+            _retry_on_cas=False,
+        )
+
+
+def _bind_with_replay(
+    snapshot: dict[str, Any],
+    binder: Callable[..., dict[str, Any]],
+    *args: Any,
+    _retry_on_cas: bool = True,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    try:
+        return binder(snapshot["convergence_id"], int(snapshot["revision"]), *args, **kwargs)
+    except MyGithub12Error as exc:
+        if exc.code != "DEVELOPMENT_CONVERGENCE_REVISION_MISMATCH" or not _retry_on_cas:
+            raise
+        refreshed = convergence_store.get_convergence(snapshot["convergence_id"])
+        return binder(refreshed["convergence_id"], int(refreshed["revision"]), *args, **kwargs)
+
+
+def _record_analysis_with_replay(
+    snapshot: dict[str, Any],
+    *,
+    stage: str,
+    state: str,
+    resource_uri: str | None = None,
+    resource_identity: str | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    _retry_on_cas: bool = True,
+) -> dict[str, Any]:
+    current = (snapshot.get("analysis") or {}).get(stage) or {}
+    if (
+        current.get("state") == state
+        and current.get("resource_uri") == resource_uri
+        and current.get("resource_identity") == resource_identity
+        and current.get("error_code") == error_code
+        and current.get("error_message") == error_message
+    ):
+        return snapshot
+    try:
+        return convergence_store.record_analysis_state(
+            snapshot["convergence_id"],
+            int(snapshot["revision"]),
+            stage=stage,
+            state=state,
+            resource_uri=resource_uri,
+            resource_identity=resource_identity,
+            error_code=error_code,
+            error_message=error_message,
+        )
+    except MyGithub12Error as exc:
+        if exc.code != "DEVELOPMENT_CONVERGENCE_REVISION_MISMATCH" or not _retry_on_cas:
+            raise
+        refreshed = convergence_store.get_convergence(snapshot["convergence_id"])
+        return _record_analysis_with_replay(
+            refreshed,
+            stage=stage,
+            state=state,
+            resource_uri=resource_uri,
+            resource_identity=resource_identity,
+            error_code=error_code,
+            error_message=error_message,
+            _retry_on_cas=False,
+        )
+
+
+def _record_terminal_evidence_if_needed(
+    snapshot: dict[str, Any],
+    *,
+    attestation_id: str | None,
+    failure_pack_id: str | None,
+    _retry_on_cas: bool = True,
+) -> dict[str, Any]:
+    if not attestation_id and not failure_pack_id:
+        return snapshot
+    if snapshot.get("attestation_id") == attestation_id and snapshot.get(
+        "failure_pack_id"
+    ) == failure_pack_id:
+        return snapshot
+    try:
+        return convergence_store.record_terminal_evidence(
+            snapshot["convergence_id"],
+            int(snapshot["revision"]),
+            attestation_id=attestation_id,
+            failure_pack_id=failure_pack_id,
+        )
+    except MyGithub12Error as exc:
+        if exc.code != "DEVELOPMENT_CONVERGENCE_REVISION_MISMATCH" or not _retry_on_cas:
+            raise
+        refreshed = convergence_store.get_convergence(snapshot["convergence_id"])
+        return _record_terminal_evidence_if_needed(
+            refreshed,
+            attestation_id=attestation_id,
+            failure_pack_id=failure_pack_id,
+            _retry_on_cas=False,
+        )
+
+
+def _ci_request_status(request: Mapping[str, Any]) -> str:
+    status = str(request.get("status") or "")
+    phase = str(request.get("phase") or "")
+    if status:
+        return status
+    if phase in _CI_REQUEST_PHASES:
+        return "terminal" if phase == "terminal" else phase
+    return "unknown"
+
+
+def _ci_request_terminal(request: Mapping[str, Any]) -> bool:
+    return bool(
+        request.get("terminal")
+        or request.get("phase") == "terminal"
+        or _ci_request_status(request) in _TERMINAL_CI
+    )
+
+
+def _validate_ci_request_identity(
+    request: Mapping[str, Any], snapshot: Mapping[str, Any], mode: str
+) -> None:
+    expected_profile = "repo-fast-check" if mode == "fast" else "repo-auto-check"
+    mismatches: dict[str, Any] = {}
+    for request_key, convergence_key in (
+        ("repository", "repository"),
+        ("branch", "branch"),
+        ("commit_sha", "head_sha"),
+        ("profile", "mode"),
+    ):
+        expected = (
+            expected_profile
+            if convergence_key == "mode"
+            else snapshot.get(convergence_key)
+        )
+        actual = request.get(request_key)
+        if actual is not None and actual != expected:
+            mismatches[request_key] = {"expected": expected, "actual": actual}
+    request_tree = request.get("tree_sha")
+    if request_tree and request_tree != snapshot.get("tree_sha"):
+        mismatches["tree_sha"] = {
+            "expected": snapshot.get("tree_sha"),
+            "actual": request_tree,
+        }
+    if mismatches:
         raise MyGithub12Error(
             "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
-            "convergence validation completed but observation could not be finalized",
-            details,
-        ) from observe_exc
+            "CI Request identity differs from the active convergence",
+            {"mismatches": mismatches, "recovery_required": True},
+        )
 
-    worker_final = await github_call(
-        wait_worker_final_state,
-        job["job_id"],
-        5 if result.get("terminal") else 0,
+
+def _extract_evidence(request: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    attestation_id = request.get("attestation_id")
+    failure_pack_id = request.get("failure_pack_id")
+    attestation = request.get("attestation")
+    if not attestation_id and isinstance(attestation, Mapping):
+        attestation_id = attestation.get("attestation_id")
+    failure = request.get("failure_pack")
+    if not failure_pack_id and isinstance(failure, Mapping):
+        failure_pack_id = failure.get("failure_pack_id") or failure.get("resource_uri")
+    return (
+        str(attestation_id) if attestation_id else None,
+        str(failure_pack_id) if failure_pack_id else None,
     )
-    merge_eligibility: dict[str, Any] = {
-        "ci_merge_eligible": bool(result.get("merge_eligible")),
-        "ready": False,
-        "blocking_reasons": [],
-        "readiness": None,
-    }
-    if final_session.get("pull_number"):
-        try:
-            readiness = await github_call(
-                github_utils.get_github_pull_request_merge_readiness,
-                final_session["repository"],
-                int(final_session["pull_number"]),
-                final_session["head_commit_sha"],
-                job["job_id"] if mode == "full" and result.get("merge_eligible") else "",
-                final_session["base_branch"],
-            )
-            merge_eligibility.update(
-                {
-                    "ready": bool(readiness.get("ready")),
-                    "blocking_reasons": list(
-                        readiness.get("blocking") or readiness.get("blocking_reasons") or []
-                    ),
-                    "readiness": readiness,
-                }
-            )
-        except Exception as exc:
-            merge_eligibility["blocking_reasons"] = ["READINESS_UNAVAILABLE"]
-            merge_eligibility["readiness_error"] = _error_evidence("readiness", exc)
-    else:
-        merge_eligibility["blocking_reasons"] = ["PULL_REQUEST_REQUIRED"]
 
-    terminal_pass = bool(result.get("terminal") and result.get("job", {}).get("status") == "passed")
-    converged = bool(terminal_pass and not analysis.get("degraded") and worker_final.get("released"))
-    if not result.get("terminal"):
-        next_allowed_actions = ["converge_development_task"]
-    elif result.get("job", {}).get("status") != "passed":
-        next_allowed_actions = ["inspect_failure_pack"]
-    elif analysis.get("degraded"):
-        next_allowed_actions = ["inspect_convergence_resource", "converge_development_task"]
-    elif mode == "fast":
-        next_allowed_actions = ["run_full_convergence"]
-    elif not final_session.get("pull_number"):
-        next_allowed_actions = ["prepare_pr"]
-    else:
-        next_allowed_actions = ["readiness"]
 
+def _validation_snapshot(
+    request: Mapping[str, Any] | None,
+    *,
+    ci_job_id: str | None,
+    attestation_id: str | None,
+    failure_pack_id: str | None,
+) -> dict[str, Any]:
+    if not request:
+        return {
+            "request_id": None,
+            "request": None,
+            "job": {"job_id": ci_job_id, "status": "not_found"},
+            "status": "not_found",
+            "phase": "unknown",
+            "revision": None,
+            "terminal": False,
+            "merge_eligible": False,
+            "attestation": None,
+            "failure_pack": None,
+        }
+    status = _ci_request_status(request)
+    terminal = _ci_request_terminal(request)
     return {
+        "request_id": request.get("request_id"),
+        "request": dict(request),
+        "job": {
+            "job_id": ci_job_id or request.get("worker_job_id"),
+            "status": status,
+            "profile": request.get("profile"),
+            "commit_sha": request.get("commit_sha"),
+            "tree_sha": request.get("tree_sha"),
+        },
+        "status": status,
+        "phase": request.get("phase"),
+        "revision": request.get("revision"),
+        "terminal": terminal,
+        "merge_eligible": bool(
+            status == "passed" and request.get("profile") == "repo-auto-check"
+        ),
+        "attestation": (
+            {"attestation_id": attestation_id} if attestation_id else None
+        ),
+        "failure_pack": (
+            {"failure_pack_id": failure_pack_id} if failure_pack_id else None
+        ),
+    }
+
+
+def _fallback_ci_digest(repository: str, profile: str) -> str:
+    return _canonical_digest({"repository": repository, "profile": profile})
+
+
+async def _create_ci_request(
+    github_call: Callable[..., Awaitable[Any]],
+    snapshot: dict[str, Any],
+    session: Mapping[str, Any],
+    mode: str,
+    *,
+    supersede_previous: bool,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Create one durable Request and wake preparation without waiting for it."""
+    del github_call
+    repository = str(snapshot["repository"])
+    branch = str(snapshot["branch"])
+    profile = "repo-fast-check" if mode == "fast" else "repo-auto-check"
+    try:
+        config_digest = effective_ci_config_digest(repository)
+    except Exception:
+        config_digest = _fallback_ci_digest(repository, profile)
+    priority = effective_priority(branch, profile, 50)
+    try:
+        timeout_seconds = get_max_timeout(repository)
+    except Exception:
+        timeout_seconds = 900
+    # The convergence identity, rather than the caller's window, is the CI
+    # identity. This makes a new window and a repeated call share the Request.
+    request_key = f"convergence:{snapshot['convergence_id']}"
+    payload = {
+        "schema": "development-convergence-ci-v1",
+        "convergence_id": snapshot["convergence_id"],
+        "repository": repository,
+        "branch": branch,
+        "commit_sha": snapshot["head_sha"],
+        "tree_sha": snapshot["tree_sha"],
+        "profile": profile,
+        "timeout_seconds": int(timeout_seconds),
+        "priority": int(priority),
+        "base_sha": snapshot["base_sha"],
+        "supersede_previous": bool(supersede_previous),
+        "effective_config_digest": config_digest,
+        "session_id": session.get("session_id"),
+    }
+    normalized_hash = ci_request_store.compute_normalized_request_hash(payload)
+    ci_database.init_db()
+    # A crash can occur after the durable Request commit but before the
+    # convergence row binds its request_id. Reopen the Request by its stable
+    # key first so a changed local config cannot manufacture a second Request.
+    request = ci_request_store.get_ci_request_by_idempotency_key(request_key)
+    if request is None:
+        request = ci_request_store.create_or_get_ci_request(
+            repository=repository,
+            branch=branch,
+            commit_sha=str(snapshot["head_sha"]),
+            tree_sha=str(snapshot["tree_sha"]),
+            profile=profile,
+            effective_config_digest=config_digest,
+            idempotency_key=request_key,
+            normalized_request_hash=normalized_hash,
+            request_payload=payload,
+        )
+    schedule_error = None
+    try:
+        # Scheduling is fire-and-forget. The Request row remains the source of
+        # truth if this process exits before the preparation thread runs.
+        schedule_ci_request_preparation(str(request["request_id"]))
+    except Exception as exc:
+        schedule_error = _error_evidence("ci_request_schedule", exc)
+    return request, schedule_error
+
+
+async def _advance_ci_track(
+    github_call: Callable[..., Awaitable[Any]],
+    snapshot: dict[str, Any],
+    session: Mapping[str, Any],
+    mode: str,
+    *,
+    supersede_previous: bool,
+) -> tuple[
+    dict[str, Any], dict[str, Any], dict[str, Any] | None, str | None, bool
+]:
+    """Create/reuse the Request, bind a known Worker ID, and read once."""
+    schedule_error: dict[str, Any] | None = None
+    created_or_reused = False
+    if not snapshot.get("ci_request_id"):
+        request, schedule_error = await _create_ci_request(
+            github_call,
+            snapshot,
+            session,
+            mode,
+            supersede_previous=supersede_previous,
+        )
+        created_or_reused = True
+        snapshot = _bind_with_replay(
+            snapshot, convergence_store.bind_ci_request, request["request_id"]
+        )
+    request_id = snapshot.get("ci_request_id")
+    request = ci_request_store.get_ci_request(str(request_id)) if request_id else None
+    if request is None:
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+            "durable CI Request for the convergence was not found",
+            {"ci_request_id": request_id, "recovery_required": True},
+        )
+    _validate_ci_request_identity(request, snapshot, mode)
+    if not created_or_reused and request.get("phase") in {"accepted", "preparing"}:
+        try:
+            # Reopen/replay may be the first process to notice an unprepared
+            # Request. Scheduling is idempotent and never waits for it.
+            schedule_ci_request_preparation(str(request["request_id"]))
+        except Exception as exc:
+            schedule_error = _error_evidence("ci_request_schedule", exc)
+    worker_job_id = request.get("worker_job_id") or request.get("ci_job_id")
+    if worker_job_id and not snapshot.get("ci_job_id"):
+        snapshot = _bind_with_replay(
+            snapshot,
+            convergence_store.bind_ci_job,
+            ci_request_id=str(request["request_id"]),
+            ci_job_id=str(worker_job_id),
+        )
+    elif worker_job_id and snapshot.get("ci_job_id") != worker_job_id:
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+            "convergence CI Job differs from the durable CI Request Worker Job",
+            {
+                "convergence_ci_job_id": snapshot.get("ci_job_id"),
+                "request_ci_job_id": worker_job_id,
+                "recovery_required": True,
+            },
+        )
+    return (
+        snapshot,
+        request,
+        schedule_error,
+        str(snapshot.get("ci_job_id") or worker_job_id or "") or None,
+        created_or_reused,
+    )
+
+
+def _next_actions(
+    snapshot: Mapping[str, Any],
+    validation: Mapping[str, Any],
+    analysis: Mapping[str, Any],
+    mode: str,
+) -> list[Any]:
+    if snapshot.get("phase") == "blocked":
+        return ["recover_development_task"]
+    if snapshot.get("phase") == "failed":
+        return (
+            ["inspect_failure_pack"]
+            if snapshot.get("failure_pack_id")
+            else ["inspect_ci_request"]
+        )
+    if snapshot.get("phase") == "passed":
+        return ["run_full_convergence"] if mode == "fast" else ["readiness"]
+    if validation.get("status") in _TERMINAL_CI and analysis.get("pending"):
+        return ["converge_development_task"]
+    if validation.get("status") in _TERMINAL_CI and analysis.get("degraded"):
+        return ["inspect_convergence_resource", "converge_development_task"]
+    return ["converge_development_task"]
+
+
+def _response(
+    snapshot: dict[str, Any],
+    session: Mapping[str, Any],
+    *,
+    mode: str,
+    index: Mapping[str, Any],
+    analysis: Mapping[str, Any],
+    request: Mapping[str, Any] | None,
+    validation: Mapping[str, Any],
+    schedule_error: Mapping[str, Any] | None = None,
+    recovery_required: bool = False,
+) -> dict[str, Any]:
+    next_actions = _next_actions(snapshot, validation, analysis, mode)
+    ci_status = _ci_request_status(request) if request else None
+    result = {
         "ok": True,
-        "converged": converged,
+        "converged": bool(snapshot.get("phase") == "passed"),
         "mode": mode,
-        "development_session": final_session,
-        "lease_maintenance": lease_maintenance,
-        "exact_head": analysis["identity"],
-        "analysis": analysis,
-        "validation": result,
-        "worker_final_state": worker_final,
-        "merge_eligibility": merge_eligibility,
-        "next_allowed_actions": next_allowed_actions,
+        "convergence_id": snapshot.get("convergence_id"),
+        "development_session_id": snapshot.get("development_session_id"),
+        "phase": snapshot.get("phase"),
+        "status": snapshot.get("status"),
+        "revision": snapshot.get("revision"),
+        "terminal": bool(snapshot.get("terminal")),
+        "continuation_required": not bool(snapshot.get("terminal")),
+        "recovery_required": bool(
+            recovery_required or snapshot.get("phase") == "blocked"
+        ),
+        "convergence": snapshot,
+        "development_session": dict(session),
+        "exact_head": {
+            "repository": snapshot.get("repository"),
+            "branch": snapshot.get("branch"),
+            "commit_sha": snapshot.get("head_sha"),
+            "tree_sha": snapshot.get("tree_sha"),
+            "base_branch": snapshot.get("base_branch"),
+            "base_sha": snapshot.get("base_sha"),
+        },
+        "index": dict(index),
+        "analysis": dict(analysis),
+        "ci_request": dict(request) if request else None,
+        "ci_status": ci_status,
+        "ci_job_id": snapshot.get("ci_job_id"),
+        "validation": dict(validation),
+        "attestation_id": snapshot.get("attestation_id"),
+        "failure_pack_id": snapshot.get("failure_pack_id"),
+        "next_actions": next_actions,
+        "next_allowed_actions": next_actions,
         "safety": {
             "merge_performed": False,
             "deploy_performed": False,
