@@ -162,15 +162,15 @@
 
 ### WEB-CI-DEV-011：Step Log 精准读取
 
-- [ ] 评审增强 `get_private_ci_logs` 或新增 `get_private_ci_step_logs`。
-- [ ] 支持指定 failed step。
-- [ ] 支持 cursor/pagination。
-- [ ] 保留完整 Job log 路径。
-- [ ] 大日志走 Resource/paging。
-- [ ] Failure Pack 能直接给出正确 step/log continuation。
+- [x] 评审增强 `get_private_ci_logs` 或新增 `get_private_ci_step_logs`。
+- [x] 支持指定 failed step。
+- [x] 支持 cursor/pagination。
+- [x] 保留完整 Job log 路径。
+- [x] 大日志走 Resource/paging。
+- [x] Failure Pack 能直接给出正确 step/log continuation。
 
 映射验收：AC-WEB-CI-07/08/09。  
-证据：`待填写`
+证据：Codex DEV-011 semantic delta 基于 `bd31f2a27a5b2b412e280c0a549b49b8e3370cf2`，patch `49607 bytes` / SHA-256 `54eb7deef46912f6bdb5fe0c3bb9aafd2bd29fae0cfebe7261c7a6ff6316c239`；fresh current-main 集成仅重放 DEV-011 四文件 delta。`get_private_ci_logs` 保持 legacy Job-wide 调用并增量支持 persisted `step_id` / unique `step_name`、重复名称 ambiguity error、严格 `[log_start_offset, log_end_offset)`、deterministic `step-log-v1` cursor-only continuation 与 bounded paging；Failure Pack 提供 durable precise continuation，Resource 过期可 rematerialize 且 `rerun_ci=false`。Targeted：`test_web_ci_step_logs.py + test_development_failure_pack.py + test_mcp_response_budget.py + test_web_ci_get_snapshot.py + test_web_ci_wait_compatibility.py` = `59 passed`。
 
 ### WEB-CI-DEV-012：Secret redaction 验真
 
