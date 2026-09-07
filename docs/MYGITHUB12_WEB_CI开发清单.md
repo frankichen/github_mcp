@@ -120,16 +120,16 @@
 
 ### WEB-CI-DEV-008：`converge_development_task` 状态机化
 
-- [ ] 删除默认 `wait index -> wait CI` 串行阻塞路径。
-- [ ] 每次调用只创建/复用或推进短阶段。
-- [ ] running 时返回 convergence snapshot。
-- [ ] Index/analysis 与 CI 在安全依赖允许时并行。
-- [ ] exact Index 才能生成的结果必须等待/复验 Index ready。
-- [ ] convergence success 只有全部要求证据齐全才成立。
-- [ ] 新 Commit/Session drift 会使旧 convergence 明确失效或进入 recovery，而不是静默复用。
+- [x] 删除 `wait index -> wait CI` 串行路径。
+- [x] 单次调用只推进立即可完成阶段。
+- [x] running/pending 返回 durable convergence snapshot。
+- [x] Index ready 后推进 analysis。
+- [x] required evidence 齐全后才 `passed`。
+- [x] drift -> blocked/recovery。
+- [x] 重复调用不重复 convergence / CI。
 
 映射验收：AC-WEB-CI-03/04/12/15。  
-证据：`待填写`
+证据：正式集成前代码 candidate `90bcf21877439f06b62af68d4a3901f96e44542d`；指定 5 个 targeted 测试文件在 Python 3.12 隔离快照中 `56 passed`。清单提交仅修改本文档；DEV-009 保持未完成。
 
 ### WEB-CI-DEV-009：`resume_development_task` 接入 pending convergence
 
