@@ -14,7 +14,7 @@ PASSWORD = "dev012-password-secret"
 DSN_PASSWORD = "dev012-dsn-password-secret"
 AUTH_VALUE = "dev012-authorization-secret"
 STEP_NAME = "pytest:secret-redaction"
-TEST_FILE = "tests/test_secret_redaction.py"
+TEST_FILE = "tests/test_redaction.py"
 TEST_NAME = "test_keeps_diagnostics"
 EXIT_CODE = 23
 
@@ -155,7 +155,7 @@ def test_failure_pack_and_its_resource_redact_secrets_but_keep_test_file_line_an
     )
     command = (
         f"token={TOKEN} password={PASSWORD} DATABASE_URL={_dsn()} "
-        f"Authorization='Bearer {AUTH_VALUE}' pytest {TEST_FILE}::{TEST_NAME}"
+        f'--header "Authorization: Bearer {AUTH_VALUE}" pytest {TEST_FILE}::{TEST_NAME}'
     )
     job = {
         "job_id": "job-dev012-failure-pack",
