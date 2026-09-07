@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from app.mcp_server import mcp
+from app.mcp_server import get_mygithub_capabilities, mcp
+from app.version import SERVICE_VERSION
 
 
 EXPECTED_REGISTERED_TOOL_COUNT = 175
@@ -199,3 +200,28 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     assert apply_tool["consequential"] is True
     assert {"patch_repository", "patch_ref", "patch_path", "expected_patch_blob_sha", "expected_patch_sha256", "expected_patch_size_bytes"} <= set(apply_tool["input_schema"]["required"])
     assert manifest["new_tools"].count("analyze_repository_patch_from_ref") == 1
+
+
+@pytest.mark.asyncio
+async def test_readme_current_state_matches_candidate_runtime_and_manifest(monkeypatch):
+    root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    current_state = readme.split("## MyGithut12 运行状态", 1)[1].split("\n## ", 1)[0]
+    manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
+
+    monkeypatch.setenv("MYGITHUB12_RUNTIME_MODE", "production")
+    monkeypatch.setenv("MYGITHUB12_BUILD_SHA", "a" * 40)
+    monkeypatch.setenv("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", "false")
+    runtime = json.loads(await get_mygithub_capabilities())
+
+    assert runtime["version"] == SERVICE_VERSION == manifest["service_version"]
+    assert runtime["tool_count"] == manifest["tool_count"]
+    assert runtime["compatibility_tool_count"] == manifest["compatibility_tool_count"]
+    assert runtime["hidden_deprecated_tool_count"] == len(manifest["hidden_deprecated_tools"])
+
+    assert f"MyGithut12 `{SERVICE_VERSION}`" in current_state
+    assert f"compatibility registration 仍为 {runtime['compatibility_tool_count']} 个工具" in current_state
+    assert f"canonical production Schema 仍为 {runtime['tool_count']} 个可见工具" in current_state
+    assert f"隐藏 {runtime['hidden_deprecated_tool_count']} 个 deprecated/compatibility-only 工具" in current_state
+    if runtime["tool_count"] == 164:
+        assert "165 个可见工具" not in current_state
