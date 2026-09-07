@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac
+import base64
 import json
 import logging
 import os
@@ -1225,39 +1226,178 @@ def append_log_batch(
     return new_offset, False
 
 
-def get_log_chunks(job_id: str, offset: int = 0, limit: int = 50) -> dict:
+def _utf8_prefix(value: str, max_bytes: int) -> str:
+    """Return the largest prefix whose UTF-8 representation fits the budget."""
+    if max_bytes <= 0:
+        return ""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def encode_step_log_cursor(
+    job_id: str,
+    step_id: int,
+    range_start: int,
+    range_end: int,
+    offset: int,
+) -> str:
+    """Create a deterministic opaque cursor for one immutable step range."""
+    payload = {
+        "version": 1,
+        "job_id": str(job_id),
+        "step_id": int(step_id),
+        "range_start": int(range_start),
+        "range_end": int(range_end),
+        "offset": int(offset),
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"step-log-v1.{encoded}"
+
+
+def decode_step_log_cursor(cursor: str) -> dict:
+    """Decode a step cursor; callers must still validate it against the row."""
+    value = str(cursor or "")
+    prefix = "step-log-v1."
+    if not value.startswith(prefix):
+        raise ValueError("invalid step log cursor")
+    encoded = value.removeprefix(prefix)
+    if not encoded:
+        raise ValueError("invalid step log cursor")
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        payload = json.loads(
+            base64.urlsafe_b64decode((encoded + padding).encode("ascii")).decode("utf-8")
+        )
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid step log cursor") from exc
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValueError("unsupported step log cursor")
+    try:
+        normalized = {
+            "version": 1,
+            "job_id": str(payload["job_id"]),
+            "step_id": int(payload["step_id"]),
+            "range_start": int(payload["range_start"]),
+            "range_end": int(payload["range_end"]),
+            "offset": int(payload["offset"]),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid step log cursor") from exc
+    return normalized
+
+
+def get_log_chunks(
+    job_id: str,
+    offset: int = 0,
+    limit: int = 50,
+    *,
+    range_start: Optional[int] = None,
+    range_end: Optional[int] = None,
+    max_bytes: Optional[int] = None,
+) -> dict:
+    """Read log chunks, optionally clipped to an exact half-open range.
+
+    Legacy callers keep the original job-wide offset/row pagination.  Range
+    callers use controller log offsets (the units persisted by the uploader)
+    and receive clipped fragments when a stored chunk crosses a boundary.
+    """
     db = _get_db()
     job = db.execute("SELECT log_total_bytes, log_truncated FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
     if not job:
         return {"job_id": job_id, "chunks": [], "next_offset": None, "total_bytes": 0, "truncated": False}
 
-    rows = db.execute(
-        "SELECT * FROM ci_job_log_chunks WHERE job_id = ? AND offset_from >= ? ORDER BY chunk_index LIMIT ?",
-        (job_id, offset, limit),
-    ).fetchall()
+    read_offset = max(int(offset), 0)
+    bounded_start = None if range_start is None else max(int(range_start), 0)
+    bounded_end = None if range_end is None else int(range_end)
+    if bounded_start is not None and bounded_end is not None and bounded_end < bounded_start:
+        raise ValueError("log range end must be greater than or equal to start")
+    if bounded_start is not None:
+        read_offset = max(read_offset, bounded_start)
+
+    row_limit = max(int(limit), 1)
+    if bounded_end is None:
+        rows = db.execute(
+            """SELECT * FROM ci_job_log_chunks
+               WHERE job_id = ? AND offset_to > ?
+               ORDER BY chunk_index LIMIT ?""",
+            (job_id, read_offset, row_limit),
+        ).fetchall()
+    elif bounded_end <= read_offset:
+        rows = []
+    else:
+        rows = db.execute(
+            """SELECT * FROM ci_job_log_chunks
+               WHERE job_id = ? AND offset_to > ? AND offset_from < ?
+               ORDER BY chunk_index LIMIT ?""",
+            (job_id, read_offset, bounded_end, row_limit),
+        ).fetchall()
 
     chunks = []
     next_offset = None
+    emitted_bytes = 0
+    stopped_inside_chunk = False
     for r in rows:
+        fragment_start = max(read_offset, r["offset_from"])
+        if bounded_start is not None:
+            fragment_start = max(fragment_start, bounded_start)
+        fragment_end = r["offset_to"] if bounded_end is None else min(r["offset_to"], bounded_end)
+        if fragment_end <= fragment_start:
+            continue
+        content = r["content"] or ""
+        local_start = max(fragment_start - r["offset_from"], 0)
+        local_end = min(fragment_end - r["offset_from"], len(content))
+        content = content[local_start:local_end]
+        if not content:
+            continue
+        actual_end = fragment_start + len(content)
+        if max_bytes is not None:
+            remaining_bytes = max(int(max_bytes) - emitted_bytes, 0)
+            bounded_content = _utf8_prefix(content, remaining_bytes)
+            if not bounded_content:
+                break
+            content = bounded_content
+            actual_end = fragment_start + len(content)
+            stopped_inside_chunk = actual_end < fragment_end
         chunks.append({
             "chunk_index": r["chunk_index"],
-            "offset_from": r["offset_from"],
-            "offset_to": r["offset_to"],
-            "content": r["content"],
+            "offset_from": fragment_start,
+            "offset_to": actual_end,
+            "content": content,
         })
-        next_offset = r["offset_to"]
+        next_offset = actual_end
+        emitted_bytes += len(content.encode("utf-8"))
+        if stopped_inside_chunk or len(chunks) >= row_limit:
+            break
 
-    has_more = db.execute(
-        "SELECT COUNT(*) FROM ci_job_log_chunks WHERE job_id = ? AND chunk_index > ?",
-        (job_id, rows[-1]["chunk_index"] if rows else 0),
-    ).fetchone()[0] > 0
+    has_more = False
+    if next_offset is not None:
+        if bounded_end is None:
+            has_more = db.execute(
+                "SELECT 1 FROM ci_job_log_chunks WHERE job_id = ? AND offset_to > ? LIMIT 1",
+                (job_id, next_offset),
+            ).fetchone() is not None
+        elif next_offset < bounded_end:
+            has_more = db.execute(
+                """SELECT 1 FROM ci_job_log_chunks
+                   WHERE job_id = ? AND offset_to > ? AND offset_from < ? LIMIT 1""",
+                (job_id, next_offset, bounded_end),
+            ).fetchone() is not None
 
     return {
         "job_id": job_id,
         "chunks": chunks,
         "next_offset": next_offset if has_more else None,
-        "total_bytes": job["log_total_bytes"],
+        "total_bytes": (
+            max(bounded_end - (bounded_start or 0), 0)
+            if bounded_start is not None and bounded_end is not None
+            else job["log_total_bytes"]
+        ),
         "truncated": bool(job["log_truncated"]),
+        "has_more": has_more,
     }
 
 
@@ -1303,9 +1443,15 @@ def add_step(
     ts = now_ts()
     with _db_write_lock:
         _begin_job_write(db, job_id, worker_id, lease_token)
+        log_start_offset = db.execute(
+            "SELECT COALESCE(MAX(offset_to), 0) FROM ci_job_log_chunks WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()[0]
         cursor = db.execute(
-            "INSERT INTO ci_job_steps (job_id, step_name, status, started_at) VALUES (?, ?, ?, ?)",
-            (job_id, step_name, status, ts if status == "running" else None),
+            """INSERT INTO ci_job_steps
+               (job_id, step_name, status, started_at, log_start_offset)
+               VALUES (?, ?, ?, ?, ?)""",
+            (job_id, step_name, status, ts if status == "running" else None, log_start_offset),
         )
         db.commit()
     _notify_job_change(job_id)
@@ -1338,6 +1484,11 @@ def finish_step(
             db.rollback()
             return False
         duration = ts - row["started_at"] if row["started_at"] else 0
+        if log_end_offset is None:
+            log_end_offset = db.execute(
+                "SELECT COALESCE(MAX(offset_to), 0) FROM ci_job_log_chunks WHERE job_id = ?",
+                (row["job_id"],),
+            ).fetchone()[0]
         db.execute(
             """UPDATE ci_job_steps SET status = ?, exit_code = ?, finished_at = ?,
                duration_seconds = ?, log_end_offset = COALESCE(?, log_end_offset)
@@ -1369,22 +1520,34 @@ def _newly_completed_steps(job_id: str, last_known_revision: int) -> list[dict]:
     return result
 
 
+def _step_row_to_dict(row) -> dict:
+    return {
+        "step_id": row["id"],
+        "step_name": row["step_name"],
+        "status": row["status"],
+        "exit_code": row["exit_code"],
+        "started_at": datetime.fromtimestamp(row["started_at"], tz=timezone.utc).isoformat() if row["started_at"] else None,
+        "finished_at": datetime.fromtimestamp(row["finished_at"], tz=timezone.utc).isoformat() if row["finished_at"] else None,
+        "duration_seconds": row["duration_seconds"],
+        "log_start_offset": row["log_start_offset"],
+        "log_end_offset": row["log_end_offset"],
+    }
+
+
+def get_job_step(job_id: str, step_id: int) -> Optional[dict]:
+    """Read one persisted step by its durable database identity."""
+    db = _get_db()
+    row = db.execute(
+        "SELECT * FROM ci_job_steps WHERE job_id = ? AND id = ?",
+        (job_id, int(step_id)),
+    ).fetchone()
+    return _step_row_to_dict(row) if row else None
+
+
 def get_steps(job_id: str) -> list[dict]:
     db = _get_db()
     rows = db.execute("SELECT * FROM ci_job_steps WHERE job_id = ? ORDER BY id", (job_id,)).fetchall()
-    return [
-        {
-            "step_name": r["step_name"],
-            "status": r["status"],
-            "exit_code": r["exit_code"],
-            "started_at": datetime.fromtimestamp(r["started_at"], tz=timezone.utc).isoformat() if r["started_at"] else None,
-            "finished_at": datetime.fromtimestamp(r["finished_at"], tz=timezone.utc).isoformat() if r["finished_at"] else None,
-            "duration_seconds": r["duration_seconds"],
-            "log_start_offset": r["log_start_offset"],
-            "log_end_offset": r["log_end_offset"],
-        }
-        for r in rows
-    ]
+    return [_step_row_to_dict(row) for row in rows]
 
 
 def _add_event(db, job_id: str, event_type: str, event_data: str):

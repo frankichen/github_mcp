@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from app import development_failure_pack_store as failure_pack_store
-from app.ci_database import get_log_tail, get_steps
+from app.ci_database import encode_step_log_cursor, get_log_tail, get_steps
 from app.mcp_response import MAX_RESPONSE_RESOURCE_CHUNK_BYTES, store_response_resource
 
 
@@ -372,6 +372,9 @@ def _normalize_step(step: Mapping[str, Any]) -> dict[str, Any]:
         "status": _safe_text(step.get("status") or "", 128) or None,
         "exit_code": _as_int(step.get("exit_code")),
     }
+    step_id = _as_int(step.get("step_id", step.get("id")))
+    if step_id is not None:
+        output["step_id"] = step_id
     for key in ("duration_seconds", "log_start_offset", "log_end_offset"):
         if key in step:
             value = _as_int(step.get(key)) if key.endswith("offset") else step.get(key)
@@ -403,11 +406,40 @@ def _merge_steps(job: Mapping[str, Any], persisted_steps: list[dict[str, Any]]) 
     for item in logical:
         normalized = _normalize_step(item)
         options = persisted_by_name.get(str(normalized.get("step_name") or ""), [])
-        persisted_item = options.pop(0) if options else None
+        persisted_item = None
+        if normalized.get("step_id") is not None:
+            for position, candidate in enumerate(options):
+                candidate_id = _as_int(candidate[1].get("step_id", candidate[1].get("id")))
+                if candidate_id == normalized["step_id"]:
+                    persisted_item = options.pop(position)
+                    break
+        elif len(options) == 1:
+            persisted_item = options.pop(0)
+        elif options:
+            # A status/exit-code match can disambiguate a summary step when
+            # names repeat.  If it cannot, leave the summary step without a
+            # persisted identity rather than silently selecting the wrong row.
+            status = str(normalized.get("status") or "").lower()
+            status_matches = [
+                candidate for candidate in options
+                if str(candidate[1].get("status") or "").lower() == status
+            ] if status else []
+            exit_code = _as_int(normalized.get("exit_code"))
+            if exit_code is not None:
+                exact_exit_matches = [
+                    candidate for candidate in status_matches
+                    if _as_int(candidate[1].get("exit_code")) == exit_code
+                ]
+                if len(exact_exit_matches) == 1:
+                    status_matches = exact_exit_matches
+            if len(status_matches) == 1:
+                candidate = status_matches[0]
+                options.remove(candidate)
+                persisted_item = candidate
         if persisted_item is not None:
             persisted_index, persisted = persisted_item
             consumed.add(persisted_index)
-            for key in ("log_start_offset", "log_end_offset", "duration_seconds"):
+            for key in ("step_id", "log_start_offset", "log_end_offset", "duration_seconds"):
                 if key in persisted and key not in normalized:
                     normalized[key] = persisted[key]
             if normalized.get("status") is None:
@@ -523,6 +555,66 @@ def _load_log(job: Mapping[str, Any], supplied: Any) -> dict[str, Any]:
             "truncated": bool(excerpt_truncated or source_truncated),
         },
     }
+
+
+def _failure_pack_log_continuation(
+    base: Mapping[str, Any],
+    job_id: str | None,
+    failed_step: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Add a durable precise-step continuation descriptor to the pack."""
+    continuation = dict(base)
+    step_id = _as_int(failed_step.get("step_id"))
+    range_start = _as_int(failed_step.get("log_start_offset"))
+    range_end = _as_int(failed_step.get("log_end_offset"))
+    valid_range = (
+        bool(job_id)
+        and step_id is not None
+        and range_start is not None
+        and range_end is not None
+        and range_start >= 0
+        and range_end >= range_start
+    )
+    continuation.update({
+        "method": "get_private_ci_logs" if job_id else None,
+        "job_id": job_id,
+        "failed_step": {
+            "step_id": step_id,
+            "step_name": _safe_text(failed_step.get("step_name") or "", 512) or None,
+            "status": _safe_text(failed_step.get("status") or "", 128) or None,
+            "exit_code": _as_int(failed_step.get("exit_code")),
+        },
+        "step_selector": {"step_id": step_id} if step_id is not None else None,
+        "step_log_range": (
+            {
+                "start_offset": range_start,
+                "end_offset": range_end,
+                "end_exclusive": True,
+                "status": "available",
+            }
+            if valid_range
+            else {
+                "start_offset": range_start,
+                "end_offset": range_end,
+                "end_exclusive": True,
+                "status": "partial" if step_id is not None else "unavailable",
+            }
+        ),
+        # No step page has been consumed by Failure Pack construction.  The
+        # first page cursor is therefore the deterministic next position.
+        "cursor": None,
+        "next_cursor": (
+            encode_step_log_cursor(
+                str(job_id), step_id, range_start, range_end, range_start
+            )
+            if valid_range and range_end > range_start
+            else None
+        ),
+        "has_more": bool(valid_range and range_end > range_start),
+        "resource_independent": True,
+        "rerun_ci": False,
+    })
+    return continuation
 
 
 def _extract_changed_files(job: Mapping[str, Any], affected: Mapping[str, Any]) -> tuple[list[Any], dict[str, Any]]:
@@ -825,7 +917,10 @@ def build_failure_pack(
     failed_step_evidence: dict[str, Any]
     if failed_steps:
         failed_step = dict(failed_steps[0])
-        failed_step_evidence = {"status": "available", "source": "ci_job_steps"}
+        failed_step_evidence = {
+            "status": "available" if _as_int(failed_step.get("step_id")) is not None else "partial",
+            "source": "ci_job_steps" if _as_int(failed_step.get("step_id")) is not None else "job_or_summary_steps",
+        }
     elif current_step:
         failed_step = {
             "step_name": current_step,
@@ -841,6 +936,11 @@ def build_failure_pack(
         }
         failed_step_evidence = {"status": "unavailable", "source": "no_failed_step_identity"}
     log_excerpt = _load_log(job, log_tail)
+    log_continuation = _failure_pack_log_continuation(
+        log_excerpt.get("continuation", {}),
+        str(job.get("job_id") or "") or None,
+        failed_step,
+    )
     failed_tests = parse_failed_tests(log_excerpt.get("content") or "")
     classification = _classify_failure_details(job, log_excerpt.get("content") or "", steps)
     primary_errors = _primary_errors(job, log_excerpt.get("content") or "")
@@ -944,7 +1044,7 @@ def build_failure_pack(
         },
         "log_excerpt": log_excerpt,
         "log_tail": log_excerpt.get("content", ""),
-        "log_continuation": log_excerpt.get("continuation", {}),
+        "log_continuation": log_continuation,
         "environment_cache": environment_cache,
     }
     evidence_sha256 = _evidence_hash(payload)

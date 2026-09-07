@@ -15,6 +15,8 @@ from mcp.server.fastmcp import FastMCP
 
 from app.config import settings as app_settings
 from app.ci_database import (
+    decode_step_log_cursor,
+    encode_step_log_cursor,
     get_job,
     get_worker,
     list_jobs as db_list_jobs,
@@ -44,6 +46,7 @@ from app.ci_repository_config import (
     get_max_timeout,
     get_allowed_profiles,
 )
+from app.development_failure_pack import redact_text
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +88,32 @@ def _error_response(code: str, message: str, retryable: bool = False, details: d
     }, ensure_ascii=False)
 
 
+def _step_selector_details(step: dict) -> dict:
+    return {
+        "step_id": step.get("step_id"),
+        "step_name": redact_text(step.get("step_name") or ""),
+        "status": step.get("status"),
+        "exit_code": step.get("exit_code"),
+        "log_start_offset": step.get("log_start_offset"),
+        "log_end_offset": step.get("log_end_offset"),
+    }
+
+
+def _redact_log_chunks(result: dict) -> dict:
+    """Redact log content while preserving durable raw-offset metadata."""
+    output = dict(result)
+    output["chunks"] = [
+        {
+            **chunk,
+            "content": redact_text(chunk.get("content") or ""),
+        }
+        for chunk in result.get("chunks", [])
+        if isinstance(chunk, dict)
+    ]
+    output["redacted"] = True
+    return output
+
+
 _PRIVATE_CI_SUMMARY_FIELDS = (
     "job_id", "repository", "branch", "commit_sha", "base_sha", "profile",
     "status", "exit_code", "priority", "worker_id", "queue_position",
@@ -97,6 +126,8 @@ _PRIVATE_CI_STEP_SUMMARY_FIELDS = ("step_name", "status", "exit_code", "duration
 _PRIVATE_CI_WORKSPACE_FIELDS = ("path", "stack", "framework", "package_manager")
 _MAX_SUMMARY_STEPS = 100
 _MAX_SUMMARY_WORKSPACES = 100
+_MAX_PRIVATE_CI_LOG_PAGE_CHUNKS = 200
+_MAX_PRIVATE_CI_STEP_PAGE_BYTES = 24 * 1024
 _PRIVATE_CI_COMPLETED_STEP_STATUSES = {
     "passed", "failed", "timed_out", "cancelled", "completed", "skipped", "autofixed",
 }
@@ -808,20 +839,270 @@ This is for the private CI system. NOT for GitHub Actions runs (use get_ci_job f
 
     @mcp.tool(
         name="get_private_ci_logs",
-        description="""Get private CI job execution logs by job_id. Supports pagination for large logs.
+        description="""Get private CI job execution logs by job_id. Supports pagination for large logs and precise persisted-step reads.
 
 Use the exact job_id from start_private_ci_job. Do NOT assume the latest job's logs.
+
+Without step_id/step_name this preserves the complete job-log API. With step_id,
+or a unique step_name, only the persisted half-open step range is returned.
+step_id is the stable selector when step names repeat. Pass next_cursor back
+as cursor for the next step page; cursor-only continuation is supported.
 
 This is for the private CI system. NOT for GitHub Actions logs (use get_ci_logs for that).""",
     )
     async def get_private_ci_logs(
-        job_id: str, offset: int = 0, limit: int = 200,
+        job_id: str = "", offset: int = 0, limit: int = 200,
+        step_id: Optional[int] = None, step_name: str = "", cursor: str = "",
     ) -> str:
         try:
+            cursor_data = None
+            if cursor:
+                try:
+                    cursor_data = decode_step_log_cursor(cursor)
+                except ValueError as exc:
+                    return _error_response("PRIVATE_CI_LOG_CURSOR_INVALID", str(exc))
+                if job_id and cursor_data["job_id"] != job_id:
+                    return _error_response(
+                        "PRIVATE_CI_LOG_CURSOR_MISMATCH",
+                        "cursor belongs to a different private CI job",
+                        details={"job_id": job_id, "cursor_job_id": cursor_data["job_id"]},
+                    )
+                if not job_id:
+                    job_id = cursor_data["job_id"]
+            if not job_id:
+                return _error_response("INVALID_ARGUMENT", "job_id or cursor is required")
             job = await asyncio.to_thread(get_job, job_id)
             if not job:
                 return _error_response("PRIVATE_CI_JOB_NOT_FOUND", f"Job '{job_id}' not found")
-            result = await asyncio.to_thread(get_log_chunks, job_id, offset, limit)
+
+            normalized_step_id = None
+            if step_id is not None:
+                if isinstance(step_id, bool):
+                    return _error_response(
+                        "INVALID_ARGUMENT", "step_id must be an integer",
+                    )
+                try:
+                    normalized_step_id = int(step_id)
+                except (TypeError, ValueError):
+                    return _error_response("INVALID_ARGUMENT", "step_id must be an integer")
+                if normalized_step_id <= 0:
+                    return _error_response("INVALID_ARGUMENT", "step_id must be positive")
+
+            requested_step_name = str(step_name or "")
+            safe_step_name = redact_text(requested_step_name)
+            step_mode = bool(cursor_data or normalized_step_id is not None or requested_step_name)
+            if not step_mode:
+                result = await asyncio.to_thread(get_log_chunks, job_id, offset, limit)
+                result = _redact_log_chunks(result)
+                result["mode"] = "job"
+                result["limit"] = min(max(int(limit), 1), _MAX_PRIVATE_CI_LOG_PAGE_CHUNKS)
+            else:
+                if cursor_data and normalized_step_id is not None and (
+                    cursor_data["step_id"] != normalized_step_id
+                ):
+                    return _error_response(
+                        "PRIVATE_CI_LOG_CURSOR_MISMATCH",
+                        "cursor does not belong to the selected step",
+                        details={
+                            "step_id": normalized_step_id,
+                            "cursor_step_id": cursor_data["step_id"],
+                        },
+                    )
+
+                persisted_steps = await asyncio.to_thread(get_steps, job_id)
+                cursor_step_id = cursor_data["step_id"] if cursor_data else None
+                selected_step_id = normalized_step_id or cursor_step_id
+                matching_by_name = [
+                    step for step in persisted_steps
+                    if str(step.get("step_name") or "") == requested_step_name
+                ] if requested_step_name else []
+
+                if requested_step_name and not matching_by_name:
+                    return _error_response(
+                        "PRIVATE_CI_STEP_NOT_FOUND",
+                        f"Step '{safe_step_name}' was not found in job '{job_id}'",
+                        details={"job_id": job_id, "step_name": safe_step_name},
+                    )
+                if requested_step_name and selected_step_id is None and len(matching_by_name) > 1:
+                    return _error_response(
+                        "PRIVATE_CI_STEP_SELECTOR_AMBIGUOUS",
+                        f"Step name '{requested_step_name}' is not unique",
+                        details={
+                            "job_id": job_id,
+                            "step_name": safe_step_name,
+                            "matches": [
+                                _step_selector_details(step) for step in matching_by_name
+                            ],
+                        },
+                    )
+                if requested_step_name and selected_step_id is not None:
+                    matching_ids = {
+                        step.get("step_id") for step in matching_by_name
+                    }
+                    if selected_step_id not in matching_ids:
+                        return _error_response(
+                            "PRIVATE_CI_LOG_CURSOR_MISMATCH" if cursor_data else "PRIVATE_CI_STEP_SELECTOR_MISMATCH",
+                            "step selector does not identify the requested step name",
+                            details={
+                                "job_id": job_id,
+                                "step_id": selected_step_id,
+                                "step_name": safe_step_name,
+                            },
+                        )
+
+                selected_step = next(
+                    (
+                        step for step in persisted_steps
+                        if step.get("step_id") == selected_step_id
+                    ),
+                    None,
+                ) if selected_step_id is not None else (
+                    matching_by_name[0] if len(matching_by_name) == 1 else None
+                )
+                if selected_step is None:
+                    error_code = (
+                        "PRIVATE_CI_STEP_NOT_FOUND"
+                        if selected_step_id is not None
+                        else "PRIVATE_CI_STEP_ID_UNAVAILABLE"
+                    )
+                    message = (
+                        f"Step id '{selected_step_id}' was not found in job '{job_id}'"
+                        if selected_step_id is not None
+                        else f"Step '{requested_step_name}' has no stable persisted identity"
+                    )
+                    return _error_response(
+                        error_code,
+                        message,
+                        details={
+                            "job_id": job_id,
+                            "step_id": selected_step_id,
+                            "step_name": safe_step_name or None,
+                        },
+                    )
+
+                selected_step_id = selected_step["step_id"]
+                range_start = int(selected_step.get("log_start_offset") or 0)
+                range_end = int(selected_step.get("log_end_offset") or 0)
+                if range_start < 0 or range_end < range_start:
+                    return _error_response(
+                        "PRIVATE_CI_STEP_LOG_RANGE_INVALID",
+                        "persisted step log range is invalid",
+                        details={
+                            "job_id": job_id,
+                            "step": _step_selector_details(selected_step),
+                        },
+                    )
+
+                if cursor_data:
+                    if (
+                        cursor_data["step_id"] != selected_step_id
+                        or cursor_data["range_start"] != range_start
+                        or cursor_data["range_end"] != range_end
+                    ):
+                        return _error_response(
+                            "PRIVATE_CI_LOG_CURSOR_STALE",
+                            "cursor no longer matches the persisted step log range",
+                            details={
+                                "job_id": job_id,
+                                "step_id": selected_step_id,
+                                "cursor_range": {
+                                    "start_offset": cursor_data["range_start"],
+                                    "end_offset": cursor_data["range_end"],
+                                },
+                                "current_range": {
+                                    "start_offset": range_start,
+                                    "end_offset": range_end,
+                                },
+                            },
+                        )
+                    current_offset = cursor_data["offset"]
+                    if current_offset < range_start or current_offset > range_end:
+                        return _error_response(
+                            "PRIVATE_CI_LOG_CURSOR_INVALID",
+                            "cursor offset is outside the persisted step log range",
+                            details={
+                                "job_id": job_id,
+                                "step_id": selected_step_id,
+                                "range": {
+                                    "start_offset": range_start,
+                                    "end_offset": range_end,
+                                },
+                            },
+                        )
+                else:
+                    try:
+                        requested_offset = int(offset)
+                    except (TypeError, ValueError):
+                        return _error_response("INVALID_ARGUMENT", "offset must be an integer")
+                    if requested_offset < 0:
+                        return _error_response("INVALID_ARGUMENT", "offset must be non-negative")
+                    if requested_offset == 0:
+                        current_offset = range_start
+                    elif range_start <= requested_offset <= range_end:
+                        # An absolute controller-log offset is accepted for
+                        # callers that already know the persisted range.
+                        current_offset = requested_offset
+                    elif requested_offset <= range_end - range_start:
+                        # Offset remains useful as a relative step offset when
+                        # the selected step starts after the beginning of the job log.
+                        current_offset = range_start + requested_offset
+                    else:
+                        return _error_response(
+                            "PRIVATE_CI_STEP_LOG_OFFSET_INVALID",
+                            "offset is outside the selected step log range",
+                            details={
+                                "job_id": job_id,
+                                "step_id": selected_step_id,
+                                "range": {
+                                    "start_offset": range_start,
+                                    "end_offset": range_end,
+                                },
+                                "offset": requested_offset,
+                            },
+                        )
+
+                if cursor_data and int(offset) != 0:
+                    return _error_response(
+                        "PRIVATE_CI_LOG_CURSOR_OFFSET_CONFLICT",
+                        "cursor and offset cannot select different positions",
+                        details={"cursor_offset": current_offset, "offset": offset},
+                    )
+
+                result = await asyncio.to_thread(
+                    get_log_chunks,
+                    job_id,
+                    current_offset,
+                    min(max(int(limit), 1), _MAX_PRIVATE_CI_LOG_PAGE_CHUNKS),
+                    range_start=range_start,
+                    range_end=range_end,
+                    max_bytes=_MAX_PRIVATE_CI_STEP_PAGE_BYTES,
+                )
+                result = _redact_log_chunks(result)
+                has_more = bool(result.get("has_more"))
+                result.update({
+                    "mode": "step",
+                    "step": _step_selector_details(selected_step),
+                    "step_selector": {"step_id": selected_step_id},
+                    "step_log_range": {
+                        "start_offset": range_start,
+                        "end_offset": range_end,
+                        "end_exclusive": True,
+                    },
+                    "cursor": cursor or None,
+                    "next_cursor": (
+                        encode_step_log_cursor(
+                            job_id,
+                            selected_step_id,
+                            range_start,
+                            range_end,
+                            int(result["next_offset"]),
+                        )
+                        if has_more and result.get("next_offset") is not None
+                        else None
+                    ),
+                    "has_more": has_more,
+                    "page_limit_bytes": _MAX_PRIVATE_CI_STEP_PAGE_BYTES,
+                })
             result["repository"] = job.get("repository")
             result["branch"] = job.get("branch")
             result["commit_sha"] = job.get("commit_sha")
