@@ -145,20 +145,20 @@
 
 ### WEB-CI-DEV-010：稳定 Failure Pack
 
-- [ ] 实现稳定 `failure_pack_id` 或等价 durable identity。
-- [ ] 保存/生成 exact job identity、failed step、exit code。
-- [ ] 分类代码/测试/依赖/Runner/网络/权限/基础设施/超时/取消/未知。
-- [ ] 生成 error fingerprint。
-- [ ] 解析 primary errors。
-- [ ] 支持常见测试框架 failed test 名称。
-- [ ] 可解析时输出 file/line/column；不可解析时明确 partial/unavailable。
-- [ ] 保存脱敏 command。
-- [ ] 保存 bounded log excerpt + log/resource continuation。
-- [ ] 保存 changed files/affected tests evidence（可用时）。
-- [ ] Resource 过期后可重新 materialize，不要求重跑 CI。
+- [x] 实现稳定 `failure_pack_id` 或等价 durable identity。
+- [x] 保存/生成 exact job identity、failed step、exit code。
+- [x] 分类代码/测试/依赖/Runner/网络/权限/基础设施/超时/取消/未知。
+- [x] 生成 error fingerprint。
+- [x] 解析 primary errors。
+- [x] 支持常见测试框架 failed test 名称。
+- [x] 可解析时输出 file/line/column；不可解析时明确 partial/unavailable。
+- [x] 保存脱敏 command。
+- [x] 保存 bounded log excerpt + log/resource continuation。
+- [x] 保存 changed files/affected tests evidence（可用时）。
+- [x] Resource 过期后可重新 materialize，不要求重跑 CI。
 
 映射验收：AC-WEB-CI-06/07/10/16。  
-证据：`待填写`
+证据：Codex semantic delta 来自 `bd31f2a27a5b2b412e280c0a549b49b8e3370cf2`，patch `62215 bytes` / SHA-256 `5ee2b7b1cec6aa241835139969d0ca9fa88c239fb6c6366cde6f59db94fe553a`；fresh current-main integration code candidate `26550d11774c619663464a5d694371012ec2a0fd`，三文件 blob 与 Codex patch 目标逐字节一致：`a18af15779f9205fd9cdd0727eb208cf0b9ba24b`、`d1f86c4213259a544da7fad5ab2a8e09143f5361`、`8924dab35398609f52340f3a13cc89f2905ae73b`。Targeted：`test_development_failure_pack.py + test_web_ci_validate_nonblocking.py + test_dx2_converge.py::test_ci_failed_is_truthfully_failed_with_failure_evidence` = `21 passed`；额外 boundary assertions 验证不同 secret 值仍得到相同 redacted evidence identity/fingerprint、nested sensitive fields/Authorization/command 脱敏、512 KiB durable limit、unittest/Node parser、location unavailable、changed/affected evidence、materialize/rematerialize 且 `rerun_ci=false`；production forbidden-call scan 无 `start_private_ci_job` / `schedule_ci_request_preparation` / `wait_private_ci_job` / `wait_for_job_change` / `time.sleep`。最终 exact-head Index / `repo-auto-check` / GitHub Checks / Draft PR 以本轮交付证据为准。
 
 ### WEB-CI-DEV-011：Step Log 精准读取
 
