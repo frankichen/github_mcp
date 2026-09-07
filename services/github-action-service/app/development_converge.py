@@ -1,35 +1,359 @@
-"""DX-2 post-write convergence orchestration for Development Sessions."""
+"""Durable, non-blocking convergence orchestration for Development Sessions.
+
+The convergence run is the durable cursor for this operation. A call may create
+or reuse the run, request an Index, perform analysis whose dependencies are
+already ready, create/reuse one durable CI Request, and consume one current CI
+Request snapshot. It never waits for an Index or CI lifecycle to change.
+"""
 from __future__ import annotations
 
-import time
-from typing import Any, Awaitable, Callable
+import hashlib
+import inspect
+import json
+from typing import Any, Awaitable, Callable, Mapping
 
-from app import development_orchestrator as dx
+from app import ci_database
+from app import ci_request_store
+from app import development_convergence_store as convergence_store
 from app import development_session_store as sessions
-from app import github_utils, mygithub12
-from app.ci_database import get_job, get_workers, reconcile_stale_workers
+from app import mygithub12
+from app.ci_models import effective_priority
+from app.ci_repository_config import get_max_timeout
+from app.ci_request_dispatch import (
+    effective_ci_config_digest,
+    schedule_ci_request_preparation,
+)
 from app.mcp_response import store_response_resource
+from app.ci_database import get_job, get_workers, reconcile_stale_workers
 
 
 MyGithub12Error = mygithub12.MyGithub12Error
-_TERMINAL_CI = {"passed", "failed", "timed_out", "cancelled", "superseded"}
+
+_TERMINAL_CI = {
+    "passed",
+    "failed",
+    "timed_out",
+    "cancelled",
+    "superseded",
+    "worker_lost",
+    "internal_error",
+    "preflight_failed",
+}
+_CI_REQUEST_PHASES = {"accepted", "preparing", "queued", "running", "terminal"}
+_ANALYSIS_CALLBACKS: tuple[tuple[str, str], ...] = (
+    ("change_context", "change_context"),
+    ("change_impact", "impact"),
+    ("contract_detection", "contracts"),
+    ("affected_tests", "affected_tests"),
+)
+_PHASE_RANK = {
+    "accepted": 0,
+    "index_requested": 1,
+    "analysis_pending": 2,
+    "ci_requested": 3,
+    "ci_running": 4,
+    "post_ci_finalize": 5,
+    "passed": 6,
+    "failed": 6,
+    "blocked": 6,
+}
 
 
 def _error_evidence(stage: str, exc: Exception) -> dict[str, Any]:
+    """Convert one analysis error into bounded, truthful evidence."""
     return {
         "stage": stage,
         "code": str(getattr(exc, "code", "INTERNAL_ERROR")),
-        "message": str(getattr(exc, "message", "convergence analysis failed")),
+        "message": str(getattr(exc, "message", str(exc)))[:1000],
         "type": type(exc).__name__,
     }
 
 
-def _index_is_exact_ready(index_status: dict[str, Any], head_sha: str, tree_sha: str) -> bool:
+def _index_is_exact_ready(
+    index_status: Mapping[str, Any], head_sha: str, tree_sha: str
+) -> bool:
+    """Only an exact commit/tree result may unlock dependent analysis."""
     return bool(
-        index_status.get("status") == "ready"
+        index_status.get("status") in {"ready", "completed"}
         and index_status.get("commit_sha") == head_sha
         and index_status.get("tree_sha") == tree_sha
     )
+
+
+def _canonical_digest(value: Any) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _analysis_failure_state(result: Mapping[str, Any]) -> str:
+    if result.get("ok") is False:
+        return "failed"
+    if result.get("complete") is False:
+        return "degraded"
+    return "ready"
+
+
+def _analysis_result_details(
+    details: Mapping[str, Any],
+    *,
+    repository: str = "",
+    index_status: Mapping[str, Any],
+    index_request: Mapping[str, Any] | None,
+    head_sha: str,
+    tree_sha: str,
+    base_sha: str,
+    degraded_reasons: list[dict[str, Any]],
+    pending_reasons: list[dict[str, Any]],
+    analysis_resource: Mapping[str, Any] | None,
+    analysis_states: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build the compact public analysis view shared by direct and durable calls."""
+    change_context = (
+        details.get("change_context")
+        if isinstance(details.get("change_context"), dict)
+        else {}
+    )
+    impact = details.get("impact") if isinstance(details.get("impact"), dict) else {}
+    contracts = (
+        details.get("contracts") if isinstance(details.get("contracts"), dict) else {}
+    )
+    affected = (
+        details.get("affected_tests")
+        if isinstance(details.get("affected_tests"), dict)
+        else {}
+    )
+    compact_index_request = None
+    if isinstance(index_request, Mapping):
+        compact_index_request = {
+            key: index_request.get(key)
+            for key in (
+                "job_id",
+                "status",
+                "strategy",
+                "revision",
+                "step",
+                "deduplicated",
+            )
+            if key in index_request
+        }
+    analysis_states = analysis_states or {}
+    index_ready = _index_is_exact_ready(index_status, head_sha, tree_sha)
+    impact_state = str((analysis_states.get("change_impact") or {}).get("state") or "")
+    impact_ok = impact.get("ok") is not False and impact_state != "failed"
+    impact_complete = impact.get("complete") is True or impact_state == "ready"
+    context_state = str((analysis_states.get("change_context") or {}).get("state") or "")
+    contracts_state = str(
+        (analysis_states.get("contract_detection") or {}).get("state") or ""
+    )
+    affected_state = str((analysis_states.get("affected_tests") or {}).get("state") or "")
+    pending = bool(pending_reasons) or not index_ready
+    return {
+        "identity": {
+            "repository": repository or index_status.get("repository"),
+            "commit_sha": head_sha,
+            "tree_sha": tree_sha,
+        },
+        "base_sha": base_sha,
+        "index": {
+            "ready": index_ready,
+            "status": index_status.get("status"),
+            "commit_sha": index_status.get("commit_sha"),
+            "tree_sha": index_status.get("tree_sha"),
+            "index_version": index_status.get("index_version"),
+            "request": compact_index_request,
+        },
+        "change_context": {
+            "ok": change_context.get("ok") is not False and context_state != "failed",
+            "items_total": len(change_context.get("items") or []),
+            "omitted_count": int(change_context.get("omitted_count", 0) or 0),
+        },
+        "impact": {
+            "ok": impact_ok,
+            "complete": impact_complete,
+            "changed_paths": list(impact.get("changed_paths") or [])[:100],
+            "affected_modules": list(impact.get("affected_modules") or [])[:100],
+            "affected_test_count": len(impact.get("affected_tests") or []),
+            "contract_change_count": len(impact.get("contract_changes") or []),
+        },
+        "contracts": {
+            "ok": contracts.get("ok") is not False and contracts_state != "failed",
+            "summary": contracts.get("summary") or {},
+            "changes": list(contracts.get("changes") or [])[:50],
+        },
+        "affected_tests": {
+            "ok": affected.get("ok") is not False and affected_state != "failed",
+            "authoritative": bool(affected.get("authoritative", False)),
+            "tests": list(affected.get("tests") or [])[:100],
+        },
+        "details": dict(details),
+        "pending": pending,
+        "pending_reasons": list(pending_reasons),
+        "degraded": bool(degraded_reasons),
+        "degraded_reasons": list(degraded_reasons),
+        "conservative_ci_required": bool(
+            degraded_reasons or pending or not index_ready
+        ),
+        "analysis_resource": dict(analysis_resource) if analysis_resource else None,
+    }
+
+
+def _run_analysis_callbacks(
+    service: Any,
+    session: Mapping[str, Any],
+    base_sha: str,
+    *,
+    existing_states: Mapping[str, Mapping[str, Any]] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Run only analysis stages still pending after exact Index readiness."""
+    repository = str(session["repository"])
+    head_sha = str(session["head_commit_sha"])
+    task = str(
+        (session.get("metadata") or {}).get("task_name")
+        or "development task convergence"
+    )
+    callbacks: dict[str, Callable[[], Any]] = {
+        "change_context": lambda: mygithub12.change_context_pack(
+            service, repository, base_sha, head_sha, task, 50, 1024 * 1024
+        ),
+        "change_impact": lambda: mygithub12.change_impact(
+            service, repository, base_sha, head_sha
+        ),
+        "contract_detection": lambda: mygithub12.contract_changes(
+            service, repository, base_sha, head_sha
+        ),
+        "affected_tests": lambda: mygithub12.affected_tests(
+            service, repository, head_sha, base_sha
+        ),
+    }
+    details: dict[str, Any] = {}
+    degraded_reasons: list[dict[str, Any]] = []
+    existing_states = existing_states or {}
+    for stage, public_key in _ANALYSIS_CALLBACKS:
+        state = str((existing_states.get(stage) or {}).get("state") or "pending")
+        if state != "pending":
+            continue
+        try:
+            result = callbacks[stage]()
+            if not isinstance(result, dict):
+                result = {"ok": True, "value": result}
+            details[public_key] = result
+            result_state = _analysis_failure_state(result)
+            if result_state != "ready":
+                degraded_reasons.append(
+                    {
+                        "stage": stage,
+                        "code": (
+                            "IMPACT_ANALYSIS_INCOMPLETE"
+                            if stage == "change_impact"
+                            else "ANALYSIS_STAGE_INCOMPLETE"
+                        ),
+                        "message": f"{stage} returned incomplete evidence",
+                    }
+                )
+        except Exception as exc:
+            error = _error_evidence(stage, exc)
+            details[public_key] = {"ok": False, "error": error}
+            degraded_reasons.append(error)
+
+    impact = details.get("impact") if isinstance(details.get("impact"), dict) else {}
+    if impact and impact.get("ok") is not False and impact.get("complete") is not True:
+        reason = {
+            "stage": "change_impact",
+            "code": "IMPACT_ANALYSIS_INCOMPLETE",
+            "message": "change impact is incomplete; full CI must remain conservative",
+        }
+        if reason not in degraded_reasons:
+            degraded_reasons.append(reason)
+    return details, degraded_reasons
+
+
+def _analysis_readiness_reasons(
+    snapshot: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Expose durable analysis failures/pending states on every replay."""
+    pending: list[dict[str, Any]] = []
+    degraded: list[dict[str, Any]] = []
+    for stage in convergence_store.ANALYSIS_STAGES:
+        state = (snapshot.get("analysis") or {}).get(stage) or {}
+        state_name = str(state.get("state") or "pending")
+        if state_name == "pending":
+            pending.append(
+                {
+                    "stage": stage,
+                    "code": "INDEX_NOT_READY" if stage == "index" else "ANALYSIS_NOT_READY",
+                    "message": (
+                        "exact HEAD Repository Index is not ready; analysis remains pending"
+                        if stage == "index"
+                        else f"{stage} evidence is not ready"
+                    ),
+                }
+            )
+        elif state_name in {"failed", "degraded"}:
+            degraded.append(
+                {
+                    "stage": stage,
+                    "code": str(
+                        state.get("error_code")
+                        or (
+                            "IMPACT_ANALYSIS_INCOMPLETE"
+                            if stage == "change_impact"
+                            else "ANALYSIS_STAGE_INCOMPLETE"
+                        )
+                    ),
+                    "message": str(
+                        state.get("error_message")
+                        or f"{stage} evidence is {state_name}"
+                    ),
+                }
+            )
+    return pending, degraded
+
+
+def _analysis_resource(
+    *,
+    session: Mapping[str, Any],
+    base_sha: str,
+    index_status: Mapping[str, Any],
+    index_request: Mapping[str, Any] | None,
+    details: Mapping[str, Any],
+    degraded_reasons: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not _index_is_exact_ready(
+        index_status, str(session["head_commit_sha"]), str(session["tree_sha"])
+    ):
+        return None
+    evidence = {
+        "identity": {
+            "repository": session["repository"],
+            "commit_sha": session["head_commit_sha"],
+            "tree_sha": session["tree_sha"],
+        },
+        "base_sha": base_sha,
+        "index": {"status": dict(index_status), "request": dict(index_request or {})},
+        "analysis": dict(details),
+        "degraded_reasons": list(degraded_reasons),
+    }
+    try:
+        resource = store_response_resource(evidence)
+    except Exception as exc:
+        degraded_reasons.append(_error_evidence("analysis_resource", exc))
+        return None
+    if not isinstance(resource, dict):
+        degraded_reasons.append(
+            {
+                "stage": "analysis_resource",
+                "code": "ANALYSIS_RESOURCE_UNAVAILABLE",
+                "message": "analysis evidence resource was not returned",
+            }
+        )
+        return None
+    return {
+        "resource_uri": resource.get("resource_uri"),
+        "total_bytes": resource.get("total_bytes"),
+        "content_sha256": resource.get("sha256"),
+    }
 
 
 def convergence_analysis(
@@ -39,22 +363,49 @@ def convergence_analysis(
     index_wait_seconds: int = 55,
     idempotency_key: str = "",
 ) -> dict[str, Any]:
-    """Collect exact-head analysis while degrading conservatively instead of narrowing full CI."""
+    """Perform one no-wait analysis pass.
+
+    ``index_wait_seconds`` remains in the signature for compatibility only. It
+    is deliberately ignored, as is any external Index lifecycle wait.
+    """
+    del index_wait_seconds
     repository = session["repository"]
     head_sha = session["head_commit_sha"]
     tree_sha = session["tree_sha"]
     resolved_base = base_sha or session["base_commit_sha"]
     identity = mygithub12.resolve_identity(service, repository, commit_sha=head_sha)
-    if identity.get("tree_sha") != tree_sha:
+    if identity.get("commit_sha") not in {None, head_sha} or identity.get("tree_sha") != tree_sha:
         raise MyGithub12Error(
             "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
             "exact HEAD Tree differs from the Development Session",
-            {"session_tree": tree_sha, "actual_tree": identity.get("tree_sha"), "head_sha": head_sha},
+            {
+                "session_head": head_sha,
+                "session_tree": tree_sha,
+                "actual_head": identity.get("commit_sha"),
+                "actual_tree": identity.get("tree_sha"),
+                "recovery_required": True,
+            },
         )
 
-    index_status = mygithub12.get_index_status(service, repository, head_sha)
+    index_error = None
+    try:
+        index_status = mygithub12.get_index_status(service, repository, head_sha)
+    except Exception as exc:
+        index_status = {
+            "status": "unknown",
+            "repository": repository,
+            "commit_sha": head_sha,
+            "tree_sha": None,
+        }
+        index_error = _error_evidence("index_status", exc)
+    if not isinstance(index_status, Mapping):
+        index_status = {
+            "status": "unknown",
+            "repository": repository,
+            "commit_sha": head_sha,
+            "tree_sha": None,
+        }
     index_request = None
-    index_wait = None
     if not _index_is_exact_ready(index_status, head_sha, tree_sha):
         index_request = mygithub12.request_index_build(
             service,
@@ -66,167 +417,93 @@ def convergence_analysis(
             f"converge-index:{session['session_id']}:{head_sha}:{idempotency_key or 'default'}",
             False,
         )
-        job_id = index_request.get("job_id") if isinstance(index_request, dict) else None
-        if job_id and int(index_wait_seconds) > 0:
-            index_wait = mygithub12.wait_index_job(
-                job_id,
-                min(max(int(index_wait_seconds), 0), 55),
-                int(index_request.get("revision", 0) or 0),
-                str(index_request.get("status") or ""),
-                str(index_request.get("step") or ""),
-            )
-        index_status = mygithub12.get_index_status(service, repository, head_sha)
+        if isinstance(index_request, dict) and _index_is_exact_ready(
+            index_request, head_sha, tree_sha
+        ):
+            index_status = index_request
+        elif isinstance(index_request, dict) and index_request.get("status") in {
+            "failed",
+            "cancelled",
+        }:
+            index_error = {
+                "stage": "index",
+                "code": str(index_request.get("error_code") or "INDEX_BUILD_FAILED"),
+                "message": str(index_request.get("error_message") or "Index build failed"),
+            }
+        elif isinstance(index_request, dict) and index_request.get("status"):
+            index_status = index_request
+            index_error = None
 
+    details: dict[str, Any] = {}
     degraded_reasons: list[dict[str, Any]] = []
-    index_ready = _index_is_exact_ready(index_status, head_sha, tree_sha)
-    if not index_ready:
-        degraded_reasons.append(
+    pending_reasons: list[dict[str, Any]] = []
+    if _index_is_exact_ready(index_status, head_sha, tree_sha):
+        details, degraded_reasons = _run_analysis_callbacks(
+            service, session, resolved_base
+        )
+    else:
+        pending_reasons.append(
             {
                 "stage": "index",
                 "code": "INDEX_NOT_READY",
-                "message": "exact HEAD Repository Index is not ready; full CI must remain conservative",
+                "message": "exact HEAD Repository Index is not ready; analysis remains pending",
             }
         )
+        if index_error:
+            degraded_reasons.append(index_error)
 
-    task = str((session.get("metadata") or {}).get("task_name") or "development task convergence")
-    details: dict[str, Any] = {}
-    stages = (
-        (
-            "change_context",
-            lambda: mygithub12.change_context_pack(
-                service, repository, resolved_base, head_sha, task, 50, 1024 * 1024
-            ),
-        ),
-        ("impact", lambda: mygithub12.change_impact(service, repository, resolved_base, head_sha)),
-        ("contracts", lambda: mygithub12.contract_changes(service, repository, resolved_base, head_sha)),
-        (
-            "affected_tests",
-            lambda: mygithub12.affected_tests(service, repository, head_sha, resolved_base),
-        ),
+    resource = _analysis_resource(
+        session=session,
+        base_sha=resolved_base,
+        index_status=index_status,
+        index_request=index_request,
+        details=details,
+        degraded_reasons=degraded_reasons,
     )
-    for stage, callback in stages:
-        try:
-            details[stage] = callback()
-        except Exception as exc:
-            error = _error_evidence(stage, exc)
-            details[stage] = {"ok": False, "error": error}
-            degraded_reasons.append(error)
-
-    impact = details.get("impact") if isinstance(details.get("impact"), dict) else {}
-    if impact.get("ok") is not False and impact.get("complete") is not True:
-        degraded_reasons.append(
-            {
-                "stage": "impact",
-                "code": "IMPACT_ANALYSIS_INCOMPLETE",
-                "message": "change impact is incomplete; full CI must remain conservative",
-            }
-        )
-
-    full_evidence = {
-        "identity": {"repository": repository, "commit_sha": head_sha, "tree_sha": tree_sha},
-        "base_sha": resolved_base,
-        "index": {"status": index_status, "request": index_request, "wait": index_wait},
-        "analysis": details,
-        "degraded_reasons": degraded_reasons,
-    }
-    resource = None
-    try:
-        resource = store_response_resource(full_evidence)
-    except Exception as exc:
-        degraded_reasons.append(_error_evidence("analysis_resource", exc))
-
-    change_context = details.get("change_context") if isinstance(details.get("change_context"), dict) else {}
-    contracts = details.get("contracts") if isinstance(details.get("contracts"), dict) else {}
-    affected = details.get("affected_tests") if isinstance(details.get("affected_tests"), dict) else {}
-    compact_index_request = None
-    if isinstance(index_request, dict):
-        compact_index_request = {
-            key: index_request.get(key)
-            for key in ("job_id", "status", "strategy", "revision", "step", "deduplicated")
-            if key in index_request
-        }
-    return {
-        "identity": {"repository": repository, "commit_sha": head_sha, "tree_sha": tree_sha},
-        "base_sha": resolved_base,
-        "index": {
-            "ready": index_ready,
-            "status": index_status.get("status"),
-            "commit_sha": index_status.get("commit_sha"),
-            "tree_sha": index_status.get("tree_sha"),
-            "index_version": index_status.get("index_version"),
-            "request": compact_index_request,
-        },
-        "change_context": {
-            "ok": change_context.get("ok") is not False,
-            "items_total": len(change_context.get("items") or []),
-            "omitted_count": int(change_context.get("omitted_count", 0) or 0),
-        },
-        "impact": {
-            "ok": impact.get("ok") is not False,
-            "complete": impact.get("complete") is True,
-            "changed_paths": list(impact.get("changed_paths") or [])[:100],
-            "affected_modules": list(impact.get("affected_modules") or [])[:100],
-            "affected_test_count": len(impact.get("affected_tests") or []),
-            "contract_change_count": len(impact.get("contract_changes") or []),
-        },
-        "contracts": {
-            "ok": contracts.get("ok") is not False,
-            "summary": contracts.get("summary") or {},
-            "changes": list(contracts.get("changes") or [])[:50],
-        },
-        "affected_tests": {
-            "ok": affected.get("ok") is not False,
-            "authoritative": bool(affected.get("authoritative", False)),
-            "tests": list(affected.get("tests") or [])[:100],
-        },
-        "degraded": bool(degraded_reasons),
-        "degraded_reasons": degraded_reasons,
-        "conservative_ci_required": bool(degraded_reasons),
-        "analysis_resource": (
-            {
-                "resource_uri": resource["resource_uri"],
-                "total_bytes": resource["total_bytes"],
-                "content_sha256": resource["sha256"],
-            }
-            if resource
-            else None
-        ),
-    }
+    result = _analysis_result_details(
+        details,
+        repository=str(repository),
+        index_status=index_status,
+        index_request=index_request,
+        head_sha=head_sha,
+        tree_sha=tree_sha,
+        base_sha=resolved_base,
+        degraded_reasons=degraded_reasons,
+        pending_reasons=pending_reasons,
+        analysis_resource=resource,
+    )
+    result["index_job_id"] = (
+        index_request.get("job_id") if isinstance(index_request, dict) else None
+    )
+    return result
 
 
-def wait_worker_final_state(job_id: str, wait_seconds: int = 5) -> dict[str, Any]:
-    """Boundedly prove that a terminal CI job no longer occupies its Worker."""
+def _worker_snapshot(job_id: str) -> dict[str, Any]:
+    """Return one local Worker snapshot; this compatibility helper never waits."""
     job = get_job(job_id)
     if not job:
-        raise MyGithub12Error("PRIVATE_CI_JOB_NOT_FOUND", "private CI job disappeared", {"job_id": job_id})
+        raise MyGithub12Error(
+            "PRIVATE_CI_JOB_NOT_FOUND",
+            "private CI job disappeared",
+            {"job_id": job_id},
+        )
     worker_id = job.get("worker_id")
-    terminal = job.get("status") in _TERMINAL_CI
     if not worker_id:
         return {
             "worker_id": None,
-            "terminal": terminal,
+            "terminal": job.get("status") in _TERMINAL_CI,
             "released": False,
             "idle": False,
             "reason": "worker_not_recorded",
         }
-
-    deadline = time.monotonic() + min(max(int(wait_seconds), 0), 5)
-    worker = None
-    while True:
-        reconcile_stale_workers()
-        worker = next((item for item in get_workers() if item.get("worker_id") == worker_id), None)
-        if worker is None:
-            break
-        if worker.get("current_job") != job_id:
-            break
-        if not terminal or time.monotonic() >= deadline:
-            break
-        time.sleep(0.1)
-
+    reconcile_stale_workers()
+    worker = next(
+        (item for item in get_workers() if item.get("worker_id") == worker_id), None
+    )
     if worker is None:
         return {
             "worker_id": worker_id,
-            "terminal": terminal,
+            "terminal": job.get("status") in _TERMINAL_CI,
             "released": False,
             "idle": False,
             "reason": "worker_not_registered",
@@ -234,7 +511,7 @@ def wait_worker_final_state(job_id: str, wait_seconds: int = 5) -> dict[str, Any
     released = worker.get("current_job") != job_id
     return {
         "worker_id": worker_id,
-        "terminal": terminal,
+        "terminal": job.get("status") in _TERMINAL_CI,
         "online": bool(worker.get("online")),
         "status": worker.get("status"),
         "current_job": worker.get("current_job"),
