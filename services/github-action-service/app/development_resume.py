@@ -14,7 +14,8 @@ from typing import Any
 
 from app import development_orchestrator as dx
 from app import development_session_store as sessions
-from app import attestation_registry, github_utils, mygithub12
+from app import attestation_registry, ci_request_store, github_utils, mygithub12
+from app import development_convergence_store as convergence_store
 from app import development_managed_merge as managed_merge
 from app.github_policy import repository_is_allowed
 from app.ci_repository_config import is_private_ci_enabled, is_test_deploy_enabled, is_self_deploy_enabled
@@ -26,6 +27,11 @@ ACTIVE_SESSION_STATUSES = {"active", "pr_ready"}
 BLOCKED_SESSION_STATUSES = {"blocked", "drifted", "closing", "validating_fast", "validating_full"}
 TRANSIENT_VALIDATION_STATUSES = {"validating_fast": "fast", "validating_full": "full"}
 VALIDATION_IN_PROGRESS_STATUSES = {"queued", "leased", "downloading", "preparing", "running", "cancel_requested"}
+CONVERGENCE_RESUME_MODES = ("full", "fast")
+CONVERGENCE_TERMINAL_CI_STATUSES = {
+    "passed", "failed", "timed_out", "cancelled", "superseded", "worker_lost",
+    "internal_error", "preflight_failed",
+}
 
 
 def _raise_result_error(result: dict[str, Any], default_code: str, default_message: str) -> None:
@@ -151,6 +157,292 @@ def _recent_ci(repository: str, branch: str, commit_sha: str) -> dict[str, Any]:
         if profile in by_profile and by_profile[profile] is None:
             by_profile[profile] = summary
     return {"fast": by_profile["repo-fast-check"], "full": by_profile["repo-auto-check"], "recent": all_items[:10]}
+
+
+def _resume_convergence_identity(
+    repository: str,
+    branch: str,
+    branch_head: str,
+    branch_tree: str,
+    workspace: dict[str, Any] | None,
+    session: dict[str, Any] | None,
+    current_main: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Build the Store lookup identity from the current recovery evidence."""
+    if not session:
+        return None
+    session_id = str(session.get("session_id") or "")
+    workspace_id = str(session.get("workspace_id") or (workspace or {}).get("workspace_id") or "")
+    base_branch = str(
+        session.get("base_branch")
+        or (workspace or {}).get("base_branch")
+        or current_main.get("branch")
+        or ""
+    )
+    base_sha = str(
+        session.get("base_commit_sha")
+        or (workspace or {}).get("base_commit_sha")
+        or current_main.get("commit_sha")
+        or ""
+    )
+    if not session_id or not workspace_id or not base_branch or not base_sha:
+        return None
+    return {
+        "repository": repository,
+        "branch": branch,
+        "development_session_id": session_id,
+        "workspace_id": workspace_id,
+        "head_sha": str(branch_head),
+        "tree_sha": str(branch_tree),
+        "base_branch": base_branch,
+        "base_sha": base_sha,
+    }
+
+
+def _resume_convergence_is_current(
+    snapshot: dict[str, Any],
+    identity: dict[str, Any],
+    session: dict[str, Any] | None,
+    workspace: dict[str, Any] | None,
+) -> bool:
+    """Require the persisted run and the fresh branch/session evidence to agree."""
+    for key in (
+        "repository", "branch", "development_session_id", "head_sha", "tree_sha",
+        "base_branch", "base_sha",
+    ):
+        if snapshot.get(key) != identity.get(key):
+            return False
+    if snapshot.get("workspace_id") not in {None, identity.get("workspace_id")}:
+        return False
+    if session:
+        if session.get("head_commit_sha") and session.get("head_commit_sha") != identity["head_sha"]:
+            return False
+        if session.get("tree_sha") and session.get("tree_sha") != identity["tree_sha"]:
+            return False
+    if workspace:
+        if workspace.get("head_sha") and workspace.get("head_sha") != identity["head_sha"]:
+            return False
+        if workspace.get("tree_sha") and workspace.get("tree_sha") != identity["tree_sha"]:
+            return False
+    return True
+
+
+def _read_historical_convergences(identity: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read every same-session/base run without creating or advancing one."""
+    return convergence_store.list_convergences_for_session(
+        repository=identity["repository"],
+        branch=identity["branch"],
+        development_session_id=identity["development_session_id"],
+        base_branch=identity["base_branch"],
+        base_sha=identity["base_sha"],
+        modes=CONVERGENCE_RESUME_MODES,
+        limit=50,
+    )
+
+
+def _convergence_request_snapshot(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    request_id = str(snapshot.get("ci_request_id") or "")
+    if not request_id:
+        return None
+    try:
+        request = ci_request_store.get_ci_request(request_id)
+    except Exception as exc:
+        return {
+            "request_id": request_id,
+            "status": "unavailable",
+            "phase": "unknown",
+            "revision": None,
+            "terminal": False,
+            "available": False,
+            "error_type": type(exc).__name__,
+        }
+    if request is not None:
+        return request
+    return {
+        "request_id": request_id,
+        "status": "not_found",
+        "phase": "unknown",
+        "revision": None,
+        "terminal": False,
+        "available": False,
+    }
+
+
+def _convergence_worker_snapshot(
+    snapshot: dict[str, Any], request: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    request_job_id = str((request or {}).get("worker_job_id") or "")
+    job_id = str(snapshot.get("ci_job_id") or request_job_id or "")
+    if not job_id:
+        return None
+    try:
+        job = db_get_job(job_id)
+    except Exception as exc:
+        return {
+            "job_id": job_id,
+            "status": "unavailable",
+            "terminal": False,
+            "error_type": type(exc).__name__,
+        }
+    if job is None:
+        return {"job_id": job_id, "status": "not_found", "terminal": False}
+    result = _ci_summary(job) or {"job_id": job_id, "status": job.get("status")}
+    result["terminal"] = str(job.get("status") or "") in CONVERGENCE_TERMINAL_CI_STATUSES
+    return result
+
+
+def _enrich_convergence_snapshot(
+    snapshot: dict[str, Any],
+    *,
+    classification: str,
+) -> dict[str, Any]:
+    """Attach bounded request/Worker observations to one Store snapshot."""
+    result = dict(snapshot)
+    request = _convergence_request_snapshot(result)
+    worker = _convergence_worker_snapshot(result, request)
+    identity = {
+        "convergence_id": result.get("convergence_id"),
+        "repository": result.get("repository"),
+        "branch": result.get("branch"),
+        "development_session_id": result.get("development_session_id"),
+        "session_id": result.get("development_session_id"),
+        "workspace_id": result.get("workspace_id"),
+        "head_sha": result.get("head_sha"),
+        "commit_sha": result.get("head_sha"),
+        "tree_sha": result.get("tree_sha"),
+        "base_branch": result.get("base_branch"),
+        "base_sha": result.get("base_sha"),
+        "mode": result.get("mode"),
+    }
+    result["convergence_identity"] = identity
+    result["resume_classification"] = classification
+    result["ci_request"] = request
+    result["ci_request_phase"] = (request or {}).get("phase")
+    result["ci_request_status"] = (request or {}).get("status")
+    result["ci_request_revision"] = (request or {}).get("revision")
+    result["worker_job_id"] = str(result.get("ci_job_id") or (request or {}).get("worker_job_id") or "") or None
+    result["worker"] = worker
+    result["worker_job"] = worker
+    result["ci_job"] = worker
+    result["worker_status"] = (worker or {}).get("status")
+    return result
+
+
+def _resume_convergences(
+    *,
+    repository: str,
+    branch: str,
+    branch_head: str,
+    branch_tree: str,
+    workspace: dict[str, Any] | None,
+    session: dict[str, Any] | None,
+    current_main: dict[str, Any],
+) -> dict[str, Any]:
+    """Return current exact, pending and historical convergence evidence."""
+    identity = _resume_convergence_identity(
+        repository, branch, branch_head, branch_tree, workspace, session, current_main
+    )
+    empty = {
+        "identity": identity,
+        "live": {"identity": identity, "exact_head": False, "convergence": None},
+        "current_exact": [],
+        "pending": [],
+        "historical": [],
+        "primary": None,
+        "errors": [],
+    }
+    if not identity or not session:
+        return empty
+
+    session_exact = _resume_convergence_is_current(
+        {
+            "repository": repository,
+            "branch": branch,
+            "development_session_id": session.get("session_id"),
+            "head_sha": session.get("head_commit_sha"),
+            "tree_sha": session.get("tree_sha"),
+            "base_branch": identity["base_branch"],
+            "base_sha": identity["base_sha"],
+            "workspace_id": identity["workspace_id"],
+        },
+        identity,
+        session,
+        workspace,
+    )
+    snapshots: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    if session_exact:
+        for mode in CONVERGENCE_RESUME_MODES:
+            try:
+                active = convergence_store.find_active_convergence(
+                    repository=identity["repository"],
+                    development_session_id=identity["development_session_id"],
+                    head_sha=identity["head_sha"],
+                    tree_sha=identity["tree_sha"],
+                    mode=mode,
+                    base_branch=identity["base_branch"],
+                    base_sha=identity["base_sha"],
+                )
+            except Exception as exc:
+                errors.append({"operation": "find_active_convergence", "mode": mode, "error_type": type(exc).__name__})
+                continue
+            if active:
+                snapshots.append(active)
+    try:
+        snapshots.extend(_read_historical_convergences(identity))
+    except Exception as exc:
+        errors.append({"operation": "read_convergence_history", "error_type": type(exc).__name__})
+
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for snapshot in snapshots:
+        convergence_id = str(snapshot.get("convergence_id") or "")
+        if not convergence_id or convergence_id in seen:
+            continue
+        seen.add(convergence_id)
+        unique.append(snapshot)
+
+    current_raw = [
+        snapshot for snapshot in unique
+        if _resume_convergence_is_current(snapshot, identity, session, workspace)
+    ]
+    mode_order = {mode: index for index, mode in enumerate(CONVERGENCE_RESUME_MODES)}
+    current_raw.sort(key=lambda item: (mode_order.get(str(item.get("mode") or ""), 99), -float(item.get("updated_at") or 0)))
+    current_exact = [
+        _enrich_convergence_snapshot(
+            snapshot,
+            classification="pending" if not bool(snapshot.get("terminal")) else "historical",
+        )
+        for snapshot in current_raw
+    ]
+    pending = [item for item in current_exact if not bool(item.get("terminal"))]
+    pending_ids = {str(item.get("convergence_id")) for item in pending}
+    historical = [
+        _enrich_convergence_snapshot(
+            snapshot,
+            classification="historical",
+        )
+        for snapshot in unique
+        if str(snapshot.get("convergence_id")) not in pending_ids
+    ]
+    historical.sort(key=lambda item: -float(item.get("updated_at") or 0))
+    primary = pending[0] if pending else None
+    empty.update(
+        {
+            "live": {
+                "identity": identity,
+                "exact_head": bool(pending),
+                "convergence": primary,
+                "convergences": pending,
+            },
+            "current_exact": current_exact,
+            "pending": pending,
+            "historical": historical,
+            "primary": primary,
+            "errors": errors,
+        }
+    )
+    return empty
 
 
 def _session_evidence(session: dict[str, Any] | None, current_head: str) -> dict[str, Any]:
@@ -428,7 +720,16 @@ def _reconcile_transient_validation(session: dict[str, Any]) -> tuple[dict[str, 
     }, None
 
 
-def _next_actions(blockers: list[str], workspace: dict[str, Any] | None, session: dict[str, Any] | None, index: dict[str, Any] | None, pr: dict[str, Any] | None, policy: dict[str, Any], recovery_plan: dict[str, Any] | None = None) -> list[str]:
+def _next_actions(
+    blockers: list[str],
+    workspace: dict[str, Any] | None,
+    session: dict[str, Any] | None,
+    index: dict[str, Any] | None,
+    pr: dict[str, Any] | None,
+    policy: dict[str, Any],
+    recovery_plan: dict[str, Any] | None = None,
+    pending_convergences: list[dict[str, Any]] | None = None,
+) -> list[str]:
     if pr and pr.get("merged") is True and session and session.get("status") == "merged" and workspace and str(workspace.get("status")) == "closed":
         return ["managed_merge_finalized"]
     actions: list[str] = []
@@ -458,7 +759,13 @@ def _next_actions(blockers: list[str], workspace: dict[str, Any] | None, session
     if not blockers and workspace.get("lease_valid") and session.get("status") in ACTIVE_SESSION_STATUSES and index and index.get("status") == "ready":
         actions.append("continue_write")
         if bool((policy.get("policy") or {}).get("private_ci")):
-            actions.extend(["run_fast_ci", "run_full_ci"])
+            pending_modes = {
+                str(item.get("mode") or "") for item in (pending_convergences or [])
+            }
+            if "fast" not in pending_modes:
+                actions.append("run_fast_ci")
+            if "full" not in pending_modes:
+                actions.append("run_full_ci")
         actions.append("prepare_pr")
         if pr or session.get("pull_number"):
             actions.append("readiness")
@@ -645,6 +952,17 @@ def resume_task(
 
     ci = _recent_ci(repository, effective_branch, branch_head)
     session_evidence = _session_evidence(session, branch_head)
+    convergence_evidence = _resume_convergences(
+        repository=repository,
+        branch=effective_branch,
+        branch_head=branch_head,
+        branch_tree=branch_tree,
+        workspace=workspace,
+        session=session,
+        current_main=current_main,
+    )
+    if convergence_evidence["errors"]:
+        degraded.append("CONVERGENCE_STATE_UNAVAILABLE")
     blockers = list(dict.fromkeys(blockers))
     workspace_recovery = recovery or _workspace_recovery_plan(
         workspace,
@@ -667,20 +985,79 @@ def resume_task(
         "session_candidates": session_candidates,
         "index": index,
         "private_ci": {"current_head": ci, "session_evidence": session_evidence},
+        "convergence": convergence_evidence["primary"],
+        "convergence_identity": (
+            convergence_evidence["primary"].get("convergence_identity")
+            if convergence_evidence["primary"]
+            else None
+        ),
+        "convergence_phase": (
+            convergence_evidence["primary"].get("phase")
+            if convergence_evidence["primary"]
+            else None
+        ),
+        "convergence_status": (
+            convergence_evidence["primary"].get("status")
+            if convergence_evidence["primary"]
+            else None
+        ),
+        "convergence_revision": (
+            convergence_evidence["primary"].get("revision")
+            if convergence_evidence["primary"]
+            else None
+        ),
+        "current_exact_convergence": convergence_evidence["primary"],
+        "pending_convergence": (
+            convergence_evidence["pending"][0]
+            if convergence_evidence["pending"]
+            else None
+        ),
+        "pending_convergences": convergence_evidence["pending"],
+        "historical_convergences": convergence_evidence["historical"],
+        "convergence_evidence": {
+            "live": convergence_evidence["live"],
+            "pending": convergence_evidence["pending"],
+            "historical": convergence_evidence["historical"],
+        },
+        "pending_work": {
+            "convergences": convergence_evidence["pending"],
+            "ci_requests": [
+                item["ci_request"]
+                for item in convergence_evidence["pending"]
+                if item.get("ci_request")
+            ],
+            "worker_jobs": [
+                item["worker"]
+                for item in convergence_evidence["pending"]
+                if item.get("worker")
+            ],
+        },
         "pull_request_readiness": readiness,
         "overlap": overlap,
         "recovery": workspace_recovery,
         "blockers": blockers,
         "degraded": degraded,
     }
-    next_actions = _next_actions(blockers, workspace, session, index, pr, policy, workspace_recovery)
+    next_actions = _next_actions(
+        blockers,
+        workspace,
+        session,
+        index,
+        pr,
+        policy,
+        workspace_recovery,
+        convergence_evidence["pending"],
+    )
     response["live_facts"] = {
         "policy": policy, "current_main": current_main, "branch": branch_state, "pull_request": pr,
         "workspace": workspace, "development_session": session, "index": index,
         "private_ci_current_head": ci, "current_attestation": (session_evidence.get("current_head") or {}).get("validated_attestation"),
+        "convergence": convergence_evidence["live"],
         "pull_request_readiness": readiness, "overlap": overlap,
     }
     response["historical_evidence"] = {"session": session_evidence.get("historical")}
+    if convergence_evidence["historical"]:
+        response["historical_evidence"]["convergences"] = convergence_evidence["historical"]
     response["candidate_next_actions"] = next_actions
     response["next_allowed_actions"] = next_actions
     return response
