@@ -450,7 +450,7 @@ def _next_actions(blockers: list[str], workspace: dict[str, Any] | None, session
     if not session:
         return ["recovery_required", "prepare_development_task"]
     if "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS" in blockers:
-        return ["wait_private_ci_job", "resume_development_task"]
+        return ["get_private_ci_job", "resume_development_task"]
     if session.get("status") in BLOCKED_SESSION_STATUSES:
         return ["recovery_required"]
     if index and index.get("status") != "ready":

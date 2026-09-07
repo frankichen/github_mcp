@@ -587,7 +587,7 @@ CRITICAL WORKFLOW:
 1. Supply the FULL 40-character commit_sha and a stable idempotency_key
 2. Save request_id; worker_job_id/job_id may truthfully be null while preparing
 3. Replaying the same request/key is safe; a different request with the same key conflicts
-4. Once worker_job_id exists, existing get/wait/log tools continue to use that Worker Job ID
+4. Continue non-terminal tracking with get_private_ci_job snapshots; use diagnostics only when needed
 
 This is for the private WSL CI system. NOT for GitHub Actions dispatch (use start_ci_job for that).""",
     )
@@ -791,7 +791,7 @@ This is for the private CI system. NOT for GitHub Actions runs (use get_ci_job f
 
     @mcp.tool(
         name="wait_private_ci_job",
-        description="Long-poll one private CI job for up to 55 seconds. Returns on status, step, log revision, terminal, or timeout; use instead of repeated polling.",
+        description="Deprecated compatibility-only long-poll for explicit legacy/debug callers. Retains the legacy up-to-55-second status/step/revision wait contract. It is not the canonical ChatGPT Web CI tracking path; normal Web continuation uses get_private_ci_job snapshots and must not loop this tool until terminal.",
     )
     async def wait_private_ci_job(
         job_id: str, timeout_seconds: int = 55, last_known_status: str = "",

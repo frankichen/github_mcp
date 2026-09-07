@@ -6,7 +6,7 @@
 
 - Controller 注册 `get_private_ci_log_tail`，只返回指定 job 的日志尾部。
 - Agent 日志批处理默认 32KB，并保留日志上限和 `truncated` 状态。
-- `wait_private_ci_job`、`wait_test_deployment`、`get_test_deployment_log_tail` 保留长轮询和尾部读取能力。
+- `wait_private_ci_job` 继续保留 legacy 55 秒 long-poll，但仅作为 compatibility/debug 能力；ChatGPT Web canonical CI 跟踪使用 `start_private_ci_job` → `get_private_ci_job` snapshot，不循环 wait 到 terminal。`wait_test_deployment`、`get_test_deployment_log_tail` 继续保留既有长轮询/尾部读取能力。
 - `scripts/test_local_parallel.sh` 并行运行 Controller、Private CI Agent、Executor 三套测试。
 - `scripts/ci_performance_5x.sh` 连续执行五次本地完整测试并生成 JSONL 性能记录。
 

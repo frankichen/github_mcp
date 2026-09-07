@@ -184,7 +184,7 @@ def test_resume_keeps_running_validation_fail_closed(monkeypatch):
     assert result["development_session"] == session
     assert result["recovery"]["transient"]["validation_in_progress"] is True
     assert "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS" in result["blockers"]
-    assert result["next_allowed_actions"] == ["wait_private_ci_job", "resume_development_task"]
+    assert result["next_allowed_actions"] == ["get_private_ci_job", "resume_development_task"]
     assert "continue_write" not in result["next_allowed_actions"]
 
 
