@@ -4102,7 +4102,7 @@
       "read_only": false,
       "consequential": true,
       "category": "private_ci",
-      "description": "Long-poll one private CI job for up to 55 seconds. Returns on status, step, log revision, terminal, or timeout; use instead of repeated polling.",
+      "description": "Deprecated compatibility-only long-poll for explicit legacy/debug callers. Retains the legacy up-to-55-second status/step/revision wait contract. It is not the canonical ChatGPT Web CI tracking path; normal Web continuation uses get_private_ci_job snapshots and must not loop this tool until terminal.",
       "input_schema": {
         "properties": {
           "job_id": {

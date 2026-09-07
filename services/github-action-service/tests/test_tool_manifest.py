@@ -8,7 +8,7 @@ from app.mcp_server import mcp
 
 
 EXPECTED_REGISTERED_TOOL_COUNT = 175
-EXPECTED_CANONICAL_TOOL_COUNT = 165
+EXPECTED_CANONICAL_TOOL_COUNT = 164
 DX1_TOOLS = [
     "prepare_development_task",
     "resume_development_task",
@@ -59,6 +59,7 @@ HIDDEN_DEPRECATED_TOOLS = {
     "begin_github_file_upload", "append_github_file_upload_chunk", "finalize_github_file_upload",
     "commit_github_uploaded_files", "put_github_file", "put_github_files",
     "put_github_file_from_local_candidate",
+    "wait_private_ci_job",
 }
 
 
