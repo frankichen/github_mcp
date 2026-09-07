@@ -30,6 +30,9 @@ _ORCHESTRATION=ToolAnnotations(readOnlyHint=False,destructiveHint=False,idempote
 def _error_payload(exc: Exception, *, log_unexpected: bool = True) -> dict[str, Any]:
     if isinstance(exc,mygithub12.MyGithub12Error):
         return {"ok":False,"error":{"code":exc.code,"message":exc.message,"details":exc.details,"trace_id":exc.trace_id,"retryable":bool(exc.details.get("retryable",False))}}
+    if isinstance(exc,mygithub10.MyGithub10Error):
+        details=dict(exc.details or {})
+        return {"ok":False,"error":{"code":exc.code,"message":exc.message,"details":details,"trace_id":str(uuid.uuid4()),"retryable":bool(details.get("retryable",False))}}
     if log_unexpected:
         logger.exception("DX orchestration failed")
     return {"ok":False,"error":{"code":"INTERNAL_ERROR","message":"development orchestration failed","details":{"type":type(exc).__name__},"trace_id":str(uuid.uuid4()),"retryable":False}}
@@ -505,7 +508,7 @@ def register_dx_tools(
                     )
                 prepared=await github_call(
                     prepared_store.create_prepared_change_set,source_artifact,parsed,result,session,workspace,
-                    expected_head_sha=session["head_commit_sha"],
+                    expected_head_sha=session["head_commit_sha"],idempotency_key=effective_idempotency_key,
                 )
                 owned_artifact_id=""
                 result.update({

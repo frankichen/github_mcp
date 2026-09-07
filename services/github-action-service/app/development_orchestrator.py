@@ -222,11 +222,39 @@ def maybe_auto_renew_session_workspace(
     session=sessions.get_session(session_id); ws=mygithub12.get_workspace(service,session["workspace_id"])
     current_revision=int(session["session_revision"]); workspace_revision=int(ws["revision"])
     last=(session.get("metadata") or {}).get("last_session_recovery")
-    replay_candidate=bool(
-        idempotency_key and isinstance(last,dict) and last.get("idempotency_key")==idempotency_key
+    same_recovery_key=bool(idempotency_key and isinstance(last,dict) and last.get("idempotency_key")==idempotency_key)
+    recovery_replay=bool(
+        same_recovery_key
         and int(((last.get("after") or {}).get("session_revision") or -1))==current_revision
     )
-    if current_revision!=int(expected_session_revision) and not replay_candidate:
+    recovery_before=(last.get("before") or {}) if same_recovery_key else {}
+    recovery_after=(last.get("after") or {}) if same_recovery_key else {}
+    renewal_event=next((
+        event for event in reversed(sessions.list_events(session_id))
+        if event.get("event_type")=="workspace_lease_auto_renewed"
+        and (event.get("data") or {}).get("idempotency_key")==idempotency_key
+    ),None) if idempotency_key and current_revision!=int(expected_session_revision) else None
+    renewal_data=(renewal_event or {}).get("data") or {}
+    renewal_replay=bool(
+        renewal_event
+        and int(renewal_event.get("session_revision") or -1)==current_revision
+        and int(renewal_data.get("after_workspace_revision") or -1)==workspace_revision
+        and int(expected_session_revision) in {
+            current_revision-1,
+            int(recovery_before.get("session_revision") or -1),
+        }
+        and int(expected_workspace_revision) in {
+            int(renewal_data.get("before_workspace_revision") or -1),
+            int(recovery_before.get("workspace_revision") or -1),
+            int(recovery_after.get("workspace_revision") or -1),
+        }
+        and (
+            not same_recovery_key
+            or int(recovery_after.get("session_revision") or -1) in {current_revision,current_revision-1}
+        )
+    )
+    internal_replay=recovery_replay or renewal_replay
+    if current_revision!=int(expected_session_revision) and not internal_replay:
         sessions._require_revision(session_id,expected_session_revision)
     local_stale=(
         int(session["workspace_revision"])!=workspace_revision
@@ -234,12 +262,13 @@ def maybe_auto_renew_session_workspace(
         or abs(float(session["lease_expires_at"])-float(ws["lease_expires_at"]))>0.001
     )
     recovery=None
-    if local_stale or replay_candidate:
+    if local_stale or recovery_replay:
         recovery=recover_stale_session(service,session_id,expected_session_revision,expected_workspace_revision,expected_head_sha,idempotency_key)
         session=recovery["session"]; ws=recovery["workspace"]; workspace_revision=int(ws["revision"]); current_revision=int(session["session_revision"])
     else:
-        sessions._require_revision(session_id,expected_session_revision)
-        if expected_workspace_revision and workspace_revision!=int(expected_workspace_revision): raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH","workspace revision changed",{"expected":expected_workspace_revision,"actual":workspace_revision})
+        if not renewal_replay:
+            sessions._require_revision(session_id,expected_session_revision)
+        if expected_workspace_revision and workspace_revision!=int(expected_workspace_revision) and not renewal_replay: raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH","workspace revision changed",{"expected":expected_workspace_revision,"actual":workspace_revision})
         if expected_head_sha and session["head_commit_sha"]!=expected_head_sha: raise MyGithub12Error("DEVELOPMENT_SESSION_RECOVERY_REQUIRED","session HEAD identity differs from expected HEAD",{"session_head":session["head_commit_sha"],"expected_head":expected_head_sha})
     if session["status"] not in AUTO_RENEW_SESSION_STATES: raise MyGithub12Error("DEVELOPMENT_SESSION_STATE_INVALID","development session state does not permit workspace auto-renew",{"status":session["status"]})
     if int(session["workspace_revision"])!=workspace_revision: raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH","session does not reference the current workspace revision",{"session_workspace_revision":session["workspace_revision"],"workspace_revision":workspace_revision})
@@ -249,7 +278,7 @@ def maybe_auto_renew_session_workspace(
     if session["head_commit_sha"]!=ws["head_sha"] or session["tree_sha"]!=ws["tree_sha"]: raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH","session and workspace Git identities differ")
     now=mygithub12._now(); remaining=min(float(session["lease_expires_at"]),float(ws["lease_expires_at"]))-now
     if remaining>AUTO_RENEW_THRESHOLD_SECONDS:
-        return {"renewed":False,"session":session,"workspace":ws,"remaining_seconds":remaining,"recovery":recovery}
+        return {"renewed":False,"session":session,"workspace":ws,"remaining_seconds":remaining,"recovery":recovery,"replayed_internal_maintenance":renewal_replay}
     branch_state=service.client.get_branch(session["repository"],session["branch"]); actual_head=str(branch_state.commit.sha) if branch_state else ""
     if actual_head!=session["head_commit_sha"]:
         _append_recovery_event_best_effort(session_id,current_revision,"external_drift_detected",{"reason_code":"WORKSPACE_BRANCH_DRIFTED","workspace_head":ws["head_sha"],"session_head":session["head_commit_sha"],"actual_head":actual_head})
