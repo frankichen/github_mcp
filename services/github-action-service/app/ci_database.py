@@ -395,7 +395,7 @@ def create_or_get_job(
 def _create_or_get_job_in_transaction(
     db, repository, branch, commit_sha, profile, priority, timeout_seconds,
     force_rerun, supersede_previous, base_sha, changed_files,
-    changed_files_total, changed_files_truncated, idem_key, ts,
+    changed_files_total, changed_files_truncated, idem_key, ts, commit: bool = True,
 ) -> dict:
 
     if not force_rerun:
@@ -425,7 +425,8 @@ def _create_or_get_job_in_transaction(
                 "queued_count": _count_queued(db),
                 "created_at": datetime.fromtimestamp(row["created_at"], tz=timezone.utc).isoformat(),
             }
-            db.commit()
+            if commit:
+                db.commit()
             return result
 
     if supersede_previous:
@@ -445,14 +446,14 @@ def _create_or_get_job_in_transaction(
          int(bool(changed_files_truncated)), profile, priority, timeout_seconds, ts),
     )
     _upsert_repo_queue_state(db, repository, queued_delta=1)
-    db.commit()
-
-    # Verify the durable row on the same connection before reporting success.
-    # This turns any unexpected persistence failure into an error response,
-    # never a false-positive job id.
-    persisted = db.execute("SELECT 1 FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
-    if not persisted:
-        raise sqlite3.OperationalError("CI job commit verification failed")
+    if commit:
+        db.commit()
+        # Verify the durable row on the same connection before reporting success.
+        # This turns any unexpected persistence failure into an error response,
+        # never a false-positive job id.
+        persisted = db.execute("SELECT 1 FROM ci_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        if not persisted:
+            raise sqlite3.OperationalError("CI job commit verification failed")
 
     return {
         "job_id": job_id,
@@ -474,6 +475,26 @@ def _create_or_get_job_in_transaction(
         "queued_count": _count_queued(db),
         "created_at": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
     }
+
+
+def create_ci_request_job_in_transaction(
+    db, *, request_id: str, repository: str, branch: str, commit_sha: str,
+    profile: str, priority: int, timeout_seconds: int, base_sha: str,
+    changed_files: list[str], changed_files_total: int,
+    changed_files_truncated: bool, supersede_previous: bool,
+) -> dict:
+    """Create/reuse one Worker Job for a durable Request without committing.
+
+    The caller owns the surrounding SQLite transaction so Worker creation and
+    Request binding become visible atomically. A request-scoped Worker
+    idempotency key prevents legacy repository+commit+profile aliasing.
+    """
+    return _create_or_get_job_in_transaction(
+        db, repository, branch, commit_sha, profile, priority, timeout_seconds,
+        False, supersede_previous, base_sha, changed_files,
+        changed_files_total, changed_files_truncated,
+        f"ci-request:{request_id}", now_ts(), commit=False,
+    )
 
 
 def _get_queue_position(db, job_id: str) -> int:
