@@ -608,10 +608,10 @@ def register_dx_tools(
                     logger.exception("unprepared ChangeSet artifact could not be invalidated")
             return _error(exc)
 
-    @mcp.tool(name="validate_development_task",description="Run or reuse fast/full private CI for an exact Session head; fast feedback never becomes merge-eligible, full success yields attestation.",annotations=_ORCHESTRATION)
+    @mcp.tool(name="validate_development_task",description="Run or reuse fast/full private CI for an exact Session head and return the current durable status without waiting by default; fast feedback never becomes merge-eligible, full success yields attestation.",annotations=_ORCHESTRATION)
     async def validate_development_task(
         development_session_id: str, expected_session_revision: int, mode: str="fast", base_sha: str="", force_rerun: bool=False,
-        supersede_previous: bool=True, wait_seconds: int=55, include_failure_pack: bool=True, idempotency_key: str="",
+        supersede_previous: bool=True, wait_seconds: int=0, include_failure_pack: bool=True, idempotency_key: str="",
     ) -> str:
         try:
             session=sessions.get_session(development_session_id)
