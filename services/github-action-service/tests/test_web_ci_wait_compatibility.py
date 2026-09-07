@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -113,6 +114,7 @@ async def test_explicit_compatibility_exposure_restores_wait_and_legacy_contract
 @pytest.mark.asyncio
 async def test_capabilities_report_wait_deprecation_and_schema_visibility(monkeypatch):
     monkeypatch.setenv("MYGITHUB12_RUNTIME_MODE", "production")
+    monkeypatch.setenv("MYGITHUB12_BUILD_SHA", "a" * 40)
     monkeypatch.setenv("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", "false")
 
     production = json.loads(await get_mygithub_capabilities())
@@ -143,7 +145,7 @@ async def test_capabilities_report_wait_deprecation_and_schema_visibility(monkey
 
 @pytest.mark.asyncio
 async def test_static_manifests_keep_wait_as_hidden_compatibility_tool(monkeypatch):
-    root = Path(__file__).resolve().parents[3]
+    root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     legacy = json.loads((root / "docs" / "MYGITHUB10_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     canonical = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     legacy_wait = next(tool for tool in legacy["tools"] if tool["name"] == "wait_private_ci_job")
@@ -159,7 +161,7 @@ async def test_static_manifests_keep_wait_as_hidden_compatibility_tool(monkeypat
 
 
 def test_current_web_instructions_recommend_snapshot_continuation():
-    root = Path(__file__).resolve().parents[3]
+    root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     readme = (root / "README.md").read_text(encoding="utf-8")
     instructions = (root / "services" / "github-action-service" / "custom-gpt-instructions.md").read_text(encoding="utf-8")
 
