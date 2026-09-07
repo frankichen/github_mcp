@@ -608,10 +608,10 @@ def register_dx_tools(
                     logger.exception("unprepared ChangeSet artifact could not be invalidated")
             return _error(exc)
 
-    @mcp.tool(name="validate_development_task",description="Run or reuse fast/full private CI for an exact Session head; fast feedback never becomes merge-eligible, full success yields attestation.",annotations=_ORCHESTRATION)
+    @mcp.tool(name="validate_development_task",description="Run or reuse fast/full private CI for an exact Session head and return the current durable status without waiting by default; fast feedback never becomes merge-eligible, full success yields attestation.",annotations=_ORCHESTRATION)
     async def validate_development_task(
         development_session_id: str, expected_session_revision: int, mode: str="fast", base_sha: str="", force_rerun: bool=False,
-        supersede_previous: bool=True, wait_seconds: int=55, include_failure_pack: bool=True, idempotency_key: str="",
+        supersede_previous: bool=True, wait_seconds: int=0, include_failure_pack: bool=True, idempotency_key: str="",
     ) -> str:
         try:
             session=sessions.get_session(development_session_id)
@@ -628,7 +628,7 @@ def register_dx_tools(
             phase="validating_fast" if mode=="fast" else "validating_full"
             phase_session=await github_call(sessions.transition,development_session_id,effective_session_revision,phase,event_type="validation_started",allowed_from={"active","pr_ready","validating_fast","validating_full"})
             try:
-                job,selection=await github_call(dx.start_validation_job,service,phase_session,mode,resolved_base,force_rerun,supersede_previous,prepared)
+                request,selection=await github_call(dx.start_validation_request,service,phase_session,mode,resolved_base,force_rerun,supersede_previous,idempotency_key,prepared)
             except Exception as start_exc:
                 rollback=None; rollback_error=None
                 try:
@@ -652,22 +652,25 @@ def register_dx_tools(
             try:
                 await github_call(
                     sessions.record_validation,development_session_id,phase_session["session_revision"],mode,
-                    phase_session["head_commit_sha"],phase_session["tree_sha"],job_id=job["job_id"],
-                    status=job.get("status") or "queued",evidence={"selection":selection},
+                    phase_session["head_commit_sha"],phase_session["tree_sha"],job_id=request.get("worker_job_id") or "",
+                    status=request.get("status") or "accepted",evidence={"selection":selection,"request_id":request["request_id"]},
                 )
             except Exception as correlate_exc:
                 correlate_error=_error_payload(correlate_exc)
                 return json.dumps({
                     "ok":False,"development_session":phase_session,"mode":mode,
                     "validation_started":True,"recovery_required":True,
-                    "job":{"job_id":job.get("job_id"),"status":job.get("status"),"profile":job.get("profile"),"commit_sha":job.get("commit_sha")},
+                    "request":{"request_id":request.get("request_id"),"phase":request.get("phase"),"status":request.get("status"),"worker_job_id":request.get("worker_job_id")},
+                    "job":{"job_id":request.get("worker_job_id"),"status":None,"profile":request.get("profile"),"commit_sha":request.get("commit_sha")},
                     "failed_stage":"validation_correlate","orchestration_error":correlate_error["error"],
                 },ensure_ascii=False)
             result=None
             try:
-                job=await github_call(dx.wait_validation,job["job_id"],wait_seconds)
-                result=await github_call(dx.validation_result,development_session_id,phase_session["session_revision"],mode,job,selection,include_failure_pack)
-                fields={"last_fast_ci_job_id" if mode=="fast" else "last_full_ci_job_id":job["job_id"]}
+                if int(wait_seconds or 0)>0:
+                    _,_,request=await github_call(dx.wait_validation_request,request,wait_seconds)
+                result=await github_call(dx.validation_observation,development_session_id,phase_session["session_revision"],mode,request,selection,include_failure_pack)
+                fields={}
+                if result.get("job",{}).get("job_id"): fields["last_fast_ci_job_id" if mode=="fast" else "last_full_ci_job_id"]=result["job"]["job_id"]
                 if isinstance(result.get("attestation"),dict) and result["attestation"].get("attestation_id"): fields["last_attestation_id"]=result["attestation"]["attestation_id"]
                 if isinstance(result.get("failure_pack"),dict) and result["failure_pack"].get("resource_uri"): fields["last_failure_resource_uri"]=result["failure_pack"]["resource_uri"]
                 next_status=("pr_ready" if result.get("merge_eligible") else "active") if result.get("terminal") else phase
@@ -677,7 +680,8 @@ def register_dx_tools(
                 return json.dumps({
                     "ok":False,"development_session":phase_session,"mode":mode,
                     "validation_started":True,"recovery_required":True,
-                    "job":{"job_id":job.get("job_id"),"status":job.get("status"),"profile":job.get("profile"),"commit_sha":job.get("commit_sha")},
+                    "request":{"request_id":request.get("request_id"),"phase":request.get("phase"),"status":request.get("status"),"worker_job_id":request.get("worker_job_id")},
+                    "job":{"job_id":request.get("worker_job_id"),"status":None,"profile":request.get("profile"),"commit_sha":request.get("commit_sha")},
                     "validation_result":result,"failed_stage":"validation_observe",
                     "orchestration_error":observe_error["error"],
                 },ensure_ascii=False)

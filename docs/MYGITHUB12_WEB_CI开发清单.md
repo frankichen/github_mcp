@@ -108,15 +108,15 @@
 
 ### WEB-CI-DEV-007：`validate_development_task` 非阻塞化
 
-- [ ] 默认调用不再 `wait_seconds=55`。
-- [ ] 启动/复用 CI 后立即返回 durable status。
-- [ ] running 时返回 `continuation_required=true`。
-- [ ] terminal passed 时生成/读取 attestation。
-- [ ] terminal failed 时返回 failure_pack identity/availability。
-- [ ] 重试由 exact Session revision + idempotency 保证。
+- [x] 默认调用不再 `wait_seconds=55`。
+- [x] 启动/复用 CI 后立即返回 durable status。
+- [x] running 时返回 `continuation_required=true`。
+- [x] terminal passed 时生成/读取 attestation。
+- [x] terminal failed 时返回 failure_pack identity/availability。
+- [x] 重试由 exact Session revision + idempotency 保证。
 
 映射验收：AC-WEB-CI-01/03/05/12。  
-证据：`待填写`
+证据：implementation commits `d8fe93a7ef0a416cd9bf7cc847bfbb808943ac16`、`1377949e88caa43bbea7811d0cfae4cbb7d29a06`、`7498cf373278d6798cd96e37a80193ec04b24e8d`、`cfce1418d4cce93f5caff17f498e5c03947485e2`、`9c0a49c3eaa809f053dd9fbd70420f7b8544f703`、`5d79c2c626d946b0880786750347a09bd20a36e6`；test commits `30d3cd33c5086308be24d64399e6401c5cd4aa22`、`4bb69260fe15fd8cd5a65e97c7eb368349cc64ff`、`64c70d7377455f0431fe210a567487421e4a5694`、`81bcfbd06785feb21cdb60333ae0637ca59bfd5d` / Tree `0a90a828ab7977414702bdf384f7e1164992336a`。`validate_development_task` canonical default `wait_seconds=0`，使用 `start_validation_request` 创建/复用 durable CI Request，默认只读取 Request/Worker snapshot；显式 `wait_seconds>0` 才走 compatibility `wait_validation_request`。`test_web_ci_validate_nonblocking.py` 覆盖 accepted/preparing Worker absent truthful snapshot、queued/running snapshot、terminal passed attestation、terminal failed failure_pack identity、same idempotency no duplicate Request/Job、stale Session revision fail-stop、fake 10+ minute CI non-blocking；`test_web_ci_wait_baseline.py` 保留 legacy wait baseline 并更新 validate 默认非阻塞断言；`test_dx1_orchestration.py` 更新 start failure rollback hook。修复前 Job `7094f954a363481b` 暴露测试辅助函数误写不存在的 `ci_jobs.current_step`；修复后 Private CI `repo-auto-check` Job `274ed63cd1674592` passed / exit 0，含 `services/github-action-service` ruff、compileall、pytest 与其他 Python workspace checks。DEV-008/009、Failure Pack redesign、recovery redesign 未纳入本任务。
 
 ### WEB-CI-DEV-008：`converge_development_task` 状态机化
 

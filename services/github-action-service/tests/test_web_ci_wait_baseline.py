@@ -123,8 +123,8 @@ def test_wait_for_job_change_caps_long_poll_at_55_without_real_sleep(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_validate_development_task_defaults_to_55_and_enters_wait_path(monkeypatch):
-    mcp = StructuredFastMCP("web-ci-validate-baseline")
+async def test_validate_development_task_defaults_to_zero_and_returns_durable_snapshot(monkeypatch):
+    mcp = StructuredFastMCP("web-ci-validate-nonblocking")
     service = SimpleNamespace()
     session = _session(session_revision=1, workspace_revision=3)
     events = []
@@ -136,6 +136,9 @@ async def test_validate_development_task_defaults_to_55_and_enters_wait_path(mon
         lambda *args, **kwargs: {
             "profile": "repo-fast-check",
             "selection": {"complete": True},
+            "base_sha": SHA_A,
+            "priority": 100,
+            "timeout_seconds": 900,
         },
     )
     monkeypatch.setattr(
@@ -157,32 +160,45 @@ async def test_validate_development_task_defaults_to_55_and_enters_wait_path(mon
         return {**session, "status": status, "session_revision": expected_revision + 1}
 
     monkeypatch.setattr(sessions, "transition", transition)
-    job = {
-        "job_id": "job-validate",
-        "status": "running",
+    request = {
+        "request_id": "ci_req_validate",
+        "phase": "accepted",
+        "status": "accepted",
+        "revision": 0,
+        "worker_job_id": None,
         "profile": "repo-fast-check",
         "commit_sha": SHA_B,
     }
 
-    def start_validation(*args, **kwargs):
-        events.append(("start_ci", "job-validate"))
-        return dict(job), {"complete": True}
+    def start_validation_request(*args, **kwargs):
+        events.append(("start_request", "ci_req_validate"))
+        return dict(request), {"complete": True}
 
-    monkeypatch.setattr(dx, "start_validation_job", start_validation)
+    monkeypatch.setattr(dx, "start_validation_request", start_validation_request)
     monkeypatch.setattr(sessions, "record_validation", lambda *args, **kwargs: None)
-
-    def wait_validation(job_id, wait_seconds):
-        events.append(("wait_ci", wait_seconds))
-        return dict(job)
-
-    monkeypatch.setattr(dx, "wait_validation", wait_validation)
     monkeypatch.setattr(
         dx,
-        "validation_result",
+        "wait_validation_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("default validate must not wait")),
+    )
+    monkeypatch.setattr(
+        dx,
+        "validation_observation",
         lambda *args, **kwargs: {
+            "request": {
+                "request_id": "ci_req_validate",
+                "phase": "accepted",
+                "status": "accepted",
+                "revision": 0,
+                "worker_job_id": None,
+            },
+            "request_id": "ci_req_validate",
+            "phase": "accepted",
+            "status": "accepted",
+            "revision": 0,
             "job": {
-                "job_id": "job-validate",
-                "status": "running",
+                "job_id": None,
+                "status": None,
                 "profile": "repo-fast-check",
                 "commit_sha": SHA_B,
             },
@@ -191,6 +207,9 @@ async def test_validate_development_task_defaults_to_55_and_enters_wait_path(mon
             "attestation": None,
             "failure_pack": None,
             "terminal": False,
+            "continuation_required": True,
+            "durable_status": {"queue_state": "not_created"},
+            "next_actions": [{"tool": "get_private_ci_job", "request_id": "ci_req_validate"}],
         },
     )
 
@@ -212,10 +231,11 @@ async def test_validate_development_task_defaults_to_55_and_enters_wait_path(mon
         )
     )
 
-    assert ("start_ci", "job-validate") in events
-    assert ("wait_ci", 55) in events
-    assert events.index(("start_ci", "job-validate")) < events.index(("wait_ci", 55))
-    assert result["job"]["status"] == "running"
+    assert ("start_request", "ci_req_validate") in events
+    assert not any(event[0] == "wait_ci" for event in events)
+    assert result["request_id"] == "ci_req_validate"
+    assert result["continuation_required"] is True
+    assert result["durable_status"]["queue_state"] == "not_created"
 
 
 @pytest.mark.asyncio
