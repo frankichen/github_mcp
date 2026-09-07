@@ -133,13 +133,13 @@
 
 ### WEB-CI-DEV-009：`resume_development_task` 接入 pending convergence
 
-- [ ] resume 返回当前 exact-head convergence identity/phase。
-- [ ] 区分 live/pending/historical evidence。
-- [ ] 可从 branch/PR 新窗口恢复同一 CI。
-- [ ] 不因 Resource 过期或窗口变化重复跑 CI。
+- [x] resume 返回当前 exact-head convergence identity/phase。
+- [x] 区分 live/pending/historical evidence。
+- [x] 可从 branch/PR 新窗口恢复同一 CI。
+- [x] 不因 Resource 过期或窗口变化重复跑 CI。
 
 映射验收：AC-WEB-CI-03/10/14。  
-证据：`待填写`
+证据：正式集成代码 candidate `e83544257a14e1d9a066a6f157846c8dc397e5d6`；DEV-009 targeted `test_web_ci_convergence_resume.py + test_development_convergence_store.py + test_dx2_resume.py` 在 Python 3.12 隔离容器中 `41 passed`；resume production delta 静态确认无 CI start/wait/sleep 调用，历史 convergence 通过 Store 最小 read-only public helper 读取。
 
 ## 5. P0：诊断面增强
 
