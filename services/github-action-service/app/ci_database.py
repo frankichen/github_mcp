@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from app import observability
 from app.ci_models import CIJobStatus, ALLOWED_PRIORITIES, make_idempotency_key
 
 logger = logging.getLogger(__name__)
@@ -478,11 +479,11 @@ def _create_or_get_job_in_transaction(
 
     db.execute(
         """INSERT INTO ci_jobs (job_id, idempotency_key, repository, branch, commit_sha, base_sha, changed_files_json,
-           changed_files_total, changed_files_truncated, profile, priority, status, timeout_seconds, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+           changed_files_total, changed_files_truncated, profile, priority, status, timeout_seconds, created_at, queued_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)""",
         (job_id, idem_key, repository, branch, commit_sha, base_sha, json.dumps(changed_files or []),
          int(changed_files_total if changed_files_total is not None else len(changed_files or [])),
-         int(bool(changed_files_truncated)), profile, priority, timeout_seconds, ts),
+         int(bool(changed_files_truncated)), profile, priority, timeout_seconds, ts, ts),
     )
     _upsert_repo_queue_state(db, repository, queued_delta=1)
     if commit:
@@ -1007,7 +1008,18 @@ def complete_job(
             )
         _upsert_repo_queue_state(db, row["repository"], running_delta=-1)
         _add_event(db, job_id, "completed", json.dumps({"status": status, "exit_code": exit_code}))
+        completed_lifecycle = {
+            "created_at": row["created_at"],
+            "queued_at": row["queued_at"],
+            "started_at": row["started_at"],
+            "finished_at": ts,
+            "duration_seconds": duration,
+        }
         db.commit()
+    try:
+        observability.observe_private_ci_lifecycle(completed_lifecycle)
+    except Exception:
+        logger.exception("private CI lifecycle metric observation failed")
     _notify_job_change(job_id)
     return True
 

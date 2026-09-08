@@ -225,17 +225,17 @@
 
 ### WEB-CI-DEV-016：MCP duration 与 wait-path 指标
 
-- [ ] 每个 canonical tool 有 duration metric。
-- [ ] 能区分主动 wait 与普通 handler 时间。
-- [ ] CI phase、queue、execution 时间可统计。
-- [ ] convergence phase 时间可统计。
-- [ ] idempotent reuse/conflict 可统计。
-- [ ] Failure Pack build duration/bytes 可统计。
-- [ ] inline/resource fallback 可统计。
-- [ ] 避免 repository/job/branch 等高基数字段进入 Prometheus label。
+- [x] 每个 canonical tool 有 duration metric。
+- [x] 能区分主动 wait 与普通 handler 时间。
+- [x] CI phase、queue、execution 时间可统计。
+- [x] convergence phase 时间可统计。
+- [x] idempotent reuse/conflict 可统计。
+- [x] Failure Pack build duration/bytes 可统计。
+- [x] inline/resource fallback 可统计。
+- [x] 避免 repository/job/branch 等高基数字段进入 Prometheus label。
 
 映射验收：AC-WEB-CI-14/15。  
-证据：`待填写`
+证据：implementation candidate `05310ef4b1c97251509f7afe1635837073ec5a84` / Tree `4164421c5c5c09281a52cdea0232f2ecbe5eb59a`；exact Index `12.0.0-1` ready（`288 files / 3296 symbols`）；`test_web_ci_observability.py` 覆盖 canonical MCP count/duration、ordinary vs explicit wait、durable CI queue/execution/total、Convergence phase、idempotency reuse/conflict、Failure Pack duration/bytes/redaction、inline/resource fallback 与 label cardinality，并证明重复 snapshot 不重复累计 lifecycle duration；candidate `repo-auto-check` Job `a3962f8606cb4ae9` passed / exit 0，`github-action-service` ruff passed、compileall passed、full pytest `880 passed in 199.21s`；Change Impact 为 8 files / 1 affected module，Contract Change Detection 为 0；初始 queued Job 在现有 `ci_jobs.queued_at` 写 durable timestamp，terminal duration 仅在 durable `complete_job` commit 后累计；`/metrics` 仍沿用原认证路由。
 
 ### WEB-CI-DEV-017：CI 本身性能优化保持独立
 

@@ -47,6 +47,7 @@ from app.ci_repository_config import (
     get_max_timeout,
     get_allowed_profiles,
 )
+from app import observability
 from app.development_failure_pack import redact_text
 
 logger = logging.getLogger(__name__)
@@ -523,6 +524,7 @@ def build_private_ci_snapshot_response(
     })
     if detail_level == "full" and request:
         result["request"] = dict(request)
+    observability.observe_private_ci_phase(phase)
     return _redact_private_ci_value(result)
 
 
@@ -734,6 +736,7 @@ This is for the private WSL CI system. NOT for GitHub Actions dispatch (use star
                         get_ci_request, existing["request_id"]
                     ) or existing
                     request["deduplicated"] = True
+                    observability.observe_idempotency("private_ci", "reuse")
                     snapshot = build_private_ci_start_response(request)
                     if request["phase"] in {"accepted", "preparing"}:
                         schedule_ci_request_preparation(request["request_id"])
@@ -782,11 +785,14 @@ This is for the private WSL CI system. NOT for GitHub Actions dispatch (use star
                 normalized_request_hash=request_hash,
                 request_payload=normalized_payload,
             )
+            if request.get("deduplicated"):
+                observability.observe_idempotency("private_ci", "reuse")
             snapshot = build_private_ci_start_response(request)
             if request["phase"] in {"accepted", "preparing"}:
                 schedule_ci_request_preparation(request["request_id"])
             return json.dumps(snapshot, ensure_ascii=False)
         except CIRequestIdempotencyConflictError:
+            observability.observe_idempotency("private_ci", "conflict")
             return _error_response(
                 "IDEMPOTENCY_CONFLICT",
                 "idempotency_key is already bound to a different normalized CI request",
@@ -889,10 +895,17 @@ This is for the private CI system. NOT for GitHub Actions runs (use get_ci_job f
         last_known_step: str = "", last_known_revision: int = 0,
     ) -> str:
         try:
-            result = await asyncio.to_thread(
-                wait_for_job_change, job_id, timeout_seconds, last_known_status,
-                last_known_step, last_known_revision,
-            )
+            if timeout_seconds > 0:
+                with observability.explicit_wait("private_ci_job"):
+                    result = await asyncio.to_thread(
+                        wait_for_job_change, job_id, timeout_seconds, last_known_status,
+                        last_known_step, last_known_revision,
+                    )
+            else:
+                result = await asyncio.to_thread(
+                    wait_for_job_change, job_id, timeout_seconds, last_known_status,
+                    last_known_step, last_known_revision,
+                )
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:
             return _error_response("INTERNAL_ERROR", str(e))

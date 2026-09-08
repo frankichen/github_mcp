@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from app import development_failure_pack_store as failure_pack_store
+from app import observability
 from app.ci_database import encode_step_log_cursor, get_log_tail, get_steps
 from app.mcp_response import MAX_RESPONSE_RESOURCE_CHUNK_BYTES, store_response_resource
 
@@ -905,6 +906,7 @@ def build_failure_pack(
     """Build or retrieve one durable failure pack for exact CI evidence."""
     if not isinstance(job, Mapping):
         raise TypeError("job must be a mapping")
+    started = observability.monotonic()
     affected_map = affected if isinstance(affected, Mapping) else {}
     persisted_steps = _load_persisted_steps(job)
     steps = _merge_steps(job, persisted_steps)
@@ -1064,7 +1066,11 @@ def build_failure_pack(
         # directory is temporarily unavailable; the next materialization can
         # retry without rerunning CI.
         resource_error = type(exc).__name__
-    return _public_pack(durable_payload, record, resource, resource_error)
+    result = _public_pack(durable_payload, record, resource, resource_error)
+    observability.observe_failure_pack_build(
+        observability.monotonic() - started, int(record.get("payload_bytes", 0))
+    )
+    return result
 
 
 def read_failure_pack(failure_pack_id: str) -> dict[str, Any] | None:
