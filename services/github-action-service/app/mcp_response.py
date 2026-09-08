@@ -153,7 +153,9 @@ def store_response_resource(value: Any) -> dict[str, Any]:
     return {
         "resource_uri": f"{RESOURCE_URI_PREFIX}{resource_id}",
         "total_bytes": len(data),
+        "size": len(data),
         "sha256": digest,
+        "cursor": 0,
         "expires_at": now + RESPONSE_RESOURCE_TTL_SECONDS,
     }
 
@@ -203,17 +205,23 @@ def read_response_resource_chunk(
         content = ""
     chunk = data[offset:end]
     eof = end >= total
+    next_cursor = None if eof else end
     return {
         "ok": True,
         "resource_uri": resource_uri,
         "offset_from": offset,
         "offset_to": end,
-        "next_offset": None if eof else end,
+        "next_offset": next_cursor,
         "total_bytes": total,
+        "size": total,
         "has_more": not eof,
         "eof": eof,
         "content_sha256": meta["sha256"],
+        "sha256": meta["sha256"],
         "chunk_sha256": _sha256(chunk),
+        "chunk_size_bytes": len(chunk),
+        "cursor": offset,
+        "next_cursor": next_cursor,
         "content": content,
     }
 
@@ -247,6 +255,19 @@ def _compact_collection(value: Any) -> Any:
     return value
 
 
+def _list_summary_metadata(value: dict[str, Any], key: str, item: list[Any], included_count: int) -> tuple[int, bool]:
+    total_key = f"{key}_total"
+    truncated_key = f"{key}_truncated"
+    source_total = value.get(total_key)
+    total = (
+        source_total
+        if isinstance(source_total, int) and not isinstance(source_total, bool) and source_total >= len(item)
+        else len(item)
+    )
+    source_truncated = bool(value.get(truncated_key, False)) or total > len(item)
+    return total, source_truncated or included_count < len(item)
+
+
 def compact_large_payload(value: dict[str, Any]) -> dict[str, Any]:
     """Return bounded decision metadata while the complete payload moves to a resource."""
     summary: dict[str, Any] = {}
@@ -263,14 +284,15 @@ def compact_large_payload(value: dict[str, Any]) -> dict[str, Any]:
             compacted = _compact_collection(item)
             if response_size_bytes(compacted) <= 8192:
                 summary[key] = compacted
+                if isinstance(item, list):
+                    total, truncated = _list_summary_metadata(value, key, item, len(compacted))
+                    summary[f"{key}_total"] = total
+                    summary[f"{key}_truncated"] = truncated
                 continue
         if isinstance(item, list):
-            total_key = f"{key}_total"
-            truncated_key = f"{key}_truncated"
-            if total_key not in value:
-                summary[total_key] = len(item)
-            if truncated_key not in value:
-                summary[truncated_key] = bool(item)
+            total, truncated = _list_summary_metadata(value, key, item, 0)
+            summary[f"{key}_total"] = total
+            summary[f"{key}_truncated"] = truncated
         elif isinstance(item, dict):
             summary[f"{key}_available"] = bool(item)
         elif isinstance(item, str) and len(item.encode("utf-8")) > 2048:
@@ -317,10 +339,13 @@ def prepare_tool_response(value: dict[str, Any]) -> dict[str, Any]:
         "requested_mode": requested_mode,
         "inline_bytes": 0,
         "total_bytes": resource["total_bytes"],
+        "size": resource["size"],
         "truncated": True,
         "resource_uri": resource["resource_uri"],
         "has_more": True,
         "content_sha256": resource["sha256"],
+        "sha256": resource["sha256"],
+        "cursor": resource["cursor"],
         "resource_expires_at": resource["expires_at"],
     }
     result = _attach_meta(compact, resource_meta)
