@@ -505,6 +505,7 @@ def dispatch_ci_request(
                 changed_files_truncated=bool(changed_files_truncated),
                 supersede_previous=bool(payload.get("supersede_previous")),
             )
+            superseded_job_ids = worker_job.pop("_superseded_job_ids", [])
             worker_job_id = worker_job["job_id"]
             _assert_worker_job_identity(db, row, worker_job_id)
             new_revision = int(expected_revision) + 1
@@ -544,6 +545,8 @@ def dispatch_ci_request(
     result = _request_row_to_dict(persisted)
     result["deduplicated"] = False
     result["worker_job"] = worker_job
+    for superseded_job_id in superseded_job_ids:
+        db_core._notify_job_change(superseded_job_id)
     return result
 
 
