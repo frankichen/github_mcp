@@ -71,7 +71,7 @@ _SENSITIVE_OPTION_RE = re.compile(
     r"(?i)(--?(?:token|password|passwd|secret|api[-_]?key|access[-_]?key|credential|client[-_]?secret|private[-_]?key|auth)(?:=|\s+))([^\s,;\"']+)"
 )
 _SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?i)(\b[\w.-]*(?:token|password|passwd|secret|(?:api|access|client)[_-]?key|credential|private[_-]?key|authorization|headers?)[\w.-]*\s*[:=]\s*)([^\s,;\"']+)"
+    r"(?i)((?<![\w.-])[\w.-]*(?:token|password|passwd|secret|(?:api|access|client)[_-]?key|credential|private[_-]?key|authorization|headers?)[\w.-]*\s*[:=]\s*)([^\s,;\"']+)"
 )
 _QUOTED_SENSITIVE_RE = re.compile(
     r"(?i)([\"'](?:token|password|passwd|secret|(?:api|access|client)[_-]?key|credential|private[_-]?key|authorization|headers?)[\"']\s*[:=]\s*)([\"'])(.*?)([\"'])"
