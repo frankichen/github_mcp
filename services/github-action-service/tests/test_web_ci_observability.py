@@ -3,8 +3,13 @@ import re
 
 import pytest
 
-from app import ci_mcp, development_converge, development_failure_pack as failure_pack
-from app import observability
+from app import (
+    ci_database,
+    ci_mcp,
+    development_converge,
+    development_failure_pack as failure_pack,
+    observability,
+)
 from app.mcp_response import (
     StructuredFastMCP,
     json_bytes,
@@ -127,11 +132,9 @@ def test_private_ci_lifecycle_durations_come_from_durable_timestamps():
             "finished_at": "2026-09-08T10:00:20+00:00",
             "duration_seconds": 13.0,
         },
-        "terminal",
     )
 
     metrics = observability.prometheus_metrics()
-    assert 'mygithub_private_ci_phase_observations_total{phase="terminal"} 1' in metrics
     assert (
         'mygithub_private_ci_lifecycle_duration_observations_total{kind="queue"} 1'
         in metrics
@@ -156,6 +159,86 @@ def test_private_ci_lifecycle_durations_come_from_durable_timestamps():
         'mygithub_private_ci_lifecycle_duration_seconds_total{kind="total"} 20.000000'
         in metrics
     )
+
+
+def test_private_ci_completion_metrics_are_durable_and_snapshots_do_not_duplicate(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ci_database, "DB_PATH", str(tmp_path / "ci.db"))
+    previous = getattr(ci_database._local, "db", None)
+    if previous is not None:
+        previous.close()
+    ci_database._local.db = None
+    try:
+        ci_database.init_db()
+        monkeypatch.setattr(ci_database, "now_ts", lambda: 100.0)
+        job = ci_database.create_or_get_job(
+            repository="owner/repo",
+            branch="main",
+            commit_sha="c" * 40,
+            profile="repo-auto-check",
+            priority=100,
+            timeout_seconds=900,
+            force_rerun=False,
+            supersede_previous=False,
+        )
+        row = ci_database._get_db().execute(
+            "SELECT created_at,queued_at FROM ci_jobs WHERE job_id=?",
+            (job["job_id"],),
+        ).fetchone()
+        assert row["created_at"] == 100.0
+        assert row["queued_at"] == 100.0
+
+        assert ci_database.register_worker(
+            "worker-observe", "token-observe", ["repo-auto-check"], 1
+        )
+        monkeypatch.setattr(ci_database, "now_ts", lambda: 105.0)
+        lease = ci_database.lease_job("worker-observe", ["repo-auto-check"], 1)
+        assert lease is not None
+        assert lease["job_id"] == job["job_id"]
+
+        monkeypatch.setattr(ci_database, "now_ts", lambda: 120.0)
+        assert ci_database.complete_job(
+            job["job_id"],
+            0,
+            "passed",
+            {"status": "passed"},
+            worker_id="worker-observe",
+            lease_token=lease["lease_token"],
+        ) is True
+
+        metrics = observability.prometheus_metrics()
+        assert (
+            'mygithub_private_ci_lifecycle_duration_observations_total{kind="queue"} 1'
+            in metrics
+        )
+        assert (
+            'mygithub_private_ci_lifecycle_duration_seconds_total{kind="queue"} 5.000000'
+            in metrics
+        )
+        assert (
+            'mygithub_private_ci_lifecycle_duration_seconds_total{kind="execution"} 15.000000'
+            in metrics
+        )
+        assert (
+            'mygithub_private_ci_lifecycle_duration_seconds_total{kind="total"} 20.000000'
+            in metrics
+        )
+
+        finished = ci_database.get_job(job["job_id"])
+        ci_mcp.build_private_ci_snapshot_response(None, finished, [], "summary")
+        ci_mcp.build_private_ci_snapshot_response(None, finished, [], "summary")
+        after_snapshots = observability.prometheus_metrics()
+        assert (
+            'mygithub_private_ci_lifecycle_duration_observations_total{kind="total"} 1'
+            in after_snapshots
+        )
+        assert 'mygithub_private_ci_phase_observations_total{phase="terminal"} 2' in after_snapshots
+    finally:
+        current = getattr(ci_database._local, "db", None)
+        if current is not None:
+            current.close()
+        ci_database._local.db = None
 
 
 @pytest.mark.parametrize(
@@ -350,8 +433,8 @@ def test_prometheus_exposition_has_only_bounded_label_names_and_no_runtime_ident
             "finished_at": "2026-09-08T10:00:03+00:00",
             "duration_seconds": 1,
         },
-        "terminal",
     )
+    observability.observe_private_ci_phase("terminal")
     observability.observe_convergence_transition(
         "accepted",
         "index_requested",

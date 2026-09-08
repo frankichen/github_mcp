@@ -149,14 +149,14 @@ def explicit_wait(kind: str) -> Iterator[None]:
             _mcp_wait_duration_seconds[normalized] += elapsed
 
 
-def observe_private_ci_lifecycle(job: Mapping[str, Any] | None, phase: str | None) -> None:
-    """Observe durable CI lifecycle facts; repeated snapshot reads are observations."""
-    normalized_phase = _bounded(phase, _PRIVATE_CI_PHASES)
+def observe_private_ci_phase(phase: str | None) -> None:
+    """Observe a bounded phase from a durable Private CI snapshot."""
     with _lock:
-        _private_ci_phase_observations[normalized_phase] += 1
-    if not job:
-        return
+        _private_ci_phase_observations[_bounded(phase, _PRIVATE_CI_PHASES)] += 1
 
+
+def observe_private_ci_lifecycle(job: Mapping[str, Any]) -> None:
+    """Observe one terminal lifecycle from durable timestamps at its commit boundary."""
     created = _timestamp_seconds(job.get("created_at"))
     queued = _timestamp_seconds(job.get("queued_at"))
     started = _timestamp_seconds(job.get("started_at"))

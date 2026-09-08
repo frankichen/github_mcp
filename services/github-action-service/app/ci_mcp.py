@@ -524,7 +524,7 @@ def build_private_ci_snapshot_response(
     })
     if detail_level == "full" and request:
         result["request"] = dict(request)
-    observability.observe_private_ci_lifecycle(job, phase)
+    observability.observe_private_ci_phase(phase)
     return _redact_private_ci_value(result)
 
 
