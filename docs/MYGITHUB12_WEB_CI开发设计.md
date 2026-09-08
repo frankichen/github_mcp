@@ -371,11 +371,19 @@ Vue warn 等高频非 fatal 输出可以作为独立性能/噪声优化项；在
 
 ### 11.2 Supersede
 
-新 HEAD supersede 旧 Job 时必须写持久事件，并保证旧 Job 不能再生成当前 HEAD attestation。
+新 HEAD supersede 旧 queued Job 时，必须先确定新 Job identity，再在与新 Job 创建相同的事务内把旧 Job 标记为 `superseded`，写入 `superseded_by_job_id`、`finished_at`，清理 Worker/lease，并对 repository queued counter 做一次 `-1`。同一事务必须追加 durable `superseded` event，至少记录 old/new job identity、old/new commit、repository、branch、profile 和持久时间戳；事务成功后才 notify。
+
+任何 `superseded_by_job_id != NULL` 的历史 Job，即使曾经 `passed + exit_code=0`，也不能再成为 attestation、PR merge、release artifact 或 validation merge-eligible evidence；lease fencing 必须阻止 stale Worker callback 把 `superseded` 写回 `passed`。
 
 ### 11.3 Cancel
 
-cancel 必须针对准确 job_id；不能用“最新 Job”隐式取消。Worker 最终 release 状态必须可验证。
+cancel 必须针对调用者提供的准确 `job_id`；不能查“最新 Job”，不能按 repository/branch 猜测，也不能创建替代 Job。unknown identity 返回 `PRIVATE_CI_JOB_NOT_FOUND`。
+
+- queued：在同一事务中写 `cancelled + finished_at`、清理 Worker/lease、追加一次 durable `cancelled` event、queued counter `-1`；commit 后 notify；重复调用只返回 terminal truth，不重复 event/accounting。
+- leased/downloading/preparing/running：首次只写 `cancel_requested=1` 和一次 durable `cancel_requested` event，由 Worker 在安全边界完成 terminal cancel；重复调用不得增加 durable 副作用。SQLite UPDATE 成功必须依据当前 statement 的 `cursor.rowcount`，禁止使用 connection-wide `total_changes`。
+- terminal：`passed/failed/cancelled/timed_out/superseded/worker_lost/internal_error` 均 immutable，返回 `PRIVATE_CI_JOB_ALREADY_FINISHED`，不得修改 Worker 或追加误导事件。
+
+Worker 完成 cancelled 后必须清理 job lease/worker identity、把 owning Worker 恢复为 `idle/current_job_id=NULL` 并归零 running accounting；后续 stale callback 继续由 lease fencing fail-stop。`get_private_ci_job` 的 top-level effective state 以 terminal Worker truth 覆盖尚未推进的 Request queued/running 投影。
 
 ## 12. ToolAnnotations 与 Schema
 

@@ -667,7 +667,7 @@ VALIDATION_TERMINAL_STATUSES = {"passed", "failed", "timed_out", "cancelled", "s
 
 
 def validation_result(session_id: str, session_revision: int, mode: str, job: dict[str,Any], selection: dict[str,Any], include_failure_pack: bool=True) -> dict[str,Any]:
-    status=job.get("status"); terminal=status in VALIDATION_TERMINAL_STATUSES; merge_eligible=bool(mode!="fast" and status=="passed")
+    status=job.get("status"); terminal=status in VALIDATION_TERMINAL_STATUSES; merge_eligible=bool(mode!="fast" and status=="passed" and job.get("exit_code")==0 and not job.get("superseded_by_job_id"))
     attestation=None; failure=None
     if merge_eligible:
         try: attestation=attestation_registry.create_attestation_for_passed_job(job_id=job["job_id"])

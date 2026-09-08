@@ -76,7 +76,7 @@ _PRIVATE_CI_EXECUTION_WRITE = ToolAnnotations(
 _PRIVATE_CI_CANCELLATION = ToolAnnotations(
     readOnlyHint=False,
     destructiveHint=True,
-    idempotentHint=False,
+    idempotentHint=True,
     openWorldHint=True,
 )
 
@@ -1214,11 +1214,26 @@ This is for the private CI system. NOT for GitHub Actions (use cancel_ci_job for
             status = job.get("status", "")
             if status == "queued":
                 ok = await asyncio.to_thread(cancel_queued_job, job_id)
-                return json.dumps({"ok": True, "status": "cancelled", "job_id": job_id} if ok else _error_response("INTERNAL_ERROR", "cancel failed"))
+                if ok:
+                    return json.dumps({"ok": True, "status": "cancelled", "job_id": job_id})
+                latest = await asyncio.to_thread(get_job, job_id)
+                if latest and latest.get("status") in ("leased", "downloading", "preparing", "running"):
+                    await asyncio.to_thread(request_cancel_job, job_id)
+                    latest = await asyncio.to_thread(get_job, job_id)
+                    if latest and latest.get("cancel_requested"):
+                        return json.dumps({"ok": True, "status": "cancel_requested", "job_id": job_id, "message": "Cancel signal sent to worker"})
+                if latest and latest.get("status") in ("passed", "failed", "cancelled", "timed_out", "superseded", "worker_lost", "internal_error"):
+                    return _error_response("PRIVATE_CI_JOB_ALREADY_FINISHED", f"Cannot cancel job in status '{latest['status']}'")
+                return _error_response("INTERNAL_ERROR", "cancel failed")
             if status in ("leased", "downloading", "preparing", "running"):
                 await asyncio.to_thread(request_cancel_job, job_id)
-                return json.dumps({"ok": True, "status": "cancel_requested", "job_id": job_id, "message": "Cancel signal sent to worker"})
-            if status in ("passed", "failed", "cancelled", "timed_out", "superseded", "worker_lost"):
+                latest = await asyncio.to_thread(get_job, job_id)
+                if latest and latest.get("status") in ("leased", "downloading", "preparing", "running") and latest.get("cancel_requested"):
+                    return json.dumps({"ok": True, "status": "cancel_requested", "job_id": job_id, "message": "Cancel signal sent to worker"})
+                if latest and latest.get("status") in ("passed", "failed", "cancelled", "timed_out", "superseded", "worker_lost", "internal_error"):
+                    return _error_response("PRIVATE_CI_JOB_ALREADY_FINISHED", f"Cannot cancel job in status '{latest['status']}'")
+                return _error_response("INTERNAL_ERROR", "cancel failed")
+            if status in ("passed", "failed", "cancelled", "timed_out", "superseded", "worker_lost", "internal_error"):
                 return _error_response("PRIVATE_CI_JOB_ALREADY_FINISHED", f"Cannot cancel job in status '{status}'")
             return _error_response("INVALID_ARGUMENT", f"Cannot cancel job in status '{status}'")
         except Exception as e:

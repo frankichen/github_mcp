@@ -382,7 +382,7 @@ def create_or_get_job(
     with _db_write_lock:
         db.execute("BEGIN IMMEDIATE")
         try:
-            return _create_or_get_job_in_transaction(
+            result = _create_or_get_job_in_transaction(
                 db, repository, branch, commit_sha, profile, priority,
                 timeout_seconds, force_rerun, supersede_previous, base_sha,
                 changed_files, changed_files_total, changed_files_truncated,
@@ -391,6 +391,9 @@ def create_or_get_job(
         except Exception:
             db.rollback()
             raise
+    for superseded_job_id in result.pop("_superseded_job_ids", []):
+        _notify_job_change(superseded_job_id)
+    return result
 
 
 def _create_or_get_job_in_transaction(
@@ -430,14 +433,49 @@ def _create_or_get_job_in_transaction(
                 db.commit()
             return result
 
-    if supersede_previous:
-        db.execute(
-            """UPDATE ci_jobs SET status = 'superseded'
-               WHERE repository = ? AND branch = ? AND profile = ? AND status = 'queued' AND idempotency_key != ?""",
-            (repository, branch, profile, idem_key),
-        )
-
     job_id = uuid.uuid4().hex[:16]
+    superseded_job_ids = []
+    if supersede_previous:
+        superseded_rows = db.execute(
+            """SELECT job_id, repository, branch, commit_sha, profile
+               FROM ci_jobs
+               WHERE repository = ? AND branch = ? AND profile = ?
+                 AND status = 'queued' AND idempotency_key != ?
+               ORDER BY created_at, job_id""",
+            (repository, branch, profile, idem_key),
+        ).fetchall()
+        for old in superseded_rows:
+            cursor = db.execute(
+                """UPDATE ci_jobs
+                   SET status = 'superseded', superseded_by_job_id = ?, finished_at = ?,
+                       worker_id = NULL, lease_token_hash = NULL, lease_expires_at = NULL
+                   WHERE job_id = ? AND status = 'queued'""",
+                (job_id, ts, old["job_id"]),
+            )
+            if cursor.rowcount != 1:
+                continue
+            _upsert_repo_queue_state(db, old["repository"], queued_delta=-1)
+            _add_event(
+                db,
+                old["job_id"],
+                "superseded",
+                json.dumps(
+                    {
+                        "old_job_id": old["job_id"],
+                        "new_job_id": job_id,
+                        "superseded_by_job_id": job_id,
+                        "old_commit_sha": old["commit_sha"],
+                        "new_commit_sha": commit_sha,
+                        "repository": old["repository"],
+                        "branch": old["branch"],
+                        "profile": old["profile"],
+                        "superseded_at": ts,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            superseded_job_ids.append(old["job_id"])
+
     db.execute(
         """INSERT INTO ci_jobs (job_id, idempotency_key, repository, branch, commit_sha, base_sha, changed_files_json,
            changed_files_total, changed_files_truncated, profile, priority, status, timeout_seconds, created_at)
@@ -475,6 +513,7 @@ def _create_or_get_job_in_transaction(
         "previous_job_id": None,
         "queued_count": _count_queued(db),
         "created_at": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+        "_superseded_job_ids": superseded_job_ids,
     }
 
 
@@ -975,27 +1014,50 @@ def complete_job(
 
 def request_cancel_job(job_id: str) -> bool:
     db = _get_db()
-    db.execute("UPDATE ci_jobs SET cancel_requested = 1 WHERE job_id = ? AND status IN ('queued', 'leased', 'downloading', 'preparing', 'running')", (job_id,))
-    if db.total_changes > 0:
+    with _db_write_lock:
+        db.execute("BEGIN IMMEDIATE")
+        cursor = db.execute(
+            """UPDATE ci_jobs SET cancel_requested = 1
+               WHERE job_id = ? AND cancel_requested = 0
+                 AND status IN ('leased', 'downloading', 'preparing', 'running')""",
+            (job_id,),
+        )
+        if cursor.rowcount != 1:
+            db.rollback()
+            return False
         _add_event(db, job_id, "cancel_requested", "{}")
         db.commit()
-        _notify_job_change(job_id)
-        return True
-    return False
+    _notify_job_change(job_id)
+    return True
 
 
 def cancel_queued_job(job_id: str) -> bool:
     db = _get_db()
-    db.execute(
-        "UPDATE ci_jobs SET status = 'cancelled', finished_at = ? WHERE job_id = ? AND status = 'queued'",
-        (now_ts(), job_id),
-    )
-    if db.total_changes > 0:
+    with _db_write_lock:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute(
+            "SELECT repository FROM ci_jobs WHERE job_id = ? AND status = 'queued'",
+            (job_id,),
+        ).fetchone()
+        if not row:
+            db.rollback()
+            return False
+        finished_at = now_ts()
+        cursor = db.execute(
+            """UPDATE ci_jobs
+               SET status = 'cancelled', finished_at = ?, worker_id = NULL,
+                   lease_token_hash = NULL, lease_expires_at = NULL
+               WHERE job_id = ? AND status = 'queued'""",
+            (finished_at, job_id),
+        )
+        if cursor.rowcount != 1:
+            db.rollback()
+            return False
+        _upsert_repo_queue_state(db, row["repository"], queued_delta=-1)
         _add_event(db, job_id, "cancelled", "{}")
         db.commit()
-        _notify_job_change(job_id)
-        return True
-    return False
+    _notify_job_change(job_id)
+    return True
 
 
 def release_job(job_id: str, worker_id: Optional[str] = None, lease_token: Optional[str] = None):
