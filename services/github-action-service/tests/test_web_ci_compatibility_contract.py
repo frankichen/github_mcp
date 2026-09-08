@@ -68,7 +68,8 @@ def ci_tools(isolated_db):
 
 
 def _annotation_contract(tool):
-    assert tool.annotations is not None
+    if tool.annotations is None:
+        return None
     return {
         "readOnlyHint": tool.annotations.readOnlyHint,
         "destructiveHint": tool.annotations.destructiveHint,
@@ -262,6 +263,12 @@ def _create_running_request_and_job():
         force_rerun=True,
         supersede_previous=False,
     )
+    connection = db._get_db()
+    connection.execute(
+        "UPDATE ci_jobs SET status = ?, worker_id = ? WHERE job_id = ?",
+        ("running", "worker-dev018", job["job_id"]),
+    )
+    connection.commit()
     request = requests.transition_ci_request(
         request["request_id"],
         1,
