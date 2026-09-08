@@ -170,7 +170,8 @@ def test_failure_pack_bounds_log_and_marks_missing_evidence(tmp_path, monkeypatc
         error_code="",
         error_message="",
     )
-    result = failure_pack.build_failure_pack(job, log_tail="x" * (failure_pack.MAX_LOG_EXCERPT_BYTES * 4))
+    oversized_log = "x" * (failure_pack.MAX_LOG_EXCERPT_BYTES + 512)
+    result = failure_pack.build_failure_pack(job, log_tail=oversized_log)
     durable = failure_pack.read_failure_pack(result["failure_pack_id"])
 
     assert durable is not None
