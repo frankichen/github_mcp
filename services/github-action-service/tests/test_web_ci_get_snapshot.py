@@ -465,6 +465,7 @@ async def test_full_keeps_diagnostics_and_oversized_payload_uses_resource_while_
     assert full["response_meta"]["requested_mode"] == "full"
     assert full["response_meta"]["truncated"] is True
     assert full["response_meta"]["resource_uri"].startswith("mygithub12://response/")
+    assert full["response_meta"]["total_bytes"] > MAX_SAFE_INLINE_BYTES
 
     parts = []
     offset = 0
