@@ -8,7 +8,7 @@ from app import ci_database as db
 from app import ci_mcp
 from app import ci_request_dispatch as dispatch
 from app import ci_request_store as requests
-from app.mcp_response import StructuredFastMCP, read_response_resource_chunk
+from app.mcp_response import MAX_SAFE_INLINE_BYTES, StructuredFastMCP, read_response_resource_chunk
 
 
 REPOSITORY = "frankichen/github_mcp"
