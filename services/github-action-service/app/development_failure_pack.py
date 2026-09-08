@@ -68,13 +68,30 @@ _HEADER_RE = re.compile(
 )
 _HEADER_ASSIGNMENT_RE = re.compile(r"(?im)(\bheaders?\s*[:=]\s*).+$")
 _SENSITIVE_OPTION_RE = re.compile(
-    r"(?i)(--?(?:token|password|passwd|secret|api[-_]?key|access[-_]?key|credential|client[-_]?secret|private[-_]?key|auth)(?:=|\s+))([^\s,;\"']+)"
+    r"(?i)(?<![\w.-])"
+    r"(?P<prefix>--?(?:token|password|passwd|secret|api[-_]?key|access[-_]?key|credential|client[-_]?secret|private[-_]?key|auth)(?:(?:\s*=\s*)|\s+))"
+    r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"
 )
-_SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?i)(\b[\w.-]*(?:token|password|passwd|secret|(?:api|access|client)[_-]?key|credential|private[_-]?key|authorization|headers?)[\w.-]*\s*[:=]\s*)([^\s,;\"']+)"
-)
-_QUOTED_SENSITIVE_RE = re.compile(
-    r"(?i)([\"'](?:token|password|passwd|secret|(?:api|access|client)[_-]?key|credential|private[_-]?key|authorization|headers?)[\"']\s*[:=]\s*)([\"'])(.*?)([\"'])"
+_SENSITIVE_ASSIGNMENT_MARKERS = (
+    "token",
+    "password",
+    "passwd",
+    "secret",
+    "apikey",
+    "api_key",
+    "api-key",
+    "accesskey",
+    "access_key",
+    "access-key",
+    "clientkey",
+    "client_key",
+    "client-key",
+    "credential",
+    "privatekey",
+    "private_key",
+    "private-key",
+    "authorization",
+    "header",
 )
 _URL_CREDENTIAL_RE = re.compile(r"(?i)(://[^\s/@:]+:)([^\s/@]+)(@)")
 _KNOWN_TOKEN_RE = re.compile(
@@ -84,10 +101,8 @@ _SENSITIVE_KEY_RE = re.compile(
     r"(?i)(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|credential|authorization|private[_-]?key|headers?)"
 )
 
-_LOCATION_RE = re.compile(
-    r"(?P<file>(?:[A-Za-z]:[\\/]|/|\./|\.\./)?[^()\s:]+):"
-    r"(?P<line>\d+)(?::(?P<column>\d+))?"
-)
+_LOCATION_FILE_TRAILING = ".,;])}>"
+_LOCATION_CANDIDATE_BOUNDARIES = ",;[<{"
 _PYTEST_FAILED_RE = re.compile(r"^\s*FAILED\s+(?P<target>\S+?)(?:\s+-\s+(?P<message>.*))?\s*$")
 _GO_FAILED_RE = re.compile(r"^\s*---\s+FAIL:\s+(?P<name>.+?)(?:\s+\([^)]*\))?\s*$")
 _NODE_BULLET_RE = re.compile(r"^\s*[●✕×]\s+(?P<name>.+?)\s*$")
@@ -115,6 +130,106 @@ def _truncate_utf8(value: str, max_bytes: int, *, from_end: bool = False) -> tup
     return text + marker, True
 
 
+def _redacted_secret_fragment(value: str) -> str:
+    if value and value[0] in "\"'":
+        quote = value[0]
+        if len(value) >= 2 and value[-1] == quote:
+            return quote + "[REDACTED]" + quote
+        return quote + "[REDACTED]"
+    return "[REDACTED]"
+
+
+def _sensitive_assignment_key_before(text: str, separator_index: int) -> bool:
+    cursor = separator_index - 1
+    while cursor >= 0 and text[cursor].isspace():
+        cursor -= 1
+    if cursor < 0:
+        return False
+
+    if text[cursor] in "\"'":
+        quote = text[cursor]
+        key_end = cursor
+        cursor -= 1
+        while cursor >= 0 and text[cursor] not in "\r\n":
+            if text[cursor] == quote:
+                key = text[cursor + 1 : key_end]
+                break
+            cursor -= 1
+        else:
+            return False
+    else:
+        key_end = cursor + 1
+        while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "_.-"):
+            cursor -= 1
+        if key_end == cursor + 1:
+            return False
+        key = text[cursor + 1 : key_end]
+
+    lowered = key.lower()
+    return any(marker in lowered for marker in _SENSITIVE_ASSIGNMENT_MARKERS)
+
+
+def _assignment_value_span(text: str, separator_index: int) -> tuple[int, int] | None:
+    cursor = separator_index + 1
+    length = len(text)
+    while cursor < length and text[cursor].isspace():
+        cursor += 1
+    if cursor >= length:
+        return None
+
+    value_start = cursor
+    if text[cursor] in "\"'":
+        quote = text[cursor]
+        cursor += 1
+        while cursor < length and text[cursor] not in "\r\n":
+            if text[cursor] == quote:
+                return value_start, cursor + 1
+            cursor += 1
+        return value_start, cursor
+
+    while cursor < length and not text[cursor].isspace() and text[cursor] not in ",;":
+        cursor += 1
+    return (value_start, cursor) if cursor > value_start else None
+
+
+def _has_sensitive_assignment_candidate(text: str) -> bool:
+    return any(
+        char in ":=" and _sensitive_assignment_key_before(text, index)
+        for index, char in enumerate(text)
+    )
+
+
+def _redact_sensitive_assignments(text: str) -> str:
+    parts: list[str] = []
+    copy_start = 0
+    index = 0
+    length = len(text)
+    while index < length:
+        if text[index] not in ":=" or not _sensitive_assignment_key_before(text, index):
+            index += 1
+            continue
+        value_span = _assignment_value_span(text, index)
+        if value_span is None:
+            index += 1
+            continue
+        value_start, value_end = value_span
+        if value_start < copy_start:
+            index += 1
+            continue
+        parts.append(text[copy_start:value_start])
+        parts.append(_redacted_secret_fragment(text[value_start:value_end]))
+        copy_start = value_end
+        index = value_end
+    if not parts:
+        return text
+    parts.append(text[copy_start:])
+    return "".join(parts)
+
+
+def _redact_sensitive_option(match: re.Match[str]) -> str:
+    return match.group("prefix") + _redacted_secret_fragment(match.group("value"))
+
+
 def redact_text(value: Any) -> str:
     """Redact credentials from commands, logs, errors and other text evidence."""
     text = _ANSI_RE.sub("", str(value))
@@ -122,11 +237,9 @@ def redact_text(value: Any) -> str:
     text = _AUTH_RE.sub(lambda match: match.group(1) + "[REDACTED]", text)
     text = _HEADER_RE.sub(lambda match: match.group(1) + "[REDACTED]", text)
     text = _HEADER_ASSIGNMENT_RE.sub(lambda match: match.group(1) + "[REDACTED]", text)
-    text = _QUOTED_SENSITIVE_RE.sub(
-        lambda match: match.group(1) + match.group(2) + "[REDACTED]" + match.group(4), text
-    )
-    text = _SENSITIVE_OPTION_RE.sub(lambda match: match.group(1) + "[REDACTED]", text)
-    text = _SENSITIVE_ASSIGNMENT_RE.sub(lambda match: match.group(1) + "[REDACTED]", text)
+    text = _SENSITIVE_OPTION_RE.sub(_redact_sensitive_option, text)
+    if _has_sensitive_assignment_candidate(text):
+        text = _redact_sensitive_assignments(text)
     text = _URL_CREDENTIAL_RE.sub(lambda match: match.group(1) + "[REDACTED]" + match.group(3), text)
     return _KNOWN_TOKEN_RE.sub("[REDACTED]", text)
 
@@ -205,14 +318,114 @@ def _location(file: str | None = None, line: Any = None, column: Any = None) -> 
     return {"status": state, "file": file_value, "line": line_value, "column": column_value}
 
 
+def _iter_location_tokens(raw: str):
+    start = None
+    for index, char in enumerate(raw):
+        if char.isspace() or char in "()":
+            if start is not None:
+                yield raw[start:index]
+                start = None
+        elif start is None:
+            start = index
+    if start is not None:
+        yield raw[start:]
+
+
+def _is_supported_location_file(file_value: str) -> bool:
+    if not file_value or "://" in file_value:
+        return False
+    if ":" not in file_value:
+        return True
+    return (
+        len(file_value) >= 3
+        and file_value[0].isalpha()
+        and file_value[1] == ":"
+        and file_value[2] in "\\/"
+        and ":" not in file_value[2:]
+    )
+
+
+def _starts_explicit_location_path(token: str, start: int) -> bool:
+    if start >= len(token):
+        return False
+    if token.startswith(("/", "./", "../"), start):
+        return True
+    return (
+        start + 2 < len(token)
+        and token[start].isalpha()
+        and token[start + 1] == ":"
+        and token[start + 2] in "\\/"
+    )
+
+
+def _parse_location_token(token: str) -> tuple[str, str, str | None] | None:
+    segment_start = 0
+    url_active = False
+    length = len(token)
+    index = 0
+    while index < length:
+        char = token[index]
+        if (
+            char in _LOCATION_CANDIDATE_BOUNDARIES
+            and _starts_explicit_location_path(token, index + 1)
+        ):
+            segment_start = index + 1
+            url_active = False
+            index += 1
+            continue
+        if char != ":":
+            index += 1
+            continue
+
+        value_start = index + 1
+        is_drive_colon = (
+            index == segment_start + 1
+            and token[segment_start].isalpha()
+            and value_start < length
+            and token[value_start] in "\\/"
+        )
+        if not is_drive_colon and token.startswith("//", value_start):
+            url_active = True
+            index = value_start + 2
+            continue
+        if value_start >= length or not token[value_start].isdigit():
+            if not is_drive_colon:
+                segment_start = value_start
+            index = value_start
+            continue
+
+        line_end = value_start
+        while line_end < length and token[line_end].isdigit():
+            line_end += 1
+        column = None
+        if (
+            line_end < length
+            and token[line_end] == ":"
+            and line_end + 1 < length
+            and token[line_end + 1].isdigit()
+        ):
+            column_start = line_end + 1
+            column_end = column_start
+            while column_end < length and token[column_end].isdigit():
+                column_end += 1
+            column = token[column_start:column_end]
+
+        file_value = token[segment_start:index].rstrip(_LOCATION_FILE_TRAILING)
+        if not url_active and _is_supported_location_file(file_value):
+            return file_value, token[value_start:line_end], column
+
+        segment_start = value_start
+        index = line_end
+    return None
+
+
 def parse_failure_location(text: Any) -> dict[str, Any]:
     """Parse ``file:line[:column]`` and always return an explicit status."""
     raw = redact_text(text)
-    for match in _LOCATION_RE.finditer(raw):
-        file_value = match.group("file").rstrip(".,;])}>")
-        if "://" in file_value:
-            continue
-        return _location(file_value, match.group("line"), match.group("column"))
+    for token in _iter_location_tokens(raw):
+        parsed = _parse_location_token(token)
+        if parsed is not None:
+            return _location(*parsed)
     return _location()
 
 

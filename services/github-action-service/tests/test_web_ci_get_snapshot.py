@@ -8,7 +8,7 @@ from app import ci_database as db
 from app import ci_mcp
 from app import ci_request_dispatch as dispatch
 from app import ci_request_store as requests
-from app.mcp_response import StructuredFastMCP, read_response_resource_chunk
+from app.mcp_response import MAX_SAFE_INLINE_BYTES, StructuredFastMCP, read_response_resource_chunk
 
 
 REPOSITORY = "frankichen/github_mcp"
@@ -16,6 +16,12 @@ BRANCH = "ai/web-ci-dev-004-test"
 PROFILE = "repo-auto-check"
 COMMIT = "a" * 40
 TREE = "b" * 40
+RESOURCE_FALLBACK_STEP_COUNT = 8
+RESOURCE_FALLBACK_ARGUMENT_REPEAT = 20
+RESOURCE_FALLBACK_CHANGED_FILE_COUNT = 80
+RESOURCE_FALLBACK_EVIDENCE_REPEAT = 5000
+RESOURCE_FALLBACK_SAMPLE_COUNT = 80
+RESOURCE_CHUNK_BYTES = 8192
 
 
 def _structured_result(call_result):
@@ -426,21 +432,25 @@ async def test_full_keeps_diagnostics_and_oversized_payload_uses_resource_while_
     worker_steps = [
         {
             "step_name": f"step-{index}",
-            "command": "python -m pytest " + ("very-long-argument " * 100),
+            "command": "python -m pytest "
+            + ("very-long-argument " * RESOURCE_FALLBACK_ARGUMENT_REPEAT),
             "status": "passed",
             "exit_code": 0,
             "duration_seconds": index + 0.5,
         }
-        for index in range(48)
+        for index in range(RESOURCE_FALLBACK_STEP_COUNT)
     ]
-    changed_files = [f"generated/file_{index:03d}.py" for index in range(220)]
+    changed_files = [
+        f"generated/file_{index:03d}.py"
+        for index in range(RESOURCE_FALLBACK_CHANGED_FILE_COUNT)
+    ]
     summary = {
         "status": "passed",
         "exit_code": 0,
         "git_tree_sha": TREE,
         "steps": worker_steps,
-        "evidence": {"diagnostic_blob": "evidence-" * 10000},
-        "performance": {"samples": list(range(500))},
+        "evidence": {"diagnostic_blob": "evidence-" * RESOURCE_FALLBACK_EVIDENCE_REPEAT},
+        "performance": {"samples": list(range(RESOURCE_FALLBACK_SAMPLE_COUNT))},
     }
     connection = db._get_db()
     connection.execute(
@@ -455,12 +465,15 @@ async def test_full_keeps_diagnostics_and_oversized_payload_uses_resource_while_
     assert full["response_meta"]["requested_mode"] == "full"
     assert full["response_meta"]["truncated"] is True
     assert full["response_meta"]["resource_uri"].startswith("mygithub12://response/")
+    assert full["response_meta"]["total_bytes"] > MAX_SAFE_INLINE_BYTES
 
     parts = []
     offset = 0
     while True:
         page = read_response_resource_chunk(
-            full["response_meta"]["resource_uri"], offset_bytes=offset, limit_bytes=4096
+            full["response_meta"]["resource_uri"],
+            offset_bytes=offset,
+            limit_bytes=RESOURCE_CHUNK_BYTES,
         )
         parts.append(page["content"])
         if not page["has_more"]:
