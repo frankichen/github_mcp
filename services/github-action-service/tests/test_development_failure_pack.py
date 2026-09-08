@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -40,25 +41,72 @@ def _job(**overrides):
     return job
 
 
-def test_redact_text_large_non_secret_bypasses_sensitive_assignment_regex(monkeypatch):
-    class ExplodingPattern:
-        def sub(self, *_args, **_kwargs):
-            raise AssertionError("expensive assignment regex should be bypassed")
+def test_redact_text_large_non_secret_bypasses_sensitive_assignment_scan(monkeypatch):
+    def explode(_text):
+        raise AssertionError("sensitive assignment scan should be bypassed")
 
-    monkeypatch.setattr(failure_pack, "_SENSITIVE_ASSIGNMENT_RE", ExplodingPattern())
+    monkeypatch.setattr(failure_pack, "_redact_sensitive_assignments", explode)
     text = "secret appears in documentation; " + ("ordinary=value;" * 4096)
 
     assert failure_pack.redact_text(text) == text
 
 
-def test_redact_text_large_secret_near_tail_still_redacts():
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        ' client_secret="{secret}"',
+        " client-secret = {secret}",
+    ],
+)
+def test_redact_text_large_secret_near_tail_still_redacts(suffix):
     secret = "repair-secret-value-12345"
-    text = ("ordinary=value;" * 4096) + f" client_secret={secret}"
+    text = ("ordinary=value;" * 4096) + suffix.format(secret=secret)
 
     redacted = failure_pack.redact_text(text)
 
     assert secret not in redacted
-    assert "client_secret=[REDACTED]" in redacted
+    assert "[REDACTED]" in redacted
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "token={secret}",
+        "token = {secret}",
+        "token: {secret}",
+        "client_secret={secret}",
+        "client-secret = {secret}",
+        "client.secret : {secret}",
+        'token="{secret}"',
+        "token='{secret}'",
+        'client_secret="{secret}"',
+        "client-secret = '{secret}'",
+        '"token"="{secret}"',
+        "'token': '{secret}'",
+        "--token {secret}",
+        "--token={secret}",
+        '--token "{secret}"',
+        '--token="{secret}"',
+        "--token '{secret}'",
+        "--client-secret {secret}",
+        '--client-secret="{secret}"',
+    ],
+)
+def test_redact_text_sensitive_assignment_and_cli_matrix(template):
+    secret = "repair-secret-value-67890"
+
+    redacted = failure_pack.redact_text(template.format(secret=secret))
+
+    assert secret not in redacted
+    assert "[REDACTED]" in redacted
+
+
+def test_redact_text_cli_matcher_does_not_start_inside_assignment_identifier():
+    secret = "repair-secret-value-24680"
+
+    redacted = failure_pack.redact_text(f"client-secret = {secret}")
+
+    assert redacted == "client-secret = [REDACTED]"
 
 
 def test_parse_failure_location_large_no_location_uses_non_overlapping_tokens(monkeypatch):
@@ -105,6 +153,91 @@ def test_parse_failure_location_rejects_invalid_location_candidates():
     text = "https://example.test:443/path file.py:not-a-line C:\\temp\\bad.py:line"
 
     assert failure_pack.parse_failure_location(text)["status"] == "unavailable"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        r",C:\src\a.py:7:2",
+        r";C:\src\a.py:7:2",
+        r"[C:\src\a.py:7:2]",
+        r"<C:\src\a.py:7:2>",
+    ],
+)
+def test_parse_failure_location_preserves_windows_drive_after_leading_punctuation(text):
+    assert failure_pack.parse_failure_location(text) == {
+        "status": "complete",
+        "file": r"C:\src\a.py",
+        "line": 7,
+        "column": 2,
+    }
+
+
+@pytest.mark.parametrize("separator", [",", ";", " "])
+def test_parse_failure_location_skips_url_candidate_and_finds_later_windows_location(separator):
+    text = f"https://example.test:443/path{separator}" + r"C:\src\tail.py:7:2"
+
+    assert failure_pack.parse_failure_location(text) == {
+        "status": "complete",
+        "file": r"C:\src\tail.py",
+        "line": 7,
+        "column": 2,
+    }
+
+
+def test_parse_failure_location_does_not_join_url_path_to_later_unix_location():
+    text = "https://example.test:443/path,/tmp/tail.py:321:9"
+
+    assert failure_pack.parse_failure_location(text) == {
+        "status": "complete",
+        "file": "/tmp/tail.py",
+        "line": 321,
+        "column": 9,
+    }
+
+
+_BASE_LOCATION_RE = re.compile(
+    r"(?P<file>(?:[A-Za-z]:[\\/]|/|\./|\.\./)?[^()\s:]+):"
+    r"(?P<line>\d+)(?::(?P<column>\d+))?"
+)
+
+
+def _base_parse_failure_location(text):
+    raw = failure_pack.redact_text(text)
+    for match in _BASE_LOCATION_RE.finditer(raw):
+        file_value = match.group("file").rstrip(".,;])}>")
+        if "://" in file_value:
+            continue
+        return failure_pack._location(file_value, match.group("line"), match.group("column"))
+    return failure_pack._location()
+
+
+@pytest.mark.parametrize(
+    ("text", "classification", "expected"),
+    [
+        ("/tmp/a.py:7:2", "compatible", {"status": "complete", "file": "/tmp/a.py", "line": 7, "column": 2}),
+        ("relative.py:8", "compatible", {"status": "partial", "file": "relative.py", "line": 8, "column": None}),
+        (r"C:\src\a.py:7:2", "compatible", {"status": "complete", "file": r"C:\src\a.py", "line": 7, "column": 2}),
+        (r",C:\src\a.py:7:2", "compatibility_restored", {"status": "complete", "file": r"C:\src\a.py", "line": 7, "column": 2}),
+        (r"[C:\src\a.py:7:2]", "compatibility_restored", {"status": "complete", "file": r"C:\src\a.py", "line": 7, "column": 2}),
+        ("file.py:not-a-line", "compatible", {"status": "unavailable", "file": None, "line": None, "column": None}),
+        ("(file.py:4:2)", "compatible", {"status": "complete", "file": "file.py", "line": 4, "column": 2}),
+        ("first.py:1:2 second.py:3:4", "compatible", {"status": "complete", "file": "first.py", "line": 1, "column": 2}),
+        (r"https://example.test:443/path,C:\src\tail.py:7:2", "compatibility_restored", {"status": "complete", "file": r"C:\src\tail.py", "line": 7, "column": 2}),
+        ("https://example.test:443/path,/tmp/tail.py:321:9", "bug_fix", {"status": "complete", "file": "/tmp/tail.py", "line": 321, "column": 9}),
+        ("https://example.test:443/path.py:12:3", "intended_tightening", {"status": "unavailable", "file": None, "line": None, "column": None}),
+        ("/tmp/a.py:7:2,", "compatible", {"status": "complete", "file": "/tmp/a.py", "line": 7, "column": 2}),
+    ],
+)
+def test_parse_failure_location_differential_compatibility(text, classification, expected):
+    base = _base_parse_failure_location(text)
+    repair = failure_pack.parse_failure_location(text)
+
+    assert repair == expected
+    if classification in {"compatible", "compatibility_restored"}:
+        assert repair == base
+    else:
+        assert repair != base
 
 
 def test_failure_parser_handles_pytest_go_and_node_locations():
