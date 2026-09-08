@@ -239,14 +239,14 @@
 
 ### WEB-CI-DEV-017：CI 本身性能优化保持独立
 
-- [ ] 记录 full CI 各 step duration baseline。
-- [ ] 优先 profile 长测试 step。
-- [ ] 独立排查 setup/cache/network 异常长尾。
-- [ ] Vue warn 等日志噪声单独处理，不把它无证据认定为运行慢根因。
-- [ ] fast CI 继续作为开发反馈，full CI 继续作为最终门禁。
+- [x] 记录 full CI 各 step duration baseline。
+- [x] 优先 profile 长测试 step。
+- [x] 独立排查 setup/cache/network 异常长尾。
+- [x] Vue warn 等日志噪声单独处理，不把它无证据认定为运行慢根因。
+- [x] fast CI 继续作为开发反馈，full CI 继续作为最终门禁。
 
 说明：本项优化可以降低总耗时，但不是 WEB-CI-01 Web 安全架构完成的替代条件。  
-证据：`待填写`
+证据：base main `fbd8161fe09a40fde56c7185c97322486f68859e` / Tree `3d22c7f5a4e2c8e17d58999ace63f0f4e6ddc677`；baseline full Private CI Job `cc59f562e2cb44f0` passed / exit 0，总时长 `199.31s`，`github-action-service pytest 194.22s`、`private-ci-agent pytest 54.45s`、`private-deploy-agent pytest 1.06s`；同一 base forced rerun Job `20ceb115e2524cd6` passed / exit 0，总时长 `211.44s`，`github-action-service pytest 206.13s`、`private-ci-agent pytest 57.79s`、`private-deploy-agent pytest 1.15s`，确认 baseline 方差约 6-7%。profiling Job `3f893bd91ac84cdd` passed / exit 0，`--durations=50` 显示 dominant cost 为 `test_web_ci_get_snapshot.py::test_full_keeps_diagnostics_and_oversized_payload_uses_resource_while_summary_stays_inline` `190.80s`，第二慢为 `test_development_failure_pack.py::test_failure_pack_bounds_log_and_marks_missing_evidence` `10.65s`；setup/cache/network 排查结论为 source mirror hit、三个 Python workspace environment-cache 均 hit/restored，runtime-dependencies/ruff/compileall 均为秒级或亚秒级，GitHub Actions `34200755829` 也显示 `Run tests` 远大于 dependency install，因此不把 Vue/pytest warning、日志量、dependency restore 或网络作为无证据根因。optimization candidate `e43baaa8a913da36810d765a4f58ef61f04355ef` / Tree `4a111f2f153f1085b259d8662ea2fcbd073b8006` 仅修改测试 fixture 与 `pytest.ini`：保留 full/detail resource fallback、summary inline、完整 resource readback、Failure Pack truncation 语义，将 synthetic oversized payload 缩至仍超过 `MAX_SAFE_INLINE_BYTES` 的最小充分规模，并将 Failure Pack oversized log 缩至 `MAX_LOG_EXCERPT_BYTES + 512`；未删除测试、未 skip/xfail、未降低断言、未改变 full gate。candidate Index `12.0.0-1` ready（Index Job `e55872d2-4d9c-4f33-b2ad-2279139efb98`，288 files，reindexed 2）。after full Private CI Job `78d236fe63a0405e` passed / exit 0，总时长 `69.19s`，`github-action-service pytest 63.08s`、`private-ci-agent pytest 49.41s`、`private-deploy-agent pytest 0.85s`，slowest tests `42.88s` / `9.49s`；repeat full Private CI Job `dd07e5889f8f4b4c` passed / exit 0，总时长 `67.89s`，`github-action-service pytest 61.50s`、`private-ci-agent pytest 48.72s`、`private-deploy-agent pytest 1.21s`，slowest tests `41.57s` / `9.05s`。before/after delta against baseline Job `cc59f562e2cb44f0`：total `-130.12s`（约 `-65.3%`），controller pytest `-131.14s`（约 `-67.5%`）；against forced rerun Job `20ceb115e2524cd6`：total `-143.56s`（约 `-67.9%`），controller pytest `-144.63s`（约 `-70.2%`）。fast feedback Job `1beb7d310d7f4cc3` failed before tests with existing `FAST_CHECK_ENTRYPOINT_MISSING` (`make ai-integrity-check` absent)，未作为 merge gate，full `repo-auto-check` 仍为最终门禁。notable noise：Job `78d236fe63a0405e` log 曾出现 non-failing background `aiosqlite` thread traceback；repeat Job `dd07e5889f8f4b4c` 未复现，未归因为耗时根因。
 
 ## 8. P0：兼容、文档、Capability
 
