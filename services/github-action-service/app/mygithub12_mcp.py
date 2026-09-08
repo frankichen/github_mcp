@@ -30,6 +30,12 @@ _WORKSPACE_WRITE = ToolAnnotations(
     idempotentHint=False,
     openWorldHint=False,
 )
+_PRIVATE_CI_PLAN = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+)
 
 
 def _error(exc: Exception) -> str:
@@ -96,7 +102,7 @@ def register_mygithub12_tools(mcp, github_call, service) -> None:
         return await _call(github_call, mygithub12.list_indexes, service, repository, limit, offset)
 
     # A2. Private CI applicability planning (1)
-    @mcp.tool(name="plan_private_ci_job", description="Plan whether a private CI profile is applicable to one exact commit using repository policy, manifests and fixed profile entrypoints. Never queues CI.", annotations=_READ_ONLY)
+    @mcp.tool(name="plan_private_ci_job", description="Plan whether a private CI profile is applicable to one exact commit using repository policy, manifests and fixed profile entrypoints. Never queues CI.", annotations=_PRIVATE_CI_PLAN)
     async def plan_private_ci_job(repository: str, commit_sha: str, profile: str = "repo-auto-check") -> str:
         return await _call(github_call, mygithub12.plan_private_ci_job, service, repository, commit_sha, profile)
 

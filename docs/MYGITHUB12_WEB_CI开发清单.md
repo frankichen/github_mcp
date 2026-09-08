@@ -188,13 +188,13 @@
 
 ### WEB-CI-DEV-013：ToolAnnotations 全量校准
 
-- [ ] 列出所有 private CI / validate / converge / log / cancel 工具。
-- [ ] 对每个 handler 实际副作用评审 readOnlyHint。
-- [ ] 评审 destructive/consequential。
-- [ ] 评审 idempotentHint，并用真实服务端保证支撑。
-- [ ] 按当前 MCP/OpenAI 定义评审 openWorldHint。
-- [ ] 写 schema snapshot/manifest 自动测试。
-- [ ] capability tool_count/schema hash 与发布结果一致。
+- [x] 列出所有 private CI / validate / converge / log / cancel 工具。
+- [x] 对每个 handler 实际副作用评审 readOnlyHint。
+- [x] 评审 destructive/consequential。
+- [x] 评审 idempotentHint，并用真实服务端保证支撑。
+- [x] 按当前 MCP/OpenAI 定义评审 openWorldHint。
+- [x] 写 schema snapshot/manifest 自动测试。
+- [x] capability tool_count/schema hash 与发布结果一致。
 
 映射验收：AC-WEB-CI-11/13。  
 证据：`待填写`

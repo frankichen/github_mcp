@@ -3940,7 +3940,7 @@
     },
     {
       "name": "list_private_ci_workers",
-      "read_only": true,
+      "read_only": false,
       "consequential": false,
       "category": "private_ci",
       "description": "List workers registered with the private CI controller, including wsl-ci-01.\n\nReturns each worker's ID, online status, supported profiles, max concurrency, and current job.\n\nThis is for the private German-controller + WSL-Podman CI system.\nNOT for GitHub Actions self-hosted runners (use list_ci_workers for that).",
@@ -4099,8 +4099,8 @@
     },
     {
       "name": "wait_private_ci_job",
-      "read_only": false,
-      "consequential": true,
+      "read_only": true,
+      "consequential": false,
       "category": "private_ci",
       "description": "Deprecated compatibility-only long-poll for explicit legacy/debug callers. Retains the legacy up-to-55-second status/step/revision wait contract. It is not the canonical ChatGPT Web CI tracking path; normal Web continuation uses get_private_ci_job snapshots and must not loop this tool until terminal.",
       "input_schema": {

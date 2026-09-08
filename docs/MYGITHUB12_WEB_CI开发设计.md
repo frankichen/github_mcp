@@ -381,12 +381,16 @@ cancel 必须针对准确 job_id；不能用“最新 Job”隐式取消。Worke
 
 实现时建立一张自动化表，逐个核验实际副作用：
 
-| 类别 | readOnly | destructive/consequential | idempotent | 说明 |
-|---|---|---|---|---|
-| list/get/plan/log/failure pack | true | false | true | 纯读取 |
-| start CI | false | false | true（有服务端保证） | 创建/复用 durable CI request |
-| validate/converge | false | false | true（有 key/revision） | 写控制面并可能启动 CI |
-| cancel/supersede | false | true | 应安全重试 | 改变执行中的 Job |
+| Tool / 类别 | readOnly | destructive/consequential | idempotent | openWorld | 说明 |
+|---|---|---|---|---|---|
+| `list_private_ci_profiles` / `list_private_ci_jobs` / `get_private_ci_job` / `wait_private_ci_job` / log reads | true | false | true | false | 只读取本地持久状态或日志；compatibility wait 只等待状态变化，不写状态 |
+| `list_private_ci_workers` | false | false | false | false | 返回前会做 stale-worker reconciliation，可能写 worker status/current job/database state |
+| `plan_private_ci_job` | true | false | true | true | 读取 exact commit、repository policy 与 manifests；不排队 CI，但会访问 GitHub 外部世界 |
+| `start_private_ci_job` | false | false | false | true | 创建/复用 durable CI request；公开 `force_rerun=True` 允许产生新的有效执行身份 |
+| `validate_development_task` / `converge_development_task` | false | false | false | true | 推进 durable Session/Index/CI 状态并可能调度 CI；公开 `force_rerun` 使 Tool 整体不能声明幂等 |
+| `cancel_private_ci_job` | false | true | false | true | DEV-013 阶段会改变 Job/cancel_requested/Worker 执行状态；DEV-014 的完整 retry guarantee 尚未集成 |
+
+`openWorldHint` 按每个 Tool 的真实边界判断，不从 read/write 类型机械推导；DEV-013 不提前声明 DEV-014 的 cancel idempotency。
 
 `openWorldHint` 等字段必须依据当前 MCP/OpenAI 定义和工具真实外部交互重新评审，不允许机械复制。
 

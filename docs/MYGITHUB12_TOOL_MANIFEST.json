@@ -21,6 +21,122 @@
     "wait_private_ci_job"
   ],
   "schema_identity_algorithm": "sha256-canonical-mcp-tools-v1",
+  "tool_annotation_snapshot": {
+    "cancel_private_ci_job": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "consequential": true,
+      "reason": "Cancels queued jobs or writes cancel_requested for active jobs; it changes execution state and can signal a Worker, while repeat behavior is not contractually stable enough for idempotent true."
+    },
+    "converge_development_task": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "consequential": true,
+      "reason": "Advances durable convergence/session/index/CI state and may schedule CI; force_rerun is a legal mode, while merge/deploy/rollback remain outside this tool."
+    },
+    "get_private_ci_job": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "consequential": false,
+      "reason": "Reads persisted Request, Worker, job and step state only; it does not wait, load logs, schedule work or mutate state."
+    },
+    "get_private_ci_log_tail": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "consequential": false,
+      "reason": "Reads a bounded persisted log tail and redacts it in the response without changing the job or log state."
+    },
+    "get_private_ci_logs": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "consequential": false,
+      "reason": "Reads persisted job metadata and log chunks only; pagination does not schedule, cancel or mutate CI state."
+    },
+    "list_private_ci_jobs": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "consequential": false,
+      "reason": "Reads bounded persisted job rows and summaries only; filters and pagination have no state or scheduling side effect."
+    },
+    "list_private_ci_profiles": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "consequential": false,
+      "reason": "Reads configured allowed profiles only; it creates no Request and changes neither Worker nor job state."
+    },
+    "list_private_ci_workers": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "consequential": false,
+      "reason": "The handler first runs stale-worker reconciliation, which can update worker status/current_job_id and commit the database before returning rows."
+    },
+    "plan_private_ci_job": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "consequential": false,
+      "reason": "Reads the exact commit tree and repository policy/manifests through the GitHub service; it never queues CI or writes private-CI control-plane state."
+    },
+    "start_private_ci_job": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "consequential": true,
+      "reason": "Creates or reuses a durable CI Request and may schedule preparation/Worker execution; force_rerun legally creates a new effective identity."
+    },
+    "validate_development_task": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "consequential": true,
+      "reason": "Advances durable Session state, may renew its workspace, records validation and may create/reuse or observe CI; force_rerun is a legal mode."
+    },
+    "wait_private_ci_job": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "consequential": false,
+      "reason": "Compatibility long-poll reads status, step and event revisions only; waiting does not write state or schedule work."
+    }
+  },
+  "schema_snapshots": {
+    "canonical": {
+      "tool_count": 164,
+      "tool_manifest_count": 164,
+      "compatibility_tool_count": 175,
+      "hidden_deprecated_tool_count": 11,
+      "tool_schema_sha256": "032c44ca05431fd6377376f5ef13c35f2d5d9b371a6c083c42b104e57a31603a",
+      "schema_generation_id": "schema-v1:032c44ca05431fd6"
+    },
+    "compatibility": {
+      "tool_count": 175,
+      "tool_manifest_count": 175,
+      "compatibility_tool_count": 175,
+      "hidden_deprecated_tool_count": 0,
+      "tool_schema_sha256": "f4823bd93bb8a7454e614f294ab5425d6683fe04749e3f55347c6febd24d36c5",
+      "schema_generation_id": "schema-v1:f4823bd93bb8a745"
+    }
+  },
   "new_tools": [
     "get_repository_index_status",
     "request_repository_index_build",

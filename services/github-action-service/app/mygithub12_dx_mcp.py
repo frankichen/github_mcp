@@ -25,6 +25,7 @@ from app import mygithub10
 
 logger=logging.getLogger(__name__)
 _ORCHESTRATION=ToolAnnotations(readOnlyHint=False,destructiveHint=False,idempotentHint=False,openWorldHint=True)
+_PRIVATE_CI_ORCHESTRATION=ToolAnnotations(readOnlyHint=False,destructiveHint=False,idempotentHint=False,openWorldHint=True)
 
 
 def _error_payload(exc: Exception, *, log_unexpected: bool = True) -> dict[str, Any]:
@@ -608,7 +609,7 @@ def register_dx_tools(
                     logger.exception("unprepared ChangeSet artifact could not be invalidated")
             return _error(exc)
 
-    @mcp.tool(name="validate_development_task",description="Run or reuse fast/full private CI for an exact Session head and return the current durable status without waiting by default; fast feedback never becomes merge-eligible, full success yields attestation.",annotations=_ORCHESTRATION)
+    @mcp.tool(name="validate_development_task",description="Run or reuse fast/full private CI for an exact Session head and return the current durable status without waiting by default; fast feedback never becomes merge-eligible, full success yields attestation.",annotations=_PRIVATE_CI_ORCHESTRATION)
     async def validate_development_task(
         development_session_id: str, expected_session_revision: int, mode: str="fast", base_sha: str="", force_rerun: bool=False,
         supersede_previous: bool=True, wait_seconds: int=0, include_failure_pack: bool=True, idempotency_key: str="",
@@ -688,7 +689,7 @@ def register_dx_tools(
             return json.dumps({"ok":True,"development_session":final_session,"mode":mode,"lease_maintenance":lease_maintenance,**result},ensure_ascii=False)
         except Exception as exc: return _error(exc)
 
-    @mcp.tool(name="converge_development_task",description="Converge exact-head Index, Change Context, Impact, Contract, Affected Tests and fast/full Private CI; never merges, deploys or rolls back.",annotations=_ORCHESTRATION)
+    @mcp.tool(name="converge_development_task",description="Converge exact-head Index, Change Context, Impact, Contract, Affected Tests and fast/full Private CI; never merges, deploys or rolls back.",annotations=_PRIVATE_CI_ORCHESTRATION)
     async def converge_development_task(
         development_session_id: str, expected_session_revision: int, mode: str="full", base_sha: str="",
         index_wait_seconds: int=55, wait_seconds: int=55, force_rerun: bool=False,

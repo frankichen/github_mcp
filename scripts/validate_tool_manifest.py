@@ -10,6 +10,36 @@ import sys
 from pathlib import Path
 
 
+ANNOTATION_FIELDS = (
+    "readOnlyHint",
+    "destructiveHint",
+    "idempotentHint",
+    "openWorldHint",
+)
+ANNOTATION_SNAPSHOT_TOOLS = {
+    "list_private_ci_workers",
+    "list_private_ci_profiles",
+    "list_private_ci_jobs",
+    "start_private_ci_job",
+    "get_private_ci_job",
+    "wait_private_ci_job",
+    "get_private_ci_logs",
+    "get_private_ci_log_tail",
+    "cancel_private_ci_job",
+    "plan_private_ci_job",
+    "validate_development_task",
+    "converge_development_task",
+}
+IDENTITY_FIELDS = (
+    "tool_count",
+    "tool_manifest_count",
+    "compatibility_tool_count",
+    "hidden_deprecated_tool_count",
+    "tool_schema_sha256",
+    "schema_generation_id",
+)
+
+
 async def main() -> int:
     root = Path(__file__).parents[1]
     os.environ.setdefault("GITHUB_TOKEN", "test_token_value")
@@ -80,6 +110,38 @@ async def main() -> int:
             if manifest12.get("compatibility_tool_count") != len(registered_names):
                 raise SystemExit("MyGithut12 compatibility_tool_count mismatch")
 
+            annotation_snapshot = manifest12.get("tool_annotation_snapshot")
+            if not isinstance(annotation_snapshot, dict) or set(annotation_snapshot) != ANNOTATION_SNAPSHOT_TOOLS:
+                raise SystemExit("MyGithut12 tool annotation snapshot inventory mismatch")
+            registered_by_name = {tool.name: tool for tool in registered}
+            for name, expected in annotation_snapshot.items():
+                if not isinstance(expected, dict):
+                    raise SystemExit(f"{name} annotation snapshot entry must be an object")
+                tool = registered_by_name[name]
+                annotations = tool.annotations
+                if annotations is None:
+                    raise SystemExit(f"{name} is missing ToolAnnotations")
+                actual = {field: getattr(annotations, field) for field in ANNOTATION_FIELDS}
+                expected_annotations = {field: expected.get(field) for field in ANNOTATION_FIELDS}
+                if actual != expected_annotations:
+                    raise SystemExit(
+                        f"{name} ToolAnnotations mismatch: actual={actual!r} expected={expected_annotations!r}"
+                    )
+                if not isinstance(expected.get("consequential"), bool) or not str(expected.get("reason", "")).strip():
+                    raise SystemExit(f"{name} annotation snapshot must record consequential and reason")
+
+            compatibility_identity = await mcp.tool_schema_identity(registered)
+            snapshots = manifest12.get("schema_snapshots")
+            if not isinstance(snapshots, dict):
+                raise SystemExit("MyGithut12 schema snapshots are missing")
+            expected_compatibility = snapshots.get("compatibility")
+            if not isinstance(expected_compatibility, dict):
+                raise SystemExit("MyGithut12 compatibility schema snapshot is missing")
+            if {field: compatibility_identity[field] for field in IDENTITY_FIELDS} != {
+                field: expected_compatibility.get(field) for field in IDENTITY_FIELDS
+            }:
+                raise SystemExit("MyGithut12 compatibility schema snapshot mismatch")
+
             hidden = manifest12.get("hidden_deprecated_tools") or []
             if not isinstance(hidden, list) or len(hidden) != len(set(hidden)):
                 raise SystemExit("MyGithut12 hidden_deprecated_tools must be a unique list")
@@ -104,6 +166,13 @@ async def main() -> int:
                 raise SystemExit("MyGithut12 runtime schema identity count mismatch")
             if len(identity["tool_schema_sha256"]) != 64:
                 raise SystemExit("MyGithut12 runtime schema fingerprint is invalid")
+            expected_canonical = snapshots.get("canonical")
+            if not isinstance(expected_canonical, dict):
+                raise SystemExit("MyGithut12 canonical schema snapshot is missing")
+            if {field: identity[field] for field in IDENTITY_FIELDS} != {
+                field: expected_canonical.get(field) for field in IDENTITY_FIELDS
+            }:
+                raise SystemExit("MyGithut12 canonical schema snapshot mismatch")
             print(
                 f"MyGithut12 manifest matches {len(canonical_names)} canonical / {len(registered_names)} compatibility tools ({len(new_names)} new)"
             )
