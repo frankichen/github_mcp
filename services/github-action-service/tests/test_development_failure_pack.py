@@ -46,7 +46,7 @@ def test_redact_text_large_non_secret_bypasses_sensitive_assignment_regex(monkey
             raise AssertionError("expensive assignment regex should be bypassed")
 
     monkeypatch.setattr(failure_pack, "_SENSITIVE_ASSIGNMENT_RE", ExplodingPattern())
-    text = "ordinary=value;" * 4096
+    text = "secret appears in documentation; " + ("ordinary=value;" * 4096)
 
     assert failure_pack.redact_text(text) == text
 

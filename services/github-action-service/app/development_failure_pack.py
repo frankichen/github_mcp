@@ -134,10 +134,21 @@ def _truncate_utf8(value: str, max_bytes: int, *, from_end: bool = False) -> tup
 
 
 def _has_sensitive_assignment_candidate(text: str) -> bool:
-    if ":" not in text and "=" not in text:
-        return False
-    lowered = text.lower()
-    return any(marker in lowered for marker in _SENSITIVE_ASSIGNMENT_MARKERS)
+    for separator_index, char in enumerate(text):
+        if char not in ":=":
+            continue
+        cursor = separator_index - 1
+        while cursor >= 0 and text[cursor].isspace():
+            cursor -= 1
+        key_end = cursor + 1
+        while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in "_.-"):
+            cursor -= 1
+        if key_end == cursor + 1:
+            continue
+        key = text[cursor + 1 : key_end].lower()
+        if any(marker in key for marker in _SENSITIVE_ASSIGNMENT_MARKERS):
+            return True
+    return False
 
 
 def redact_text(value: Any) -> str:
