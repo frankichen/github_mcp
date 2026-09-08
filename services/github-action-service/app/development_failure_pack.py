@@ -73,6 +73,27 @@ _SENSITIVE_OPTION_RE = re.compile(
 _SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?i)(\b[\w.-]*(?:token|password|passwd|secret|(?:api|access|client)[_-]?key|credential|private[_-]?key|authorization|headers?)[\w.-]*\s*[:=]\s*)([^\s,;\"']+)"
 )
+_SENSITIVE_ASSIGNMENT_MARKERS = (
+    "token",
+    "password",
+    "passwd",
+    "secret",
+    "apikey",
+    "api_key",
+    "api-key",
+    "accesskey",
+    "access_key",
+    "access-key",
+    "clientkey",
+    "client_key",
+    "client-key",
+    "credential",
+    "privatekey",
+    "private_key",
+    "private-key",
+    "authorization",
+    "header",
+)
 _QUOTED_SENSITIVE_RE = re.compile(
     r"(?i)([\"'](?:token|password|passwd|secret|(?:api|access|client)[_-]?key|credential|private[_-]?key|authorization|headers?)[\"']\s*[:=]\s*)([\"'])(.*?)([\"'])"
 )
@@ -84,10 +105,7 @@ _SENSITIVE_KEY_RE = re.compile(
     r"(?i)(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|credential|authorization|private[_-]?key|headers?)"
 )
 
-_LOCATION_RE = re.compile(
-    r"(?P<file>(?:[A-Za-z]:[\\/]|/|\./|\.\./)?[^()\s:]+):"
-    r"(?P<line>\d+)(?::(?P<column>\d+))?"
-)
+_LOCATION_FILE_TRAILING = ".,;])}>"
 _PYTEST_FAILED_RE = re.compile(r"^\s*FAILED\s+(?P<target>\S+?)(?:\s+-\s+(?P<message>.*))?\s*$")
 _GO_FAILED_RE = re.compile(r"^\s*---\s+FAIL:\s+(?P<name>.+?)(?:\s+\([^)]*\))?\s*$")
 _NODE_BULLET_RE = re.compile(r"^\s*[●✕×]\s+(?P<name>.+?)\s*$")
@@ -115,6 +133,13 @@ def _truncate_utf8(value: str, max_bytes: int, *, from_end: bool = False) -> tup
     return text + marker, True
 
 
+def _has_sensitive_assignment_candidate(text: str) -> bool:
+    if ":" not in text and "=" not in text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _SENSITIVE_ASSIGNMENT_MARKERS)
+
+
 def redact_text(value: Any) -> str:
     """Redact credentials from commands, logs, errors and other text evidence."""
     text = _ANSI_RE.sub("", str(value))
@@ -126,7 +151,10 @@ def redact_text(value: Any) -> str:
         lambda match: match.group(1) + match.group(2) + "[REDACTED]" + match.group(4), text
     )
     text = _SENSITIVE_OPTION_RE.sub(lambda match: match.group(1) + "[REDACTED]", text)
-    text = _SENSITIVE_ASSIGNMENT_RE.sub(lambda match: match.group(1) + "[REDACTED]", text)
+    if _has_sensitive_assignment_candidate(text):
+        text = _SENSITIVE_ASSIGNMENT_RE.sub(
+            lambda match: match.group(1) + "[REDACTED]", text
+        )
     text = _URL_CREDENTIAL_RE.sub(lambda match: match.group(1) + "[REDACTED]" + match.group(3), text)
     return _KNOWN_TOKEN_RE.sub("[REDACTED]", text)
 
@@ -205,14 +233,87 @@ def _location(file: str | None = None, line: Any = None, column: Any = None) -> 
     return {"status": state, "file": file_value, "line": line_value, "column": column_value}
 
 
+def _iter_location_tokens(raw: str):
+    start = None
+    for index, char in enumerate(raw):
+        if char.isspace() or char in "()":
+            if start is not None:
+                yield raw[start:index]
+                start = None
+        elif start is None:
+            start = index
+    if start is not None:
+        yield raw[start:]
+
+
+def _is_supported_location_file(file_value: str) -> bool:
+    if not file_value or "://" in file_value:
+        return False
+    if ":" not in file_value:
+        return True
+    return (
+        len(file_value) >= 3
+        and file_value[0].isalpha()
+        and file_value[1] == ":"
+        and file_value[2] in "\\/"
+        and ":" not in file_value[2:]
+    )
+
+
+def _parse_location_token(token: str) -> tuple[str, str, str | None] | None:
+    segment_start = 0
+    token_has_url = "://" in token
+    length = len(token)
+    index = 0
+    while index < length:
+        if token[index] != ":":
+            index += 1
+            continue
+        value_start = index + 1
+        is_drive_colon = (
+            index == segment_start + 1
+            and token[segment_start].isalpha()
+            and value_start < length
+            and token[value_start] in "\\/"
+        )
+        if value_start >= length or not token[value_start].isdigit():
+            if not is_drive_colon:
+                segment_start = value_start
+            index = value_start
+            continue
+
+        line_end = value_start
+        while line_end < length and token[line_end].isdigit():
+            line_end += 1
+        column = None
+        if (
+            line_end < length
+            and token[line_end] == ":"
+            and line_end + 1 < length
+            and token[line_end + 1].isdigit()
+        ):
+            column_start = line_end + 1
+            column_end = column_start
+            while column_end < length and token[column_end].isdigit():
+                column_end += 1
+            column = token[column_start:column_end]
+
+        file_value = token[segment_start:index].rstrip(_LOCATION_FILE_TRAILING)
+        if not token_has_url and _is_supported_location_file(file_value):
+            return file_value, token[value_start:line_end], column
+
+        segment_start = value_start
+        index = line_end
+    return None
+
+
 def parse_failure_location(text: Any) -> dict[str, Any]:
     """Parse ``file:line[:column]`` and always return an explicit status."""
     raw = redact_text(text)
-    for match in _LOCATION_RE.finditer(raw):
-        file_value = match.group("file").rstrip(".,;])}>")
-        if "://" in file_value:
-            continue
-        return _location(file_value, match.group("line"), match.group("column"))
+    for token in _iter_location_tokens(raw):
+        parsed = _parse_location_token(token)
+        if parsed is not None:
+            return _location(*parsed)
     return _location()
 
 

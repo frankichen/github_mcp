@@ -40,6 +40,73 @@ def _job(**overrides):
     return job
 
 
+def test_redact_text_large_non_secret_bypasses_sensitive_assignment_regex(monkeypatch):
+    class ExplodingPattern:
+        def sub(self, *_args, **_kwargs):
+            raise AssertionError("expensive assignment regex should be bypassed")
+
+    monkeypatch.setattr(failure_pack, "_SENSITIVE_ASSIGNMENT_RE", ExplodingPattern())
+    text = "ordinary=value;" * 4096
+
+    assert failure_pack.redact_text(text) == text
+
+
+def test_redact_text_large_secret_near_tail_still_redacts():
+    secret = "repair-secret-value-12345"
+    text = ("ordinary=value;" * 4096) + f" client_secret={secret}"
+
+    redacted = failure_pack.redact_text(text)
+
+    assert secret not in redacted
+    assert "client_secret=[REDACTED]" in redacted
+
+
+def test_parse_failure_location_large_no_location_uses_non_overlapping_tokens(monkeypatch):
+    original = failure_pack._parse_location_token
+    inspected_lengths = []
+
+    def counting_parse(token):
+        inspected_lengths.append(len(token))
+        return original(token)
+
+    monkeypatch.setattr(failure_pack, "_parse_location_token", counting_parse)
+    text = ("plain-diagnostic-segment:" * 4096) + "not-a-location"
+
+    location = failure_pack.parse_failure_location(text)
+
+    assert location["status"] == "unavailable"
+    assert sum(inspected_lengths) <= len(text)
+    assert len(inspected_lengths) == 1
+
+
+@pytest.mark.parametrize(
+    ("location_text", "expected_file", "expected_line", "expected_column"),
+    [
+        ("/workspace/src/tail.py:321:9", "/workspace/src/tail.py", 321, 9),
+        (r"C:\workspace\src\tail.py:654:2", r"C:\workspace\src\tail.py", 654, 2),
+    ],
+)
+def test_parse_failure_location_large_text_finds_location_near_tail(
+    location_text, expected_file, expected_line, expected_column
+):
+    text = ("noise " * 8192) + location_text
+
+    location = failure_pack.parse_failure_location(text)
+
+    assert location == {
+        "status": "complete",
+        "file": expected_file,
+        "line": expected_line,
+        "column": expected_column,
+    }
+
+
+def test_parse_failure_location_rejects_invalid_location_candidates():
+    text = "https://example.test:443/path file.py:not-a-line C:\\temp\\bad.py:line"
+
+    assert failure_pack.parse_failure_location(text)["status"] == "unavailable"
+
+
 def test_failure_parser_handles_pytest_go_and_node_locations():
     log = "\n".join(
         [
