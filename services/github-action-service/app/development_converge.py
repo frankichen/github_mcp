@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable, Mapping
 from app import ci_database
 from app import ci_request_store
 from app import development_convergence_store as convergence_store
+from app import observability
 from app import development_session_store as sessions
 from app import mygithub12
 from app.ci_models import effective_priority
@@ -671,6 +672,20 @@ def _phase_rank(phase: str) -> int:
     return _PHASE_RANK.get(phase, -1)
 
 
+def _durable_phase_started_at(snapshot: Mapping[str, Any]) -> Any:
+    current_phase = str(snapshot.get("phase") or "")
+    started_at = snapshot.get("created_at")
+    for event in convergence_store.list_convergence_events(
+        str(snapshot["convergence_id"]), limit=500
+    ):
+        if (
+            event.get("to_phase") == current_phase
+            and event.get("from_phase") != current_phase
+        ):
+            started_at = event.get("created_at")
+    return started_at
+
+
 def _transition_if_needed(
     snapshot: dict[str, Any],
     phase: str,
@@ -695,8 +710,9 @@ def _transition_if_needed(
     )
     if not (should_move or should_update_status or should_update_error):
         return snapshot
+    phase_started_at = _durable_phase_started_at(snapshot) if should_move else None
     try:
-        return convergence_store.transition_convergence(
+        updated = convergence_store.transition_convergence(
             snapshot["convergence_id"],
             int(snapshot["revision"]),
             phase if should_move else current_phase,
@@ -706,6 +722,12 @@ def _transition_if_needed(
             event_type=event_type,
             metadata=metadata,
         )
+        if should_move and updated.get("phase") != current_phase:
+            observability.observe_convergence_transition(
+                current_phase, str(updated.get("phase") or phase),
+                phase_started_at, updated.get("updated_at"),
+            )
+        return updated
     except MyGithub12Error as exc:
         if exc.code != "DEVELOPMENT_CONVERGENCE_REVISION_MISMATCH" or not _retry_on_cas:
             raise
@@ -1606,7 +1628,13 @@ async def converge_task(
                 mode=mode,
                 idempotency_key=convergence_key,
             )
+            if snapshot.get("deduplicated"):
+                observability.observe_idempotency("convergence", "reuse")
+            else:
+                observability.observe_convergence_phase_entry("accepted")
         except MyGithub12Error as exc:
+            if exc.code == "IDEMPOTENCY_CONFLICT":
+                observability.observe_idempotency("convergence", "conflict")
             # An identity conflict can be the old active run after a branch or
             # Session drift. Mark that old run blocked when its identity is
             # available instead of silently starting a new run under the key.

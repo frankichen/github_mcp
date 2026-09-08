@@ -25,6 +25,7 @@ from app.ci_repository_config import (
     get_allowed_profiles, get_max_timeout, is_private_ci_enabled, is_profile_allowed,
     is_self_deploy_enabled, is_test_deploy_enabled,
 )
+from app import observability
 from app.development_failure_pack import build_failure_pack
 from app.mcp_response import store_response_resource
 
@@ -600,11 +601,14 @@ def start_validation_request(
             normalized_request_hash=request_hash,request_payload=normalized_payload,
         )
     except CIRequestIdempotencyConflictError as exc:
+        observability.observe_idempotency("validation", "conflict")
         raise MyGithub12Error(
             "IDEMPOTENCY_CONFLICT",
             "idempotency_key is already bound to a different validation request",
             {"idempotency_key":effective_idempotency_key},
         ) from exc
+    if request.get("deduplicated"):
+        observability.observe_idempotency("validation", "reuse")
     if request["phase"] in {"accepted","preparing"}:
         schedule_ci_request_preparation(request["request_id"])
     return request,selection
@@ -657,7 +661,8 @@ def wait_validation(job_id: str, wait_seconds: int) -> dict[str,Any]:
     wait=max(0,min(int(wait_seconds),55))
     if wait:
         snap=_job_snapshot(job_id)
-        wait_for_job_change(job_id,wait,snap.get("status", ""),snap.get("current_step") or "",int(snap.get("revision",0)))
+        with observability.explicit_wait("validation"):
+            wait_for_job_change(job_id,wait,snap.get("status", ""),snap.get("current_step") or "",int(snap.get("revision",0)))
     job=get_job(job_id)
     if not job: raise MyGithub12Error("PRIVATE_CI_JOB_NOT_FOUND","private CI job disappeared",{"job_id":job_id})
     return job

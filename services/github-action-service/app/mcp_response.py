@@ -20,6 +20,8 @@ from typing_extensions import NotRequired, TypedDict
 
 from mcp.server.fastmcp import FastMCP
 
+from app import observability
+
 MAX_SAFE_INLINE_BYTES = 32 * 1024
 # Leave room for the chunk envelope and MCP transport framing.
 MAX_RESPONSE_RESOURCE_CHUNK_BYTES = 24 * 1024
@@ -329,7 +331,9 @@ def prepare_tool_response(value: dict[str, Any]) -> dict[str, Any]:
         "content_sha256": digest,
     }
     inline = _attach_meta(payload, inline_meta)
-    if response_size_bytes(inline) <= MAX_SAFE_INLINE_BYTES:
+    inline_bytes = response_size_bytes(inline)
+    if inline_bytes <= MAX_SAFE_INLINE_BYTES:
+        observability.observe_mcp_response("inline", inline_bytes)
         return inline
 
     resource = store_response_resource(payload)
@@ -352,6 +356,9 @@ def prepare_tool_response(value: dict[str, Any]) -> dict[str, Any]:
     if response_size_bytes(result) > MAX_SAFE_INLINE_BYTES:
         minimal = {key: compact[key] for key in compact if key in _IDENTITY_KEYS or key == "error"}
         result = _attach_meta(minimal, resource_meta)
+    observability.observe_mcp_response(
+        "resource", response_size_bytes(result), resource["total_bytes"]
+    )
     return result
 
 
@@ -368,21 +375,13 @@ def normalize_json_tool_result(result: Any) -> dict[str, Any]:
     return prepare_tool_response(parsed)
 
 
-def _structured_wrapper(function: Callable[..., Any]) -> Callable[..., Any]:
-    signature = inspect.signature(function)
-    try:
-        annotations = dict(get_type_hints(function, include_extras=True))
-    except Exception:
-        annotations = dict(getattr(function, "__annotations__", {}))
-    annotations["return"] = dict[str, Any]
-
-    if inspect.iscoroutinefunction(function):
-        async def wrapped(*args: Any, **kwargs: Any) -> dict[str, Any]:
-            return normalize_json_tool_result(await function(*args, **kwargs))
-    else:
-        def wrapped(*args: Any, **kwargs: Any) -> dict[str, Any]:
-            return normalize_json_tool_result(function(*args, **kwargs))
-
+def _copy_wrapper_identity(
+    wrapped: Callable[..., Any],
+    function: Callable[..., Any],
+    signature: inspect.Signature,
+    annotations: dict[str, Any],
+    return_annotation: Any,
+) -> Callable[..., Any]:
     wrapped.__name__ = function.__name__
     wrapped.__qualname__ = function.__qualname__
     wrapped.__module__ = function.__module__
@@ -393,10 +392,73 @@ def _structured_wrapper(function: Callable[..., Any]) -> Callable[..., Any]:
         for name, parameter in signature.parameters.items()
     ]
     wrapped.__signature__ = signature.replace(
-        parameters=resolved_parameters,
-        return_annotation=dict[str, Any],
+        parameters=resolved_parameters, return_annotation=return_annotation
     )
     return wrapped
+
+
+def _structured_wrapper(function: Callable[..., Any], tool_name: str) -> Callable[..., Any]:
+    signature = inspect.signature(function)
+    try:
+        annotations = dict(get_type_hints(function, include_extras=True))
+    except Exception:
+        annotations = dict(getattr(function, "__annotations__", {}))
+    annotations["return"] = dict[str, Any]
+
+    if inspect.iscoroutinefunction(function):
+        async def wrapped(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            started, state, token = observability.begin_mcp_tool(tool_name)
+            result_class = "exception"
+            try:
+                result = normalize_json_tool_result(await function(*args, **kwargs))
+                result_class = observability.classify_mcp_result(result)
+                return result
+            finally:
+                observability.finish_mcp_tool(tool_name, started, state, token, result_class)
+    else:
+        def wrapped(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            started, state, token = observability.begin_mcp_tool(tool_name)
+            result_class = "exception"
+            try:
+                result = normalize_json_tool_result(function(*args, **kwargs))
+                result_class = observability.classify_mcp_result(result)
+                return result
+            finally:
+                observability.finish_mcp_tool(tool_name, started, state, token, result_class)
+
+    return _copy_wrapper_identity(wrapped, function, signature, annotations, dict[str, Any])
+
+
+def _observed_wrapper(function: Callable[..., Any], tool_name: str) -> Callable[..., Any]:
+    signature = inspect.signature(function)
+    try:
+        annotations = dict(get_type_hints(function, include_extras=True))
+    except Exception:
+        annotations = dict(getattr(function, "__annotations__", {}))
+    return_annotation = annotations.get("return", signature.return_annotation)
+
+    if inspect.iscoroutinefunction(function):
+        async def wrapped(*args: Any, **kwargs: Any) -> Any:
+            started, state, token = observability.begin_mcp_tool(tool_name)
+            result_class = "exception"
+            try:
+                result = await function(*args, **kwargs)
+                result_class = observability.classify_mcp_result(result)
+                return result
+            finally:
+                observability.finish_mcp_tool(tool_name, started, state, token, result_class)
+    else:
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            started, state, token = observability.begin_mcp_tool(tool_name)
+            result_class = "exception"
+            try:
+                result = function(*args, **kwargs)
+                result_class = observability.classify_mcp_result(result)
+                return result
+            finally:
+                observability.finish_mcp_tool(tool_name, started, state, token, result_class)
+
+    return _copy_wrapper_identity(wrapped, function, signature, annotations, return_annotation)
 
 
 class StructuredFastMCP(FastMCP):
@@ -480,13 +542,18 @@ class StructuredFastMCP(FastMCP):
 
     def tool(self, *args: Any, **kwargs: Any):
         register = super().tool(*args, **kwargs)
+        configured_name = kwargs.get("name")
+        if configured_name is None and args and isinstance(args[0], str):
+            configured_name = args[0]
 
         def decorator(function: Callable[..., Any]):
+            tool_name = str(configured_name or function.__name__)
             return_annotation = inspect.signature(function).return_annotation
             if return_annotation is str or return_annotation == "str":
-                register(_structured_wrapper(function))
-                # Preserve direct-import compatibility for existing tests and internal callers.
-                return function
-            return register(function)
+                register(_structured_wrapper(function, tool_name))
+            else:
+                register(_observed_wrapper(function, tool_name))
+            # Preserve direct-import compatibility for existing tests and internal callers.
+            return function
 
         return decorator
