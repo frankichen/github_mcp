@@ -128,7 +128,14 @@ async def test_capabilities_report_wait_deprecation_and_schema_visibility(monkey
     assert deprecated["wait_private_ci_job"] == {
         "name": "wait_private_ci_job",
         "deprecated": True,
+        "compatibility_only": True,
         "replacement": "get_private_ci_job",
+        "guidance": (
+            "Legacy wait is compatibility-only for existing/debug clients. Canonical Web CI uses "
+            "start_private_ci_job then get_private_ci_job snapshots and must not loop wait to terminal. "
+            "The 55-second bound is legacy behavior, not an OpenAI/ChatGPT Web timeout SLA. Fast feedback "
+            "is not merge-eligible; the formal gate requires full CI plus a reusable attestation."
+        ),
     }
     production_schema_sha = production["tool_schema_sha256"]
 
