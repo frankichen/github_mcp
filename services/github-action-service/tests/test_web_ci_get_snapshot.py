@@ -471,7 +471,9 @@ async def test_full_keeps_diagnostics_and_oversized_payload_uses_resource_while_
     offset = 0
     while True:
         page = read_response_resource_chunk(
-            full["response_meta"]["resource_uri"], offset_bytes=offset, limit_bytes=4096
+            full["response_meta"]["resource_uri"],
+            offset_bytes=offset,
+            limit_bytes=RESOURCE_CHUNK_BYTES,
         )
         parts.append(page["content"])
         if not page["has_more"]:
