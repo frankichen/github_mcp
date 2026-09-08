@@ -201,14 +201,14 @@
 
 ### WEB-CI-DEV-014：Cancel / supersede / stale evidence
 
-- [ ] cancel 只接受准确 job_id。
-- [ ] queued/running/terminal 行为分别测试。
-- [ ] supersede 写 durable event。
-- [ ] 被 supersede Job 永远不能生成新 HEAD 的 merge-eligible evidence。
-- [ ] Worker release/idle 可验证。
+- [x] cancel 只接受准确 job_id。
+- [x] queued/running/terminal 行为分别测试。
+- [x] supersede 写 durable event。
+- [x] 被 supersede Job 永远不能生成新 HEAD 的 merge-eligible evidence。
+- [x] Worker release/idle 可验证。
 
 映射验收：AC-WEB-CI-12。  
-证据：`待填写`
+证据：`tests/test_web_ci_cancel_supersede.py`；cancel `idempotentHint=true`；fresh schema identity canonical `164 / 1fb6e5a5c882e43d1cea272514ea329ecb5d4a86292920f28bc04a57415c393a`、compatibility `175 / 20f6a867b9c862ab2d5ec0c69b4b526dc578d1ca741190a12e76e44095503975`。
 
 ### WEB-CI-DEV-015：Response budget / Resource fallback
 

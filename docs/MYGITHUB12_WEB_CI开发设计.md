@@ -267,7 +267,7 @@ summary 返回 exact identity、current step、bounded step metadata/count、que
 
 ### 6.7 Cancel
 
-`cancel_private_ci_job` 保留为显式 consequential 工具。canonical description 要说明 queued/running/terminal 三种行为，不得与普通 status 查询混淆。
+`cancel_private_ci_job` 保留为显式 consequential 工具；DEV-014 的 exact-id、事务与无重复 durable 副作用保证成立后声明 `idempotentHint=true`。canonical description 要说明 queued/running/terminal 三种行为，不得与普通 status 查询混淆。
 
 ## 7. Development Convergence 设计
 
@@ -396,9 +396,9 @@ Worker 完成 cancelled 后必须清理 job lease/worker identity、把 owning W
 | `plan_private_ci_job` | true | false | true | true | 读取 exact commit、repository policy 与 manifests；不排队 CI，但会访问 GitHub 外部世界 |
 | `start_private_ci_job` | false | false | false | true | 创建/复用 durable CI request；公开 `force_rerun=True` 允许产生新的有效执行身份 |
 | `validate_development_task` / `converge_development_task` | false | false | false | true | 推进 durable Session/Index/CI 状态并可能调度 CI；公开 `force_rerun` 使 Tool 整体不能声明幂等 |
-| `cancel_private_ci_job` | false | true | false | true | DEV-013 阶段会改变 Job/cancel_requested/Worker 执行状态；DEV-014 的完整 retry guarantee 尚未集成 |
+| `cancel_private_ci_job` | false | true | true | true | DEV-014 只接受 exact job_id；queued/active/terminal 重试不会重复追加 durable event 或 queue/accounting 副作用 |
 
-`openWorldHint` 按每个 Tool 的真实边界判断，不从 read/write 类型机械推导；DEV-013 不提前声明 DEV-014 的 cancel idempotency。
+`openWorldHint` 按每个 Tool 的真实边界判断，不从 read/write 类型机械推导；DEV-014 仅把 `cancel_private_ci_job.idempotentHint` 从 false 提升为 true，其余 DEV-013 annotation 保持不变。
 
 `openWorldHint` 等字段必须依据当前 MCP/OpenAI 定义和工具真实外部交互重新评审，不允许机械复制。
 

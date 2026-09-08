@@ -25,10 +25,10 @@
     "cancel_private_ci_job": {
       "readOnlyHint": false,
       "destructiveHint": true,
-      "idempotentHint": false,
+      "idempotentHint": true,
       "openWorldHint": true,
       "consequential": true,
-      "reason": "Cancels queued jobs or writes cancel_requested for active jobs; it changes execution state and can signal a Worker, while repeat behavior is not contractually stable enough for idempotent true."
+      "reason": "Cancels one exact job identity; repeated unknown, queued, active, or terminal retries add no durable state/event/accounting side effects after the first applicable transition."
     },
     "converge_development_task": {
       "readOnlyHint": false,
@@ -125,16 +125,16 @@
       "tool_manifest_count": 164,
       "compatibility_tool_count": 175,
       "hidden_deprecated_tool_count": 11,
-      "tool_schema_sha256": "032c44ca05431fd6377376f5ef13c35f2d5d9b371a6c083c42b104e57a31603a",
-      "schema_generation_id": "schema-v1:032c44ca05431fd6"
+      "tool_schema_sha256": "1fb6e5a5c882e43d1cea272514ea329ecb5d4a86292920f28bc04a57415c393a",
+      "schema_generation_id": "schema-v1:1fb6e5a5c882e43d"
     },
     "compatibility": {
       "tool_count": 175,
       "tool_manifest_count": 175,
       "compatibility_tool_count": 175,
       "hidden_deprecated_tool_count": 0,
-      "tool_schema_sha256": "f4823bd93bb8a7454e614f294ab5425d6683fe04749e3f55347c6febd24d36c5",
-      "schema_generation_id": "schema-v1:f4823bd93bb8a745"
+      "tool_schema_sha256": "20f6a867b9c862ab2d5ec0c69b4b526dc578d1ca741190a12e76e44095503975",
+      "schema_generation_id": "schema-v1:20f6a867b9c862ab"
     }
   },
   "new_tools": [

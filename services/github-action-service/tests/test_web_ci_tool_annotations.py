@@ -84,7 +84,7 @@ EXPECTED_ANNOTATIONS = {
     "cancel_private_ci_job": {
         "readOnlyHint": False,
         "destructiveHint": True,
-        "idempotentHint": False,
+        "idempotentHint": True,
         "openWorldHint": True,
         "consequential": True,
     },
@@ -205,7 +205,7 @@ async def test_list_workers_annotation_covers_real_reconciliation_call(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_repeated_running_cancel_remains_conservatively_non_idempotent(monkeypatch):
+async def test_repeated_running_cancel_is_idempotent_after_first_request(monkeypatch):
     cancel_requests = []
     monkeypatch.setattr(
         ci_mcp,
@@ -281,6 +281,8 @@ async def test_manifest_and_capability_schema_snapshots_match_runtime(monkeypatc
 
 def test_no_non_read_tool_is_claimed_idempotent_without_behavior_evidence():
     assert not any(
-        not spec["readOnlyHint"] and spec["idempotentHint"]
-        for spec in EXPECTED_ANNOTATIONS.values()
+        name != "cancel_private_ci_job"
+        and not spec["readOnlyHint"]
+        and spec["idempotentHint"]
+        for name, spec in EXPECTED_ANNOTATIONS.items()
     )
