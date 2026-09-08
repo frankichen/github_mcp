@@ -12,6 +12,7 @@ import uuid
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from app.config import settings as app_settings
 from app.ci_database import (
@@ -49,6 +50,35 @@ from app.ci_repository_config import (
 from app.development_failure_pack import redact_text
 
 logger = logging.getLogger(__name__)
+
+# Keep the private-CI annotations grouped by the side effects of the actual
+# handlers. In particular, a long-poll is still read-only, while worker
+# reconciliation is a durable write even though its public operation is named
+# "list".
+_PRIVATE_CI_DIAGNOSTIC_READ = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+_PRIVATE_CI_WORKER_RECONCILIATION = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=False,
+)
+_PRIVATE_CI_EXECUTION_WRITE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+)
+_PRIVATE_CI_CANCELLATION = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=True,
+)
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _PRIVATE_CI_SECRET_FIELD_RE = re.compile(
@@ -562,6 +592,7 @@ Returns each worker's ID, online status, supported profiles, max concurrency, an
 
 This is for the private German-controller + WSL-Podman CI system.
 NOT for GitHub Actions self-hosted runners (use list_ci_workers for that).""",
+        annotations=_PRIVATE_CI_WORKER_RECONCILIATION,
     )
     async def list_private_ci_workers(online_only: bool = False) -> str:
         try:
@@ -582,6 +613,7 @@ Returns profiles like repo-auto-check, python-check, etc.
 Use these profile names with start_private_ci_job.
 
 This is for the private CI system. NOT for GitHub Actions workflows (use list_ci_profiles for that).""",
+        annotations=_PRIVATE_CI_DIAGNOSTIC_READ,
     )
     async def list_private_ci_profiles(repository: str = "") -> str:
         try:
@@ -602,6 +634,7 @@ Use this to find jobs for a specific repository, branch, commit SHA, or status.
 Jobs are executed by wsl-ci-01 on the WSL machine with Rootless Podman.
 
 This is for the private CI system. NOT for GitHub Actions runs (use list_ci_jobs for that).""",
+        annotations=_PRIVATE_CI_DIAGNOSTIC_READ,
     )
     async def list_private_ci_jobs(
         repository: str = "",
@@ -645,6 +678,7 @@ CRITICAL WORKFLOW:
 4. Continue non-terminal tracking with get_private_ci_job snapshots; use diagnostics only when needed
 
 This is for the private WSL CI system. NOT for GitHub Actions dispatch (use start_ci_job for that).""",
+        annotations=_PRIVATE_CI_EXECUTION_WRITE,
     )
     async def start_private_ci_job(
         repository: str,
@@ -773,6 +807,7 @@ normalized workspaces, and bounded step status without commands, offsets, eviden
 Use detail_level='full' only for debugging; oversized full results are returned through a response resource.
 
 This is for the private CI system. NOT for GitHub Actions runs (use get_ci_job for that).""",
+        annotations=_PRIVATE_CI_DIAGNOSTIC_READ,
     )
     async def get_private_ci_job(
         job_id: str = "", detail_level: str = "summary", request_id: str = "",
@@ -847,6 +882,7 @@ This is for the private CI system. NOT for GitHub Actions runs (use get_ci_job f
     @mcp.tool(
         name="wait_private_ci_job",
         description="Deprecated compatibility-only long-poll for explicit legacy/debug callers. Retains the legacy up-to-55-second status/step/revision wait contract. It is not the canonical ChatGPT Web CI tracking path; normal Web continuation uses get_private_ci_job snapshots and must not loop this tool until terminal.",
+        annotations=_PRIVATE_CI_DIAGNOSTIC_READ,
     )
     async def wait_private_ci_job(
         job_id: str, timeout_seconds: int = 55, last_known_status: str = "",
@@ -873,6 +909,7 @@ step_id is the stable selector when step names repeat. Pass next_cursor back
 as cursor for the next step page; cursor-only continuation is supported.
 
 This is for the private CI system. NOT for GitHub Actions logs (use get_ci_logs for that).""",
+        annotations=_PRIVATE_CI_DIAGNOSTIC_READ,
     )
     async def get_private_ci_logs(
         job_id: str = "", offset: int = 0, limit: int = 200,
@@ -1139,6 +1176,7 @@ This is for the private CI system. NOT for GitHub Actions logs (use get_ci_logs 
     @mcp.tool(
         name="get_private_ci_log_tail",
         description="Return the redacted tail of a private CI job log without requiring the caller to page through the full log.",
+        annotations=_PRIVATE_CI_DIAGNOSTIC_READ,
     )
     async def get_private_ci_log_tail(job_id: str, lines: int = 100) -> str:
         try:
@@ -1166,6 +1204,7 @@ This is for the private CI system. NOT for GitHub Actions logs (use get_ci_logs 
 - For completed jobs: returns current status (cannot cancel)
 
 This is for the private CI system. NOT for GitHub Actions (use cancel_ci_job for that).""",
+        annotations=_PRIVATE_CI_CANCELLATION,
     )
     async def cancel_private_ci_job(job_id: str) -> str:
         try:
