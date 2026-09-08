@@ -125,16 +125,16 @@
       "tool_manifest_count": 164,
       "compatibility_tool_count": 175,
       "hidden_deprecated_tool_count": 11,
-      "tool_schema_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "schema_generation_id": "schema-v1:0000000000000000"
+      "tool_schema_sha256": "032c44ca05431fd6377376f5ef13c35f2d5d9b371a6c083c42b104e57a31603a",
+      "schema_generation_id": "schema-v1:032c44ca05431fd6"
     },
     "compatibility": {
       "tool_count": 175,
       "tool_manifest_count": 175,
       "compatibility_tool_count": 175,
       "hidden_deprecated_tool_count": 0,
-      "tool_schema_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "schema_generation_id": "schema-v1:0000000000000000"
+      "tool_schema_sha256": "f4823bd93bb8a7454e614f294ab5425d6683fe04749e3f55347c6febd24d36c5",
+      "schema_generation_id": "schema-v1:f4823bd93bb8a745"
     }
   },
   "new_tools": [
