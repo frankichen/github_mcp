@@ -432,21 +432,25 @@ async def test_full_keeps_diagnostics_and_oversized_payload_uses_resource_while_
     worker_steps = [
         {
             "step_name": f"step-{index}",
-            "command": "python -m pytest " + ("very-long-argument " * 100),
+            "command": "python -m pytest "
+            + ("very-long-argument " * RESOURCE_FALLBACK_ARGUMENT_REPEAT),
             "status": "passed",
             "exit_code": 0,
             "duration_seconds": index + 0.5,
         }
-        for index in range(48)
+        for index in range(RESOURCE_FALLBACK_STEP_COUNT)
     ]
-    changed_files = [f"generated/file_{index:03d}.py" for index in range(220)]
+    changed_files = [
+        f"generated/file_{index:03d}.py"
+        for index in range(RESOURCE_FALLBACK_CHANGED_FILE_COUNT)
+    ]
     summary = {
         "status": "passed",
         "exit_code": 0,
         "git_tree_sha": TREE,
         "steps": worker_steps,
-        "evidence": {"diagnostic_blob": "evidence-" * 10000},
-        "performance": {"samples": list(range(500))},
+        "evidence": {"diagnostic_blob": "evidence-" * RESOURCE_FALLBACK_EVIDENCE_REPEAT},
+        "performance": {"samples": list(range(RESOURCE_FALLBACK_SAMPLE_COUNT))},
     }
     connection = db._get_db()
     connection.execute(
