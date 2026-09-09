@@ -780,7 +780,7 @@ async def create_github_pull_request_comment(
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
 
-@mcp.tool(name="get_github_pull_request_merge_readiness", description="Aggregate safe PR merge readiness: exact head SHA, reviews, GitHub Checks, repository merge methods, and private CI gate.")
+@mcp.tool(name="get_github_pull_request_merge_readiness", description="Aggregate safe PR merge readiness using exact HEAD/Tree identity, required full Private CI, a fresh reusable Attestation bound to that exact job/commit/tree, reviews, GitHub Checks, and repository merge methods.")
 async def get_github_pull_request_merge_readiness(repository: str, pull_number: int, expected_head_sha: str = "", required_private_ci_job_id: str = "", expected_base_branch: str = "main") -> str:
     try:
         return json.dumps(await _github_call(github_utils.get_github_pull_request_merge_readiness, repository, pull_number, expected_head_sha, required_private_ci_job_id, expected_base_branch), ensure_ascii=False)
@@ -796,7 +796,7 @@ async def get_github_pull_request_conflicts(repository: str, pull_number: int, e
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
 
-@mcp.tool(name="plan_github_pull_request_merge", description="Read-only merge preflight with exact SHA, review, Checks, private CI, and merge-method gates. Never merges.")
+@mcp.tool(name="plan_github_pull_request_merge", description="Read-only merge preflight using the same exact HEAD/Tree + full Private CI + reusable Attestation evidence contract as readiness and merge. Never merges.")
 async def plan_github_pull_request_merge(repository: str, pull_number: int, merge_method: str = "squash", expected_head_sha: str = "", required_private_ci_job_id: str = "", expected_base_branch: str = "main") -> str:
     try:
         return json.dumps(await _github_call(github_utils.plan_github_pull_request_merge, repository, pull_number, merge_method, expected_head_sha, required_private_ci_job_id, expected_base_branch), ensure_ascii=False)
@@ -804,7 +804,7 @@ async def plan_github_pull_request_merge(repository: str, pull_number: int, merg
         return json.dumps(github_utils._error_response("INTERNAL_ERROR", str(e)))
 
 
-@mcp.tool(name="merge_github_pull_request", description="Safely merge a PR only after readiness gates, exact SHA, passed private CI, and explicit confirm=true. Never deploys. A confirmed merge finalizes any exact managed Development Session/Workspace and queues exact-SHA repository index bootstrap for the new base head.")
+@mcp.tool(name="merge_github_pull_request", description="Safely merge a PR only after the shared readiness gate proves exact HEAD/Tree, passed required full Private CI, a fresh reusable Attestation bound to that job/commit/tree, and explicit confirm=true. Never deploys. A confirmed merge finalizes any exact managed Development Session/Workspace and queues exact-SHA repository index bootstrap for the new base head.")
 async def merge_github_pull_request(repository: str, pull_number: int, merge_method: str = "squash", expected_head_sha: str = "", required_private_ci_job_id: str = "", expected_base_branch: str = "main", commit_title: str = "", commit_message: str = "", delete_head_branch: bool = False, confirm: bool = False) -> str:
     try:
         if delete_head_branch:

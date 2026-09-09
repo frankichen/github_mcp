@@ -689,7 +689,7 @@ def register_dx_tools(
             return json.dumps({"ok":True,"development_session":final_session,"mode":mode,"lease_maintenance":lease_maintenance,**result},ensure_ascii=False)
         except Exception as exc: return _error(exc)
 
-    @mcp.tool(name="converge_development_task",description="Converge exact-head Index, Change Context, Impact, Contract, Affected Tests and fast/full Private CI; never merges, deploys or rolls back.",annotations=_PRIVATE_CI_ORCHESTRATION)
+    @mcp.tool(name="converge_development_task",description="Converge exact-head Index, Change Context, Impact, Contract, Affected Tests and fast/full Private CI without blocking on external work. index_wait_seconds and wait_seconds are compatibility-only accepted-but-ignored inputs and do not establish a wait SLA. Never merges, deploys or rolls back.",annotations=_PRIVATE_CI_ORCHESTRATION)
     async def converge_development_task(
         development_session_id: str, expected_session_revision: int, mode: str="full", base_sha: str="",
         index_wait_seconds: int=55, wait_seconds: int=55, force_rerun: bool=False,
