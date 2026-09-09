@@ -20,6 +20,162 @@
     "put_github_file_from_local_candidate",
     "wait_private_ci_job"
   ],
+  "web_safe_private_ci": {
+    "supported": true,
+    "canonical_start_tool": "start_private_ci_job",
+    "canonical_snapshot_tool": "get_private_ci_job",
+    "recommended_continuation": "snapshot_resume",
+    "compatibility_wait": {
+      "tool": "wait_private_ci_job",
+      "compatibility_only": true,
+      "recommended": false,
+      "canonical_schema_exposed": false
+    },
+    "fast_ci": {
+      "purpose": "feedback_only",
+      "merge_eligible": false
+    },
+    "full_ci": {
+      "purpose": "formal_gate_candidate"
+    },
+    "formal_reuse_and_merge_gate": {
+      "requires_full_ci": true,
+      "requires_reusable_attestation": true,
+      "requires_exact_head_tree": true
+    }
+  },
+  "web_ci_tool_contract_snapshot": {
+    "start_private_ci_job": {
+      "visibility": "canonical",
+      "description": "Durably accept a private CI Request for an exact Git commit without waiting for Worker execution.\n\nCRITICAL WORKFLOW:\n1. Supply the FULL 40-character commit_sha and a stable idempotency_key\n2. Save request_id; worker_job_id/job_id may truthfully be null while preparing\n3. Replaying the same request/key is safe; a different request with the same key conflicts\n4. Continue non-terminal tracking with get_private_ci_job snapshots; use diagnostics only when needed\n\nThis is for the private WSL CI system. NOT for GitHub Actions dispatch (use start_ci_job for that).",
+      "parameters": [
+        "repository",
+        "branch",
+        "commit_sha",
+        "profile",
+        "timeout_seconds",
+        "priority",
+        "force_rerun",
+        "supersede_previous",
+        "base_sha",
+        "idempotency_key"
+      ],
+      "required": [
+        "repository",
+        "branch",
+        "commit_sha"
+      ],
+      "defaults": {
+        "profile": "repo-auto-check",
+        "timeout_seconds": 900,
+        "priority": "normal",
+        "force_rerun": false,
+        "supersede_previous": false,
+        "base_sha": "",
+        "idempotency_key": ""
+      }
+    },
+    "get_private_ci_job": {
+      "visibility": "canonical",
+      "description": "Get one private CI Request/Worker snapshot. Defaults to a compact gate-safe summary.\n\nProvide request_id and/or job_id; at least one is required. request_id works before a Worker Job exists.\nWhen both are supplied they must be the exact persisted Request/Worker pair or the call fails closed.\nsummary is a pure read of current durable state: it never waits, polls, calls GitHub/network, or loads logs.\nIt keeps exact identity, Request revision, truthful Worker execution status, queue/worker state,\nnormalized workspaces, and bounded step status without commands, offsets, evidence, or changed files.\nUse detail_level='full' only for debugging; oversized full results are returned through a response resource.\n\nThis is for the private CI system. NOT for GitHub Actions runs (use get_ci_job for that).",
+      "parameters": [
+        "job_id",
+        "detail_level",
+        "request_id"
+      ],
+      "required": [],
+      "defaults": {
+        "job_id": "",
+        "detail_level": "summary",
+        "request_id": ""
+      }
+    },
+    "wait_private_ci_job": {
+      "visibility": "compatibility_only",
+      "description": "Deprecated compatibility-only long-poll for explicit legacy/debug callers. Retains the legacy up-to-55-second status/step/revision wait contract. It is not the canonical ChatGPT Web CI tracking path; normal Web continuation uses get_private_ci_job snapshots and must not loop this tool until terminal.",
+      "parameters": [
+        "job_id",
+        "timeout_seconds",
+        "last_known_status",
+        "last_known_step",
+        "last_known_revision"
+      ],
+      "required": [
+        "job_id"
+      ],
+      "defaults": {
+        "timeout_seconds": 55,
+        "last_known_status": "",
+        "last_known_step": "",
+        "last_known_revision": 0
+      },
+      "deprecation": {
+        "name": "wait_private_ci_job",
+        "deprecated": true,
+        "compatibility_only": true,
+        "replacement": "get_private_ci_job",
+        "guidance": "Legacy wait is compatibility-only for existing/debug clients. Canonical Web CI uses start_private_ci_job then get_private_ci_job snapshots and must not loop wait to terminal. The 55-second bound is legacy behavior, not an OpenAI/ChatGPT Web timeout SLA. Fast feedback is not merge-eligible; the formal gate requires full CI plus a reusable attestation."
+      }
+    },
+    "validate_development_task": {
+      "visibility": "canonical",
+      "description": "Run or reuse fast/full private CI for an exact Session head and return the current durable status without waiting by default; fast feedback never becomes merge-eligible, full success yields attestation.",
+      "parameters": [
+        "development_session_id",
+        "expected_session_revision",
+        "mode",
+        "base_sha",
+        "force_rerun",
+        "supersede_previous",
+        "wait_seconds",
+        "include_failure_pack",
+        "idempotency_key"
+      ],
+      "required": [
+        "development_session_id",
+        "expected_session_revision"
+      ],
+      "defaults": {
+        "mode": "fast",
+        "base_sha": "",
+        "force_rerun": false,
+        "supersede_previous": true,
+        "wait_seconds": 0,
+        "include_failure_pack": true,
+        "idempotency_key": ""
+      }
+    },
+    "converge_development_task": {
+      "visibility": "canonical",
+      "description": "Converge exact-head Index, Change Context, Impact, Contract, Affected Tests and fast/full Private CI; never merges, deploys or rolls back.",
+      "parameters": [
+        "development_session_id",
+        "expected_session_revision",
+        "mode",
+        "base_sha",
+        "index_wait_seconds",
+        "wait_seconds",
+        "force_rerun",
+        "supersede_previous",
+        "include_failure_pack",
+        "idempotency_key"
+      ],
+      "required": [
+        "development_session_id",
+        "expected_session_revision"
+      ],
+      "defaults": {
+        "mode": "full",
+        "base_sha": "",
+        "index_wait_seconds": 55,
+        "wait_seconds": 55,
+        "force_rerun": false,
+        "supersede_previous": true,
+        "include_failure_pack": true,
+        "idempotency_key": ""
+      }
+    }
+  },
   "schema_identity_algorithm": "sha256-canonical-mcp-tools-v1",
   "tool_annotation_snapshot": {
     "cancel_private_ci_job": {

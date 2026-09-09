@@ -1356,6 +1356,30 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_local_git_mirror_reads": True,
         "supports_context_pack_v2": True,
         "supports_fast_feedback_ci": True,
+        "web_safe_private_ci": {
+            "supported": True,
+            "canonical_start_tool": "start_private_ci_job",
+            "canonical_snapshot_tool": "get_private_ci_job",
+            "recommended_continuation": "snapshot_resume",
+            "compatibility_wait": {
+                "tool": "wait_private_ci_job",
+                "compatibility_only": True,
+                "recommended": False,
+                "canonical_schema_exposed": False,
+            },
+            "fast_ci": {
+                "purpose": "feedback_only",
+                "merge_eligible": False,
+            },
+            "full_ci": {
+                "purpose": "formal_gate_candidate",
+            },
+            "formal_reuse_and_merge_gate": {
+                "requires_full_ci": True,
+                "requires_reusable_attestation": True,
+                "requires_exact_head_tree": True,
+            },
+        },
         "supports_dependency_environment_cache": True,
         "supports_ci_affected_selection": True,
         "supports_ci_failure_pack": True,
