@@ -728,6 +728,172 @@ def test_already_pinned_new_base_idempotent_replay_and_conflict(tmp_path, monkey
     assert exc.value.code == "IDEMPOTENCY_CONFLICT"
 
 
+def _exact_production_partial_resume(tmp_path, monkeypatch):
+    service, seeded_session, _ = _seed(tmp_path, monkeypatch)
+    stacked_branch = "ai/issue-186-p0-14-share-invite-global-locator-20260904"
+    historical_old_base = "20e8e5a5a411c55e830db33daca5cf3ab6f97db9"
+    live_new_base = "43ba158333f06e30210dca596f3b7eae204d149a"
+    old_session_head = "23aab1b9f80296d0e88c552ddbdac54c56939bc9"
+    integrated_head = "249f4dc68200e83b4fd73a8bbe43608beaac5d42"
+    old_base_tree = "7" * 40
+    new_base_tree = "8" * 40
+    old_head_tree = "9" * 40
+    integrated_tree = "0" * 40
+    service.repo.trees.update({
+        historical_old_base: old_base_tree,
+        live_new_base: new_base_tree,
+        old_session_head: old_head_tree,
+        integrated_head: integrated_tree,
+    })
+    service.repo.comparisons.update({
+        (historical_old_base, live_new_base): service.repo._cfg(
+            historical_old_base, 1, 0, ["base/region.py"],
+        ),
+        (historical_old_base, old_session_head): service.repo._cfg(
+            historical_old_base, 1, 0, ["allowed/feature.py"],
+        ),
+        (old_session_head, integrated_head): service.repo._cfg(
+            old_session_head, 2, 0, ["base/region.py", "allowed/feature.py"],
+        ),
+        (live_new_base, integrated_head): service.repo._cfg(
+            live_new_base, 1, 0, ["allowed/feature.py"],
+        ),
+    })
+    service.client.heads[BRANCH] = integrated_head
+    service.client.heads[stacked_branch] = live_new_base
+    metadata = dict(seeded_session.get("metadata") or {})
+    metadata["prepared_base_identity"] = {
+        "repository": REPO, "commit_sha": historical_old_base, "tree_sha": old_base_tree,
+    }
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            """UPDATE workspaces SET base_branch=?,base_commit_sha=?,head_sha=?,tree_sha=?,
+            status='drifted',drift_reason='branch_moved_externally' WHERE workspace_id=?""",
+            (stacked_branch, live_new_base, integrated_head, integrated_tree, WORKSPACE_ID),
+        )
+        db.execute(
+            """UPDATE development_sessions SET base_branch=?,base_commit_sha=?,head_commit_sha=?,
+            tree_sha=?,metadata_json=? WHERE session_id=?""",
+            (
+                stacked_branch, live_new_base, old_session_head, old_head_tree,
+                json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+                seeded_session["session_id"],
+            ),
+        )
+    workspace = mygithub12.get_workspace(service, WORKSPACE_ID)
+    session = sessions.get_session(seeded_session["session_id"])
+    pr = {
+        "pull_number": 823, "head_branch": BRANCH, "head_sha": integrated_head,
+        "base_branch": stacked_branch, "state": "open", "draft": True, "merged": False,
+    }
+    monkeypatch.setattr(
+        resume, "_repository_policy",
+        lambda repository: {"ok": True, "repository": repository, "policy": {"github": True, "private_ci": True}},
+    )
+    monkeypatch.setattr(resume, "_resolve_pr", lambda repository, pull_number, branch: pr)
+    monkeypatch.setattr(
+        resume, "_current_main",
+        lambda service, repository: {
+            "branch": "main", "repository": repository,
+            "commit_sha": OTHER_HEAD, "tree_sha": OTHER_TREE,
+        },
+    )
+    monkeypatch.setattr(
+        resume, "_resolve_branch",
+        lambda service, repository, branch, base_branch: {
+            "ok": True, "repository": repository, "branch": branch,
+            "base_branch": base_branch, "commit_sha": integrated_head, "tree_sha": integrated_tree,
+        },
+    )
+    monkeypatch.setattr(resume, "_select_workspace", lambda *args: (workspace, [workspace]))
+    monkeypatch.setattr(
+        resume, "find_sessions_for_workspace",
+        lambda workspace_id, include_terminal=False, limit=20: [session],
+    )
+
+    def resolve_identity(_service, repository, commit_sha="", ref=""):
+        sha = live_new_base if ref == stacked_branch else (commit_sha or OTHER_HEAD)
+        return {
+            "repository": repository, "commit_sha": sha,
+            "tree_sha": service.repo.trees.get(sha, OTHER_TREE),
+        }
+
+    monkeypatch.setattr(resume.mygithub12, "resolve_identity", resolve_identity)
+    monkeypatch.setattr(
+        resume.mygithub12, "get_index_status",
+        lambda _service, repository, commit_sha="", ref="": {
+            "ok": True, "repository": repository, "commit_sha": commit_sha,
+            "tree_sha": service.repo.trees.get(commit_sha, integrated_tree), "status": "ready",
+        },
+    )
+    monkeypatch.setattr(
+        resume.mygithub12, "workspace_overlap",
+        lambda *args, **kwargs: {"ok": True, "workspace_id": WORKSPACE_ID, "items": []},
+    )
+    monkeypatch.setattr(resume, "db_list_jobs", lambda **kwargs: [])
+    monkeypatch.setattr(
+        resume.github_utils, "get_github_pull_request_merge_readiness",
+        lambda *args, **kwargs: {"ok": True, "ready": False},
+    )
+    result = resume.resume_task(
+        service, REPO, pull_number=823, recover_stale_session=False,
+    )
+    return service, result, {
+        "stacked_branch": stacked_branch,
+        "historical_old_base": historical_old_base,
+        "live_new_base": live_new_base,
+        "old_session_head": old_session_head,
+        "integrated_head": integrated_head,
+        "integrated_tree": integrated_tree,
+    }
+
+
+def _recovery_args_from_resume_plan(plan, idempotency_key):
+    keys = (
+        "repository", "branch", "workspace_id", "development_session_id",
+        "expected_workspace_revision", "expected_session_revision",
+        "expected_old_base_sha", "expected_new_base_sha", "expected_base_branch",
+        "expected_old_session_head_sha", "expected_current_head_sha", "expected_current_tree_sha",
+    )
+    return {**{key: plan[key] for key in keys}, "idempotency_key": idempotency_key}
+
+
+def test_exact_823_partial_state_resume_plan_is_directly_consumable_by_base_sync_recovery(tmp_path, monkeypatch):
+    service, resumed, ids = _exact_production_partial_resume(tmp_path, monkeypatch)
+    plan = resumed["recovery"]
+
+    assert resumed["current_main"]["commit_sha"] != ids["live_new_base"]
+    assert resumed["recovery_base"]["branch"] == ids["stacked_branch"]
+    assert plan["action"] == "recover_base_synced_development_task"
+    assert plan["expected_old_base_sha"] == ids["historical_old_base"]
+    assert plan["expected_new_base_sha"] == ids["live_new_base"]
+    assert plan["expected_old_session_head_sha"] == ids["old_session_head"]
+    assert plan["expected_current_head_sha"] == ids["integrated_head"]
+    assert plan["preflight"]["verified"] is True
+
+    recovered = recovery.recover_base_synced_task(
+        service, **_recovery_args_from_resume_plan(plan, "823-resume-to-recovery-e2e"),
+    )
+
+    assert recovered["control_plane_recovery"] == "CONTROL_PLANE_BASE_SYNC_RECOVERY_SUCCESS"
+    assert recovered["verification"]["pinned_base_state"] == recovery.PINNED_BASE_ALREADY_NEW
+    assert recovered["workspace"]["head_sha"] == ids["integrated_head"]
+    assert recovered["development_session"]["head_commit_sha"] == ids["integrated_head"]
+
+
+def test_exact_823_resume_plan_fails_with_recovery_base_changed_if_stacked_base_advances_before_apply(tmp_path, monkeypatch):
+    service, resumed, _ = _exact_production_partial_resume(tmp_path, monkeypatch)
+    plan = resumed["recovery"]
+    service.client.heads[plan["expected_base_branch"]] = OTHER_HEAD
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        recovery.recover_base_synced_task(
+            service, **_recovery_args_from_resume_plan(plan, "823-base-moved-before-apply"),
+        )
+
+    assert exc.value.code == "RECOVERY_BASE_CHANGED"
+
+
 def test_managed_merge_finalization_atomically_closes_workspace_and_releases_writer(tmp_path, monkeypatch):
     monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "merge-finalize.db"))
     service = FakeService()

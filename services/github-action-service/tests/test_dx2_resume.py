@@ -391,6 +391,170 @@ def test_stacked_resume_uses_live_workspace_pr_base_branch_head_not_repository_m
     assert result["recovery"]["expected_base_branch"] == stacked_branch
 
 
+def _stacked_pinned_new_resume_case(
+    monkeypatch, *, metadata=None, events=None, ancestry_predicate=None, merge_base_evidence=None,
+):
+    stacked_branch = "ai/issue-186-p0-14-share-invite-global-locator-20260904"
+    historical_old_base = "20e8e5a5a411c55e830db33daca5cf3ab6f97db9"
+    live_new_base = "43ba158333f06e30210dca596f3b7eae204d149a"
+    old_session_head = "23aab1b9f80296d0e88c552ddbdac54c56939bc9"
+    integrated_head = "249f4dc68200e83b4fd73a8bbe43608beaac5d42"
+    integrated_tree = "7" * 40
+    ws = _workspace(status="drifted", revision=3)
+    ws.update({
+        "base_branch": stacked_branch,
+        "base_commit_sha": live_new_base,
+        "head_sha": integrated_head,
+        "tree_sha": integrated_tree,
+        "drift_reason": "branch_moved_externally",
+    })
+    if metadata is None:
+        metadata = {
+            "prepared_base_identity": {
+                "repository": "owner/repo",
+                "commit_sha": historical_old_base,
+                "tree_sha": "6" * 40,
+            }
+        }
+    session = {
+        **_ready_session(
+            head=old_session_head, tree="5" * 40, workspace_revision=2,
+            lease=ws["lease_expires_at"],
+        ),
+        "base_branch": stacked_branch,
+        "base_commit_sha": live_new_base,
+        "metadata": metadata,
+    }
+    pr = {
+        "pull_number": 823,
+        "head_branch": "ai/resume",
+        "head_sha": integrated_head,
+        "base_branch": stacked_branch,
+        "state": "open",
+        "draft": True,
+    }
+    _stub_resume_context(
+        monkeypatch, ws=ws, session=session, pr=pr,
+        branch_head=integrated_head, branch_tree=integrated_tree,
+    )
+    monkeypatch.setattr(
+        resume.mygithub12,
+        "resolve_identity",
+        lambda service, repository, commit_sha="", ref="": {
+            "repository": repository,
+            "commit_sha": live_new_base if ref == stacked_branch else (commit_sha or SHA_B),
+            "tree_sha": "4" * 40,
+        },
+    )
+    monkeypatch.setattr(resume.sessions, "list_events", lambda *args, **kwargs: list(events or []))
+    if merge_base_evidence is not None:
+        monkeypatch.setattr(
+            resume, "_resume_merge_base_evidence",
+            lambda *args, **kwargs: dict(merge_base_evidence),
+        )
+    predicate = ancestry_predicate or (lambda ancestor, descendant: True)
+    monkeypatch.setattr(
+        resume,
+        "_resume_ancestry_evidence",
+        lambda service, repository, ancestor, descendant: {
+            "verified": bool(predicate(ancestor, descendant)),
+            "ancestor": ancestor, "descendant": descendant,
+        },
+    )
+    result = resume.resume_task(FakeService(), "owner/repo", pull_number=823)
+    return result, {
+        "base_branch": stacked_branch,
+        "historical_old_base": historical_old_base,
+        "live_new_base": live_new_base,
+        "old_session_head": old_session_head,
+        "integrated_head": integrated_head,
+        "integrated_tree": integrated_tree,
+    }
+
+
+def test_already_pinned_new_base_stacked_resume_uses_audited_historical_old_base(monkeypatch):
+    result, ids = _stacked_pinned_new_resume_case(monkeypatch)
+
+    plan = result["recovery"]
+    assert plan["action"] == "recover_base_synced_development_task"
+    assert plan["action"] != "recover_drifted_development_task"
+    assert plan["expected_old_base_sha"] == ids["historical_old_base"]
+    assert plan["expected_new_base_sha"] == ids["live_new_base"]
+    assert plan["expected_base_branch"] == ids["base_branch"]
+    assert plan["expected_old_session_head_sha"] == ids["old_session_head"]
+    assert plan["expected_current_head_sha"] == ids["integrated_head"]
+    assert plan["expected_current_tree_sha"] == ids["integrated_tree"]
+    assert plan["repository"] == "owner/repo"
+    assert plan["branch"] == "ai/resume"
+    assert plan["expected_workspace_revision"] == 3
+    assert plan["expected_session_revision"] == 4
+    assert plan["preflight"]["verified"] is True
+
+
+def test_already_pinned_new_base_stacked_resume_fails_stop_on_ambiguous_historical_old_base(monkeypatch):
+    result, _ = _stacked_pinned_new_resume_case(
+        monkeypatch,
+        events=[{
+            "id": 9, "event_type": "base_sync_recovery", "session_revision": 3,
+            "data": {"old_base_sha": "8" * 40, "new_base_sha": "9" * 40},
+        }],
+    )
+
+    assert result["recovery"]["action"] == "recovery_required"
+    assert result["recovery"]["reason"] == "RECOVERY_HISTORICAL_OLD_BASE_AMBIGUOUS"
+    assert result["recovery"]["action"] != "recover_drifted_development_task"
+
+
+def test_already_pinned_new_base_stacked_resume_fails_stop_when_historical_old_base_unavailable(monkeypatch):
+    result, _ = _stacked_pinned_new_resume_case(
+        monkeypatch, metadata={},
+        merge_base_evidence={"verified": False, "reason": "merge_base_unavailable"},
+    )
+
+    assert result["recovery"]["action"] == "recovery_required"
+    assert result["recovery"]["reason"] == "RECOVERY_HISTORICAL_OLD_BASE_UNAVAILABLE"
+    assert result["recovery"]["action"] != "recover_drifted_development_task"
+
+
+def test_already_pinned_new_base_stacked_resume_fails_stop_when_recorded_old_base_ancestry_is_inconsistent(monkeypatch):
+    old_base = "20e8e5a5a411c55e830db33daca5cf3ab6f97db9"
+    new_base = "43ba158333f06e30210dca596f3b7eae204d149a"
+    result, _ = _stacked_pinned_new_resume_case(
+        monkeypatch,
+        ancestry_predicate=lambda ancestor, descendant: not (ancestor == old_base and descendant == new_base),
+    )
+
+    assert result["recovery"]["action"] == "recovery_required"
+    assert result["recovery"]["reason"] == "RECOVERY_ANCESTRY_MISMATCH"
+    assert result["recovery"]["preflight"]["base_ancestry"]["verified"] is False
+
+
+def test_already_pinned_new_base_stacked_resume_fails_stop_when_current_head_is_not_old_session_forward_descendant(monkeypatch):
+    old_head = "23aab1b9f80296d0e88c552ddbdac54c56939bc9"
+    current_head = "249f4dc68200e83b4fd73a8bbe43608beaac5d42"
+    result, _ = _stacked_pinned_new_resume_case(
+        monkeypatch,
+        ancestry_predicate=lambda ancestor, descendant: not (ancestor == old_head and descendant == current_head),
+    )
+
+    assert result["recovery"]["action"] == "recovery_required"
+    assert result["recovery"]["reason"] == "RECOVERY_ANCESTRY_MISMATCH"
+    assert result["recovery"]["preflight"]["task_ancestry"]["verified"] is False
+
+
+def test_already_pinned_new_base_stacked_resume_fails_stop_when_current_head_does_not_include_live_new_base(monkeypatch):
+    new_base = "43ba158333f06e30210dca596f3b7eae204d149a"
+    current_head = "249f4dc68200e83b4fd73a8bbe43608beaac5d42"
+    result, _ = _stacked_pinned_new_resume_case(
+        monkeypatch,
+        ancestry_predicate=lambda ancestor, descendant: not (ancestor == new_base and descendant == current_head),
+    )
+
+    assert result["recovery"]["action"] == "recovery_required"
+    assert result["recovery"]["reason"] == "RECOVERY_ANCESTRY_MISMATCH"
+    assert result["recovery"]["preflight"]["new_base_ancestry"]["verified"] is False
+
+
 def test_main_based_resume_keeps_repository_main_as_live_base(monkeypatch):
     current_head = "f" * 40
     current_tree = "3" * 40

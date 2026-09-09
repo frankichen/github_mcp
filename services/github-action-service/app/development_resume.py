@@ -544,6 +544,186 @@ def _resume_ancestry_evidence(service: Any, repository: str, ancestor: str, desc
         }
 
 
+def _resume_exact_commit_sha(value: Any) -> str:
+    sha = str(value or "").strip()
+    if len(sha) != 40:
+        return ""
+    try:
+        int(sha, 16)
+    except ValueError:
+        return ""
+    return sha
+
+
+def _resume_merge_base_evidence(
+    service: Any, repository: str, left: str, right: str,
+) -> dict[str, Any]:
+    try:
+        repo = mygithub12._service_repo(service, repository)
+        comparison = repo.compare(left, right)
+        merge_base = _resume_exact_commit_sha(
+            str(getattr(getattr(comparison, "merge_base_commit", None), "sha", "") or "")
+        )
+        if not merge_base:
+            return {
+                "verified": False, "left": left, "right": right,
+                "reason": "merge_base_unavailable",
+            }
+        return {
+            "verified": True, "left": left, "right": right,
+            "merge_base_sha": merge_base,
+            "ahead_by": int(getattr(comparison, "ahead_by", 0) or 0),
+            "behind_by": int(getattr(comparison, "behind_by", 0) or 0),
+        }
+    except Exception as exc:
+        return {
+            "verified": False, "left": left, "right": right,
+            "reason": "merge_base_unavailable", "cause_type": type(exc).__name__,
+        }
+
+
+def _resume_historical_old_base_evidence(
+    service: Any, session: dict[str, Any], live_new_base: str, old_session_head: str,
+) -> dict[str, Any]:
+    session_id = str(session.get("session_id") or "")
+    repository = str(session.get("repository") or "")
+    branch = str(session.get("branch") or "")
+    metadata = session.get("metadata") if isinstance(session.get("metadata"), dict) else {}
+    sources: list[dict[str, Any]] = []
+
+    prepared_record = metadata.get("prepared_base_identity")
+    prepared_sha = ""
+    if prepared_record is not None:
+        if not isinstance(prepared_record, dict):
+            return {
+                "verified": False, "reason": "RECOVERY_HISTORICAL_OLD_BASE_AMBIGUOUS",
+                "sources": sources, "detail": "prepared_base_identity_malformed",
+            }
+        prepared_sha = _resume_exact_commit_sha(prepared_record.get("commit_sha"))
+        prepared_repository = str(prepared_record.get("repository") or repository)
+        if not prepared_sha or prepared_repository != repository:
+            return {
+                "verified": False, "reason": "RECOVERY_HISTORICAL_OLD_BASE_AMBIGUOUS",
+                "sources": sources, "detail": "prepared_base_identity_invalid",
+            }
+        sources.append({"kind": "prepared_base_identity", "commit_sha": prepared_sha})
+
+    try:
+        events = sessions.list_events(session_id, limit=500)
+    except Exception as exc:
+        return {
+            "verified": False, "reason": "RECOVERY_HISTORICAL_OLD_BASE_UNAVAILABLE",
+            "sources": sources, "detail": "development_session_events_unavailable",
+            "cause_type": type(exc).__name__,
+        }
+
+    transitions: list[dict[str, Any]] = []
+    for event in events:
+        if event.get("event_type") != "base_sync_recovery":
+            continue
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        old_sha = _resume_exact_commit_sha(data.get("old_base_sha"))
+        new_sha = _resume_exact_commit_sha(data.get("new_base_sha"))
+        event_repository = str(data.get("repository") or repository)
+        event_branch = str(data.get("branch") or branch)
+        if (
+            not old_sha or not new_sha or old_sha == new_sha
+            or event_repository != repository or event_branch != branch
+        ):
+            return {
+                "verified": False, "reason": "RECOVERY_HISTORICAL_OLD_BASE_AMBIGUOUS",
+                "sources": sources, "detail": "base_sync_recovery_event_invalid",
+                "event_id": event.get("id"),
+            }
+        transitions.append({
+            "old_base_sha": old_sha, "new_base_sha": new_sha,
+            "event_id": event.get("id"), "session_revision": event.get("session_revision"),
+        })
+
+    last_record = metadata.get("last_base_sync_recovery")
+    last_pair: tuple[str, str] | None = None
+    if last_record is not None:
+        audit = last_record.get("audit") if isinstance(last_record, dict) else None
+        if not isinstance(audit, dict):
+            return {
+                "verified": False, "reason": "RECOVERY_HISTORICAL_OLD_BASE_AMBIGUOUS",
+                "sources": sources, "detail": "last_base_sync_recovery_malformed",
+            }
+        audit_old = _resume_exact_commit_sha(audit.get("old_base_sha"))
+        audit_new = _resume_exact_commit_sha(audit.get("new_base_sha"))
+        audit_repository = str(audit.get("repository") or repository)
+        audit_branch = str(audit.get("branch") or branch)
+        if (
+            not audit_old or not audit_new or audit_old == audit_new
+            or audit_repository != repository or audit_branch != branch
+        ):
+            return {
+                "verified": False, "reason": "RECOVERY_HISTORICAL_OLD_BASE_AMBIGUOUS",
+                "sources": sources, "detail": "last_base_sync_recovery_invalid",
+            }
+        last_pair = (audit_old, audit_new)
+
+    persisted_candidate = prepared_sha
+    if transitions:
+        tip = persisted_candidate or transitions[0]["old_base_sha"]
+        for transition in transitions:
+            if transition["old_base_sha"] != tip:
+                return {
+                    "verified": False, "reason": "RECOVERY_HISTORICAL_OLD_BASE_AMBIGUOUS",
+                    "sources": sources, "detail": "base_sync_recovery_history_not_linear",
+                    "expected_old_base_sha": tip,
+                    "observed_old_base_sha": transition["old_base_sha"],
+                }
+            tip = transition["new_base_sha"]
+        persisted_candidate = tip
+        sources.append({
+            "kind": "base_sync_recovery_events", "count": len(transitions),
+            "latest_new_base_sha": persisted_candidate,
+        })
+
+    if last_pair is not None:
+        if transitions:
+            event_pair = (transitions[-1]["old_base_sha"], transitions[-1]["new_base_sha"])
+            if event_pair != last_pair:
+                return {
+                    "verified": False, "reason": "RECOVERY_HISTORICAL_OLD_BASE_AMBIGUOUS",
+                    "sources": sources, "detail": "base_sync_event_metadata_disagree",
+                }
+        else:
+            if persisted_candidate and last_pair[0] != persisted_candidate:
+                return {
+                    "verified": False, "reason": "RECOVERY_HISTORICAL_OLD_BASE_AMBIGUOUS",
+                    "sources": sources, "detail": "base_sync_metadata_history_not_linear",
+                }
+            persisted_candidate = last_pair[1]
+        sources.append({
+            "kind": "last_base_sync_recovery",
+            "old_base_sha": last_pair[0], "new_base_sha": last_pair[1],
+        })
+
+    if persisted_candidate:
+        return {
+            "verified": True, "historical_old_base_sha": persisted_candidate,
+            "source": "persisted_control_plane_history", "sources": sources,
+        }
+
+    merge_base = _resume_merge_base_evidence(
+        service, repository, live_new_base, old_session_head,
+    )
+    if merge_base.get("verified") and merge_base.get("merge_base_sha"):
+        return {
+            "verified": True,
+            "historical_old_base_sha": str(merge_base["merge_base_sha"]),
+            "source": "strict_git_merge_base", "sources": sources,
+            "merge_base_evidence": merge_base,
+        }
+    return {
+        "verified": False, "reason": "RECOVERY_HISTORICAL_OLD_BASE_UNAVAILABLE",
+        "sources": sources, "detail": "no_unique_persisted_or_git_evidence",
+        "merge_base_evidence": merge_base,
+    }
+
+
 def _workspace_recovery_plan(
     workspace: dict[str, Any] | None,
     *,
@@ -572,7 +752,8 @@ def _workspace_recovery_plan(
         new_base = str(live_base.get("commit_sha") or "")
         old_head = str((session or {}).get("head_commit_sha") or "")
         current_head = str((branch_state or {}).get("commit_sha") or "")
-        base_sync = bool(
+        repository = str(workspace.get("repository") or "")
+        base_sync_shape = bool(
             service
             and session
             and live_base
@@ -583,18 +764,68 @@ def _workspace_recovery_plan(
             and old_base
             and session_base == old_base
             and new_base
-            and new_base != old_base
             and old_head
             and current_head
         )
+        recovery_old_base = old_base
+        historical_evidence: dict[str, Any] | None = None
+        base_sync = bool(base_sync_shape and new_base != old_base)
         if base_sync:
-            repository = str(workspace.get("repository") or "")
+            historical_evidence = {
+                "verified": True, "historical_old_base_sha": old_base,
+                "source": "currently_pinned_historical_base",
+                "sources": [{"kind": "workspace_session_base", "commit_sha": old_base}],
+            }
+        elif base_sync_shape and new_base == old_base and old_head != current_head:
+            historical_evidence = _resume_historical_old_base_evidence(
+                service, session, new_base, old_head,
+            )
+            if not historical_evidence.get("verified"):
+                return {
+                    "reason": historical_evidence.get("reason") or "RECOVERY_HISTORICAL_OLD_BASE_UNAVAILABLE",
+                    "action": "recovery_required",
+                    "manual_recovery_required": True,
+                    "candidate_recovery_tool": "recover_base_synced_development_task",
+                    "workspace_id": workspace.get("workspace_id"),
+                    "development_session_id": session.get("session_id"),
+                    "drift_reason": workspace.get("drift_reason"),
+                    "expected_new_base_sha": new_base,
+                    "expected_base_branch": base_branch,
+                    "expected_old_session_head_sha": old_head,
+                    "expected_current_head_sha": current_head,
+                    "historical_old_base_evidence": historical_evidence,
+                }
+            recovery_old_base = str(historical_evidence.get("historical_old_base_sha") or "")
+            base_sync = bool(recovery_old_base and recovery_old_base != new_base)
+        if base_sync:
             preflight = {
-                "base_ancestry": _resume_ancestry_evidence(service, repository, old_base, new_base),
+                "base_ancestry": _resume_ancestry_evidence(service, repository, recovery_old_base, new_base),
+                "old_task_base_ancestry": _resume_ancestry_evidence(service, repository, recovery_old_base, old_head),
                 "task_ancestry": _resume_ancestry_evidence(service, repository, old_head, current_head),
                 "new_base_ancestry": _resume_ancestry_evidence(service, repository, new_base, current_head),
             }
-            preflight["verified"] = all(item.get("verified") for item in preflight.values() if isinstance(item, dict))
+            preflight["verified"] = all(
+                item.get("verified") for item in preflight.values() if isinstance(item, dict)
+            )
+            preflight["historical_old_base_evidence"] = historical_evidence
+            if not preflight["verified"]:
+                return {
+                    "reason": "RECOVERY_ANCESTRY_MISMATCH",
+                    "action": "recovery_required",
+                    "manual_recovery_required": True,
+                    "candidate_recovery_tool": "recover_base_synced_development_task",
+                    "workspace_id": workspace.get("workspace_id"),
+                    "development_session_id": session.get("session_id"),
+                    "drift_reason": workspace.get("drift_reason"),
+                    "expected_old_base_sha": recovery_old_base,
+                    "expected_new_base_sha": new_base,
+                    "expected_base_branch": base_branch,
+                    "expected_old_session_head_sha": old_head,
+                    "expected_current_head_sha": current_head,
+                    "expected_current_tree_sha": (branch_state or {}).get("tree_sha"),
+                    "historical_old_base_evidence": historical_evidence,
+                    "preflight": preflight,
+                }
             workspace_has_current_identity = (
                 workspace.get("head_sha") == current_head
                 and workspace.get("tree_sha") == branch_state.get("tree_sha")
@@ -625,7 +856,11 @@ def _workspace_recovery_plan(
                 "workspace_id": workspace.get("workspace_id"),
                 "development_session_id": session.get("session_id"),
                 "drift_reason": workspace.get("drift_reason"),
-                "expected_old_base_sha": old_base,
+                "repository": repository,
+                "branch": workspace.get("branch"),
+                "expected_workspace_revision": workspace.get("revision"),
+                "expected_session_revision": session.get("session_revision"),
+                "expected_old_base_sha": recovery_old_base,
                 "expected_new_base_sha": new_base,
                 "expected_base_branch": base_branch,
                 "expected_old_session_head_sha": old_head,
