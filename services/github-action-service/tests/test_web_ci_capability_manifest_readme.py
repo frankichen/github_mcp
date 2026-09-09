@@ -144,8 +144,9 @@ def test_readme_exposes_complete_web_safe_private_ci_flow():
     section = readme.split("### Web-safe Private CI canonical flow", 1)[1].split(
         "\n## MyGithut12 运行状态", 1
     )[0]
+    canonical = section.split("\n\nMyGithut12 源码当前版本", 1)[0]
 
-    flow = re.search(r"```text\n(?P<flow>.*?)\n```", section, re.DOTALL)
+    flow = re.search(r"```text\n(?P<flow>.*?)\n```", canonical, re.DOTALL)
     assert flow is not None
     assert flow.group("flow").splitlines() == [
         "start_private_ci_job",
@@ -156,13 +157,13 @@ def test_readme_exposes_complete_web_safe_private_ci_flow():
         "→ reusable Attestation",
         "→ exact HEAD/Tree readiness and merge gate",
     ]
-    assert "Fast CI" in section and "feedback only" in section
-    assert "Fast CI != merge eligible" in section
-    assert "Full CI" in section and "formal CI gate candidate" in section
-    assert "`wait_private_ci_job`" in section
-    assert "compatibility-only" in section
-    assert "must not loop" in section
-    assert "55" not in section
+    assert "Fast CI" in canonical and "feedback only" in canonical
+    assert "Fast CI != merge eligible" in canonical
+    assert "Full CI" in canonical and "formal CI gate candidate" in canonical
+    assert "`wait_private_ci_job`" in canonical
+    assert "compatibility-only" in canonical
+    assert "must not loop" in canonical
+    assert "55" not in canonical
 
 
 def test_product_facing_timeout_wording_never_claims_a_numbered_openai_chatgpt_sla():
