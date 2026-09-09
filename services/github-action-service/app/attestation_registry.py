@@ -170,6 +170,34 @@ def get_attestation(attestation_id: str) -> dict | None:
     init_registry_db(); db = _db(); row = db.execute("SELECT * FROM ci_tree_attestations WHERE attestation_id=?", (attestation_id,)).fetchone(); db.close(); return _row(row)
 
 
+def find_reusable_attestation_for_job(job_id: str) -> dict:
+    """Find reusable evidence for one exact Private CI job via the canonical validator."""
+    init_registry_db()
+    db = _db()
+    rows = db.execute(
+        "SELECT attestation_id FROM ci_tree_attestations "
+        "WHERE private_ci_job_id=? ORDER BY created_at DESC",
+        (job_id,),
+    ).fetchall()
+    db.close()
+    if not rows:
+        return {
+            "ok": False,
+            "found": False,
+            "reusable": False,
+            "error_code": ATTESTATION_ERRORS["not_found"],
+        }
+
+    last_validation = None
+    for row in rows:
+        validation = validate_attestation(str(row["attestation_id"]))
+        if validation.get("ok") is True and validation.get("reusable") is True:
+            return {"found": True, **validation}
+        if last_validation is None:
+            last_validation = validation
+    return {"found": True, **(last_validation or {"ok": False, "reusable": False})}
+
+
 def validate_attestation(attestation_id: str) -> dict:
     item = get_attestation(attestation_id)
     if not item:

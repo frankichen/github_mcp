@@ -675,6 +675,32 @@ def _private_ci_job(job_id: str) -> Optional[dict]:
         return None
 
 
+def _private_ci_tree_sha(job: dict) -> str:
+    summary = job.get("summary") if isinstance(job.get("summary"), dict) else {}
+    return str(job.get("git_tree_sha") or summary.get("git_tree_sha") or "")
+
+
+def _github_commit_tree_sha(repository: str, commit_sha: str) -> str:
+    try:
+        commit = _get_gh().get_repo(repository).get_commit(commit_sha)
+        return str(commit.commit.tree.sha or "")
+    except Exception:
+        return ""
+
+
+def _validated_attestation_for_job(job_id: str) -> dict:
+    try:
+        from app.attestation_registry import find_reusable_attestation_for_job
+        return find_reusable_attestation_for_job(job_id)
+    except Exception:
+        return {
+            "ok": False,
+            "found": False,
+            "reusable": False,
+            "error_code": "ATTESTATION_VALIDATION_UNAVAILABLE",
+        }
+
+
 def _private_ci_policy(repository: str) -> tuple[bool, bool]:
     """Return (available, required) from the repository operation policy."""
     try:
@@ -901,6 +927,11 @@ def _readiness(repository: str, pull_number: int, expected_head_sha: str = "",
     if not policy_available:
         reasons.append("REPOSITORY_POLICY_UNAVAILABLE")
     private_ci = None
+    expected_tree_sha = ""
+    if private_ci_required:
+        expected_tree_sha = _github_commit_tree_sha(repository, pr_result["head_sha"])
+        if not SHA_RE.fullmatch(expected_tree_sha):
+            reasons.append("PRIVATE_CI_TREE_UNAVAILABLE")
     if private_ci_required and required_private_ci_job_id:
         private_ci = _private_ci_job(required_private_ci_job_id)
         if not private_ci:
@@ -910,10 +941,64 @@ def _readiness(repository: str, pull_number: int, expected_head_sha: str = "",
             if private_ci.get("repository") != repository: reasons.append("PRIVATE_CI_REPOSITORY_MISMATCH")
             if private_ci.get("branch") != pr_result["head_branch"]: reasons.append("PRIVATE_CI_BRANCH_MISMATCH")
             if private_ci.get("commit_sha") != pr_result["head_sha"]: reasons.append("PRIVATE_CI_SHA_MISMATCH")
+            if private_ci.get("base_sha") != pr_result["base_sha"]:
+                reasons.append("PRIVATE_CI_BASE_MISMATCH")
             required_profile = _repository_merge_policy(repository).get("required_private_ci_profile", "repo-auto-check")
             if private_ci.get("profile") != required_profile: reasons.append("PRIVATE_CI_PROFILE_MISMATCH")
             if private_ci.get("status") != "passed" or private_ci.get("exit_code") != 0: reasons.append("PRIVATE_CI_NOT_PASSED")
             if private_ci.get("superseded_by_job_id"): reasons.append("PRIVATE_CI_SUPERSEDED")
+            job_tree_sha = _private_ci_tree_sha(private_ci)
+            if expected_tree_sha and job_tree_sha != expected_tree_sha:
+                reasons.append("PRIVATE_CI_TREE_MISMATCH")
+
+            attestation_validation = _validated_attestation_for_job(required_private_ci_job_id)
+            private_ci["attestation_validation"] = {
+                "ok": bool(attestation_validation.get("ok")),
+                "found": bool(attestation_validation.get("found")),
+                "reusable": bool(attestation_validation.get("reusable")),
+                "error_code": attestation_validation.get("error_code"),
+            }
+            if not attestation_validation.get("found"):
+                reasons.append("PRIVATE_CI_ATTESTATION_REQUIRED")
+            elif not attestation_validation.get("ok"):
+                error_code = str(attestation_validation.get("error_code") or "")
+                if error_code == "ATTESTATION_REVOKED":
+                    reasons.append("PRIVATE_CI_ATTESTATION_REVOKED")
+                elif error_code == "ATTESTATION_EXPIRED":
+                    reasons.append("PRIVATE_CI_ATTESTATION_EXPIRED")
+                else:
+                    reasons.append("PRIVATE_CI_ATTESTATION_INVALID")
+            elif attestation_validation.get("reusable") is not True:
+                reasons.append("PRIVATE_CI_ATTESTATION_NOT_REUSABLE")
+            else:
+                attestation = attestation_validation.get("attestation")
+                if not isinstance(attestation, dict):
+                    reasons.append("PRIVATE_CI_ATTESTATION_INVALID")
+                else:
+                    private_ci["attestation"] = {
+                        key: attestation.get(key)
+                        for key in (
+                            "attestation_id", "repository", "tested_commit_sha",
+                            "tested_tree_sha", "private_ci_job_id", "profile",
+                            "base_sha", "status", "expires_at",
+                        )
+                    }
+                    if attestation.get("private_ci_job_id") != required_private_ci_job_id:
+                        reasons.append("PRIVATE_CI_ATTESTATION_JOB_MISMATCH")
+                    if attestation.get("repository") != repository:
+                        reasons.append("PRIVATE_CI_ATTESTATION_REPOSITORY_MISMATCH")
+                    if attestation.get("tested_commit_sha") != pr_result["head_sha"]:
+                        reasons.append("PRIVATE_CI_ATTESTATION_SHA_MISMATCH")
+                    if expected_tree_sha and attestation.get("tested_tree_sha") != expected_tree_sha:
+                        reasons.append("PRIVATE_CI_ATTESTATION_TREE_MISMATCH")
+                    if attestation.get("base_sha") != pr_result["base_sha"]:
+                        reasons.append("PRIVATE_CI_ATTESTATION_BASE_MISMATCH")
+                    if attestation.get("profile") != required_profile:
+                        reasons.append("PRIVATE_CI_ATTESTATION_PROFILE_MISMATCH")
+                    if attestation.get("status") != "active":
+                        reasons.append("PRIVATE_CI_ATTESTATION_STATUS_INVALID")
+            private_ci["expected_tree_sha"] = expected_tree_sha
+            private_ci["job_tree_sha"] = job_tree_sha
             private_ci["valid"] = not any(reason.startswith("PRIVATE_CI_") for reason in reasons)
     elif private_ci_required:
         reasons.append("PRIVATE_CI_REQUIRED")
@@ -932,6 +1017,7 @@ def _readiness(repository: str, pull_number: int, expected_head_sha: str = "",
         "state": pr_result["state"], "draft": pr_result["draft"], "merged": pr_result["merged"],
         "base_branch": pr_result["base_branch"], "base_sha": pr_result["base_sha"],
         "head_branch": pr_result["head_branch"], "head_sha": pr_result["head_sha"],
+        "expected_tree_sha": expected_tree_sha or None,
         "expected_head_match": bool(expected_head_sha) and pr_result["head_sha"] == expected_head_sha,
         "mergeable": pr_result["mergeable"], "mergeable_state": pr_result["mergeable_state"],
         "review_decision": pr_result["review_decision"], "review_policy": review_policy,
@@ -1126,6 +1212,26 @@ def merge_github_pull_request(repository: str, pull_number: int, merge_method: s
     try:
         repo = gh.get_repo(repository)
         pr = repo.get_pull(pull_number)
+        # Re-read every readiness/evidence input after obtaining the GitHub PR
+        # object and immediately before the external merge. GitHub itself is
+        # still fenced by the expected HEAD SHA passed to PullRequest.merge.
+        final_readiness = _readiness(
+            repository, pull_number, expected_head_sha, required_private_ci_job_id, expected_base_branch
+        )
+        if not final_readiness.get("ready"):
+            code = final_readiness.get("reasons", ["NOT_READY"])[0]
+            return _error_response(
+                code, "Pull request is not ready to merge",
+                details={"readiness": final_readiness, "phase": "final_preflight"},
+            )
+        if merge_method not in final_readiness.get("allowed_merge_methods", []):
+            return _error_response(
+                "METHOD_NOT_ALLOWED", "Requested merge method is disabled for this repository",
+                details={
+                    "allowed_merge_methods": final_readiness.get("allowed_merge_methods", []),
+                    "phase": "final_preflight",
+                },
+            )
         merge_kwargs = build_merge_kwargs(expected_head_sha, merge_method, commit_title, commit_message, delete_head_branch)
         logger.info("GitHub merge request repository=%s pull=%s method=%s sha=%s", repository, pull_number, merge_method, expected_head_sha)
         result = pr.merge(**merge_kwargs)
@@ -1139,13 +1245,17 @@ def merge_github_pull_request(repository: str, pull_number: int, merge_method: s
         if not merge_sha or not SHA_RE.fullmatch(merge_sha):
             return _error_response("MERGE_COMMIT_SHA_INVALID", "GitHub did not return a full merge commit SHA")
         merged_head = getattr(getattr(merged_pr, "head", None), "sha", None) or expected_head_sha
-        merged_branch = getattr(getattr(merged_pr, "head", None), "ref", None) or readiness.get("head_branch") or ""
+        merged_branch = (
+            getattr(getattr(merged_pr, "head", None), "ref", None)
+            or final_readiness.get("head_branch")
+            or ""
+        )
         merged_at = getattr(merged_pr, "merged_at", None)
         return {"ok": True, "merged": True, "repository": repository, "pull_number": pull_number,
                 "merge_method": merge_method, "previous_head_sha": expected_head_sha,
                 "head_branch": merged_branch, "head_sha": merged_head,
                 "merge_commit_sha": merge_sha, "base_branch": expected_base_branch,
-                "base_head_before": readiness["base_sha"], "base_head_after": base_after,
+                "base_head_before": final_readiness["base_sha"], "base_head_after": base_after,
                 "merged_at": merged_at.isoformat() if merged_at else None,
                 "html_url": merged_pr.html_url, "head_branch_deleted": False,
                 "message": result.message}
