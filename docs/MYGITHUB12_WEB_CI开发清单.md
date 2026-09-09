@@ -272,14 +272,14 @@ Final-repair code-candidate exact-head validation：Index `12.0.0-1` Job `88e090
 
 ### WEB-CI-DEV-018：Compatibility contract
 
-- [ ] legacy wait 客户端自动测试。
-- [ ] canonical 与 compatibility schema 暴露差异有 snapshot。
-- [ ] running Job 升级后 identity 不变。
-- [ ] 旧 Job 可查询/诊断。
-- [ ] deprecation 文案不误导 AI。
+- [x] legacy wait 客户端自动测试。
+- [x] canonical 与 compatibility schema 暴露差异有 snapshot。
+- [x] running Job 升级后 identity 不变。
+- [x] 旧 Job 可查询/诊断。
+- [x] deprecation 文案不误导 AI。
 
 映射验收：AC-WEB-CI-13。  
-证据：`待填写`
+证据：code candidate `477947ec753857029a698c5896d26f7977dc75ae` / Tree `ae8a022e5b4bf8c45ccbe4e1ec9ee891c630e5ae` 新增 `test_web_ci_compatibility_contract.py`，把 legacy old-parameter wait 的 running/timeout/terminal truth、canonical vs compatibility 的 tool name/description/parameters/required/default/annotations 结构差异、running Request/Job reopen 前后 `request_id/job_id/commit/tree/branch/profile` 与 row count 不变、缺少新 evidence 字段的 legacy Job 查询和 bounded/redacted log diagnostics 锁为自动合同；既有 `test_web_ci_wait_compatibility.py` 同步锁定 machine-readable deprecation metadata。production 仅为 `wait_private_ci_job` capability metadata 增加 `compatibility_only=true` 与 guidance：canonical 路径为 `start_private_ci_job -> get_private_ci_job` snapshot，legacy wait 只服务旧/debug client，55 秒是 legacy behavior 而非 OpenAI/ChatGPT Web 官方 timeout SLA，fast feedback 不可 merge-eligible，正式 gate 要求 full CI + reusable attestation；未修改 wait handler、durable Request/Job state machine、exact HEAD/Tree validation、attestation 或 gate 算法。code-candidate full Private CI `2c0935f1d090428e` = passed / exit 0；`github-action-service` ruff + compileall passed、pytest `932 passed in 9.09s`，`private-ci-agent` ruff + compileall passed、pytest `230 passed`，`private-deploy-agent` ruff + compileall passed、pytest `5 passed`；code-candidate Attestation `b98913a9-5884-4f32-b8e1-632acb1bec58`。本 checklist Commit 会产生新 HEAD，因此以上只作为 code-candidate evidence，最终 Index / Change Context / Impact / Contract / Affected Tests / full Private CI / attestation / GitHub Checks / Clean 2/2 必须在 docs Commit 后重新建立。
 
 ### WEB-CI-DEV-019：Capability / Manifest / README
 
