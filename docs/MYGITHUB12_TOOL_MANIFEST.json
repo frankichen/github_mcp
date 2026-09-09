@@ -21,160 +21,67 @@
     "wait_private_ci_job"
   ],
   "web_safe_private_ci": {
+    "schema_version": 1,
     "supported": true,
     "canonical_start_tool": "start_private_ci_job",
     "canonical_snapshot_tool": "get_private_ci_job",
-    "recommended_continuation": "snapshot_resume",
-    "compatibility_wait": {
+    "continuation_strategy": "snapshot_resume",
+    "formal_writer_route": "managed_development",
+    "direct_private_ci": {
+      "use_case": "standalone_exact_commit_ci",
+      "start_tool": "start_private_ci_job",
+      "snapshot_tool": "get_private_ci_job"
+    },
+    "managed_development": {
+      "formal_writer_recommended": true,
+      "prepare_tool": "prepare_development_task",
+      "resume_tool": "resume_development_task",
+      "validate_tool": "validate_development_task",
+      "converge_tool": "converge_development_task",
+      "converge_compatibility_wait_inputs": {
+        "parameters": [
+          "index_wait_seconds",
+          "wait_seconds"
+        ],
+        "compatibility_only": true,
+        "accepted_but_ignored": true,
+        "blocking_wait": false
+      }
+    },
+    "fast_feedback": {
+      "purpose": "feedback_only",
+      "profile": "repo-fast-check",
+      "merge_eligible": false
+    },
+    "full_ci": {
+      "formal_gate_candidate": true,
+      "profile": "repo-auto-check"
+    },
+    "attestation": {
+      "required": true,
+      "reusable_required": true,
+      "create_tool": "create_attestation_for_passed_job",
+      "validate_tool": "validate_attestation"
+    },
+    "identity": {
+      "commit_sha_required": true,
+      "tree_sha_required": true
+    },
+    "legacy_wait": {
       "tool": "wait_private_ci_job",
       "compatibility_only": true,
       "recommended": false,
       "canonical_schema_exposed": false
     },
-    "fast_ci": {
-      "purpose": "feedback_only",
-      "merge_eligible": false
-    },
-    "full_ci": {
-      "purpose": "formal_gate_candidate"
-    },
-    "formal_reuse_and_merge_gate": {
-      "requires_full_ci": true,
-      "requires_reusable_attestation": true,
-      "requires_exact_head_tree": true
-    }
-  },
-  "web_ci_tool_contract_snapshot": {
-    "start_private_ci_job": {
-      "visibility": "canonical",
-      "description": "Durably accept a private CI Request for an exact Git commit without waiting for Worker execution.\n\nCRITICAL WORKFLOW:\n1. Supply the FULL 40-character commit_sha and a stable idempotency_key\n2. Save request_id; worker_job_id/job_id may truthfully be null while preparing\n3. Replaying the same request/key is safe; a different request with the same key conflicts\n4. Continue non-terminal tracking with get_private_ci_job snapshots; use diagnostics only when needed\n\nThis is for the private WSL CI system. NOT for GitHub Actions dispatch (use start_ci_job for that).",
-      "parameters": [
-        "repository",
-        "branch",
-        "commit_sha",
-        "profile",
-        "timeout_seconds",
-        "priority",
-        "force_rerun",
-        "supersede_previous",
-        "base_sha",
-        "idempotency_key"
-      ],
-      "required": [
-        "repository",
-        "branch",
-        "commit_sha"
-      ],
-      "defaults": {
-        "profile": "repo-auto-check",
-        "timeout_seconds": 900,
-        "priority": "normal",
-        "force_rerun": false,
-        "supersede_previous": false,
-        "base_sha": "",
-        "idempotency_key": ""
-      }
-    },
-    "get_private_ci_job": {
-      "visibility": "canonical",
-      "description": "Get one private CI Request/Worker snapshot. Defaults to a compact gate-safe summary.\n\nProvide request_id and/or job_id; at least one is required. request_id works before a Worker Job exists.\nWhen both are supplied they must be the exact persisted Request/Worker pair or the call fails closed.\nsummary is a pure read of current durable state: it never waits, polls, calls GitHub/network, or loads logs.\nIt keeps exact identity, Request revision, truthful Worker execution status, queue/worker state,\nnormalized workspaces, and bounded step status without commands, offsets, evidence, or changed files.\nUse detail_level='full' only for debugging; oversized full results are returned through a response resource.\n\nThis is for the private CI system. NOT for GitHub Actions runs (use get_ci_job for that).",
-      "parameters": [
-        "job_id",
-        "detail_level",
-        "request_id"
-      ],
-      "required": [],
-      "defaults": {
-        "job_id": "",
-        "detail_level": "summary",
-        "request_id": ""
-      }
-    },
-    "wait_private_ci_job": {
-      "visibility": "compatibility_only",
-      "description": "Deprecated compatibility-only long-poll for explicit legacy/debug callers. Retains the legacy up-to-55-second status/step/revision wait contract. It is not the canonical ChatGPT Web CI tracking path; normal Web continuation uses get_private_ci_job snapshots and must not loop this tool until terminal.",
-      "parameters": [
-        "job_id",
-        "timeout_seconds",
-        "last_known_status",
-        "last_known_step",
-        "last_known_revision"
-      ],
-      "required": [
-        "job_id"
-      ],
-      "defaults": {
-        "timeout_seconds": 55,
-        "last_known_status": "",
-        "last_known_step": "",
-        "last_known_revision": 0
-      },
-      "deprecation": {
-        "name": "wait_private_ci_job",
-        "deprecated": true,
-        "compatibility_only": true,
-        "replacement": "get_private_ci_job",
-        "guidance": "Legacy wait is compatibility-only for existing/debug clients. Canonical Web CI uses start_private_ci_job then get_private_ci_job snapshots and must not loop wait to terminal. The 55-second bound is legacy behavior, not an OpenAI/ChatGPT Web timeout SLA. Fast feedback is not merge-eligible; the formal gate requires full CI plus a reusable attestation."
-      }
-    },
-    "validate_development_task": {
-      "visibility": "canonical",
-      "description": "Run or reuse fast/full private CI for an exact Session head and return the current durable status without waiting by default; fast feedback never becomes merge-eligible, full success yields attestation.",
-      "parameters": [
-        "development_session_id",
-        "expected_session_revision",
-        "mode",
-        "base_sha",
-        "force_rerun",
-        "supersede_previous",
-        "wait_seconds",
-        "include_failure_pack",
-        "idempotency_key"
-      ],
-      "required": [
-        "development_session_id",
-        "expected_session_revision"
-      ],
-      "defaults": {
-        "mode": "fast",
-        "base_sha": "",
-        "force_rerun": false,
-        "supersede_previous": true,
-        "wait_seconds": 0,
-        "include_failure_pack": true,
-        "idempotency_key": ""
-      }
-    },
-    "converge_development_task": {
-      "visibility": "canonical",
-      "description": "Converge exact-head Index, Change Context, Impact, Contract, Affected Tests and fast/full Private CI; never merges, deploys or rolls back.",
-      "parameters": [
-        "development_session_id",
-        "expected_session_revision",
-        "mode",
-        "base_sha",
-        "index_wait_seconds",
-        "wait_seconds",
-        "force_rerun",
-        "supersede_previous",
-        "include_failure_pack",
-        "idempotency_key"
-      ],
-      "required": [
-        "development_session_id",
-        "expected_session_revision"
-      ],
-      "defaults": {
-        "mode": "full",
-        "base_sha": "",
-        "index_wait_seconds": 55,
-        "wait_seconds": 55,
-        "force_rerun": false,
-        "supersede_previous": true,
-        "include_failure_pack": true,
-        "idempotency_key": ""
-      }
-    }
+    "readiness_tool": "get_github_pull_request_merge_readiness",
+    "merge_plan_tool": "plan_github_pull_request_merge",
+    "merge_tool": "merge_github_pull_request",
+    "shared_formal_evidence": [
+      "full_private_ci",
+      "reusable_attestation",
+      "exact_commit_sha",
+      "exact_tree_sha"
+    ]
   },
   "schema_identity_algorithm": "sha256-canonical-mcp-tools-v1",
   "tool_annotation_snapshot": {
@@ -281,16 +188,16 @@
       "tool_manifest_count": 164,
       "compatibility_tool_count": 175,
       "hidden_deprecated_tool_count": 11,
-      "tool_schema_sha256": "1fb6e5a5c882e43d1cea272514ea329ecb5d4a86292920f28bc04a57415c393a",
-      "schema_generation_id": "schema-v1:1fb6e5a5c882e43d"
+      "tool_schema_sha256": "7089df13c9720de86f1d3d93d5af26bfa2eba5508f1e7c8a4cc1a1013691f873",
+      "schema_generation_id": "schema-v1:7089df13c9720de8"
     },
     "compatibility": {
       "tool_count": 175,
       "tool_manifest_count": 175,
       "compatibility_tool_count": 175,
       "hidden_deprecated_tool_count": 0,
-      "tool_schema_sha256": "20f6a867b9c862ab2d5ec0c69b4b526dc578d1ca741190a12e76e44095503975",
-      "schema_generation_id": "schema-v1:20f6a867b9c862ab"
+      "tool_schema_sha256": "cfbd7c254b875baef8d2b613f2446d174c67233e5830181c6c6723c0869ee6b6",
+      "schema_generation_id": "schema-v1:cfbd7c254b875bae"
     }
   },
   "new_tools": [
@@ -349,5 +256,681 @@
     "plan_infrastructure_deployment",
     "start_infrastructure_deployment",
     "get_infrastructure_deployment"
-  ]
+  ],
+  "legacy_manifest_role": "historical_inventory_snapshot_only",
+  "current_contract_source": "runtime_registration",
+  "current_contract_scope": [
+    "start_private_ci_job",
+    "get_private_ci_job",
+    "get_private_ci_logs",
+    "list_private_ci_workers",
+    "wait_private_ci_job",
+    "validate_development_task",
+    "converge_development_task",
+    "get_github_pull_request_merge_readiness",
+    "plan_github_pull_request_merge",
+    "merge_github_pull_request",
+    "create_attestation_for_passed_job",
+    "validate_attestation"
+  ],
+  "current_tool_contracts": {
+    "start_private_ci_job": {
+      "name": "start_private_ci_job",
+      "description": "Durably accept a private CI Request for an exact Git commit without waiting for Worker execution.\n\nCRITICAL WORKFLOW:\n1. Supply the FULL 40-character commit_sha and a stable idempotency_key\n2. Save request_id; worker_job_id/job_id may truthfully be null while preparing\n3. Replaying the same request/key is safe; a different request with the same key conflicts\n4. Continue non-terminal tracking with get_private_ci_job snapshots; use diagnostics only when needed\n\nThis is for the private WSL CI system. NOT for GitHub Actions dispatch (use start_ci_job for that).",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "commit_sha": {
+            "title": "Commit Sha",
+            "type": "string"
+          },
+          "profile": {
+            "default": "repo-auto-check",
+            "title": "Profile",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "default": 900,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "priority": {
+            "default": "normal",
+            "title": "Priority",
+            "type": "string"
+          },
+          "force_rerun": {
+            "default": false,
+            "title": "Force Rerun",
+            "type": "boolean"
+          },
+          "supersede_previous": {
+            "default": false,
+            "title": "Supersede Previous",
+            "type": "boolean"
+          },
+          "base_sha": {
+            "default": "",
+            "title": "Base Sha",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "default": "",
+            "title": "Idempotency Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "branch",
+          "commit_sha"
+        ],
+        "title": "start_private_ci_jobArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "start_private_ci_jobDictOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "deprecated": false,
+      "compatibility_only": false,
+      "visibility": "canonical",
+      "exposed_by_default": true,
+      "deprecation": null
+    },
+    "get_private_ci_job": {
+      "name": "get_private_ci_job",
+      "description": "Get one private CI Request/Worker snapshot. Defaults to a compact gate-safe summary.\n\nProvide request_id and/or job_id; at least one is required. request_id works before a Worker Job exists.\nWhen both are supplied they must be the exact persisted Request/Worker pair or the call fails closed.\nsummary is a pure read of current durable state: it never waits, polls, calls GitHub/network, or loads logs.\nIt keeps exact identity, Request revision, truthful Worker execution status, queue/worker state,\nnormalized workspaces, and bounded step status without commands, offsets, evidence, or changed files.\nUse detail_level='full' only for debugging; oversized full results are returned through a response resource.\n\nThis is for the private CI system. NOT for GitHub Actions runs (use get_ci_job for that).",
+      "input_schema": {
+        "properties": {
+          "job_id": {
+            "default": "",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "detail_level": {
+            "default": "summary",
+            "title": "Detail Level",
+            "type": "string"
+          },
+          "request_id": {
+            "default": "",
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "title": "get_private_ci_jobArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "get_private_ci_jobDictOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "deprecated": false,
+      "compatibility_only": false,
+      "visibility": "canonical",
+      "exposed_by_default": true,
+      "deprecation": null
+    },
+    "get_private_ci_logs": {
+      "name": "get_private_ci_logs",
+      "description": "Get private CI job execution logs by job_id. Supports pagination for large logs and precise persisted-step reads.\n\nUse the exact job_id from start_private_ci_job. Do NOT assume the latest job's logs.\n\nWithout step_id/step_name this preserves the complete job-log API. With step_id,\nor a unique step_name, only the persisted half-open step range is returned.\nstep_id is the stable selector when step names repeat. Pass next_cursor back\nas cursor for the next step page; cursor-only continuation is supported.\n\nThis is for the private CI system. NOT for GitHub Actions logs (use get_ci_logs for that).",
+      "input_schema": {
+        "properties": {
+          "job_id": {
+            "default": "",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "offset": {
+            "default": 0,
+            "title": "Offset",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 200,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "step_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Step Id"
+          },
+          "step_name": {
+            "default": "",
+            "title": "Step Name",
+            "type": "string"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          }
+        },
+        "title": "get_private_ci_logsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "get_private_ci_logsDictOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "deprecated": false,
+      "compatibility_only": false,
+      "visibility": "canonical",
+      "exposed_by_default": true,
+      "deprecation": null
+    },
+    "list_private_ci_workers": {
+      "name": "list_private_ci_workers",
+      "description": "List workers registered with the private CI controller, including wsl-ci-01.\n\nReturns each worker's ID, online status, supported profiles, max concurrency, and current job.\n\nThis is for the private German-controller + WSL-Podman CI system.\nNOT for GitHub Actions self-hosted runners (use list_ci_workers for that).",
+      "input_schema": {
+        "properties": {
+          "online_only": {
+            "default": false,
+            "title": "Online Only",
+            "type": "boolean"
+          }
+        },
+        "title": "list_private_ci_workersArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "list_private_ci_workersDictOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      },
+      "deprecated": false,
+      "compatibility_only": false,
+      "visibility": "canonical",
+      "exposed_by_default": true,
+      "deprecation": null
+    },
+    "wait_private_ci_job": {
+      "name": "wait_private_ci_job",
+      "description": "Deprecated compatibility-only long-poll for explicit legacy/debug callers. Retains the legacy up-to-55-second status/step/revision wait contract. It is not the canonical ChatGPT Web CI tracking path; normal Web continuation uses get_private_ci_job snapshots and must not loop this tool until terminal.",
+      "input_schema": {
+        "properties": {
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "default": 55,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "last_known_status": {
+            "default": "",
+            "title": "Last Known Status",
+            "type": "string"
+          },
+          "last_known_step": {
+            "default": "",
+            "title": "Last Known Step",
+            "type": "string"
+          },
+          "last_known_revision": {
+            "default": 0,
+            "title": "Last Known Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "title": "wait_private_ci_jobArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "wait_private_ci_jobDictOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "deprecated": true,
+      "compatibility_only": true,
+      "visibility": "compatibility_only",
+      "exposed_by_default": false,
+      "deprecation": {
+        "name": "wait_private_ci_job",
+        "deprecated": true,
+        "compatibility_only": true,
+        "replacement": "get_private_ci_job",
+        "guidance": "Legacy wait is compatibility-only for existing/debug clients. Canonical Web CI uses start_private_ci_job then get_private_ci_job snapshots and must not loop wait to terminal. The 55-second bound is legacy behavior, not an OpenAI/ChatGPT Web timeout SLA. Fast feedback is not merge-eligible; the formal gate requires full CI plus a reusable attestation."
+      }
+    },
+    "validate_development_task": {
+      "name": "validate_development_task",
+      "description": "Run or reuse fast/full private CI for an exact Session head and return the current durable status without waiting by default; fast feedback never becomes merge-eligible, full success yields attestation.",
+      "input_schema": {
+        "properties": {
+          "development_session_id": {
+            "title": "Development Session Id",
+            "type": "string"
+          },
+          "expected_session_revision": {
+            "title": "Expected Session Revision",
+            "type": "integer"
+          },
+          "mode": {
+            "default": "fast",
+            "title": "Mode",
+            "type": "string"
+          },
+          "base_sha": {
+            "default": "",
+            "title": "Base Sha",
+            "type": "string"
+          },
+          "force_rerun": {
+            "default": false,
+            "title": "Force Rerun",
+            "type": "boolean"
+          },
+          "supersede_previous": {
+            "default": true,
+            "title": "Supersede Previous",
+            "type": "boolean"
+          },
+          "wait_seconds": {
+            "default": 0,
+            "title": "Wait Seconds",
+            "type": "integer"
+          },
+          "include_failure_pack": {
+            "default": true,
+            "title": "Include Failure Pack",
+            "type": "boolean"
+          },
+          "idempotency_key": {
+            "default": "",
+            "title": "Idempotency Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "development_session_id",
+          "expected_session_revision"
+        ],
+        "title": "validate_development_taskArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "validate_development_taskDictOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "deprecated": false,
+      "compatibility_only": false,
+      "visibility": "canonical",
+      "exposed_by_default": true,
+      "deprecation": null
+    },
+    "converge_development_task": {
+      "name": "converge_development_task",
+      "description": "Converge exact-head Index, Change Context, Impact, Contract, Affected Tests and fast/full Private CI without blocking on external work. index_wait_seconds and wait_seconds are compatibility-only accepted-but-ignored inputs and do not establish a wait SLA. Never merges, deploys or rolls back.",
+      "input_schema": {
+        "properties": {
+          "development_session_id": {
+            "title": "Development Session Id",
+            "type": "string"
+          },
+          "expected_session_revision": {
+            "title": "Expected Session Revision",
+            "type": "integer"
+          },
+          "mode": {
+            "default": "full",
+            "title": "Mode",
+            "type": "string"
+          },
+          "base_sha": {
+            "default": "",
+            "title": "Base Sha",
+            "type": "string"
+          },
+          "index_wait_seconds": {
+            "default": 55,
+            "title": "Index Wait Seconds",
+            "type": "integer"
+          },
+          "wait_seconds": {
+            "default": 55,
+            "title": "Wait Seconds",
+            "type": "integer"
+          },
+          "force_rerun": {
+            "default": false,
+            "title": "Force Rerun",
+            "type": "boolean"
+          },
+          "supersede_previous": {
+            "default": true,
+            "title": "Supersede Previous",
+            "type": "boolean"
+          },
+          "include_failure_pack": {
+            "default": true,
+            "title": "Include Failure Pack",
+            "type": "boolean"
+          },
+          "idempotency_key": {
+            "default": "",
+            "title": "Idempotency Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "development_session_id",
+          "expected_session_revision"
+        ],
+        "title": "converge_development_taskArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "converge_development_taskDictOutput",
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "deprecated": false,
+      "compatibility_only": false,
+      "visibility": "canonical",
+      "exposed_by_default": true,
+      "deprecation": null
+    },
+    "get_github_pull_request_merge_readiness": {
+      "name": "get_github_pull_request_merge_readiness",
+      "description": "Aggregate safe PR merge readiness using exact HEAD/Tree identity, required full Private CI, a fresh reusable Attestation bound to that exact job/commit/tree, reviews, GitHub Checks, and repository merge methods.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "expected_head_sha": {
+            "default": "",
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "required_private_ci_job_id": {
+            "default": "",
+            "title": "Required Private Ci Job Id",
+            "type": "string"
+          },
+          "expected_base_branch": {
+            "default": "main",
+            "title": "Expected Base Branch",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "get_github_pull_request_merge_readinessArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "get_github_pull_request_merge_readinessDictOutput",
+        "type": "object"
+      },
+      "annotations": null,
+      "deprecated": false,
+      "compatibility_only": false,
+      "visibility": "canonical",
+      "exposed_by_default": true,
+      "deprecation": null
+    },
+    "plan_github_pull_request_merge": {
+      "name": "plan_github_pull_request_merge",
+      "description": "Read-only merge preflight using the same exact HEAD/Tree + full Private CI + reusable Attestation evidence contract as readiness and merge. Never merges.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "merge_method": {
+            "default": "squash",
+            "title": "Merge Method",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "default": "",
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "required_private_ci_job_id": {
+            "default": "",
+            "title": "Required Private Ci Job Id",
+            "type": "string"
+          },
+          "expected_base_branch": {
+            "default": "main",
+            "title": "Expected Base Branch",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "plan_github_pull_request_mergeArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "plan_github_pull_request_mergeDictOutput",
+        "type": "object"
+      },
+      "annotations": null,
+      "deprecated": false,
+      "compatibility_only": false,
+      "visibility": "canonical",
+      "exposed_by_default": true,
+      "deprecation": null
+    },
+    "merge_github_pull_request": {
+      "name": "merge_github_pull_request",
+      "description": "Safely merge a PR only after the shared readiness gate proves exact HEAD/Tree, passed required full Private CI, a fresh reusable Attestation bound to that job/commit/tree, and explicit confirm=true. Never deploys. A confirmed merge finalizes any exact managed Development Session/Workspace and queues exact-SHA repository index bootstrap for the new base head.",
+      "input_schema": {
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "pull_number": {
+            "title": "Pull Number",
+            "type": "integer"
+          },
+          "merge_method": {
+            "default": "squash",
+            "title": "Merge Method",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "default": "",
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "required_private_ci_job_id": {
+            "default": "",
+            "title": "Required Private Ci Job Id",
+            "type": "string"
+          },
+          "expected_base_branch": {
+            "default": "main",
+            "title": "Expected Base Branch",
+            "type": "string"
+          },
+          "commit_title": {
+            "default": "",
+            "title": "Commit Title",
+            "type": "string"
+          },
+          "commit_message": {
+            "default": "",
+            "title": "Commit Message",
+            "type": "string"
+          },
+          "delete_head_branch": {
+            "default": false,
+            "title": "Delete Head Branch",
+            "type": "boolean"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_number"
+        ],
+        "title": "merge_github_pull_requestArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "merge_github_pull_requestDictOutput",
+        "type": "object"
+      },
+      "annotations": null,
+      "deprecated": false,
+      "compatibility_only": false,
+      "visibility": "canonical",
+      "exposed_by_default": true,
+      "deprecation": null
+    },
+    "create_attestation_for_passed_job": {
+      "name": "create_attestation_for_passed_job",
+      "description": "Create a Tree SHA attestation from server-side CI evidence; callers may only choose job_id and bounded expiry.",
+      "input_schema": {
+        "properties": {
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "expires_in_seconds": {
+            "default": 604800,
+            "title": "Expires In Seconds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "title": "create_attestation_for_passed_jobArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "create_attestation_for_passed_jobDictOutput",
+        "type": "object"
+      },
+      "annotations": null,
+      "deprecated": false,
+      "compatibility_only": false,
+      "visibility": "canonical",
+      "exposed_by_default": true,
+      "deprecation": null
+    },
+    "validate_attestation": {
+      "name": "validate_attestation",
+      "description": "Validate every identity, job, toolchain, dependency, config, expiry and revocation gate before CI reuse.",
+      "input_schema": {
+        "properties": {
+          "attestation_id": {
+            "title": "Attestation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attestation_id"
+        ],
+        "title": "validate_attestationArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "validate_attestationDictOutput",
+        "type": "object"
+      },
+      "annotations": null,
+      "deprecated": false,
+      "compatibility_only": false,
+      "visibility": "canonical",
+      "exposed_by_default": true,
+      "deprecation": null
+    }
+  }
 }

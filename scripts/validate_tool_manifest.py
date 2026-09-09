@@ -39,6 +39,43 @@ IDENTITY_FIELDS = (
     "schema_generation_id",
 )
 
+CURRENT_CONTRACT_TOOLS = (
+    "start_private_ci_job",
+    "get_private_ci_job",
+    "get_private_ci_logs",
+    "list_private_ci_workers",
+    "wait_private_ci_job",
+    "validate_development_task",
+    "converge_development_task",
+    "get_github_pull_request_merge_readiness",
+    "plan_github_pull_request_merge",
+    "merge_github_pull_request",
+    "create_attestation_for_passed_job",
+    "validate_attestation",
+)
+
+
+def _annotations(tool):
+    if tool.annotations is None:
+        return None
+    return {field: getattr(tool.annotations, field) for field in ANNOTATION_FIELDS}
+
+
+def _current_contract(tool, *, hidden: set[str], deprecated_by_name: dict[str, dict]) -> dict:
+    deprecation = deprecated_by_name.get(tool.name)
+    return {
+        "name": tool.name,
+        "description": tool.description or "",
+        "input_schema": tool.inputSchema,
+        "output_schema": tool.outputSchema,
+        "annotations": _annotations(tool),
+        "deprecated": bool(deprecation),
+        "compatibility_only": bool((deprecation or {}).get("compatibility_only")),
+        "visibility": "compatibility_only" if tool.name in hidden else "canonical",
+        "exposed_by_default": tool.name not in hidden,
+        "deprecation": deprecation,
+    }
+
 
 async def main() -> int:
     root = Path(__file__).parents[1]
@@ -58,6 +95,7 @@ async def main() -> int:
         if len(registered_names) != len(set(registered_names)):
             raise SystemExit("actual MCP registration contains duplicate names")
 
+        from app import mygithub10  # noqa: PLC0415
         from app.version import SERVICE_NAME, SERVICE_VERSION  # noqa: PLC0415
 
         required = {
@@ -101,7 +139,7 @@ async def main() -> int:
             manifest_registered_names = legacy_names + new_names
             if registered_names != manifest_registered_names:
                 raise SystemExit(
-                    f"MyGithut12 compatibility manifest mismatch: actual={registered_names!r} manifest={manifest_registered_names!r}"
+                    f"MyGithut12 compatibility inventory mismatch: actual={registered_names!r} manifest={manifest_registered_names!r}"
                 )
             if manifest12["legacy_tool_count"] != len(legacy_names):
                 raise SystemExit("MyGithut12 legacy_tool_count mismatch")
@@ -114,6 +152,31 @@ async def main() -> int:
             if not isinstance(annotation_snapshot, dict) or set(annotation_snapshot) != ANNOTATION_SNAPSHOT_TOOLS:
                 raise SystemExit("MyGithut12 tool annotation snapshot inventory mismatch")
             registered_by_name = {tool.name: tool for tool in registered}
+
+            if manifest12.get("legacy_manifest_role") != "historical_inventory_snapshot_only":
+                raise SystemExit("MyGithut12 legacy manifest role must be historical inventory only")
+            if manifest12.get("current_contract_source") != "runtime_registration":
+                raise SystemExit("MyGithut12 current contract source must be runtime registration")
+            if manifest12.get("current_contract_scope") != list(CURRENT_CONTRACT_TOOLS):
+                raise SystemExit("MyGithut12 current contract scope mismatch")
+            hidden_for_contract = set(manifest12.get("hidden_deprecated_tools") or [])
+            capability_contract = mygithub10.capabilities("a" * 40)
+            deprecated_by_name = {
+                item["name"]: item for item in capability_contract.get("deprecated_tools", [])
+            }
+            actual_contracts = {
+                name: _current_contract(
+                    registered_by_name[name],
+                    hidden=hidden_for_contract,
+                    deprecated_by_name=deprecated_by_name,
+                )
+                for name in CURRENT_CONTRACT_TOOLS
+            }
+            if actual_contracts != manifest12.get("current_tool_contracts"):
+                raise SystemExit("MyGithut12 current Web-CI runtime contract snapshot mismatch")
+            if capability_contract.get("web_safe_private_ci") != manifest12.get("web_safe_private_ci"):
+                raise SystemExit("MyGithut12 Web-safe Private CI capability/manifest mismatch")
+
             for name, expected in annotation_snapshot.items():
                 if not isinstance(expected, dict):
                     raise SystemExit(f"{name} annotation snapshot entry must be an object")
