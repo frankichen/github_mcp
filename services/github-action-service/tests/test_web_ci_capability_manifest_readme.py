@@ -145,15 +145,17 @@ def test_readme_exposes_complete_web_safe_private_ci_flow():
         "\n## MyGithut12 运行状态", 1
     )[0]
 
-    ordered = (
-        "`start_private_ci_job`",
-        "`get_private_ci_job`",
-        "terminal Full CI",
-        "reusable Attestation",
-        "exact HEAD/Tree",
-    )
-    positions = [section.index(item) for item in ordered]
-    assert positions == sorted(positions)
+    flow = re.search(r"```text\n(?P<flow>.*?)\n```", section, re.DOTALL)
+    assert flow is not None
+    assert flow.group("flow").splitlines() == [
+        "start_private_ci_job",
+        "→ durable Request accepted",
+        "→ get_private_ci_job snapshot",
+        "→ non-terminal: persist request_id/job_id and resume with another snapshot",
+        "→ terminal Full CI passed",
+        "→ reusable Attestation",
+        "→ exact HEAD/Tree readiness and merge gate",
+    ]
     assert "Fast CI" in section and "feedback only" in section
     assert "Fast CI != merge eligible" in section
     assert "Full CI" in section and "formal CI gate candidate" in section
