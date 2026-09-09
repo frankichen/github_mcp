@@ -229,6 +229,15 @@ def _db_state(session_id):
     return workspace, session, events
 
 
+def _pin_bases_to_new(session_id):
+    """Model the production partial state: bases already new, Session HEAD still old."""
+    with sessions._LOCK, sessions._db() as db:
+        db.execute("UPDATE workspaces SET base_commit_sha=? WHERE workspace_id=?", (NEW_BASE, WORKSPACE_ID))
+        db.execute(
+            "UPDATE development_sessions SET base_commit_sha=? WHERE session_id=?", (NEW_BASE, session_id)
+        )
+
+
 def test_t1_base_sync_happy_path_advances_base_head_atomically_and_requests_new_base_index(tmp_path, monkeypatch):
     service, session, index_requests = _seed(tmp_path, monkeypatch)
     result = _call(service, session)
@@ -612,6 +621,111 @@ def test_imported_base_path_does_not_create_false_current_task_overlap(tmp_path,
     assert overlap["current_task_delta_paths"] == ["allowed/feature.py"]
     assert overlap["items"][0]["level"] == "none"
     assert overlap["items"][0]["evidence"] == []
+
+
+def test_already_pinned_new_base_recovers_partial_control_plane_state(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _pin_bases_to_new(session["session_id"])
+
+    result = _call(service, session)
+
+    assert result["control_plane_recovery"] == "CONTROL_PLANE_BASE_SYNC_RECOVERY_SUCCESS"
+    assert result["verification"]["pinned_base_state"] == recovery.PINNED_BASE_ALREADY_NEW
+    assert result["before"]["pinned_base_state"] == recovery.PINNED_BASE_ALREADY_NEW
+    assert result["before"]["workspace_base_sha"] == NEW_BASE
+    assert result["before"]["session_base_sha"] == NEW_BASE
+    assert result["workspace"]["base_commit_sha"] == NEW_BASE
+    assert result["development_session"]["base_commit_sha"] == NEW_BASE
+    assert result["workspace"]["head_sha"] == result["development_session"]["head_commit_sha"] == CURRENT_HEAD
+    assert result["workspace"]["tree_sha"] == result["development_session"]["tree_sha"] == CURRENT_TREE
+    assert result["workspace"]["drift_reason"] is None
+    assert result["audit"]["pinned_base_state"] == recovery.PINNED_BASE_ALREADY_NEW
+
+
+def test_already_pinned_new_base_scope_and_overlap_ignore_large_imported_upstream_delta(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _pin_bases_to_new(session["session_id"])
+    imported = [f"upstream/{index:03d}.py" for index in range(95)]
+    task_paths = [f"allowed/task-{index:02d}.py" for index in range(14)]
+    service.repo.set_compare(OLD_BASE, NEW_BASE, paths=imported)
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=task_paths)
+    service.repo.set_compare(OLD_HEAD, CURRENT_HEAD, paths=[*imported, *task_paths])
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=task_paths)
+    monkeypatch.setattr(
+        recovery.mygithub12,
+        "workspace_overlap",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "workspace_id": WORKSPACE_ID,
+            "items": [{
+                "workspace_id": "ws_imported_overlap",
+                "branch": "ai/other",
+                "level": "high",
+                "evidence": [{"kind": "changed_paths", "items": [imported[0]]}],
+            }],
+        },
+    )
+
+    result = _call(service, session)
+
+    expected_task_paths = sorted(task_paths)
+    assert result["verification"]["scope"]["changed_paths"] == expected_task_paths
+    overlap = result["verification"]["ownership"]["overlap"]
+    assert overlap["current_task_delta_paths"] == expected_task_paths
+    assert overlap["items"][0]["level"] == "none"
+    assert overlap["items"][0]["evidence"] == []
+
+
+def test_already_pinned_new_base_real_task_overlap_still_blocks(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _pin_bases_to_new(session["session_id"])
+    monkeypatch.setattr(
+        recovery.mygithub12,
+        "workspace_overlap",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "workspace_id": WORKSPACE_ID,
+            "items": [{
+                "workspace_id": "ws_task_overlap",
+                "branch": "ai/other",
+                "level": "high",
+                "evidence": [{"kind": "changed_paths", "items": ["allowed/feature.py"]}],
+            }],
+        },
+    )
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == "RECOVERY_WORKSPACE_OVERLAP"
+
+
+def test_already_pinned_new_base_live_base_moves_again_fails_closed(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _pin_bases_to_new(session["session_id"])
+    service.client.heads[BASE_BRANCH] = OTHER_HEAD
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == "RECOVERY_BASE_CHANGED"
+
+
+def test_mixed_partial_base_state_is_not_accepted(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    with sessions._LOCK, sessions._db() as db:
+        db.execute("UPDATE workspaces SET base_commit_sha=? WHERE workspace_id=?", (NEW_BASE, WORKSPACE_ID))
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == "RECOVERY_BASE_CHANGED"
+
+
+def test_already_pinned_new_base_idempotent_replay_and_conflict(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _pin_bases_to_new(session["session_id"])
+    first = _call(service, session)
+    second = _call(service, session)
+    assert second["replayed"] is True
+    assert second["after"] == first["after"]
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session, lease_seconds=7100)
+    assert exc.value.code == "IDEMPOTENCY_CONFLICT"
 
 
 def test_managed_merge_finalization_atomically_closes_workspace_and_releases_writer(tmp_path, monkeypatch):

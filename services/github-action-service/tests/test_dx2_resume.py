@@ -333,6 +333,85 @@ def test_resume_task_drifted_workspace_never_invokes_session_recovery(monkeypatc
     assert result["next_allowed_actions"] == ["recover_drifted_development_task", "recovery_required"]
 
 
+def test_stacked_resume_uses_live_workspace_pr_base_branch_head_not_repository_main(monkeypatch):
+    stacked_branch = "ai/stacked-base"
+    old_base = "d" * 40
+    stacked_head = "e" * 40
+    current_head = "f" * 40
+    current_tree = "3" * 40
+    ws = _workspace(status="drifted", revision=3)
+    ws.update({
+        "base_branch": stacked_branch,
+        "base_commit_sha": old_base,
+        "head_sha": current_head,
+        "tree_sha": current_tree,
+        "drift_reason": "branch_moved_externally",
+    })
+    session = {
+        **_ready_session(head=SHA_A, tree=TREE_A, workspace_revision=2, lease=ws["lease_expires_at"]),
+        "base_branch": stacked_branch,
+        "base_commit_sha": old_base,
+    }
+    pr = {
+        "pull_number": 7,
+        "head_branch": "ai/resume",
+        "head_sha": current_head,
+        "base_branch": stacked_branch,
+        "state": "open",
+        "draft": True,
+    }
+    _stub_resume_context(
+        monkeypatch, ws=ws, session=session, pr=pr, branch_head=current_head, branch_tree=current_tree,
+    )
+    monkeypatch.setattr(
+        resume.mygithub12,
+        "resolve_identity",
+        lambda service, repository, commit_sha="", ref="": {
+            "repository": repository,
+            "commit_sha": stacked_head if ref == stacked_branch else (commit_sha or SHA_B),
+            "tree_sha": "4" * 40,
+        },
+    )
+    monkeypatch.setattr(
+        resume,
+        "_resume_ancestry_evidence",
+        lambda service, repository, ancestor, descendant: {
+            "verified": True, "ancestor": ancestor, "descendant": descendant,
+        },
+    )
+
+    result = resume.resume_task(FakeService(), "owner/repo", pull_number=7)
+
+    assert result["current_main"]["commit_sha"] == SHA_B
+    assert result["recovery_base"]["branch"] == stacked_branch
+    assert result["recovery_base"]["commit_sha"] == stacked_head
+    assert result["recovery"]["action"] == "recover_base_synced_development_task"
+    assert result["recovery"]["expected_new_base_sha"] == stacked_head
+    assert result["recovery"]["expected_new_base_sha"] != SHA_B
+    assert result["recovery"]["expected_base_branch"] == stacked_branch
+
+
+def test_main_based_resume_keeps_repository_main_as_live_base(monkeypatch):
+    current_head = "f" * 40
+    current_tree = "3" * 40
+    ws = _workspace(status="drifted", revision=3)
+    ws.update({"head_sha": current_head, "tree_sha": current_tree, "drift_reason": "branch_moved_externally"})
+    session = {
+        **_ready_session(head=SHA_A, tree=TREE_A, workspace_revision=2, lease=ws["lease_expires_at"]),
+        "base_branch": "main",
+        "base_commit_sha": SHA_A,
+    }
+    _stub_resume_context(monkeypatch, ws=ws, session=session, branch_head=current_head, branch_tree=current_tree)
+    monkeypatch.setattr(resume, "_resume_ancestry_evidence", lambda *args, **kwargs: {"verified": True})
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["recovery_base"] == result["current_main"]
+    assert result["recovery"]["action"] == "recover_base_synced_development_task"
+    assert result["recovery"]["expected_new_base_sha"] == SHA_B
+    assert result["recovery"]["expected_base_branch"] == "main"
+
+
 def test_session_evidence_never_promotes_old_head_or_invalid_attestation(monkeypatch):
     historical = {"head_commit_sha": SHA_A, "last_full_ci_job_id": "old-full", "last_attestation_id": "old-att", "last_fast_ci_job_id": None, "last_failure_resource_uri": None}
     evidence = resume._session_evidence(historical, SHA_B)

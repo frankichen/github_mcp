@@ -86,6 +86,52 @@ def _current_main(service: Any, repository: str) -> dict[str, Any]:
     return {"branch": default_branch, **identity}
 
 
+def _resolve_recovery_base(
+    service: Any,
+    repository: str,
+    workspace: dict[str, Any] | None,
+    session: dict[str, Any] | None,
+    pr: dict[str, Any] | None,
+    current_main: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve the exact live base branch for drift recovery, not just repository main."""
+    candidates = {
+        str(value)
+        for value in (
+            (workspace or {}).get("base_branch"),
+            (session or {}).get("base_branch"),
+            (pr or {}).get("base_branch"),
+        )
+        if value
+    }
+    if len(candidates) > 1:
+        raise MyGithub12Error(
+            "RECOVERY_IDENTITY_MISMATCH",
+            "Workspace, Development Session and Pull Request disagree on the recovery base branch",
+            {"base_branches": sorted(candidates)},
+        )
+    base_branch = next(iter(candidates), str(current_main.get("branch") or ""))
+    if not base_branch:
+        raise MyGithub12Error("RECOVERY_BASE_CHANGED", "recovery base branch is unavailable")
+    if base_branch == current_main.get("branch"):
+        return dict(current_main)
+    try:
+        identity = mygithub12.resolve_identity(service, repository, ref=base_branch)
+    except Exception as exc:
+        raise MyGithub12Error(
+            "RECOVERY_BASE_CHANGED",
+            "recovery base branch could not be resolved",
+            {"base_branch": base_branch, "cause_type": type(exc).__name__},
+        ) from exc
+    if not identity.get("commit_sha") or not identity.get("tree_sha"):
+        raise MyGithub12Error(
+            "RECOVERY_BASE_CHANGED",
+            "recovery base branch did not resolve to an exact HEAD/Tree",
+            {"base_branch": base_branch},
+        )
+    return {**identity, "branch": base_branch}
+
+
 def _resolve_branch(service: Any, repository: str, branch: str, base_branch: str) -> dict[str, Any]:
     branch_result = github_utils.get_github_branch(repository, branch, base_branch)
     _raise_result_error(branch_result, "BRANCH_NOT_FOUND", "branch was not found")
@@ -504,6 +550,7 @@ def _workspace_recovery_plan(
     service: Any | None = None,
     session: dict[str, Any] | None = None,
     current_main: dict[str, Any] | None = None,
+    current_base: dict[str, Any] | None = None,
     branch_state: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if not workspace:
@@ -519,15 +566,20 @@ def _workspace_recovery_plan(
     if status == "drifted":
         old_base = str(workspace.get("base_commit_sha") or "")
         session_base = str((session or {}).get("base_commit_sha") or "")
-        new_base = str((current_main or {}).get("commit_sha") or "")
+        live_base = current_base or current_main or {}
+        base_branch = str(workspace.get("base_branch") or "")
+        live_base_branch = str(live_base.get("branch") or "")
+        new_base = str(live_base.get("commit_sha") or "")
         old_head = str((session or {}).get("head_commit_sha") or "")
         current_head = str((branch_state or {}).get("commit_sha") or "")
         base_sync = bool(
             service
             and session
-            and current_main
+            and live_base
             and branch_state
             and workspace.get("drift_reason") == "branch_moved_externally"
+            and base_branch
+            and live_base_branch == base_branch
             and old_base
             and session_base == old_base
             and new_base
@@ -555,6 +607,7 @@ def _workspace_recovery_plan(
                     "workspace_id": workspace.get("workspace_id"),
                     "development_session_id": session.get("session_id"),
                     "expected_workspace_revision": workspace.get("revision"),
+                    "expected_base_branch": base_branch,
                     "expected_current_head_sha": current_head,
                     "expected_current_tree_sha": branch_state.get("tree_sha"),
                     "next_action": "recover_base_synced_development_task",
@@ -574,6 +627,7 @@ def _workspace_recovery_plan(
                 "drift_reason": workspace.get("drift_reason"),
                 "expected_old_base_sha": old_base,
                 "expected_new_base_sha": new_base,
+                "expected_base_branch": base_branch,
                 "expected_old_session_head_sha": old_head,
                 "expected_current_head_sha": current_head,
                 "expected_current_tree_sha": branch_state.get("tree_sha"),
@@ -964,11 +1018,17 @@ def resume_task(
     if convergence_evidence["errors"]:
         degraded.append("CONVERGENCE_STATE_UNAVAILABLE")
     blockers = list(dict.fromkeys(blockers))
+    recovery_base = current_main
+    if workspace and workspace.get("status") == "drifted":
+        recovery_base = _resolve_recovery_base(
+            service, repository, workspace, session, pr, current_main,
+        )
     workspace_recovery = recovery or _workspace_recovery_plan(
         workspace,
         service=service,
         session=session,
         current_main=current_main,
+        current_base=recovery_base,
         branch_state=branch_state,
     )
     response = {
@@ -977,6 +1037,7 @@ def resume_task(
         "input": {"branch": branch or "", "pull_number": int(pull_number or 0)},
         "policy": policy,
         "current_main": current_main,
+        "recovery_base": recovery_base,
         "branch": branch_state,
         "pull_request": pr,
         "workspace": workspace,
@@ -1049,7 +1110,7 @@ def resume_task(
         convergence_evidence["pending"],
     )
     response["live_facts"] = {
-        "policy": policy, "current_main": current_main, "branch": branch_state, "pull_request": pr,
+        "policy": policy, "current_main": current_main, "recovery_base": recovery_base, "branch": branch_state, "pull_request": pr,
         "workspace": workspace, "development_session": session, "index": index,
         "private_ci_current_head": ci, "current_attestation": (session_evidence.get("current_head") or {}).get("validated_attestation"),
         "convergence": convergence_evidence["live"],
