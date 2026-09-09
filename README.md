@@ -97,6 +97,7 @@ start_private_ci_job
 - **Fast CI** = feedback only；`Fast CI != merge gate`，也不是 merge-eligible evidence。Managed fast 使用 `repo-fast-check`；正式 Full gate 使用 `repo-auto-check`。
 - **Full CI** = formal CI gate candidate；只有 exact HEAD/Tree 上的 Full 成功，再配合 fresh reusable Attestation，才构成 readiness/merge 可验证 evidence。
 - **Attestation** = 由服务端 CI evidence 生成并经 `validate_attestation` 验证的 reusable evidence；正式 gate 要求它与 required CI job、commit 和 Tree 全部精确绑定，且 active、未 revoked、未 expired。
+- **Current PR base** = readiness 每次都以 fresh GitHub PR `base_sha` 为准；Full CI `base_sha` 与 validated reusable Attestation `base_sha` 必须同时精确等于该 current base，base branch 前移后旧 evidence 立即 fail closed。
 - `wait_private_ci_job` 是 compatibility-only legacy/debug 入口，不是 Web 推荐 continuation；canonical Web 客户端 **must not loop** long-poll wait 到 terminal。`converge_development_task` 的 `index_wait_seconds` / `wait_seconds` 也只是 compatibility-only accepted-but-ignored 参数，不建立 blocking wait contract。
 - 这里的 Web-safe 仅表示 bounded、durable、resumable；不声明 OpenAI 或 ChatGPT 产品存在固定 Web timeout SLA。
 

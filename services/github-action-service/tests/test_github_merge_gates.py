@@ -2,20 +2,30 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import github_utils
+from app import attestation_registry, ci_database, github_utils
 
 
 HEAD = "a" * 40
 TREE = "c" * 40
+BASE = "b" * 40
+ADVANCED_BASE = "d" * 40
 FORMAL_PROFILE = "repo-auto-check"
 
 
-def _attestation(job_id="job", repository="owner/repo", commit_sha=HEAD, tree_sha=TREE, **overrides):
+def _attestation(
+    job_id="job",
+    repository="owner/repo",
+    commit_sha=HEAD,
+    tree_sha=TREE,
+    base_sha=BASE,
+    **overrides,
+):
     item = {
         "attestation_id": "att-1",
         "repository": repository,
         "tested_commit_sha": commit_sha,
         "tested_tree_sha": tree_sha,
+        "base_sha": base_sha,
         "private_ci_job_id": job_id,
         "profile": FORMAL_PROFILE,
         "status": "active",
@@ -30,21 +40,89 @@ def _valid_attestation_result(**overrides):
     return {"ok": True, "found": True, "reusable": True, "attestation": item}
 
 
-def _formal_job(repository="owner/repo", branch="feature", commit_sha=HEAD, tree_sha=TREE, profile=FORMAL_PROFILE, **overrides):
+def _formal_job(
+    repository="owner/repo",
+    branch="feature",
+    commit_sha=HEAD,
+    tree_sha=TREE,
+    base_sha=BASE,
+    profile=FORMAL_PROFILE,
+    **overrides,
+):
     job = {
         "repository": repository,
         "branch": branch,
         "commit_sha": commit_sha,
+        "base_sha": base_sha,
         "profile": profile,
         "status": "passed",
         "exit_code": 0,
-        "summary": {"git_tree_sha": tree_sha},
+        "summary": {
+            "git_tree_sha": tree_sha,
+            "evidence": {"base_sha": base_sha},
+        },
     }
     job.update(overrides)
     return job
 
 
-def _install_gate_baseline(monkeypatch, *, repository="owner/repo", job=None, attestation=None, fake_pr=None):
+def _reset_ci_database():
+    current = getattr(ci_database._local, "db", None)
+    if current is not None:
+        current.close()
+    ci_database._local.db = None
+
+
+@pytest.fixture
+def isolated_gate_registry(tmp_path, monkeypatch):
+    path = tmp_path / "merge-gate-ci.db"
+    monkeypatch.setattr(ci_database, "DB_PATH", str(path))
+    monkeypatch.setenv("CI_DB_PATH", str(path))
+    _reset_ci_database()
+    ci_database.init_db()
+    yield path
+    _reset_ci_database()
+
+
+def _create_registry_backed_job(base_sha=BASE):
+    job = ci_database.create_or_get_job(
+        repository="owner/repo",
+        branch="feature",
+        commit_sha=HEAD,
+        profile=FORMAL_PROFILE,
+        priority=100,
+        timeout_seconds=900,
+        force_rerun=True,
+        supersede_previous=False,
+        base_sha=base_sha,
+        changed_files=["app.py"],
+    )
+    summary = {
+        "git_tree_sha": TREE,
+        "image_digest": "sha256:image-set",
+        "evidence": {
+            "base_sha": base_sha,
+            "changed_files": ["app.py"],
+            "dependency_manifest_sha256": "deps",
+            "test_config_sha256": "config",
+            "source_immutable": True,
+        },
+    }
+    ci_database.complete_job(job["job_id"], 0, "passed", summary)
+    return ci_database.get_job(job["job_id"])
+
+
+def _install_gate_baseline(
+    monkeypatch,
+    *,
+    repository="owner/repo",
+    job=None,
+    attestation=None,
+    fake_pr=None,
+    pr_overrides=None,
+    mock_evidence=True,
+    on_get_pull=None,
+):
     job = job or _formal_job(repository=repository)
     attestation = attestation or _valid_attestation_result(repository=repository)
     pr_read = {
@@ -53,7 +131,7 @@ def _install_gate_baseline(monkeypatch, *, repository="owner/repo", job=None, at
         "merged": False,
         "draft": False,
         "base_branch": "main",
-        "base_sha": "b" * 40,
+        "base_sha": BASE,
         "head_branch": "feature",
         "head_sha": HEAD,
         "mergeable": True,
@@ -63,20 +141,74 @@ def _install_gate_baseline(monkeypatch, *, repository="owner/repo", job=None, at
         "requested_reviewers": [],
         "requested_teams": [],
     }
+    pr_read.update(pr_overrides or {})
     monkeypatch.setattr(github_utils, "get_github_pull_request", lambda *_: pr_read)
     monkeypatch.setattr(github_utils, "_private_ci_policy", lambda *_: (True, True))
-    monkeypatch.setattr(github_utils, "_private_ci_job", lambda *_: job)
-    monkeypatch.setattr(github_utils, "_repository_merge_policy", lambda *_: {"required_private_ci_profile": FORMAL_PROFILE})
+    monkeypatch.setattr(
+        github_utils,
+        "_repository_merge_policy",
+        lambda *_: {"required_private_ci_profile": FORMAL_PROFILE},
+    )
     monkeypatch.setattr(github_utils, "_github_commit_tree_sha", lambda *_: TREE)
-    monkeypatch.setattr(github_utils, "_validated_attestation_for_job", lambda *_: attestation)
-    monkeypatch.setattr(github_utils, "_review_policy", lambda *_: {"required_approvals": 0, "current_approvals": 0, "source": "none", "changes_requested": False})
-    monkeypatch.setattr(github_utils, "get_github_pull_request_checks", lambda *_: {"ok": True, "checks": [], "statuses": [], "overall_conclusion": "success", "required_check_sources": {"errors": []}})
-    monkeypatch.setattr(github_utils, "get_github_repository", lambda *_: {"allow_squash_merge": True})
+    if mock_evidence:
+        monkeypatch.setattr(github_utils, "_private_ci_job", lambda *_: job)
+        monkeypatch.setattr(github_utils, "_validated_attestation_for_job", lambda *_: attestation)
+    monkeypatch.setattr(
+        github_utils,
+        "_review_policy",
+        lambda *_: {
+            "required_approvals": 0,
+            "current_approvals": 0,
+            "source": "none",
+            "changes_requested": False,
+        },
+    )
+    monkeypatch.setattr(
+        github_utils,
+        "get_github_pull_request_checks",
+        lambda *_: {
+            "ok": True,
+            "checks": [],
+            "statuses": [],
+            "overall_conclusion": "success",
+            "required_check_sources": {"errors": []},
+        },
+    )
+    monkeypatch.setattr(
+        github_utils, "get_github_repository", lambda *_: {"allow_squash_merge": True}
+    )
     repo_obj = SimpleNamespace(allow_squash_merge=True)
     if fake_pr is not None:
-        repo_obj.get_pull = lambda *_: fake_pr
-        repo_obj.get_branch = lambda *_: SimpleNamespace(commit=SimpleNamespace(sha="d" * 40))
-    monkeypatch.setattr(github_utils, "_get_gh", lambda: SimpleNamespace(get_repo=lambda *_: repo_obj))
+        def get_pull(*_args):
+            if on_get_pull is not None:
+                on_get_pull()
+            return fake_pr
+
+        repo_obj.get_pull = get_pull
+        repo_obj.get_branch = lambda *_: SimpleNamespace(
+            commit=SimpleNamespace(sha="d" * 40)
+        )
+    monkeypatch.setattr(
+        github_utils, "_get_gh", lambda: SimpleNamespace(get_repo=lambda *_: repo_obj)
+    )
+    return pr_read
+
+
+def _recording_pr():
+    class FakePR:
+        merged = True
+        merge_commit_sha = "c" * 40
+        html_url = "https://github.com/owner/repo/pull/1"
+        merged_at = None
+
+        def __init__(self):
+            self.calls = []
+
+        def merge(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(merged=True, sha="c" * 40, message="merged")
+
+    return FakePR()
 
 
 def test_check_classification_non_required_failure_and_infrastructure_signals():
@@ -175,6 +307,12 @@ def test_private_ci_exact_sha_profile_and_superseded(monkeypatch):
     [
         (_formal_job(), {"ok": False, "found": False, "reusable": False, "error_code": "ATTESTATION_NOT_FOUND"}, "PRIVATE_CI_ATTESTATION_REQUIRED"),
         (_formal_job(tree_sha="x" * 40), _valid_attestation_result(), "PRIVATE_CI_TREE_MISMATCH"),
+        (_formal_job(base_sha="x" * 40), _valid_attestation_result(), "PRIVATE_CI_BASE_MISMATCH"),
+        (
+            _formal_job(),
+            _valid_attestation_result(base_sha="x" * 40),
+            "PRIVATE_CI_ATTESTATION_BASE_MISMATCH",
+        ),
         (_formal_job(), _valid_attestation_result(job_id="other-job"), "PRIVATE_CI_ATTESTATION_JOB_MISMATCH"),
         (_formal_job(), _valid_attestation_result(commit_sha="x" * 40), "PRIVATE_CI_ATTESTATION_SHA_MISMATCH"),
         (_formal_job(), _valid_attestation_result(tree_sha="x" * 40), "PRIVATE_CI_ATTESTATION_TREE_MISMATCH"),
@@ -183,7 +321,19 @@ def test_private_ci_exact_sha_profile_and_superseded(monkeypatch):
         (_formal_job(), {"ok": True, "found": True, "reusable": False, "attestation": _attestation()}, "PRIVATE_CI_ATTESTATION_NOT_REUSABLE"),
         (_formal_job(profile="repo-fast-check"), _valid_attestation_result(), "PRIVATE_CI_PROFILE_MISMATCH"),
     ],
-    ids=["no-attestation", "wrong-job-tree", "wrong-attestation-job", "wrong-attestation-commit", "wrong-attestation-tree", "revoked", "expired", "non-reusable", "fast-ci"],
+    ids=[
+        "no-attestation",
+        "wrong-job-tree",
+        "wrong-job-base",
+        "wrong-attestation-base",
+        "wrong-attestation-job",
+        "wrong-attestation-commit",
+        "wrong-attestation-tree",
+        "revoked",
+        "expired",
+        "non-reusable",
+        "fast-ci",
+    ],
 )
 def test_formal_merge_gate_negative_matrix_is_shared_by_readiness_plan_and_merge(monkeypatch, job, attestation, reason):
     class NeverMerge:
@@ -201,6 +351,128 @@ def test_formal_merge_gate_negative_matrix_is_shared_by_readiness_plan_and_merge
     assert plan["ready"] is False
     assert merge["ok"] is False
     assert reason in merge["error"]["details"]["readiness"]["blocking"]
+
+
+def test_real_registry_validator_binds_evidence_to_fresh_pr_base(
+    monkeypatch, isolated_gate_registry
+):
+    job = _create_registry_backed_job(BASE)
+    attestation = attestation_registry.create_attestation_for_passed_job(job_id=job["job_id"])
+    pr_read = _install_gate_baseline(monkeypatch, mock_evidence=False)
+
+    exact = github_utils._readiness("owner/repo", 1, HEAD, job["job_id"], "main")
+    assert exact["ready"] is True
+    assert exact["private_ci"]["base_sha"] == BASE
+    assert exact["private_ci"]["attestation"]["attestation_id"] == attestation["attestation_id"]
+    assert exact["private_ci"]["attestation"]["base_sha"] == BASE
+    assert exact["private_ci"]["attestation_validation"]["reusable"] is True
+
+    pr_read["base_sha"] = ADVANCED_BASE
+    stale = github_utils._readiness("owner/repo", 1, HEAD, job["job_id"], "main")
+    assert stale["ready"] is False
+    assert "PRIVATE_CI_BASE_MISMATCH" in stale["blocking"]
+    assert "PRIVATE_CI_ATTESTATION_BASE_MISMATCH" in stale["blocking"]
+
+
+def test_final_preflight_blocks_if_pr_base_advances_after_initial_readiness(monkeypatch):
+    state = {"final": False}
+    fake_pr = _recording_pr()
+    pr_read = _install_gate_baseline(
+        monkeypatch,
+        fake_pr=fake_pr,
+        on_get_pull=lambda: state.__setitem__("final", True),
+    )
+    monkeypatch.setattr(
+        github_utils,
+        "get_github_pull_request",
+        lambda *_: {
+            **pr_read,
+            "base_sha": ADVANCED_BASE if state["final"] else BASE,
+        },
+    )
+
+    result = github_utils.merge_github_pull_request(
+        "owner/repo", 1, "squash", HEAD, "job", "main", confirm=True
+    )
+
+    assert state["final"] is True
+    assert fake_pr.calls == []
+    assert result["error"]["details"]["phase"] == "final_preflight"
+    assert (
+        "PRIVATE_CI_BASE_MISMATCH"
+        in result["error"]["details"]["readiness"]["blocking"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("error_code", "reason"),
+    [
+        ("ATTESTATION_REVOKED", "PRIVATE_CI_ATTESTATION_REVOKED"),
+        ("ATTESTATION_EXPIRED", "PRIVATE_CI_ATTESTATION_EXPIRED"),
+    ],
+)
+def test_final_preflight_revalidates_attestation_state_before_merge(
+    monkeypatch, error_code, reason
+):
+    state = {"final": False}
+    fake_pr = _recording_pr()
+    _install_gate_baseline(
+        monkeypatch,
+        fake_pr=fake_pr,
+        on_get_pull=lambda: state.__setitem__("final", True),
+    )
+
+    def attestation_result(*_args):
+        if not state["final"]:
+            return _valid_attestation_result()
+        return {
+            "ok": False,
+            "found": True,
+            "reusable": False,
+            "error_code": error_code,
+        }
+
+    monkeypatch.setattr(
+        github_utils, "_validated_attestation_for_job", attestation_result
+    )
+    result = github_utils.merge_github_pull_request(
+        "owner/repo", 1, "squash", HEAD, "job", "main", confirm=True
+    )
+
+    assert state["final"] is True
+    assert fake_pr.calls == []
+    assert result["error"]["details"]["phase"] == "final_preflight"
+    assert reason in result["error"]["details"]["readiness"]["blocking"]
+
+
+def test_final_preflight_revalidates_superseded_ci_before_merge(monkeypatch):
+    state = {"final": False}
+    fake_pr = _recording_pr()
+    _install_gate_baseline(
+        monkeypatch,
+        fake_pr=fake_pr,
+        on_get_pull=lambda: state.__setitem__("final", True),
+    )
+    monkeypatch.setattr(
+        github_utils,
+        "_private_ci_job",
+        lambda *_: (
+            _formal_job(superseded_by_job_id="new-job")
+            if state["final"]
+            else _formal_job()
+        ),
+    )
+    result = github_utils.merge_github_pull_request(
+        "owner/repo", 1, "squash", HEAD, "job", "main", confirm=True
+    )
+
+    assert state["final"] is True
+    assert fake_pr.calls == []
+    assert result["error"]["details"]["phase"] == "final_preflight"
+    assert (
+        "PRIVATE_CI_SUPERSEDED"
+        in result["error"]["details"]["readiness"]["blocking"]
+    )
 
 
 def test_exact_full_ci_and_exact_reusable_attestation_are_ready_and_mergeable(monkeypatch):

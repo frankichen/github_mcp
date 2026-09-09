@@ -1373,6 +1373,7 @@ def capabilities(build_sha: str) -> dict[str, Any]:
                 "resume_tool": "resume_development_task",
                 "validate_tool": "validate_development_task",
                 "converge_tool": "converge_development_task",
+                "finalize_tool": "finalize_development_task",
                 "converge_compatibility_wait_inputs": {
                     "parameters": ["index_wait_seconds", "wait_seconds"],
                     "compatibility_only": True,

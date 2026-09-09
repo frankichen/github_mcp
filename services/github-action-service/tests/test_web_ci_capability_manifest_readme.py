@@ -92,6 +92,7 @@ async def test_web_safe_private_ci_capability_matches_canonical_manifest(monkeyp
     assert managed["formal_writer_recommended"] is True
     assert managed["validate_tool"] == "validate_development_task"
     assert managed["converge_tool"] == "converge_development_task"
+    assert managed["finalize_tool"] == "finalize_development_task"
     assert managed["converge_compatibility_wait_inputs"] == {
         "parameters": ["index_wait_seconds", "wait_seconds"],
         "compatibility_only": True,
