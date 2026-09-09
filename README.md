@@ -70,23 +70,35 @@ private-deploy-agent（服务器端）
 
 ### Web-safe Private CI canonical flow
 
-Web AI / 开发者只需要记住一条可恢复的 canonical 路径：
+正式 Web Writer 与 standalone CI 不是两套 truth source：它们共享同一组正式 merge evidence（Full Private CI、reusable Attestation、exact commit SHA、exact Tree SHA）。正式 Writer 推荐 managed Development Session；只有不需要 Workspace/Session 写入生命周期的 standalone exact-commit CI 才走 Direct Private CI。
+
+#### Managed Writer / formal development
+
+```text
+prepare_development_task / resume_development_task
+→ validate_development_task or converge_development_task(mode=full)
+→ terminal Full CI passed
+→ reusable Attestation
+→ exact HEAD/Tree readiness
+→ explicit merge
+```
+
+#### Direct Private CI
 
 ```text
 start_private_ci_job
 → durable Request accepted
-→ get_private_ci_job snapshot
-→ non-terminal: persist request_id/job_id and resume with another snapshot
+→ get_private_ci_job snapshots
 → terminal Full CI passed
 → reusable Attestation
-→ exact HEAD/Tree readiness and merge gate
+→ exact HEAD/Tree readiness
 ```
 
-- **Fast CI** = feedback only；`Fast CI != merge eligible`，不能作为正式复用或 merge gate evidence。
-- **Full CI** = formal CI gate candidate；Full 通过本身仍不代表可以 merge。
-- **Attestation** = Full CI 成功后、绑定 exact HEAD/Tree 的 reusable evidence；正式复用和 merge gate 要求 reusable Attestation。
-- `wait_private_ci_job` 是 compatibility-only legacy/debug 入口，不是 Web 推荐 continuation；canonical Web 客户端 **must not loop** long-poll wait 到 terminal。
-- 这里的 Web-safe 含义是 bounded、durable、resumable；不声明 OpenAI 或 ChatGPT 产品存在某个固定 Web timeout SLA。
+- **Fast CI** = feedback only；`Fast CI != merge gate`，也不是 merge-eligible evidence。Managed fast 使用 `repo-fast-check`；正式 Full gate 使用 `repo-auto-check`。
+- **Full CI** = formal CI gate candidate；只有 exact HEAD/Tree 上的 Full 成功，再配合 fresh reusable Attestation，才构成 readiness/merge 可验证 evidence。
+- **Attestation** = 由服务端 CI evidence 生成并经 `validate_attestation` 验证的 reusable evidence；正式 gate 要求它与 required CI job、commit 和 Tree 全部精确绑定，且 active、未 revoked、未 expired。
+- `wait_private_ci_job` 是 compatibility-only legacy/debug 入口，不是 Web 推荐 continuation；canonical Web 客户端 **must not loop** long-poll wait 到 terminal。`converge_development_task` 的 `index_wait_seconds` / `wait_seconds` 也只是 compatibility-only accepted-but-ignored 参数，不建立 blocking wait contract。
+- 这里的 Web-safe 仅表示 bounded、durable、resumable；不声明 OpenAI 或 ChatGPT 产品存在固定 Web timeout SLA。
 
 MyGithut12 源码当前版本为 `12.9.6`；生产运行版本必须以 `get_mygithub_capabilities` 的实时结果为准。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。AI 日常生成 UTF-8 文本文件继续只有一个推荐入口 `put_generated_files`：普通内容使用 `files[{path,content}]`，超过 inline transport budget 时仍调用同一个工具，由 ChatGPT/Codex runtime 通过顶层 `bundle_file` 交付 version=1 的 JSON 文件包；服务端负责临时文件下载、JSON/UTF-8/路径/大小校验、Workspace/Session CAS、旧 blob 推断、hash、chunk staging、原子 Commit 和 durable read-back。bundle 下载只接受 `*.oaiusercontent.com` 或受限 OpenAI Azure Blob fileParam 投递域名的 HTTPS/443 临时 URL，并在首跳与每次 redirect 前重新校验域名 allowlist 和公网 DNS；窗口不管理 upload/chunk/offset/hash/candidate/expected_blob；V2 仍不支持二进制仓库文件和删除。
 

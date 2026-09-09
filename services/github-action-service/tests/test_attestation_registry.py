@@ -175,3 +175,26 @@ def test_artifact_validation_requires_real_bundle_files(tmp_path, monkeypatch):
     )
     assert result["ok"] is False
     assert result["error_code"] in {"ARTIFACT_ARCHIVE_INVALID", "ARTIFACT_UNSAFE_ARCHIVE_ENTRY"}
+
+
+def test_find_reusable_attestation_for_job_reuses_validator_and_skips_invalid_newer(tmp_path, monkeypatch):
+    monkeypatch.setenv("CI_DB_PATH", str(tmp_path / "ci.db"))
+    monkeypatch.setattr(registry, "get_job", lambda _: _job())
+
+    older = registry.create_attestation_for_passed_job(job_id="job")
+    newer = registry.create_attestation_for_passed_job(job_id="job")
+    registry.revoke_attestation(newer["attestation_id"])
+
+    result = registry.find_reusable_attestation_for_job("job")
+    assert result["ok"] is True
+    assert result["found"] is True
+    assert result["reusable"] is True
+    assert result["attestation"]["attestation_id"] == older["attestation_id"]
+
+    missing = registry.find_reusable_attestation_for_job("missing-job")
+    assert missing == {
+        "ok": False,
+        "found": False,
+        "reusable": False,
+        "error_code": "ATTESTATION_NOT_FOUND",
+    }
