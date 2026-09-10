@@ -1037,3 +1037,73 @@ def test_no_request_id_and_no_strict_job_correlation_fails_closed(monkeypatch):
     assert recovered is session
     assert blocker == "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
     assert evidence["reason"] == "validation_request_correlation_missing"
+
+
+def test_resume_after_fast_correlation_backfill_is_idempotent_and_starts_no_ci(monkeypatch):
+    ws = _workspace()
+    session = {
+        **_ready_session(),
+        "workspace_id": ws["workspace_id"],
+        "base_commit_sha": ws["base_commit_sha"],
+        "status": "active",
+        "last_fast_ci_job_id": "job-existing",
+    }
+    _stub_resume_context(monkeypatch, ws=ws, session=session)
+    monkeypatch.setattr(
+        resume, "_reconcile_transient_validation",
+        lambda *args, **kwargs: pytest.fail("completed correlation must not be reconciled twice"),
+    )
+    monkeypatch.setattr(
+        resume.sessions, "transition",
+        lambda *args, **kwargs: pytest.fail("completed correlation must not repeat a Session transition"),
+    )
+    monkeypatch.setattr(
+        resume.dx, "start_validation_request",
+        lambda *args, **kwargs: pytest.fail("idempotent resume must not start another CI Request"),
+    )
+    monkeypatch.setattr(
+        resume.dx, "start_validation_job",
+        lambda *args, **kwargs: pytest.fail("idempotent resume must not start another Worker"),
+    )
+    monkeypatch.setattr(
+        resume.dx, "create_or_get_job",
+        lambda *args, **kwargs: pytest.fail("idempotent resume must not create/reuse another execution"),
+    )
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["development_session"]["status"] == "active"
+    assert result["development_session"]["last_fast_ci_job_id"] == "job-existing"
+
+
+def test_same_head_unowned_historical_worker_is_never_claimed(monkeypatch):
+    ws, session, _, _, historical_job, no_new_ci = _production_validation_case(
+        monkeypatch, mode="fast", repository="owner/repo", branch="ai/resume",
+        head=SHA_A, tree=TREE_A, base=SHA_A, request_id="ci_req_unowned", job_id="job-historical",
+    )
+    monkeypatch.setattr(
+        resume.sessions, "validation_correlations",
+        lambda *args: [{
+            "request_id": None, "job_id": None, "session_revision": 7,
+            "tree_sha": TREE_A, "evidence": {},
+        }],
+    )
+    monkeypatch.setattr(
+        resume.ci_request_store, "get_ci_request_by_worker_job_id",
+        lambda *args: pytest.fail("no strict persisted job anchor exists for reverse Request lookup"),
+    )
+    monkeypatch.setattr(
+        resume, "db_get_job",
+        lambda *args: pytest.fail("same-HEAD historical Worker without Request ownership must not be inspected"),
+    )
+    monkeypatch.setattr(
+        resume, "db_list_jobs",
+        lambda **kwargs: [historical_job],
+    )
+
+    recovered, evidence, blocker = resume._reconcile_transient_validation(session, ws)
+
+    assert recovered is session
+    assert blocker == "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    assert evidence["reason"] == "validation_request_correlation_missing"
+    assert no_new_ci == {"requests": 0, "workers": 0}
