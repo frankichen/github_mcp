@@ -167,6 +167,95 @@ def test_validation_correlation_is_restart_durable_and_idempotent(tmp_path, monk
     assert correlations[0]["finished_at"] is not None
 
 
+def test_validation_request_anchor_late_worker_binding_is_one_logical_row(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "validation-request-anchor.db"))
+    created = sessions.create_session(_workspace(), idempotency_key="request-anchor")
+    validating = sessions.transition(
+        created["session_id"], created["session_revision"], "validating_fast", allowed_from={"active"}
+    )
+    first_id = sessions.record_validation(
+        validating["session_id"], validating["session_revision"], "fast", SHA_B, SHA_C,
+        request_id="ci_req_exact", status="preparing",
+        evidence={"selection": {"complete": True}, "request_id": "ci_req_exact"},
+    )
+    second_id = sessions.record_validation(
+        validating["session_id"], validating["session_revision"], "fast", SHA_B, SHA_C,
+        request_id="ci_req_exact", job_id="job-late", status="passed",
+        evidence={"selection": {"complete": True}, "request_id": "ci_req_exact"}, finished=True,
+    )
+    correlations = sessions.validation_correlations(
+        validating["session_id"], validating["session_revision"], "fast", SHA_B, SHA_C,
+    )
+
+    assert second_id == first_id
+    assert len(correlations) == 1
+    assert correlations[0]["request_id"] == "ci_req_exact"
+    assert correlations[0]["request_id_source"] == "column"
+    assert correlations[0]["job_id"] == "job-late"
+
+
+def test_validation_request_bind_backfills_legacy_duplicate_null_job_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "validation-request-backfill.db"))
+    monkeypatch.setattr(sessions, "_now", lambda: 1000.0)
+    mygithub12.init_db()
+    with mygithub12._db() as db:
+        db.execute(
+            "INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("ws_test","owner/repo","ai/task","main",SHA_A,SHA_B,SHA_C,"active",3,"test",1100.0,SHA_B,"{}",None,None,10.0,20.0),
+        )
+    created = sessions.create_session(_workspace(lease_expires_at=1100.0), idempotency_key="legacy-backfill")
+    validating = sessions.transition(
+        created["session_id"], created["session_revision"], "validating_fast", allowed_from={"active"}
+    )
+    legacy_evidence = json.dumps(
+        {"request_id": "ci_req_legacy", "selection": {"complete": True}},
+        ensure_ascii=False, separators=(",", ":"),
+    )
+    with sessions._LOCK, sessions._db() as db:
+        for _ in range(2):
+            db.execute(
+                """INSERT INTO development_session_validations(
+                   session_id,session_revision,mode,commit_sha,tree_sha,request_id,job_id,status,
+                   merge_eligible,attestation_id,evidence_json,created_at,finished_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    validating["session_id"], validating["session_revision"], "fast", SHA_B, SHA_C,
+                    None, None, "preparing", 0, None, legacy_evidence, 1000.0, None,
+                ),
+            )
+
+    first = sessions.bind_validation_request_worker(
+        validating["session_id"], validating["session_revision"], 3,
+        "fast", SHA_B, SHA_C, "ci_req_legacy", "job-legacy",
+    )
+    replay = sessions.bind_validation_request_worker(
+        validating["session_id"], validating["session_revision"], 3,
+        "fast", SHA_B, SHA_C, "ci_req_legacy", "job-legacy",
+    )
+    correlations = sessions.validation_correlations(
+        validating["session_id"], validating["session_revision"], "fast", SHA_B, SHA_C,
+    )
+
+    assert first["logical_duplicate_count"] == 1
+    assert replay["canonical_validation_id"] == first["canonical_validation_id"]
+    assert replay["logical_duplicate_count"] == 1
+    assert len(correlations) == 2
+    assert {row["request_id"] for row in correlations} == {"ci_req_legacy"}
+    assert sum(row["request_id_source"] == "column" for row in correlations) == 1
+    assert [row["job_id"] for row in correlations].count("job-legacy") == 1
+    with sessions._db() as db:
+        first_class_count = db.execute(
+            "SELECT COUNT(*) FROM development_session_validations WHERE session_id=? AND request_id=?",
+            (validating["session_id"], "ci_req_legacy"),
+        ).fetchone()[0]
+        row_count = db.execute(
+            "SELECT COUNT(*) FROM development_session_validations WHERE session_id=?",
+            (validating["session_id"],),
+        ).fetchone()[0]
+    assert first_class_count == 1
+    assert row_count == 2
+
+
 def test_atomic_session_workspace_auto_renew_syncs_revisions_and_audit(tmp_path, monkeypatch):
     monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "auto-renew.db"))
     monkeypatch.setattr(sessions, "_now", lambda: 1000.0)

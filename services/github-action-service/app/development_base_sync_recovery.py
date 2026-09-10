@@ -17,6 +17,33 @@ from app import development_session_store as sessions
 from app import mygithub12
 
 MyGithub12Error = mygithub12.MyGithub12Error
+PINNED_BASE_HISTORICAL_OLD = "historical_old_base"
+PINNED_BASE_ALREADY_NEW = "already_pinned_new_base"
+
+
+def _classify_pinned_base_state(
+    workspace_base_sha: str,
+    session_base_sha: str,
+    expected_old_base_sha: str,
+    expected_new_base_sha: str,
+) -> str:
+    """Accept only the two exact base-sync states; mixed or unrelated bases fail closed."""
+    if workspace_base_sha == expected_old_base_sha and session_base_sha == expected_old_base_sha:
+        return PINNED_BASE_HISTORICAL_OLD
+    if workspace_base_sha == expected_new_base_sha and session_base_sha == expected_new_base_sha:
+        return PINNED_BASE_ALREADY_NEW
+    raise MyGithub12Error(
+        "RECOVERY_BASE_CHANGED",
+        "Workspace/Development Session bases do not match an allowed base-sync recovery state",
+        {
+            "workspace_base_sha": workspace_base_sha,
+            "session_base_sha": session_base_sha,
+            "expected_old_base_sha": expected_old_base_sha,
+            "expected_new_base_sha": expected_new_base_sha,
+            "allowed_states": [PINNED_BASE_HISTORICAL_OLD, PINNED_BASE_ALREADY_NEW],
+        },
+    )
+
 
 def _base_sync_request_identity(
     repository: str,
@@ -161,14 +188,19 @@ def _verify_base_sync_deltas(
     new_base_ancestry, new_task_delta_paths = _compare_delta(
         repo, new_base_sha, current_head_sha, label="new_base_to_current_head",
     )
-    overlap = sorted(set(old_task_delta_paths) & set(base_delta_paths))
+    historical_base_overlap = sorted(set(old_task_delta_paths) & set(base_delta_paths))
+    current_base_overlap = sorted(set(new_task_delta_paths) & set(base_delta_paths))
+    overlap = sorted(set(historical_base_overlap) | set(current_base_overlap))
     if overlap:
         raise MyGithub12Error(
             "RECOVERY_BASE_SYNC_OVERLAP",
-            "base synchronization overlaps the task's pre-sync changed paths",
+            "base synchronization overlaps task-owned changed paths",
             {
                 "overlapping_paths": overlap,
+                "historical_base_overlap_paths": historical_base_overlap,
+                "current_base_overlap_paths": current_base_overlap,
                 "old_task_delta_paths": old_task_delta_paths,
+                "new_task_delta_paths": new_task_delta_paths,
                 "base_delta_paths": base_delta_paths,
             },
         )
@@ -188,6 +220,13 @@ def _verify_base_sync_deltas(
                 "unexplained_task_path_changes": unexplained_task_path_changes,
             },
         )
+    forward_paths = set(forward_task_delta_paths)
+    base_paths = set(base_delta_paths)
+    excluded_imported_base_paths = sorted(forward_paths & base_paths)
+    recovery_scope_delta_paths = sorted(forward_paths - base_paths)
+    excluded_unchanged_historical_cumulative_paths = sorted(
+        set(old_task_delta_paths) - forward_paths
+    )
     return {
         "base_ancestry": base_ancestry,
         "old_task_ancestry": old_task_ancestry,
@@ -197,8 +236,15 @@ def _verify_base_sync_deltas(
         "old_task_delta_paths": old_task_delta_paths,
         "new_task_delta_paths": new_task_delta_paths,
         "forward_task_delta_paths": forward_task_delta_paths,
+        "historical_cumulative_task_delta_paths": old_task_delta_paths,
+        "external_forward_delta_paths": forward_task_delta_paths,
+        "recovery_scope_delta_paths": recovery_scope_delta_paths,
+        "excluded_imported_base_paths": excluded_imported_base_paths,
+        "excluded_unchanged_historical_cumulative_paths": excluded_unchanged_historical_cumulative_paths,
         "task_path_changes": task_path_changes,
         "unexplained_task_path_changes": unexplained_task_path_changes,
+        "historical_base_overlap_paths": historical_base_overlap,
+        "current_base_overlap_paths": current_base_overlap,
         "base_task_overlap_paths": overlap,
     }
 
@@ -477,16 +523,16 @@ def _atomic_recover_base_sync(
             )
             if not identity_ok:
                 raise MyGithub12Error("RECOVERY_IDENTITY_MISMATCH", "Workspace/Session identity changed before base-sync recovery")
-            if workspace_row["base_commit_sha"] != old_base_sha or session_row["base_commit_sha"] != old_base_sha:
+            pinned_base_state = _classify_pinned_base_state(
+                str(workspace_row["base_commit_sha"]), str(session_row["base_commit_sha"]), old_base_sha, new_base_sha,
+            )
+            if pinned_base_state != verification.get("pinned_base_state"):
                 raise MyGithub12Error(
                     "RECOVERY_BASE_CHANGED",
-                    "pinned Workspace/Session base changed before base-sync recovery",
-                    {
-                        "workspace_base_sha": workspace_row["base_commit_sha"],
-                        "session_base_sha": session_row["base_commit_sha"],
-                        "expected_old_base_sha": old_base_sha,
-                    },
+                    "pinned base recovery state changed before atomic recovery",
+                    {"expected_state": verification.get("pinned_base_state"), "actual_state": pinned_base_state},
                 )
+            pinned_base_before = new_base_sha if pinned_base_state == PINNED_BASE_ALREADY_NEW else old_base_sha
             if session_row["head_commit_sha"] != old_session_head:
                 raise MyGithub12Error(
                     "RECOVERY_ANCESTRY_MISMATCH",
@@ -510,6 +556,7 @@ def _atomic_recover_base_sync(
             before = {
                 "workspace_revision": int(workspace_row["revision"]),
                 "session_revision": int(session_row["session_revision"]),
+                "pinned_base_state": pinned_base_state,
                 "workspace_base_sha": workspace_row["base_commit_sha"],
                 "session_base_sha": session_row["base_commit_sha"],
                 "workspace_head_sha": workspace_row["head_sha"],
@@ -536,19 +583,29 @@ def _atomic_recover_base_sync(
                 "development_session_id": session_id,
                 "old_base_sha": old_base_sha,
                 "new_base_sha": new_base_sha,
+                "pinned_base_state": pinned_base_state,
                 "old_session_head": old_session_head,
                 "adopted_head": current_head,
                 "adopted_tree": current_tree,
                 "base_ancestry": verification["deltas"]["base_ancestry"],
+                "old_task_ancestry": verification["deltas"]["old_task_ancestry"],
                 "task_ancestry": verification["deltas"]["task_ancestry"],
                 "new_base_ancestry": verification["deltas"]["new_base_ancestry"],
                 "base_delta_paths": verification["deltas"]["base_delta_paths"],
                 "old_task_delta_paths": verification["deltas"]["old_task_delta_paths"],
                 "new_task_delta_paths": verification["deltas"]["new_task_delta_paths"],
                 "forward_task_delta_paths": verification["deltas"]["forward_task_delta_paths"],
+                "historical_cumulative_task_delta_paths": verification["deltas"]["historical_cumulative_task_delta_paths"],
+                "external_forward_delta_paths": verification["deltas"]["external_forward_delta_paths"],
+                "recovery_scope_delta_paths": verification["deltas"]["recovery_scope_delta_paths"],
+                "excluded_imported_base_paths": verification["deltas"]["excluded_imported_base_paths"],
+                "excluded_unchanged_historical_cumulative_paths": verification["deltas"]["excluded_unchanged_historical_cumulative_paths"],
                 "task_path_changes": verification["deltas"]["task_path_changes"],
                 "unexplained_task_path_changes": verification["deltas"]["unexplained_task_path_changes"],
+                "outside_scope_paths": verification["scope"].get("outside_scope_paths", []),
                 "overlap_result": {
+                    "historical_base_overlap_paths": verification["deltas"]["historical_base_overlap_paths"],
+                    "current_base_overlap_paths": verification["deltas"]["current_base_overlap_paths"],
                     "base_task_overlap_paths": verification["deltas"]["base_task_overlap_paths"],
                     "workspace": verification["ownership"],
                 },
@@ -573,7 +630,7 @@ def _atomic_recover_base_sync(
                 AND base_commit_sha=?""",
                 (
                     new_base_sha, current_head, current_tree, lease_expires_at, now,
-                    workspace_id, expected_workspace_revision, old_base_sha,
+                    workspace_id, expected_workspace_revision, pinned_base_before,
                 ),
             )
             if ws_update.rowcount != 1:
@@ -587,7 +644,7 @@ def _atomic_recover_base_sync(
                 (
                     new_base_sha, current_head, current_tree, after["workspace_revision"], lease_expires_at,
                     json.dumps(metadata, ensure_ascii=False, separators=(",", ":")), now,
-                    session_id, expected_session_revision, old_base_sha, old_session_head,
+                    session_id, expected_session_revision, pinned_base_before, old_session_head,
                 ),
             )
             if session_update.rowcount != 1:
@@ -765,16 +822,10 @@ def recover_base_synced_task(
         raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH", "workspace revision changed before base-sync recovery")
     if int(session.get("session_revision") or 0) != int(expected_session_revision):
         raise MyGithub12Error("DEVELOPMENT_SESSION_REVISION_MISMATCH", "development session revision changed before base-sync recovery")
-    if workspace.get("base_commit_sha") != expected_old_base_sha or session.get("base_commit_sha") != expected_old_base_sha:
-        raise MyGithub12Error(
-            "RECOVERY_BASE_CHANGED",
-            "old pinned base differs from Workspace/Development Session state",
-            {
-                "workspace_base_sha": workspace.get("base_commit_sha"),
-                "session_base_sha": session.get("base_commit_sha"),
-                "expected_old_base_sha": expected_old_base_sha,
-            },
-        )
+    pinned_base_state = _classify_pinned_base_state(
+        str(workspace.get("base_commit_sha") or ""), str(session.get("base_commit_sha") or ""),
+        expected_old_base_sha, expected_new_base_sha,
+    )
     if session.get("head_commit_sha") != expected_old_session_head_sha:
         raise MyGithub12Error(
             "RECOVERY_ANCESTRY_MISMATCH",
@@ -804,12 +855,18 @@ def recover_base_synced_task(
         expected_old_session_head_sha,
         expected_current_head_sha,
     )
-    # Scope belongs to the task under the new base, never to the imported base delta.
-    scope = _verify_base_sync_scope(workspace, deltas["new_task_delta_paths"])
+    # Scope/ownership apply only to task-owned changes after the old Session HEAD.
+    scope = _verify_base_sync_scope(workspace, deltas["recovery_scope_delta_paths"])
     ownership = _verify_base_sync_ownership(
-        service, repo, workspace, expected_new_base_sha, deltas["new_task_delta_paths"],
+        service, repo, workspace, expected_new_base_sha, deltas["recovery_scope_delta_paths"],
     )
-    verification = {"github": github_identity, "deltas": deltas, "scope": scope, "ownership": ownership}
+    verification = {
+        "github": github_identity,
+        "pinned_base_state": pinned_base_state,
+        "deltas": deltas,
+        "scope": scope,
+        "ownership": ownership,
+    }
     recovered = _atomic_recover_base_sync(
         service, request=request, idempotency_key=idempotency_key, verification=verification,
     )

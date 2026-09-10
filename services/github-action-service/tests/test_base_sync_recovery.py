@@ -229,6 +229,15 @@ def _db_state(session_id):
     return workspace, session, events
 
 
+def _pin_bases_to_new(session_id):
+    """Model the production partial state: bases already new, Session HEAD still old."""
+    with sessions._LOCK, sessions._db() as db:
+        db.execute("UPDATE workspaces SET base_commit_sha=? WHERE workspace_id=?", (NEW_BASE, WORKSPACE_ID))
+        db.execute(
+            "UPDATE development_sessions SET base_commit_sha=? WHERE session_id=?", (NEW_BASE, session_id)
+        )
+
+
 def test_t1_base_sync_happy_path_advances_base_head_atomically_and_requests_new_base_index(tmp_path, monkeypatch):
     service, session, index_requests = _seed(tmp_path, monkeypatch)
     result = _call(service, session)
@@ -255,6 +264,9 @@ def test_t1_base_sync_happy_path_advances_base_head_atomically_and_requests_new_
     assert result["audit"]["old_task_delta_paths"] == ["allowed/feature.py"]
     assert result["audit"]["base_delta_paths"] == ["base/region.py"]
     assert result["audit"]["new_task_delta_paths"] == ["allowed/feature.py"]
+    assert result["audit"]["recovery_scope_delta_paths"] == ["allowed/feature.py"]
+    assert result["audit"]["excluded_imported_base_paths"] == ["base/region.py"]
+    assert result["audit"]["excluded_unchanged_historical_cumulative_paths"] == []
     assert result["audit"]["overlap_result"]["base_task_overlap_paths"] == []
     assert index_requests
     request_args = index_requests[0][0]
@@ -309,19 +321,190 @@ def test_t6_base_and_old_task_path_overlap_fails_stop_including_rename_paths(tmp
     assert exc.value.details["overlapping_paths"] == ["allowed/feature.py"]
 
 
-def test_t7_scope_applies_only_to_new_base_task_delta(tmp_path, monkeypatch):
+def test_preexisting_historical_task_path_outside_late_phase_scope_is_ignored_when_unchanged(tmp_path, monkeypatch):
     service, session, _ = _seed(tmp_path, monkeypatch)
-    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=["outside/task.py"])
-    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=["outside/task.py"])
+    historical = ["allowed/feature.py", "outside/historical.py"]
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=historical)
+    service.repo.set_compare(OLD_HEAD, CURRENT_HEAD, paths=["base/region.py"])
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=historical)
+
+    result = _call(service, session)
+
+    assert result["verification"]["scope"]["changed_paths"] == []
+    assert result["audit"]["recovery_scope_delta_paths"] == []
+    assert result["audit"]["excluded_unchanged_historical_cumulative_paths"] == sorted(historical)
+
+
+def test_exact_824_cumulative_pr_late_phase_workspace_base_sync_recovery_passes(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    old_base = "80eba83ca34d629f051c6f617fbae7fabefbd5a7"
+    new_base = "973d3b06340e5dd511b9f62fa199fb79aec6d47e"
+    old_head = "cfe73b5cc5e5c6b5295dd41115771280e1eb12d2"
+    current_head = "e498519ed064ce9d413c91d1ab1453e1583e65e5"
+    old_tree = "4b83b879a2cca31ff3068c60b59e3bfb6c1500b7"
+    current_tree = "765027d769b6d6bf06d82d86dbbb86e23a8d57b0"
+    cumulative_paths = [
+        "h5/lenshub-console-react/region-foundation-component-test.html",
+        "h5/lenshub-console-react/sharegroup-component-test.html",
+        "h5/lenshub-console-react/src/App.tsx",
+        "h5/lenshub-console-react/src/features/appregistration/AppRegistrationWorkbench.tsx",
+        "h5/lenshub-console-react/src/features/appregistration/appRegistrationApi.spec.ts",
+        "h5/lenshub-console-react/src/features/appregistration/appRegistrationApi.ts",
+        "h5/lenshub-console-react/src/features/appregistration/appRegistrationModel.spec.ts",
+        "h5/lenshub-console-react/src/features/appregistration/appRegistrationModel.ts",
+        "h5/lenshub-console-react/src/features/regionfoundation/RegionFoundationComponentTest.tsx",
+        "h5/lenshub-console-react/src/features/regionfoundation/RegionFoundationWorkbench.tsx",
+        "h5/lenshub-console-react/src/features/regionfoundation/regionFoundationApi.spec.ts",
+        "h5/lenshub-console-react/src/features/regionfoundation/regionFoundationApi.ts",
+        "h5/lenshub-console-react/src/features/regionfoundation/regionFoundationModel.spec.ts",
+        "h5/lenshub-console-react/src/features/regionfoundation/regionFoundationModel.ts",
+        "h5/lenshub-console-react/src/features/sharegroup/ShareGroupComponentTest.tsx",
+        "h5/lenshub-console-react/src/features/sharegroup/ShareGroupWorkbench.tsx",
+        "h5/lenshub-console-react/src/features/sharegroup/shareGroupApi.ts",
+        "h5/lenshub-console-react/src/features/sharegroup/shareGroupModel.spec.ts",
+        "h5/lenshub-console-react/src/features/sharegroup/shareGroupModel.ts",
+        "h5/lenshub-console-react/src/shared/components/DangerActionConfirm.tsx",
+        "h5/lenshub-console-react/src/shared/feedback/ApiErrorPresenter.tsx",
+        "h5/lenshub-console-react/vite.config.ts",
+        "tests/e2e/specs/12-admin-sharegroup-components.spec.ts",
+        "tests/e2e/specs/13-admin-region-foundation-components.spec.ts",
+    ]
+    late_phase_scope = {
+        "paths": [
+            "h5/lenshub-console-react/src/App.tsx",
+            "h5/lenshub-console-react/src/features/appregistration/AppRegistrationWorkbench.tsx",
+            "h5/lenshub-console-react/src/features/appregistration/appRegistrationApi.ts",
+            "h5/lenshub-console-react/src/features/appregistration/appRegistrationApi.spec.ts",
+            "h5/lenshub-console-react/src/features/appregistration/appRegistrationModel.ts",
+            "h5/lenshub-console-react/src/features/appregistration/appRegistrationModel.spec.ts",
+        ]
+    }
+    base_only_paths = [
+        "api/openapi/app.yaml",
+        "db/migrations/001055_auth_code_resend_count_semantics.sql",
+        "docs/contracts/APP_API_Contract_Next.openapi.yaml",
+        "internal/modules/account/h5_service.go",
+        "internal/modules/account/registration_policy_country_code_test.go",
+    ]
+    service.repo.trees.update({
+        old_base: "7" * 40, new_base: "8" * 40, old_head: old_tree, current_head: current_tree,
+    })
+    service.repo.comparisons.update({
+        (old_base, new_base): service.repo._cfg(old_base, 1, 0, base_only_paths),
+        (old_base, old_head): service.repo._cfg(old_base, 8, 0, cumulative_paths),
+        (old_head, current_head): service.repo._cfg(old_head, 1, 0, base_only_paths),
+        (new_base, current_head): service.repo._cfg(new_base, 9, 0, cumulative_paths),
+    })
+    service.client.heads[BRANCH] = current_head
+    service.client.heads[BASE_BRANCH] = new_base
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            """UPDATE workspaces SET base_commit_sha=?,head_sha=?,tree_sha=?,scope_json=?,
+            status='drifted',revision=5,drift_reason='branch_moved_externally',index_commit_sha=NULL,lease_expires_at=0
+            WHERE workspace_id=?""",
+            (old_base, current_head, current_tree, json.dumps(late_phase_scope, separators=(",", ":")), WORKSPACE_ID),
+        )
+        db.execute(
+            "UPDATE development_sessions SET base_commit_sha=?,head_commit_sha=?,tree_sha=? WHERE session_id=?",
+            (old_base, old_head, old_tree, session["session_id"]),
+        )
+    monkeypatch.setattr(
+        recovery.mygithub12,
+        "get_index_status",
+        lambda service, repository, commit_sha="", ref="": {
+            "ok": True, "repository": repository, "commit_sha": commit_sha,
+            "tree_sha": current_tree, "status": "ready",
+        },
+    )
+
+    result = recovery.recover_base_synced_task(
+        service,
+        **_args(
+            session,
+            expected_old_base_sha=old_base,
+            expected_new_base_sha=new_base,
+            expected_old_session_head_sha=old_head,
+            expected_current_head_sha=current_head,
+            expected_current_tree_sha=current_tree,
+            idempotency_key="p0-25d-824-cumulative-late-phase",
+        ),
+    )
+
+    assert result["control_plane_recovery"] == "CONTROL_PLANE_BASE_SYNC_RECOVERY_SUCCESS"
+    assert result["verification"]["scope"]["changed_paths"] == []
+    assert result["audit"]["historical_cumulative_task_delta_paths"] == sorted(cumulative_paths)
+    assert result["audit"]["external_forward_delta_paths"] == sorted(base_only_paths)
+    assert result["audit"]["recovery_scope_delta_paths"] == []
+    assert result["audit"]["excluded_imported_base_paths"] == sorted(base_only_paths)
+    assert result["audit"]["excluded_unchanged_historical_cumulative_paths"] == sorted(cumulative_paths)
+    assert result["workspace"]["scope"] == late_phase_scope
+
+
+def test_external_advance_adds_outside_scope_task_path_fails_closed(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    service.repo.set_compare(OLD_HEAD, CURRENT_HEAD, paths=["base/region.py", "outside/new.py"])
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=["allowed/feature.py", "outside/new.py"])
     with pytest.raises(recovery.MyGithub12Error) as exc:
         _call(service, session)
     assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
-    assert exc.value.details["outside_scope_paths"] == ["outside/task.py"]
+    assert exc.value.details["outside_scope_paths"] == ["outside/new.py"]
+
+
+def test_external_advance_modifies_historical_outside_scope_task_path_fails_closed(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    historical = ["allowed/feature.py", "outside/historical.py"]
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=historical)
+    service.repo.set_compare(OLD_HEAD, CURRENT_HEAD, paths=["base/region.py", "outside/historical.py"])
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=historical)
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
+    assert exc.value.details["outside_scope_paths"] == ["outside/historical.py"]
+
+
+def test_external_advance_deletes_historical_outside_scope_task_path_fails_closed(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=["allowed/feature.py", "outside/historical.py"])
+    service.repo.set_compare(OLD_HEAD, CURRENT_HEAD, paths=["base/region.py", "outside/historical.py"])
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=["allowed/feature.py"])
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
+    assert exc.value.details["outside_scope_paths"] == ["outside/historical.py"]
+
+
+def test_external_advance_rename_checks_previous_and_current_outside_scope_paths(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=["allowed/feature.py", "outside/legacy.py"])
+    service.repo.set_compare(
+        OLD_HEAD, CURRENT_HEAD,
+        paths=["base/region.py", "outside/current.py"],
+        previous={"outside/current.py": "outside/legacy.py"},
+    )
+    service.repo.set_compare(
+        NEW_BASE, CURRENT_HEAD,
+        paths=["allowed/feature.py", "outside/current.py"],
+        previous={"outside/current.py": "outside/legacy.py"},
+    )
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
+    assert exc.value.details["outside_scope_paths"] == ["outside/current.py", "outside/legacy.py"]
+
+
+def test_current_task_edit_of_imported_base_path_keeps_overlap_fail_closed(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=["allowed/feature.py", "base/region.py"])
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == "RECOVERY_BASE_SYNC_OVERLAP"
+    assert exc.value.details["current_base_overlap_paths"] == ["base/region.py"]
 
 
 def test_base_delta_outside_workspace_scope_is_not_a_scope_violation(tmp_path, monkeypatch):
     service, session, _ = _seed(tmp_path, monkeypatch)
     service.repo.set_compare(OLD_BASE, NEW_BASE, paths=["outside/base-owned.py"])
+    service.repo.set_compare(OLD_HEAD, CURRENT_HEAD, paths=["outside/base-owned.py", "allowed/feature.py"])
     result = _call(service, session)
     assert result["verification"]["scope"]["changed_paths"] == ["allowed/feature.py"]
 
@@ -612,6 +795,277 @@ def test_imported_base_path_does_not_create_false_current_task_overlap(tmp_path,
     assert overlap["current_task_delta_paths"] == ["allowed/feature.py"]
     assert overlap["items"][0]["level"] == "none"
     assert overlap["items"][0]["evidence"] == []
+
+
+def test_already_pinned_new_base_recovers_partial_control_plane_state(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _pin_bases_to_new(session["session_id"])
+
+    result = _call(service, session)
+
+    assert result["control_plane_recovery"] == "CONTROL_PLANE_BASE_SYNC_RECOVERY_SUCCESS"
+    assert result["verification"]["pinned_base_state"] == recovery.PINNED_BASE_ALREADY_NEW
+    assert result["before"]["pinned_base_state"] == recovery.PINNED_BASE_ALREADY_NEW
+    assert result["before"]["workspace_base_sha"] == NEW_BASE
+    assert result["before"]["session_base_sha"] == NEW_BASE
+    assert result["workspace"]["base_commit_sha"] == NEW_BASE
+    assert result["development_session"]["base_commit_sha"] == NEW_BASE
+    assert result["workspace"]["head_sha"] == result["development_session"]["head_commit_sha"] == CURRENT_HEAD
+    assert result["workspace"]["tree_sha"] == result["development_session"]["tree_sha"] == CURRENT_TREE
+    assert result["workspace"]["drift_reason"] is None
+    assert result["audit"]["pinned_base_state"] == recovery.PINNED_BASE_ALREADY_NEW
+
+
+def test_already_pinned_new_base_scope_and_overlap_ignore_large_imported_upstream_delta(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _pin_bases_to_new(session["session_id"])
+    imported = [f"upstream/{index:03d}.py" for index in range(95)]
+    task_paths = [f"allowed/task-{index:02d}.py" for index in range(14)]
+    service.repo.set_compare(OLD_BASE, NEW_BASE, paths=imported)
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=task_paths)
+    service.repo.set_compare(OLD_HEAD, CURRENT_HEAD, paths=[*imported, *task_paths])
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=task_paths)
+    monkeypatch.setattr(
+        recovery.mygithub12,
+        "workspace_overlap",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "workspace_id": WORKSPACE_ID,
+            "items": [{
+                "workspace_id": "ws_imported_overlap",
+                "branch": "ai/other",
+                "level": "high",
+                "evidence": [{"kind": "changed_paths", "items": [imported[0]]}],
+            }],
+        },
+    )
+
+    result = _call(service, session)
+
+    expected_task_paths = sorted(task_paths)
+    assert result["verification"]["scope"]["changed_paths"] == expected_task_paths
+    overlap = result["verification"]["ownership"]["overlap"]
+    assert overlap["current_task_delta_paths"] == expected_task_paths
+    assert overlap["items"][0]["level"] == "none"
+    assert overlap["items"][0]["evidence"] == []
+
+
+def test_already_pinned_new_base_real_task_overlap_still_blocks(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _pin_bases_to_new(session["session_id"])
+    monkeypatch.setattr(
+        recovery.mygithub12,
+        "workspace_overlap",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "workspace_id": WORKSPACE_ID,
+            "items": [{
+                "workspace_id": "ws_task_overlap",
+                "branch": "ai/other",
+                "level": "high",
+                "evidence": [{"kind": "changed_paths", "items": ["allowed/feature.py"]}],
+            }],
+        },
+    )
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == "RECOVERY_WORKSPACE_OVERLAP"
+
+
+def test_already_pinned_new_base_live_base_moves_again_fails_closed(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _pin_bases_to_new(session["session_id"])
+    service.client.heads[BASE_BRANCH] = OTHER_HEAD
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == "RECOVERY_BASE_CHANGED"
+
+
+def test_mixed_partial_base_state_is_not_accepted(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    with sessions._LOCK, sessions._db() as db:
+        db.execute("UPDATE workspaces SET base_commit_sha=? WHERE workspace_id=?", (NEW_BASE, WORKSPACE_ID))
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == "RECOVERY_BASE_CHANGED"
+
+
+def test_already_pinned_new_base_idempotent_replay_and_conflict(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _pin_bases_to_new(session["session_id"])
+    first = _call(service, session)
+    second = _call(service, session)
+    assert second["replayed"] is True
+    assert second["after"] == first["after"]
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session, lease_seconds=7100)
+    assert exc.value.code == "IDEMPOTENCY_CONFLICT"
+
+
+def _exact_production_partial_resume(tmp_path, monkeypatch):
+    service, seeded_session, _ = _seed(tmp_path, monkeypatch)
+    stacked_branch = "ai/issue-186-p0-14-share-invite-global-locator-20260904"
+    historical_old_base = "20e8e5a5a411c55e830db33daca5cf3ab6f97db9"
+    live_new_base = "43ba158333f06e30210dca596f3b7eae204d149a"
+    old_session_head = "23aab1b9f80296d0e88c552ddbdac54c56939bc9"
+    integrated_head = "249f4dc68200e83b4fd73a8bbe43608beaac5d42"
+    old_base_tree = "7" * 40
+    new_base_tree = "8" * 40
+    old_head_tree = "9" * 40
+    integrated_tree = "0" * 40
+    service.repo.trees.update({
+        historical_old_base: old_base_tree,
+        live_new_base: new_base_tree,
+        old_session_head: old_head_tree,
+        integrated_head: integrated_tree,
+    })
+    service.repo.comparisons.update({
+        (historical_old_base, live_new_base): service.repo._cfg(
+            historical_old_base, 1, 0, ["base/region.py"],
+        ),
+        (historical_old_base, old_session_head): service.repo._cfg(
+            historical_old_base, 1, 0, ["allowed/feature.py"],
+        ),
+        (old_session_head, integrated_head): service.repo._cfg(
+            old_session_head, 2, 0, ["base/region.py", "allowed/feature.py"],
+        ),
+        (live_new_base, integrated_head): service.repo._cfg(
+            live_new_base, 1, 0, ["allowed/feature.py"],
+        ),
+    })
+    service.client.heads[BRANCH] = integrated_head
+    service.client.heads[stacked_branch] = live_new_base
+    metadata = dict(seeded_session.get("metadata") or {})
+    metadata["prepared_base_identity"] = {
+        "repository": REPO, "commit_sha": historical_old_base, "tree_sha": old_base_tree,
+    }
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            """UPDATE workspaces SET base_branch=?,base_commit_sha=?,head_sha=?,tree_sha=?,
+            status='drifted',drift_reason='branch_moved_externally' WHERE workspace_id=?""",
+            (stacked_branch, live_new_base, integrated_head, integrated_tree, WORKSPACE_ID),
+        )
+        db.execute(
+            """UPDATE development_sessions SET base_branch=?,base_commit_sha=?,head_commit_sha=?,
+            tree_sha=?,metadata_json=? WHERE session_id=?""",
+            (
+                stacked_branch, live_new_base, old_session_head, old_head_tree,
+                json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+                seeded_session["session_id"],
+            ),
+        )
+    workspace = mygithub12.get_workspace(service, WORKSPACE_ID)
+    session = sessions.get_session(seeded_session["session_id"])
+    pr = {
+        "pull_number": 823, "head_branch": BRANCH, "head_sha": integrated_head,
+        "base_branch": stacked_branch, "state": "open", "draft": True, "merged": False,
+    }
+    monkeypatch.setattr(
+        resume, "_repository_policy",
+        lambda repository: {"ok": True, "repository": repository, "policy": {"github": True, "private_ci": True}},
+    )
+    monkeypatch.setattr(resume, "_resolve_pr", lambda repository, pull_number, branch: pr)
+    monkeypatch.setattr(
+        resume, "_current_main",
+        lambda service, repository: {
+            "branch": "main", "repository": repository,
+            "commit_sha": OTHER_HEAD, "tree_sha": OTHER_TREE,
+        },
+    )
+    monkeypatch.setattr(
+        resume, "_resolve_branch",
+        lambda service, repository, branch, base_branch: {
+            "ok": True, "repository": repository, "branch": branch,
+            "base_branch": base_branch, "commit_sha": integrated_head, "tree_sha": integrated_tree,
+        },
+    )
+    monkeypatch.setattr(resume, "_select_workspace", lambda *args: (workspace, [workspace]))
+    monkeypatch.setattr(
+        resume, "find_sessions_for_workspace",
+        lambda workspace_id, include_terminal=False, limit=20: [session],
+    )
+
+    def resolve_identity(_service, repository, commit_sha="", ref=""):
+        sha = live_new_base if ref == stacked_branch else (commit_sha or OTHER_HEAD)
+        return {
+            "repository": repository, "commit_sha": sha,
+            "tree_sha": service.repo.trees.get(sha, OTHER_TREE),
+        }
+
+    monkeypatch.setattr(resume.mygithub12, "resolve_identity", resolve_identity)
+    monkeypatch.setattr(
+        resume.mygithub12, "get_index_status",
+        lambda _service, repository, commit_sha="", ref="": {
+            "ok": True, "repository": repository, "commit_sha": commit_sha,
+            "tree_sha": service.repo.trees.get(commit_sha, integrated_tree), "status": "ready",
+        },
+    )
+    monkeypatch.setattr(
+        resume.mygithub12, "workspace_overlap",
+        lambda *args, **kwargs: {"ok": True, "workspace_id": WORKSPACE_ID, "items": []},
+    )
+    monkeypatch.setattr(resume, "db_list_jobs", lambda **kwargs: [])
+    monkeypatch.setattr(
+        resume.github_utils, "get_github_pull_request_merge_readiness",
+        lambda *args, **kwargs: {"ok": True, "ready": False},
+    )
+    result = resume.resume_task(
+        service, REPO, pull_number=823, recover_stale_session=False,
+    )
+    return service, result, {
+        "stacked_branch": stacked_branch,
+        "historical_old_base": historical_old_base,
+        "live_new_base": live_new_base,
+        "old_session_head": old_session_head,
+        "integrated_head": integrated_head,
+        "integrated_tree": integrated_tree,
+    }
+
+
+def _recovery_args_from_resume_plan(plan, idempotency_key):
+    keys = (
+        "repository", "branch", "workspace_id", "development_session_id",
+        "expected_workspace_revision", "expected_session_revision",
+        "expected_old_base_sha", "expected_new_base_sha", "expected_base_branch",
+        "expected_old_session_head_sha", "expected_current_head_sha", "expected_current_tree_sha",
+    )
+    return {**{key: plan[key] for key in keys}, "idempotency_key": idempotency_key}
+
+
+def test_exact_823_partial_state_resume_plan_is_directly_consumable_by_base_sync_recovery(tmp_path, monkeypatch):
+    service, resumed, ids = _exact_production_partial_resume(tmp_path, monkeypatch)
+    plan = resumed["recovery"]
+
+    assert resumed["current_main"]["commit_sha"] != ids["live_new_base"]
+    assert resumed["recovery_base"]["branch"] == ids["stacked_branch"]
+    assert plan["action"] == "recover_base_synced_development_task"
+    assert plan["expected_old_base_sha"] == ids["historical_old_base"]
+    assert plan["expected_new_base_sha"] == ids["live_new_base"]
+    assert plan["expected_old_session_head_sha"] == ids["old_session_head"]
+    assert plan["expected_current_head_sha"] == ids["integrated_head"]
+    assert plan["preflight"]["verified"] is True
+
+    recovered = recovery.recover_base_synced_task(
+        service, **_recovery_args_from_resume_plan(plan, "823-resume-to-recovery-e2e"),
+    )
+
+    assert recovered["control_plane_recovery"] == "CONTROL_PLANE_BASE_SYNC_RECOVERY_SUCCESS"
+    assert recovered["verification"]["pinned_base_state"] == recovery.PINNED_BASE_ALREADY_NEW
+    assert recovered["workspace"]["head_sha"] == ids["integrated_head"]
+    assert recovered["development_session"]["head_commit_sha"] == ids["integrated_head"]
+
+
+def test_exact_823_resume_plan_fails_with_recovery_base_changed_if_stacked_base_advances_before_apply(tmp_path, monkeypatch):
+    service, resumed, _ = _exact_production_partial_resume(tmp_path, monkeypatch)
+    plan = resumed["recovery"]
+    service.client.heads[plan["expected_base_branch"]] = OTHER_HEAD
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        recovery.recover_base_synced_task(
+            service, **_recovery_args_from_resume_plan(plan, "823-base-moved-before-apply"),
+        )
+
+    assert exc.value.code == "RECOVERY_BASE_CHANGED"
 
 
 def test_managed_merge_finalization_atomically_closes_workspace_and_releases_writer(tmp_path, monkeypatch):

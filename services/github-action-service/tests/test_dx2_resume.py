@@ -132,30 +132,66 @@ def _validation_job(*, mode="fast", status="passed", job_id="job-exact", tree=TR
         "repository": "owner/repo",
         "branch": "ai/resume",
         "commit_sha": SHA_A,
+        "base_sha": SHA_A,
         "profile": "repo-fast-check" if mode == "fast" else "repo-auto-check",
         "status": status,
         "exit_code": 0 if status == "passed" else 1,
-        "summary": {"git_tree_sha": tree},
+        "superseded_by_job_id": None,
+        "summary": {"git_tree_sha": tree} if tree else {},
     }
 
 
 def _stub_transient_recovery(monkeypatch, *, mode="fast", status="passed", correlations=1):
     ws = _workspace()
     phase = "validating_fast" if mode == "fast" else "validating_full"
-    session = {**_ready_session(), "status": phase}
+    session = {**_ready_session(), "workspace_id": ws["workspace_id"], "base_commit_sha": ws["base_commit_sha"], "status": phase}
     _stub_resume_context(monkeypatch, ws=ws, session=session)
     job = _validation_job(mode=mode, status=status)
+    request_ids = ["ci_req_exact" if i == 0 else f"ci_req_other_{i}" for i in range(correlations)]
     rows = [
         {
-            "job_id": job["job_id"] if i == 0 else f"job-other-{i}",
+            "request_id": request_ids[i],
+            "request_id_source": "legacy_evidence",
+            "job_id": None,
             "session_revision": session["session_revision"],
             "tree_sha": session["tree_sha"],
-            "evidence": {"selection": {"complete": True, "changed_paths": ["x.py"]}},
+            "evidence": {"selection": {"complete": True, "changed_paths": ["x.py"]}, "request_id": request_ids[i]},
         }
         for i in range(correlations)
     ]
+    request = {
+        "request_id": "ci_req_exact", "repository": session["repository"], "branch": session["branch"],
+        "commit_sha": session["head_commit_sha"], "tree_sha": session["tree_sha"],
+        "profile": job["profile"], "worker_job_id": job["job_id"], "phase": "queued", "status": "queued",
+    }
+    payload = {
+        "development_session_id": session["session_id"], "workspace_id": ws["workspace_id"],
+        "repository": session["repository"], "branch": session["branch"],
+        "commit_sha": session["head_commit_sha"], "tree_sha": session["tree_sha"],
+        "profile": job["profile"], "mode": mode, "base_sha": session["base_commit_sha"],
+    }
     monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: rows)
-    monkeypatch.setattr(resume, "db_get_job", lambda job_id: job if job_id == job["job_id"] else {**job, "job_id": job_id})
+    monkeypatch.setattr(resume.ci_request_store, "get_ci_request", lambda request_id: request if request_id == "ci_req_exact" else None)
+    monkeypatch.setattr(resume.ci_request_store, "get_ci_request_by_worker_job_id", lambda job_id: request if job_id == job["job_id"] else None)
+    monkeypatch.setattr(resume.ci_request_store, "get_ci_request_payload", lambda request_id: payload if request_id == "ci_req_exact" else {})
+    monkeypatch.setattr(resume, "db_get_job", lambda job_id: job if job_id == job["job_id"] else None)
+    monkeypatch.setattr(
+        resume.sessions, "bind_validation_request_worker",
+        lambda *args, **kwargs: {"request_id": "ci_req_exact", "job_id": job["job_id"], "logical_duplicate_count": 0},
+    )
+    if mode == "full":
+        attestation = {
+            "attestation_id": "att-exact", "repository": session["repository"],
+            "tested_commit_sha": session["head_commit_sha"], "tested_tree_sha": session["tree_sha"],
+            "base_sha": session["base_commit_sha"], "private_ci_job_id": job["job_id"], "profile": job["profile"],
+        }
+        monkeypatch.setattr(
+            resume.attestation_registry, "find_reusable_attestation_for_job",
+            lambda job_id: {"ok": True, "reusable": True, "attestation": attestation},
+        )
+    monkeypatch.setattr(resume.dx, "start_validation_request", lambda *args, **kwargs: pytest.fail("recovery must not start a second CI Request"))
+    monkeypatch.setattr(resume.dx, "start_validation_job", lambda *args, **kwargs: pytest.fail("recovery must not start a second Worker"))
+    monkeypatch.setattr(resume.dx, "create_or_get_job", lambda *args, **kwargs: pytest.fail("recovery must not create or reuse a new execution"))
     return ws, session, job
 
 
@@ -269,8 +305,8 @@ def test_resume_recovers_restart_after_nonterminal_observation_with_legacy_fast_
     result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
 
     assert result["development_session"]["status"] == "active"
-    assert result["recovery"]["transient"]["correlation_source"] == "session_last_observed_job"
-    assert result["recovery"]["transient"]["tree_evidence"] == "exact_immutable_commit_identity"
+    assert result["recovery"]["transient"]["correlation_source"] == "legacy_exact_job_to_request"
+    assert result["recovery"]["transient"]["tree_evidence"] == "request_tree_worker_pair"
 
 
 def test_resume_task_rejects_repository_before_github_reads(monkeypatch):
@@ -331,6 +367,249 @@ def test_resume_task_drifted_workspace_never_invokes_session_recovery(monkeypatc
     assert result["recovery"]["recovery_tool"] == "recover_drifted_development_task"
     assert result["recovery"]["manual_recovery_required"] is True
     assert result["next_allowed_actions"] == ["recover_drifted_development_task", "recovery_required"]
+
+
+def test_stacked_resume_uses_live_workspace_pr_base_branch_head_not_repository_main(monkeypatch):
+    stacked_branch = "ai/stacked-base"
+    old_base = "d" * 40
+    stacked_head = "e" * 40
+    current_head = "f" * 40
+    current_tree = "3" * 40
+    ws = _workspace(status="drifted", revision=3)
+    ws.update({
+        "base_branch": stacked_branch,
+        "base_commit_sha": old_base,
+        "head_sha": current_head,
+        "tree_sha": current_tree,
+        "drift_reason": "branch_moved_externally",
+    })
+    session = {
+        **_ready_session(head=SHA_A, tree=TREE_A, workspace_revision=2, lease=ws["lease_expires_at"]),
+        "base_branch": stacked_branch,
+        "base_commit_sha": old_base,
+    }
+    pr = {
+        "pull_number": 7,
+        "head_branch": "ai/resume",
+        "head_sha": current_head,
+        "base_branch": stacked_branch,
+        "state": "open",
+        "draft": True,
+    }
+    _stub_resume_context(
+        monkeypatch, ws=ws, session=session, pr=pr, branch_head=current_head, branch_tree=current_tree,
+    )
+    monkeypatch.setattr(
+        resume.mygithub12,
+        "resolve_identity",
+        lambda service, repository, commit_sha="", ref="": {
+            "repository": repository,
+            "commit_sha": stacked_head if ref == stacked_branch else (commit_sha or SHA_B),
+            "tree_sha": "4" * 40,
+        },
+    )
+    monkeypatch.setattr(
+        resume,
+        "_resume_ancestry_evidence",
+        lambda service, repository, ancestor, descendant: {
+            "verified": True, "ancestor": ancestor, "descendant": descendant,
+        },
+    )
+
+    result = resume.resume_task(FakeService(), "owner/repo", pull_number=7)
+
+    assert result["current_main"]["commit_sha"] == SHA_B
+    assert result["recovery_base"]["branch"] == stacked_branch
+    assert result["recovery_base"]["commit_sha"] == stacked_head
+    assert result["recovery"]["action"] == "recover_base_synced_development_task"
+    assert result["recovery"]["expected_new_base_sha"] == stacked_head
+    assert result["recovery"]["expected_new_base_sha"] != SHA_B
+    assert result["recovery"]["expected_base_branch"] == stacked_branch
+
+
+def _stacked_pinned_new_resume_case(
+    monkeypatch, *, metadata=None, events=None, ancestry_predicate=None, merge_base_evidence=None,
+):
+    stacked_branch = "ai/issue-186-p0-14-share-invite-global-locator-20260904"
+    historical_old_base = "20e8e5a5a411c55e830db33daca5cf3ab6f97db9"
+    live_new_base = "43ba158333f06e30210dca596f3b7eae204d149a"
+    old_session_head = "23aab1b9f80296d0e88c552ddbdac54c56939bc9"
+    integrated_head = "249f4dc68200e83b4fd73a8bbe43608beaac5d42"
+    integrated_tree = "7" * 40
+    ws = _workspace(status="drifted", revision=3)
+    ws.update({
+        "base_branch": stacked_branch,
+        "base_commit_sha": live_new_base,
+        "head_sha": integrated_head,
+        "tree_sha": integrated_tree,
+        "drift_reason": "branch_moved_externally",
+    })
+    if metadata is None:
+        metadata = {
+            "prepared_base_identity": {
+                "repository": "owner/repo",
+                "commit_sha": historical_old_base,
+                "tree_sha": "6" * 40,
+            }
+        }
+    session = {
+        **_ready_session(
+            head=old_session_head, tree="5" * 40, workspace_revision=2,
+            lease=ws["lease_expires_at"],
+        ),
+        "base_branch": stacked_branch,
+        "base_commit_sha": live_new_base,
+        "metadata": metadata,
+    }
+    pr = {
+        "pull_number": 823,
+        "head_branch": "ai/resume",
+        "head_sha": integrated_head,
+        "base_branch": stacked_branch,
+        "state": "open",
+        "draft": True,
+    }
+    _stub_resume_context(
+        monkeypatch, ws=ws, session=session, pr=pr,
+        branch_head=integrated_head, branch_tree=integrated_tree,
+    )
+    monkeypatch.setattr(
+        resume.mygithub12,
+        "resolve_identity",
+        lambda service, repository, commit_sha="", ref="": {
+            "repository": repository,
+            "commit_sha": live_new_base if ref == stacked_branch else (commit_sha or SHA_B),
+            "tree_sha": "4" * 40,
+        },
+    )
+    monkeypatch.setattr(resume.sessions, "list_events", lambda *args, **kwargs: list(events or []))
+    if merge_base_evidence is not None:
+        monkeypatch.setattr(
+            resume, "_resume_merge_base_evidence",
+            lambda *args, **kwargs: dict(merge_base_evidence),
+        )
+    predicate = ancestry_predicate or (lambda ancestor, descendant: True)
+    monkeypatch.setattr(
+        resume,
+        "_resume_ancestry_evidence",
+        lambda service, repository, ancestor, descendant: {
+            "verified": bool(predicate(ancestor, descendant)),
+            "ancestor": ancestor, "descendant": descendant,
+        },
+    )
+    result = resume.resume_task(FakeService(), "owner/repo", pull_number=823)
+    return result, {
+        "base_branch": stacked_branch,
+        "historical_old_base": historical_old_base,
+        "live_new_base": live_new_base,
+        "old_session_head": old_session_head,
+        "integrated_head": integrated_head,
+        "integrated_tree": integrated_tree,
+    }
+
+
+def test_already_pinned_new_base_stacked_resume_uses_audited_historical_old_base(monkeypatch):
+    result, ids = _stacked_pinned_new_resume_case(monkeypatch)
+
+    plan = result["recovery"]
+    assert plan["action"] == "recover_base_synced_development_task"
+    assert plan["action"] != "recover_drifted_development_task"
+    assert plan["expected_old_base_sha"] == ids["historical_old_base"]
+    assert plan["expected_new_base_sha"] == ids["live_new_base"]
+    assert plan["expected_base_branch"] == ids["base_branch"]
+    assert plan["expected_old_session_head_sha"] == ids["old_session_head"]
+    assert plan["expected_current_head_sha"] == ids["integrated_head"]
+    assert plan["expected_current_tree_sha"] == ids["integrated_tree"]
+    assert plan["repository"] == "owner/repo"
+    assert plan["branch"] == "ai/resume"
+    assert plan["expected_workspace_revision"] == 3
+    assert plan["expected_session_revision"] == 4
+    assert plan["preflight"]["verified"] is True
+
+
+def test_already_pinned_new_base_stacked_resume_fails_stop_on_ambiguous_historical_old_base(monkeypatch):
+    result, _ = _stacked_pinned_new_resume_case(
+        monkeypatch,
+        events=[{
+            "id": 9, "event_type": "base_sync_recovery", "session_revision": 3,
+            "data": {"old_base_sha": "8" * 40, "new_base_sha": "9" * 40},
+        }],
+    )
+
+    assert result["recovery"]["action"] == "recovery_required"
+    assert result["recovery"]["reason"] == "RECOVERY_HISTORICAL_OLD_BASE_AMBIGUOUS"
+    assert result["recovery"]["action"] != "recover_drifted_development_task"
+
+
+def test_already_pinned_new_base_stacked_resume_fails_stop_when_historical_old_base_unavailable(monkeypatch):
+    result, _ = _stacked_pinned_new_resume_case(
+        monkeypatch, metadata={},
+        merge_base_evidence={"verified": False, "reason": "merge_base_unavailable"},
+    )
+
+    assert result["recovery"]["action"] == "recovery_required"
+    assert result["recovery"]["reason"] == "RECOVERY_HISTORICAL_OLD_BASE_UNAVAILABLE"
+    assert result["recovery"]["action"] != "recover_drifted_development_task"
+
+
+def test_already_pinned_new_base_stacked_resume_fails_stop_when_recorded_old_base_ancestry_is_inconsistent(monkeypatch):
+    old_base = "20e8e5a5a411c55e830db33daca5cf3ab6f97db9"
+    new_base = "43ba158333f06e30210dca596f3b7eae204d149a"
+    result, _ = _stacked_pinned_new_resume_case(
+        monkeypatch,
+        ancestry_predicate=lambda ancestor, descendant: not (ancestor == old_base and descendant == new_base),
+    )
+
+    assert result["recovery"]["action"] == "recovery_required"
+    assert result["recovery"]["reason"] == "RECOVERY_ANCESTRY_MISMATCH"
+    assert result["recovery"]["preflight"]["base_ancestry"]["verified"] is False
+
+
+def test_already_pinned_new_base_stacked_resume_fails_stop_when_current_head_is_not_old_session_forward_descendant(monkeypatch):
+    old_head = "23aab1b9f80296d0e88c552ddbdac54c56939bc9"
+    current_head = "249f4dc68200e83b4fd73a8bbe43608beaac5d42"
+    result, _ = _stacked_pinned_new_resume_case(
+        monkeypatch,
+        ancestry_predicate=lambda ancestor, descendant: not (ancestor == old_head and descendant == current_head),
+    )
+
+    assert result["recovery"]["action"] == "recovery_required"
+    assert result["recovery"]["reason"] == "RECOVERY_ANCESTRY_MISMATCH"
+    assert result["recovery"]["preflight"]["task_ancestry"]["verified"] is False
+
+
+def test_already_pinned_new_base_stacked_resume_fails_stop_when_current_head_does_not_include_live_new_base(monkeypatch):
+    new_base = "43ba158333f06e30210dca596f3b7eae204d149a"
+    current_head = "249f4dc68200e83b4fd73a8bbe43608beaac5d42"
+    result, _ = _stacked_pinned_new_resume_case(
+        monkeypatch,
+        ancestry_predicate=lambda ancestor, descendant: not (ancestor == new_base and descendant == current_head),
+    )
+
+    assert result["recovery"]["action"] == "recovery_required"
+    assert result["recovery"]["reason"] == "RECOVERY_ANCESTRY_MISMATCH"
+    assert result["recovery"]["preflight"]["new_base_ancestry"]["verified"] is False
+
+
+def test_main_based_resume_keeps_repository_main_as_live_base(monkeypatch):
+    current_head = "f" * 40
+    current_tree = "3" * 40
+    ws = _workspace(status="drifted", revision=3)
+    ws.update({"head_sha": current_head, "tree_sha": current_tree, "drift_reason": "branch_moved_externally"})
+    session = {
+        **_ready_session(head=SHA_A, tree=TREE_A, workspace_revision=2, lease=ws["lease_expires_at"]),
+        "base_branch": "main",
+        "base_commit_sha": SHA_A,
+    }
+    _stub_resume_context(monkeypatch, ws=ws, session=session, branch_head=current_head, branch_tree=current_tree)
+    monkeypatch.setattr(resume, "_resume_ancestry_evidence", lambda *args, **kwargs: {"verified": True})
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["recovery_base"] == result["current_main"]
+    assert result["recovery"]["action"] == "recover_base_synced_development_task"
+    assert result["recovery"]["expected_new_base_sha"] == SHA_B
+    assert result["recovery"]["expected_base_branch"] == "main"
 
 
 def test_session_evidence_never_promotes_old_head_or_invalid_attestation(monkeypatch):
@@ -495,3 +774,336 @@ def test_resume_merged_legacy_task_never_suggests_writer_lease_recovery(monkeypa
     assert result["recovery"]["managed_merge_reconciliation"]["reason"] == "MANAGED_MERGE_RECONCILIATION_REQUIRED"
     assert result["next_allowed_actions"] == ["resume_development_task"]
     assert "resume_development_workspace" not in result["next_allowed_actions"]
+
+
+def _production_validation_case(monkeypatch, *, mode, repository, branch, head, tree, base, request_id, job_id, status="passed", worker_tree=True, attestation_id=""):
+    ws = {
+        "workspace_id": "ws-production", "repository": repository, "branch": branch,
+        "base_branch": "main", "base_commit_sha": base, "head_sha": head, "tree_sha": tree,
+        "status": "active", "revision": 7, "lease_expires_at": 9999999999.0, "drift_reason": None,
+    }
+    session = {
+        "session_id": "dev-production", "workspace_id": ws["workspace_id"], "repository": repository,
+        "branch": branch, "base_branch": "main", "base_commit_sha": base,
+        "head_commit_sha": head, "tree_sha": tree, "workspace_revision": 7, "session_revision": 7,
+        "status": "validating_fast" if mode == "fast" else "validating_full",
+        "last_fast_ci_job_id": None, "last_full_ci_job_id": None,
+        "last_attestation_id": None, "last_failure_resource_uri": None,
+    }
+    profile = "repo-fast-check" if mode == "fast" else "repo-auto-check"
+    correlation = {
+        "request_id": request_id, "request_id_source": "legacy_evidence", "job_id": None,
+        "session_revision": 7, "tree_sha": tree,
+        "evidence": {"request_id": request_id, "selection": {"complete": True, "changed_paths": ["production-shape"]}},
+    }
+    request = {
+        "request_id": request_id, "repository": repository, "branch": branch, "commit_sha": head,
+        "tree_sha": tree, "profile": profile, "worker_job_id": job_id, "phase": "queued", "status": "queued",
+    }
+    payload = {
+        "development_session_id": session["session_id"], "workspace_id": ws["workspace_id"],
+        "repository": repository, "branch": branch, "commit_sha": head, "tree_sha": tree,
+        "profile": profile, "mode": mode, "base_sha": base,
+    }
+    job = {
+        "job_id": job_id, "repository": repository, "branch": branch, "commit_sha": head,
+        "base_sha": base, "profile": profile, "status": status,
+        "exit_code": 0 if status == "passed" else 1, "superseded_by_job_id": None,
+        "summary": {"git_tree_sha": tree} if worker_tree else {},
+    }
+    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: [correlation])
+    monkeypatch.setattr(resume.ci_request_store, "get_ci_request", lambda value: request if value == request_id else None)
+    monkeypatch.setattr(resume.ci_request_store, "get_ci_request_payload", lambda value: payload if value == request_id else {})
+    monkeypatch.setattr(resume, "db_get_job", lambda value: job if value == job_id else None)
+    monkeypatch.setattr(
+        resume.sessions, "bind_validation_request_worker",
+        lambda *args, **kwargs: {"request_id": request_id, "job_id": job_id, "logical_duplicate_count": 0},
+    )
+    no_new_ci = {"requests": 0, "workers": 0}
+    def forbidden_request(*args, **kwargs):
+        no_new_ci["requests"] += 1
+        pytest.fail("recovery must not start a new CI Request")
+    def forbidden_worker(*args, **kwargs):
+        no_new_ci["workers"] += 1
+        pytest.fail("recovery must not create a second Worker")
+    monkeypatch.setattr(resume.dx, "start_validation_request", forbidden_request)
+    monkeypatch.setattr(resume.dx, "start_validation_job", forbidden_worker)
+    monkeypatch.setattr(resume.dx, "create_or_get_job", forbidden_worker)
+    if mode == "full" and attestation_id:
+        attestation = {
+            "attestation_id": attestation_id, "repository": repository, "tested_commit_sha": head,
+            "tested_tree_sha": tree, "base_sha": base, "private_ci_job_id": job_id, "profile": profile,
+        }
+        monkeypatch.setattr(
+            resume.attestation_registry, "find_reusable_attestation_for_job",
+            lambda value: {"ok": True, "reusable": True, "attestation": attestation} if value == job_id else {"ok": False, "reusable": False},
+        )
+    return ws, session, request, payload, job, no_new_ci
+
+
+def test_p0_02b_full_late_bound_request_recovers_existing_worker_without_new_ci(monkeypatch):
+    ws, session, _, _, job, no_new_ci = _production_validation_case(
+        monkeypatch, mode="full", repository="frankichen/sxt",
+        branch="ai/issue-186-p0-02b-gateway-ingress-tenant-isolation-20260909-r2",
+        head="47a4219649318a6ad265e21dc16f2e7506c47862",
+        tree="03086bb9ca1ecce64570cd40987b9da2a0cc9936",
+        base="973d3b06340e5dd511b9f62fa199fb79aec6d47e",
+        request_id="ci_req_ab87697ec3bd4a7399a3d3e8", job_id="7d6709dca1154434",
+        attestation_id="1e26fb25-641c-443c-820a-a2a600a08a60",
+    )
+    expected_attestation = {
+        "attestation_id": "1e26fb25-641c-443c-820a-a2a600a08a60",
+        "repository": "frankichen/sxt", "tested_commit_sha": session["head_commit_sha"],
+        "tested_tree_sha": session["tree_sha"], "base_sha": session["base_commit_sha"],
+        "private_ci_job_id": job["job_id"], "profile": "repo-auto-check",
+    }
+    monkeypatch.setattr(
+        resume.dx, "validation_result",
+        lambda *args, **kwargs: {"terminal": True, "merge_eligible": True, "attestation": expected_attestation, "failure_pack": None},
+    )
+    captured = {}
+    def transition(*args, **kwargs):
+        captured.update(kwargs)
+        return {**session, "status": "pr_ready", "session_revision": 8,
+                "last_full_ci_job_id": job["job_id"], "last_attestation_id": expected_attestation["attestation_id"]}
+    monkeypatch.setattr(resume.sessions, "transition", transition)
+
+    recovered, evidence, blocker = resume._reconcile_transient_validation(session, ws)
+
+    assert blocker is None
+    assert recovered["status"] == "pr_ready"
+    assert captured["fields"]["last_full_ci_job_id"] == "7d6709dca1154434"
+    assert captured["fields"]["last_attestation_id"] == "1e26fb25-641c-443c-820a-a2a600a08a60"
+    assert evidence["request"]["request_id"] == "ci_req_ab87697ec3bd4a7399a3d3e8"
+    assert no_new_ci == {"requests": 0, "workers": 0}
+
+
+def test_p0_23a_fast_late_bound_request_recovers_existing_worker_to_active_without_new_ci(monkeypatch):
+    ws, session, _, _, job, no_new_ci = _production_validation_case(
+        monkeypatch, mode="fast", repository="frankichen/sxt",
+        branch="ai/issue-186-p0-23a-p2p-boundary-regression-20260907",
+        head="f44f03506bc17643d620545cadadda5d8667612b",
+        tree="6998f06fc01cacb2b51c82d1e20790d7b7528daf",
+        base="973d3b06340e5dd511b9f62fa199fb79aec6d47e",
+        request_id="ci_req_97db061be503489fa02a7ad5", job_id="8593feac57224840",
+        worker_tree=False,
+    )
+    monkeypatch.setattr(
+        resume.dx, "validation_result",
+        lambda *args, **kwargs: {"terminal": True, "merge_eligible": False, "attestation": None, "failure_pack": None},
+    )
+    captured = {}
+    def transition(*args, **kwargs):
+        captured.update(kwargs)
+        return {**session, "status": "active", "session_revision": 8, "last_fast_ci_job_id": job["job_id"]}
+    monkeypatch.setattr(resume.sessions, "transition", transition)
+
+    recovered, evidence, blocker = resume._reconcile_transient_validation(session, ws)
+
+    assert blocker is None
+    assert recovered["status"] == "active"
+    assert captured["fields"] == {"last_fast_ci_job_id": "8593feac57224840"}
+    assert evidence["tree_evidence"] == "request_tree_worker_pair"
+    assert evidence["validation_result"]["merge_eligible"] is False
+    assert no_new_ci == {"requests": 0, "workers": 0}
+
+
+def test_request_exists_without_worker_keeps_validation_in_progress_and_starts_nothing(monkeypatch):
+    ws, session, request, _, _, no_new_ci = _production_validation_case(
+        monkeypatch, mode="fast", repository="owner/repo", branch="ai/resume",
+        head=SHA_A, tree=TREE_A, base=SHA_A,
+        request_id="ci_req_waiting", job_id="job-not-yet-created",
+    )
+    request["worker_job_id"] = None
+    request["phase"] = "preparing"
+    monkeypatch.setattr(resume, "db_get_job", lambda *args: pytest.fail("no Worker should be looked up before Request binds one"))
+    monkeypatch.setattr(resume.sessions, "bind_validation_request_worker", lambda *args, **kwargs: pytest.fail("cannot bind before Worker exists"))
+
+    recovered, evidence, blocker = resume._reconcile_transient_validation(session, ws)
+
+    assert recovered is session
+    assert blocker == "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS"
+    assert evidence["validation_in_progress"] is True
+    assert no_new_ci == {"requests": 0, "workers": 0}
+
+
+def test_same_request_legacy_duplicate_placeholders_are_one_logical_correlation(monkeypatch):
+    ws, session, request, _, job, _ = _production_validation_case(
+        monkeypatch, mode="fast", repository="owner/repo", branch="ai/resume",
+        head=SHA_A, tree=TREE_A, base=SHA_A, request_id="ci_req_dup", job_id="job-dup",
+    )
+    duplicate_rows = [
+        {"request_id": "ci_req_dup", "job_id": None, "session_revision": 7, "tree_sha": TREE_A,
+         "evidence": {"request_id": "ci_req_dup", "selection": {"complete": True}}},
+        {"request_id": "ci_req_dup", "job_id": None, "session_revision": 6, "tree_sha": TREE_A,
+         "evidence": {"request_id": "ci_req_dup", "selection": {"complete": True}}},
+    ]
+    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: duplicate_rows)
+    monkeypatch.setattr(
+        resume.sessions, "bind_validation_request_worker",
+        lambda *args, **kwargs: {"request_id": request["request_id"], "job_id": job["job_id"], "logical_duplicate_count": 1},
+    )
+    monkeypatch.setattr(resume.dx, "validation_result", lambda *args, **kwargs: {"terminal": True, "merge_eligible": False, "attestation": None, "failure_pack": None})
+    monkeypatch.setattr(resume.sessions, "transition", lambda *args, **kwargs: {**session, "status": "active", "session_revision": 8})
+
+    _, evidence, blocker = resume._reconcile_transient_validation(session, ws)
+
+    assert blocker is None
+    assert evidence["correlation_backfill"]["logical_duplicate_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("missing_request", "validation_request_not_found"),
+        ("request_repository", "validation_request_identity_mismatch"),
+        ("request_branch", "validation_request_identity_mismatch"),
+        ("request_profile", "validation_request_identity_mismatch"),
+        ("request_tree", "validation_request_identity_mismatch"),
+        ("request_base", "validation_request_identity_mismatch"),
+        ("worker_pair", "validation_request_worker_pair_mismatch"),
+        ("worker_repository", "validation_job_identity_mismatch"),
+        ("worker_branch", "validation_job_identity_mismatch"),
+        ("worker_profile", "validation_job_identity_mismatch"),
+        ("worker_base", "validation_job_identity_mismatch"),
+        ("worker_tree", "validation_job_identity_mismatch"),
+        ("worker_superseded", "validation_job_identity_mismatch"),
+    ],
+)
+def test_request_worker_recovery_identity_matrix_fails_closed(monkeypatch, mutation, expected_reason):
+    ws, session, request, payload, job, _ = _production_validation_case(
+        monkeypatch, mode="fast", repository="owner/repo", branch="ai/resume",
+        head=SHA_A, tree=TREE_A, base=SHA_A, request_id="ci_req_matrix", job_id="job-matrix",
+    )
+    if mutation == "missing_request":
+        monkeypatch.setattr(resume.ci_request_store, "get_ci_request", lambda *args: None)
+    elif mutation == "request_repository": request["repository"] = "owner/other"
+    elif mutation == "request_branch": request["branch"] = "ai/other"
+    elif mutation == "request_profile": request["profile"] = "repo-auto-check"
+    elif mutation == "request_tree": request["tree_sha"] = "9" * 40
+    elif mutation == "request_base": payload["base_sha"] = SHA_B
+    elif mutation == "worker_pair":
+        monkeypatch.setattr(
+            resume.sessions, "validation_correlations",
+            lambda *args: [{"request_id": request["request_id"], "job_id": "job-other", "session_revision": 7,
+                           "tree_sha": TREE_A, "evidence": {"request_id": request["request_id"]}},],
+        )
+    elif mutation == "worker_repository": job["repository"] = "owner/other"
+    elif mutation == "worker_branch": job["branch"] = "ai/other"
+    elif mutation == "worker_profile": job["profile"] = "repo-auto-check"
+    elif mutation == "worker_base": job["base_sha"] = SHA_B
+    elif mutation == "worker_tree": job["summary"] = {"git_tree_sha": "8" * 40}
+    elif mutation == "worker_superseded": job["superseded_by_job_id"] = "job-newer"
+
+    recovered, evidence, blocker = resume._reconcile_transient_validation(session, ws)
+
+    assert recovered is session
+    assert blocker == "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    assert evidence["reason"] == expected_reason
+
+
+def test_full_pass_without_reusable_attestation_fails_closed_without_transition(monkeypatch):
+    ws, session, _, _, _, no_new_ci = _production_validation_case(
+        monkeypatch, mode="full", repository="owner/repo", branch="ai/resume",
+        head=SHA_A, tree=TREE_A, base=SHA_A, request_id="ci_req_no_att", job_id="job-no-att",
+    )
+    monkeypatch.setattr(
+        resume.attestation_registry, "find_reusable_attestation_for_job",
+        lambda *args: {"ok": False, "reusable": False, "error_code": "ATTESTATION_NOT_FOUND"},
+    )
+    monkeypatch.setattr(resume.sessions, "bind_validation_request_worker", lambda *args, **kwargs: pytest.fail("invalid full evidence must not be backfilled as complete"))
+    monkeypatch.setattr(resume.sessions, "transition", lambda *args, **kwargs: pytest.fail("invalid full evidence must not change Session fields"))
+
+    recovered, evidence, blocker = resume._reconcile_transient_validation(session, ws)
+
+    assert recovered is session
+    assert blocker == "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    assert evidence["reason"] == "validation_full_attestation_not_reusable"
+    assert no_new_ci == {"requests": 0, "workers": 0}
+
+
+def test_no_request_id_and_no_strict_job_correlation_fails_closed(monkeypatch):
+    ws, session, _, _, _, _ = _production_validation_case(
+        monkeypatch, mode="fast", repository="owner/repo", branch="ai/resume",
+        head=SHA_A, tree=TREE_A, base=SHA_A, request_id="ci_req_unused", job_id="job-unused",
+    )
+    monkeypatch.setattr(
+        resume.sessions, "validation_correlations",
+        lambda *args: [{"request_id": None, "job_id": None, "session_revision": 7, "tree_sha": TREE_A, "evidence": {}}],
+    )
+
+    recovered, evidence, blocker = resume._reconcile_transient_validation(session, ws)
+
+    assert recovered is session
+    assert blocker == "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    assert evidence["reason"] == "validation_request_correlation_missing"
+
+
+def test_resume_after_fast_correlation_backfill_is_idempotent_and_starts_no_ci(monkeypatch):
+    ws = _workspace()
+    session = {
+        **_ready_session(),
+        "workspace_id": ws["workspace_id"],
+        "base_commit_sha": ws["base_commit_sha"],
+        "status": "active",
+        "last_fast_ci_job_id": "job-existing",
+    }
+    _stub_resume_context(monkeypatch, ws=ws, session=session)
+    monkeypatch.setattr(
+        resume, "_reconcile_transient_validation",
+        lambda *args, **kwargs: pytest.fail("completed correlation must not be reconciled twice"),
+    )
+    monkeypatch.setattr(
+        resume.sessions, "transition",
+        lambda *args, **kwargs: pytest.fail("completed correlation must not repeat a Session transition"),
+    )
+    monkeypatch.setattr(
+        resume.dx, "start_validation_request",
+        lambda *args, **kwargs: pytest.fail("idempotent resume must not start another CI Request"),
+    )
+    monkeypatch.setattr(
+        resume.dx, "start_validation_job",
+        lambda *args, **kwargs: pytest.fail("idempotent resume must not start another Worker"),
+    )
+    monkeypatch.setattr(
+        resume.dx, "create_or_get_job",
+        lambda *args, **kwargs: pytest.fail("idempotent resume must not create/reuse another execution"),
+    )
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["development_session"]["status"] == "active"
+    assert result["development_session"]["last_fast_ci_job_id"] == "job-existing"
+
+
+def test_same_head_unowned_historical_worker_is_never_claimed(monkeypatch):
+    ws, session, _, _, historical_job, no_new_ci = _production_validation_case(
+        monkeypatch, mode="fast", repository="owner/repo", branch="ai/resume",
+        head=SHA_A, tree=TREE_A, base=SHA_A, request_id="ci_req_unowned", job_id="job-historical",
+    )
+    monkeypatch.setattr(
+        resume.sessions, "validation_correlations",
+        lambda *args: [{
+            "request_id": None, "job_id": None, "session_revision": 7,
+            "tree_sha": TREE_A, "evidence": {},
+        }],
+    )
+    monkeypatch.setattr(
+        resume.ci_request_store, "get_ci_request_by_worker_job_id",
+        lambda *args: pytest.fail("no strict persisted job anchor exists for reverse Request lookup"),
+    )
+    monkeypatch.setattr(
+        resume, "db_get_job",
+        lambda *args: pytest.fail("same-HEAD historical Worker without Request ownership must not be inspected"),
+    )
+    monkeypatch.setattr(
+        resume, "db_list_jobs",
+        lambda **kwargs: [historical_job],
+    )
+
+    recovered, evidence, blocker = resume._reconcile_transient_validation(session, ws)
+
+    assert recovered is session
+    assert blocker == "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    assert evidence["reason"] == "validation_request_correlation_missing"
+    assert no_new_ci == {"requests": 0, "workers": 0}

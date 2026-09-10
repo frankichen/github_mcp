@@ -637,7 +637,10 @@ def validation_observation(
     snapshot,job,current=validation_request_snapshot(request)
     terminal=bool(snapshot.get("terminal"))
     if terminal and job:
-        result=validation_result(session_id,session_revision,mode,job,selection,include_failure_pack)
+        result=validation_result(
+            session_id,session_revision,mode,job,selection,include_failure_pack,
+            request_id=str(current.get("request_id") or ""),
+        )
     else:
         result={
             "job":{"job_id":snapshot.get("job_id"),"status":snapshot.get("worker_status"),"profile":snapshot.get("profile"),"commit_sha":snapshot.get("commit_sha"),"current_step":snapshot.get("current_step"),"exit_code":snapshot.get("exit_code")},
@@ -671,14 +674,25 @@ def wait_validation(job_id: str, wait_seconds: int) -> dict[str,Any]:
 VALIDATION_TERMINAL_STATUSES = {"passed", "failed", "timed_out", "cancelled", "superseded", "worker_lost", "internal_error"}
 
 
-def validation_result(session_id: str, session_revision: int, mode: str, job: dict[str,Any], selection: dict[str,Any], include_failure_pack: bool=True) -> dict[str,Any]:
+def validation_result(
+    session_id: str, session_revision: int, mode: str, job: dict[str,Any], selection: dict[str,Any],
+    include_failure_pack: bool=True, *, request_id: str="", reusable_attestation: dict[str,Any] | None=None,
+    allow_attestation_creation: bool=True,
+) -> dict[str,Any]:
     status=job.get("status"); terminal=status in VALIDATION_TERMINAL_STATUSES; merge_eligible=bool(mode!="fast" and status=="passed" and job.get("exit_code")==0 and not job.get("superseded_by_job_id"))
     attestation=None; failure=None
     if merge_eligible:
-        try: attestation=attestation_registry.create_attestation_for_passed_job(job_id=job["job_id"])
-        except ValueError as exc: attestation={"ok":False,"error_code":str(exc)}; merge_eligible=False
+        if reusable_attestation is not None:
+            attestation=dict(reusable_attestation)
+        elif allow_attestation_creation:
+            try: attestation=attestation_registry.create_attestation_for_passed_job(job_id=job["job_id"])
+            except ValueError as exc: attestation={"ok":False,"error_code":str(exc)}; merge_eligible=False
+        else:
+            merge_eligible=False
     elif terminal and status!="passed" and include_failure_pack:
         try: failure=build_failure_pack(job,affected=selection)
         except Exception: failure={"summary":{"job_id":job.get("job_id"),"status":status},"error_code":"FAILURE_PACK_UNAVAILABLE"}
-    sessions.record_validation(session_id,session_revision,mode,job.get("commit_sha",""),(job.get("summary") or {}).get("git_tree_sha","") if isinstance(job.get("summary"),dict) else "",job_id=job["job_id"],status=status,merge_eligible=merge_eligible,attestation_id=(attestation or {}).get("attestation_id","") if isinstance(attestation,dict) else "",evidence={"selection":selection},finished=terminal)
+    validation_evidence={"selection":selection}
+    if request_id: validation_evidence["request_id"]=request_id
+    sessions.record_validation(session_id,session_revision,mode,job.get("commit_sha",""),(job.get("summary") or {}).get("git_tree_sha","") if isinstance(job.get("summary"),dict) else "",request_id=request_id,job_id=job["job_id"],status=status,merge_eligible=merge_eligible,attestation_id=(attestation or {}).get("attestation_id","") if isinstance(attestation,dict) else "",evidence=validation_evidence,finished=terminal)
     return {"job":{"job_id":job["job_id"],"status":status,"profile":job.get("profile"),"commit_sha":job.get("commit_sha"),"current_step":job.get("current_step"),"exit_code":job.get("exit_code")},"affected":selection,"merge_eligible":merge_eligible,"attestation":attestation,"failure_pack":failure,"terminal":terminal}
