@@ -103,7 +103,8 @@ def test_resume_task_rejects_branch_pr_mismatch(monkeypatch):
 def _ready_session(*, head=SHA_A, tree=TREE_A, workspace_revision=2, lease=9999999999.0):
     return {
         "session_id": "dev_resume", "status": "active", "session_revision": 4,
-        "repository": "owner/repo", "branch": "ai/resume",
+        "repository": "owner/repo", "branch": "ai/resume", "base_branch": "main",
+        "base_commit_sha": SHA_A,
         "workspace_revision": workspace_revision, "head_commit_sha": head, "tree_sha": tree,
         "lease_expires_at": lease, "pull_number": None, "last_fast_ci_job_id": None,
         "last_full_ci_job_id": None, "last_attestation_id": None, "last_failure_resource_uri": None,
@@ -786,6 +787,7 @@ def _production_validation_case(monkeypatch, *, mode, repository, branch, head, 
         "session_id": "dev-production", "workspace_id": ws["workspace_id"], "repository": repository,
         "branch": branch, "base_branch": "main", "base_commit_sha": base,
         "head_commit_sha": head, "tree_sha": tree, "workspace_revision": 7, "session_revision": 7,
+        "lease_expires_at": ws["lease_expires_at"],
         "status": "validating_fast" if mode == "fast" else "validating_full",
         "last_fast_ci_job_id": None, "last_full_ci_job_id": None,
         "last_attestation_id": None, "last_failure_resource_uri": None,
@@ -905,6 +907,67 @@ def test_p0_23a_fast_late_bound_request_recovers_existing_worker_to_active_witho
     assert captured["fields"] == {"last_fast_ci_job_id": "8593feac57224840"}
     assert evidence["tree_evidence"] == "request_tree_worker_pair"
     assert evidence["validation_result"]["merge_eligible"] is False
+    assert no_new_ci == {"requests": 0, "workers": 0}
+
+
+def test_resume_revision_only_workspace_recovery_reconciles_queued_request_and_passed_worker(monkeypatch):
+    ws, session, _, _, job, no_new_ci = _production_validation_case(
+        monkeypatch, mode="fast", repository="frankichen/sxt",
+        branch="ai/issue-186-p0-23a-p2p-boundary-regression-20260907",
+        head="f44f03506bc17643d620545cadadda5d8667612b",
+        tree="6998f06fc01cacb2b51c82d1e20790d7b7528daf",
+        base="973d3b06340e5dd511b9f62fa199fb79aec6d47e",
+        request_id="ci_req_97db061be503489fa02a7ad5", job_id="8593feac57224840",
+        worker_tree=False,
+    )
+    session.update({"session_revision": 12, "workspace_revision": 3})
+    ws.update({"revision": 4})
+    _stub_resume_context(
+        monkeypatch, ws=ws, session=session,
+        branch_head=session["head_commit_sha"], branch_tree=session["tree_sha"],
+    )
+    monkeypatch.setattr(
+        resume, "_repository_policy",
+        lambda repository: {"ok": True, "repository": repository, "policy": {"github": True, "private_ci": True}},
+    )
+    recovered_session = {**session, "session_revision": 13, "workspace_revision": 4}
+    recovery_calls = []
+
+    def recover(service, session_id, session_revision, workspace_revision, expected_head_sha, idempotency_key):
+        recovery_calls.append((session_id, session_revision, workspace_revision, expected_head_sha, idempotency_key))
+        return {"session": recovered_session, "workspace": ws, "recovered": True}
+
+    monkeypatch.setattr(resume.dx, "recover_stale_session", recover)
+    monkeypatch.setattr(
+        resume.dx, "validation_result",
+        lambda *args, **kwargs: {
+            "terminal": True, "merge_eligible": False,
+            "attestation": None, "failure_pack": None,
+        },
+    )
+    monkeypatch.setattr(
+        resume.sessions, "transition",
+        lambda *args, **kwargs: {
+            **recovered_session, "status": "active", "session_revision": 14,
+            "last_fast_ci_job_id": job["job_id"],
+        },
+    )
+
+    result = resume.resume_task(
+        FakeService(), "frankichen/sxt",
+        branch="ai/issue-186-p0-23a-p2p-boundary-regression-20260907",
+        expected_session_revision=12,
+    )
+
+    assert recovery_calls == [
+        (
+            session["session_id"], 12, 4, session["head_commit_sha"],
+            f"resume:{session['session_id']}:4",
+        )
+    ]
+    assert result["development_session"]["status"] == "active"
+    assert result["recovery"]["transient"]["reconciled"] is True
+    assert result["recovery"]["transient"]["request"]["request_id"] == "ci_req_97db061be503489fa02a7ad5"
     assert no_new_ci == {"requests": 0, "workers": 0}
 
 

@@ -616,17 +616,113 @@ def register_dx_tools(
     ) -> str:
         try:
             session=sessions.get_session(development_session_id)
+            # Validate the requested mode before any state transition, then
+            # pin a transient Session to that mode. A caller cannot turn a
+            # validating_fast Session into a second full/fast Request by
+            # changing the mode or force-rerun flags on a retry.
+            dx.validation_profile(mode)
+            phase="validating_fast" if mode=="fast" else "validating_full"
+            if session.get("status") in {"validating_fast", "validating_full"} and session.get("status") != phase:
+                raise mygithub12.MyGithub12Error(
+                    "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                    "validation mode differs from the transient Development Session state",
+                    {
+                        "development_session_id": development_session_id,
+                        "session_status": session.get("status"),
+                        "requested_mode": mode,
+                        "recovery_required": True,
+                    },
+                )
             preflight_head=session["head_commit_sha"]
             resolved_base=base_sha or session["base_commit_sha"]
-            prepared=await github_call(dx.validation_preflight,service,session,mode,resolved_base)
             maintenance=await github_call(dx.maybe_auto_renew_session_workspace,service,development_session_id,expected_session_revision,int(session["workspace_revision"]),session["head_commit_sha"],idempotency_key)
             session=maintenance["session"]; ws=maintenance["workspace"]; effective_session_revision=int(session["session_revision"])
-            if session["head_commit_sha"]!=preflight_head:
+            if session["head_commit_sha"]!=preflight_head or session["base_commit_sha"]!=resolved_base:
                 resolved_base=base_sha or session["base_commit_sha"]
-                prepared=await github_call(dx.validation_preflight,service,session,mode,resolved_base)
             lease_maintenance={"renewed":bool(maintenance.get("renewed")),"remaining_seconds":maintenance.get("remaining_seconds"),"audit":maintenance.get("audit"),"recovery":maintenance.get("recovery")}
             await github_call(mygithub12.workspace_write_preflight,service,session["repository"],session["branch"],session["head_commit_sha"],session["workspace_id"],ws["revision"])
-            phase="validating_fast" if mode=="fast" else "validating_full"
+
+            if session.get("status") in {"validating_fast", "validating_full"}:
+                # Reconciliation is the only legal first action for a
+                # transient validation. It consumes durable Request -> Worker
+                # evidence, including a Request still reporting queued while
+                # its exact Worker is already terminal. force_rerun is
+                # intentionally ignored here: ambiguity/staleness is a
+                # fail-closed recovery condition, never permission to create
+                # another Request.
+                if base_sha and base_sha != session.get("base_commit_sha"):
+                    raise mygithub12.MyGithub12Error(
+                        "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                        "validation base identity differs from the transient Session",
+                        {
+                            "expected_base_sha": session.get("base_commit_sha"),
+                            "requested_base_sha": base_sha,
+                            "recovery_required": True,
+                        },
+                    )
+                recovered_session, validation_recovery, recovery_blocker = resume._reconcile_transient_validation(session, ws)
+                if recovery_blocker:
+                    if recovery_blocker == "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS":
+                        return json.dumps({
+                            "ok": True,
+                            "development_session": recovered_session,
+                            "mode": mode,
+                            "lease_maintenance": lease_maintenance,
+                            "validation_started": False,
+                            "validation_reused": True,
+                            "reconciled": False,
+                            "continuation_required": True,
+                            "terminal": False,
+                            "request": validation_recovery.get("request"),
+                            "job": validation_recovery.get("job"),
+                            "validation_recovery": validation_recovery,
+                        }, ensure_ascii=False)
+                    return json.dumps({
+                        "ok": False,
+                        "development_session": recovered_session,
+                        "mode": mode,
+                        "lease_maintenance": lease_maintenance,
+                        "validation_started": False,
+                        "validation_reused": False,
+                        "recovery_required": True,
+                        "validation_recovery": validation_recovery,
+                        "error": {
+                            "code": "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                            "message": "persisted validation evidence is ambiguous or does not match the current identity",
+                            "details": {"blocker": recovery_blocker, **validation_recovery},
+                        },
+                    }, ensure_ascii=False)
+                result=validation_recovery.get("validation_result")
+                if not isinstance(result, dict):
+                    return json.dumps({
+                        "ok": False,
+                        "development_session": recovered_session,
+                        "mode": mode,
+                        "lease_maintenance": lease_maintenance,
+                        "validation_started": False,
+                        "recovery_required": True,
+                        "validation_recovery": validation_recovery,
+                        "error": {
+                            "code": "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                            "message": "terminal validation reconciliation did not produce a result",
+                            "details": {"recovery_required": True},
+                        },
+                    }, ensure_ascii=False)
+                return json.dumps({
+                    "ok": True,
+                    "development_session": recovered_session,
+                    "mode": mode,
+                    "lease_maintenance": lease_maintenance,
+                    "validation_started": False,
+                    "validation_reused": True,
+                    "reconciled": True,
+                    "validation_recovery": validation_recovery,
+                    **result,
+                    "request": validation_recovery.get("request"),
+                    "job": validation_recovery.get("job") or result.get("job"),
+                }, ensure_ascii=False)
+
+            prepared=await github_call(dx.validation_preflight,service,session,mode,resolved_base)
             phase_session=await github_call(sessions.transition,development_session_id,effective_session_revision,phase,event_type="validation_started",allowed_from={"active","pr_ready","validating_fast","validating_full"})
             try:
                 request,selection=await github_call(dx.start_validation_request,service,phase_session,mode,resolved_base,force_rerun,supersede_previous,idempotency_key,prepared)
@@ -653,7 +749,7 @@ def register_dx_tools(
             try:
                 await github_call(
                     sessions.record_validation,development_session_id,phase_session["session_revision"],mode,
-                    phase_session["head_commit_sha"],phase_session["tree_sha"],job_id=request.get("worker_job_id") or "",
+                    phase_session["head_commit_sha"],phase_session["tree_sha"],request_id=request["request_id"],job_id=request.get("worker_job_id") or "",
                     status=request.get("status") or "accepted",evidence={"selection":selection,"request_id":request["request_id"]},
                 )
             except Exception as correlate_exc:

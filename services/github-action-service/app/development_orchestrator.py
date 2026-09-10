@@ -273,6 +273,35 @@ def maybe_auto_renew_session_workspace(
         or session["head_commit_sha"]!=ws["head_sha"] or session["tree_sha"]!=ws["tree_sha"]
         or abs(float(session["lease_expires_at"])-float(ws["lease_expires_at"]))>0.001
     )
+    if (
+        local_stale
+        and session["status"] in {"validating_fast", "validating_full"}
+        and not all(
+            session.get(session_key) not in (None, "")
+            and ws.get(workspace_key) not in (None, "")
+            and session.get(session_key) == ws.get(workspace_key)
+            for session_key, workspace_key in (
+                ("workspace_id", "workspace_id"),
+                ("repository", "repository"),
+                ("branch", "branch"),
+                ("base_branch", "base_branch"),
+                ("base_commit_sha", "base_commit_sha"),
+                ("head_commit_sha", "head_sha"),
+                ("tree_sha", "tree_sha"),
+            )
+        )
+    ):
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+            "transient validation cannot cross a Workspace revision with changed identity",
+            {
+                "development_session_id": session_id,
+                "workspace_id": ws["workspace_id"],
+                "session_workspace_revision": session["workspace_revision"],
+                "workspace_revision": workspace_revision,
+                "recovery_required": True,
+            },
+        )
     recovery=None
     if local_stale or recovery_replay:
         recovery=recover_stale_session(service,session_id,expected_session_revision,expected_workspace_revision,expected_head_sha,idempotency_key)
