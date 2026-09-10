@@ -319,6 +319,88 @@ def test_t6_base_and_old_task_path_overlap_fails_stop_including_rename_paths(tmp
         _call(service, session)
     assert exc.value.code == "RECOVERY_BASE_SYNC_OVERLAP"
     assert exc.value.details["overlapping_paths"] == ["allowed/feature.py"]
+    assert exc.value.details["reviewed_overlap_paths"] == []
+
+
+def test_reviewed_overlap_exact_match_allows_only_overlap_gate_and_audits_paths(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    task_paths = ["allowed/feature.py", "base/region.py"]
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=task_paths)
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=task_paths)
+
+    result = _call(
+        service, session, reviewed_overlap_paths_json=json.dumps(["base/region.py"]),
+    )
+
+    assert result["control_plane_recovery"] == "CONTROL_PLANE_BASE_SYNC_RECOVERY_SUCCESS"
+    assert result["audit"]["actual_overlap_paths"] == ["base/region.py"]
+    assert result["audit"]["reviewed_overlap_paths"] == ["base/region.py"]
+    assert result["audit"]["old_base_sha"] == OLD_BASE
+    assert result["audit"]["new_base_sha"] == NEW_BASE
+    assert result["audit"]["old_session_head"] == OLD_HEAD
+    assert result["audit"]["current_head"] == CURRENT_HEAD
+    assert result["audit"]["current_tree"] == CURRENT_TREE
+    assert result["audit"]["old_workspace_revision"] == 5
+    assert result["audit"]["new_workspace_revision"] == 6
+    assert result["audit"]["new_session_revision"] == result["audit"]["old_session_revision"] + 1
+
+
+def test_reviewed_overlap_missing_one_actual_path_fails_closed(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    overlap_paths = ["allowed/feature.py", "base/region.py"]
+    service.repo.set_compare(OLD_BASE, NEW_BASE, paths=overlap_paths)
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=overlap_paths)
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=overlap_paths)
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session, reviewed_overlap_paths_json=json.dumps(["base/region.py"]))
+
+    assert exc.value.code == "RECOVERY_BASE_SYNC_OVERLAP"
+    assert exc.value.details["actual_overlap_paths"] == sorted(overlap_paths)
+    assert exc.value.details["missing_reviewed_overlap_paths"] == ["allowed/feature.py"]
+    assert exc.value.details["unexpected_reviewed_overlap_paths"] == []
+
+
+def test_reviewed_overlap_extra_path_fails_closed(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    task_paths = ["allowed/feature.py", "base/region.py"]
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=task_paths)
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=task_paths)
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(
+            service, session,
+            reviewed_overlap_paths_json=json.dumps(["base/region.py", "extra/not-overlap.py"]),
+        )
+
+    assert exc.value.code == "RECOVERY_BASE_SYNC_OVERLAP"
+    assert exc.value.details["missing_reviewed_overlap_paths"] == []
+    assert exc.value.details["unexpected_reviewed_overlap_paths"] == ["extra/not-overlap.py"]
+
+
+def test_reviewed_overlap_rename_identity_must_match_server_actual_path(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    service.repo.set_compare(
+        OLD_BASE,
+        NEW_BASE,
+        paths=["base/renamed.py"],
+        previous={"base/renamed.py": "allowed/feature.py"},
+    )
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session, reviewed_overlap_paths_json=json.dumps(["base/renamed.py"]))
+
+    assert exc.value.code == "RECOVERY_BASE_SYNC_OVERLAP"
+    assert exc.value.details["actual_overlap_paths"] == ["allowed/feature.py"]
+    assert exc.value.details["missing_reviewed_overlap_paths"] == ["allowed/feature.py"]
+    assert exc.value.details["unexpected_reviewed_overlap_paths"] == ["base/renamed.py"]
+
+
+def test_reviewed_overlap_json_rejects_duplicates_before_recovery(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session, reviewed_overlap_paths_json='["base/region.py","base/region.py"]')
+    assert exc.value.code == "SEARCH_QUERY_INVALID"
 
 
 def test_preexisting_historical_task_path_outside_late_phase_scope_is_ignored_when_unchanged(tmp_path, monkeypatch):
@@ -442,10 +524,12 @@ def test_exact_824_cumulative_pr_late_phase_workspace_base_sync_recovery_passes(
 
 def test_external_advance_adds_outside_scope_task_path_fails_closed(tmp_path, monkeypatch):
     service, session, _ = _seed(tmp_path, monkeypatch)
+    task_paths = ["allowed/feature.py", "base/region.py"]
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=task_paths)
     service.repo.set_compare(OLD_HEAD, CURRENT_HEAD, paths=["base/region.py", "outside/new.py"])
-    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=["allowed/feature.py", "outside/new.py"])
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=task_paths + ["outside/new.py"])
     with pytest.raises(recovery.MyGithub12Error) as exc:
-        _call(service, session)
+        _call(service, session, reviewed_overlap_paths_json=json.dumps(["base/region.py"]))
     assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
     assert exc.value.details["outside_scope_paths"] == ["outside/new.py"]
 
@@ -742,6 +826,9 @@ def test_t16_legacy_merged_workspace_high_overlap_is_ignored_only_with_exact_mer
 
 def test_t16_active_overlapping_writer_is_never_ignored_without_terminal_merged_evidence(tmp_path, monkeypatch):
     service, session, _ = _seed(tmp_path, monkeypatch)
+    task_paths = ["allowed/feature.py", "base/region.py"]
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=task_paths)
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=task_paths)
     with sessions._LOCK, sessions._db() as db:
         db.execute(
             "INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -768,7 +855,7 @@ def test_t16_active_overlapping_writer_is_never_ignored_without_terminal_merged_
         },
     )
     with pytest.raises(recovery.MyGithub12Error) as exc:
-        _call(service, session)
+        _call(service, session, reviewed_overlap_paths_json=json.dumps(["base/region.py"]))
     assert exc.value.code == "RECOVERY_WORKSPACE_OVERLAP"
 
 

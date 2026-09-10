@@ -21,6 +21,40 @@ PINNED_BASE_HISTORICAL_OLD = "historical_old_base"
 PINNED_BASE_ALREADY_NEW = "already_pinned_new_base"
 
 
+def _parse_reviewed_overlap_paths(reviewed_overlap_paths_json: str) -> list[str]:
+    """Parse an exact caller-reviewed overlap set without path normalization."""
+    raw = reviewed_overlap_paths_json or "[]"
+    try:
+        values = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise MyGithub12Error(
+            "SEARCH_QUERY_INVALID",
+            "reviewed_overlap_paths_json must be a JSON array of exact Git paths",
+        ) from exc
+    if not isinstance(values, list):
+        raise MyGithub12Error(
+            "SEARCH_QUERY_INVALID",
+            "reviewed_overlap_paths_json must be a JSON array of exact Git paths",
+        )
+    reviewed: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value:
+            raise MyGithub12Error(
+                "SEARCH_QUERY_INVALID",
+                "reviewed_overlap_paths_json entries must be non-empty exact Git path strings",
+            )
+        if value in seen:
+            raise MyGithub12Error(
+                "SEARCH_QUERY_INVALID",
+                "reviewed_overlap_paths_json must not contain duplicate paths",
+                {"duplicate_path": value},
+            )
+        seen.add(value)
+        reviewed.append(value)
+    return sorted(reviewed)
+
+
 def _classify_pinned_base_state(
     workspace_base_sha: str,
     session_base_sha: str,
@@ -58,9 +92,10 @@ def _base_sync_request_identity(
     expected_old_session_head_sha: str,
     expected_current_head_sha: str,
     expected_current_tree_sha: str,
+    reviewed_overlap_paths: list[str],
     lease_seconds: int,
 ) -> dict[str, Any]:
-    return {
+    request = {
         "repository": repository,
         "branch": branch,
         "workspace_id": workspace_id,
@@ -75,6 +110,9 @@ def _base_sync_request_identity(
         "expected_current_tree_sha": expected_current_tree_sha,
         "lease_seconds": int(lease_seconds),
     }
+    if reviewed_overlap_paths:
+        request["reviewed_overlap_paths"] = list(reviewed_overlap_paths)
+    return request
 
 
 def _compare_delta(
@@ -157,6 +195,7 @@ def _verify_base_sync_deltas(
     new_base_sha: str,
     old_session_head_sha: str,
     current_head_sha: str,
+    reviewed_overlap_paths: list[str],
 ) -> dict[str, Any]:
     try:
         old_session_tree = mygithub12._tree_sha(repo.get_commit(old_session_head_sha))
@@ -191,12 +230,19 @@ def _verify_base_sync_deltas(
     historical_base_overlap = sorted(set(old_task_delta_paths) & set(base_delta_paths))
     current_base_overlap = sorted(set(new_task_delta_paths) & set(base_delta_paths))
     overlap = sorted(set(historical_base_overlap) | set(current_base_overlap))
-    if overlap:
+    reviewed_overlap = sorted(reviewed_overlap_paths)
+    if overlap != reviewed_overlap:
+        missing_reviewed = sorted(set(overlap) - set(reviewed_overlap))
+        unexpected_reviewed = sorted(set(reviewed_overlap) - set(overlap))
         raise MyGithub12Error(
             "RECOVERY_BASE_SYNC_OVERLAP",
-            "base synchronization overlaps task-owned changed paths",
+            "base synchronization overlap was not reviewed with an exact path-set match",
             {
                 "overlapping_paths": overlap,
+                "actual_overlap_paths": overlap,
+                "reviewed_overlap_paths": reviewed_overlap,
+                "missing_reviewed_overlap_paths": missing_reviewed,
+                "unexpected_reviewed_overlap_paths": unexpected_reviewed,
                 "historical_base_overlap_paths": historical_base_overlap,
                 "current_base_overlap_paths": current_base_overlap,
                 "old_task_delta_paths": old_task_delta_paths,
@@ -246,6 +292,8 @@ def _verify_base_sync_deltas(
         "historical_base_overlap_paths": historical_base_overlap,
         "current_base_overlap_paths": current_base_overlap,
         "base_task_overlap_paths": overlap,
+        "actual_overlap_paths": overlap,
+        "reviewed_overlap_paths": reviewed_overlap,
     }
 
 
@@ -587,6 +635,10 @@ def _atomic_recover_base_sync(
                 "old_session_head": old_session_head,
                 "adopted_head": current_head,
                 "adopted_tree": current_tree,
+                "current_head": current_head,
+                "current_tree": current_tree,
+                "actual_overlap_paths": verification["deltas"]["actual_overlap_paths"],
+                "reviewed_overlap_paths": verification["deltas"]["reviewed_overlap_paths"],
                 "base_ancestry": verification["deltas"]["base_ancestry"],
                 "old_task_ancestry": verification["deltas"]["old_task_ancestry"],
                 "task_ancestry": verification["deltas"]["task_ancestry"],
@@ -723,8 +775,9 @@ def recover_base_synced_task(
     expected_current_tree_sha: str,
     idempotency_key: str,
     lease_seconds: int = mygithub12.DEFAULT_LEASE_SECONDS,
+    reviewed_overlap_paths_json: str = "[]",
 ) -> dict[str, Any]:
-    """Adopt an already-completed, conflict-free base synchronization without moving Git refs."""
+    """Adopt a verified base sync, allowing only an exact explicitly reviewed overlap set."""
     if not repository or "/" not in repository or not branch:
         raise MyGithub12Error("SEARCH_QUERY_INVALID", "repository and branch are required")
     if not workspace_id or not development_session_id or not idempotency_key:
@@ -742,6 +795,7 @@ def recover_base_synced_task(
             "base-sync recovery requires distinct old pinned and new live base SHAs",
             {"expected_old_base_sha": expected_old_base_sha, "expected_new_base_sha": expected_new_base_sha},
         )
+    reviewed_overlap_paths = _parse_reviewed_overlap_paths(reviewed_overlap_paths_json)
     workspace = mygithub12.get_workspace(service, workspace_id)
     session = sessions.get_session(development_session_id)
     request = _base_sync_request_identity(
@@ -757,6 +811,7 @@ def recover_base_synced_task(
         expected_old_session_head_sha,
         expected_current_head_sha,
         expected_current_tree_sha,
+        reviewed_overlap_paths,
         lease_seconds,
     )
     identity_ok = (
@@ -854,6 +909,7 @@ def recover_base_synced_task(
         expected_new_base_sha,
         expected_old_session_head_sha,
         expected_current_head_sha,
+        reviewed_overlap_paths,
     )
     # Scope/ownership apply only to task-owned changes after the old Session HEAD.
     scope = _verify_base_sync_scope(workspace, deltas["recovery_scope_delta_paths"])
