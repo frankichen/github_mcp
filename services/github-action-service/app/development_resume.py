@@ -890,120 +890,252 @@ def _transient_recovery_failure(session: dict[str, Any], reason: str, **details:
     }
 
 
-def _reconcile_transient_validation(session: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], str | None]:
-    """Reconcile one exact persisted validation without starting CI or touching Git."""
+def _reconcile_transient_validation(
+    session: dict[str, Any], workspace: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any], str | None]:
+    """Reconcile exactly one persisted Request -> Worker pair without starting CI."""
     mode = TRANSIENT_VALIDATION_STATUSES[str(session["status"])]
     expected_profile = "repo-fast-check" if mode == "fast" else "repo-auto-check"
+    expected_base = str(session.get("base_commit_sha") or workspace.get("base_commit_sha") or "")
+    session_id = str(session["session_id"])
+    session_revision = int(session["session_revision"])
+    workspace_revision = int(workspace.get("revision") or 0)
+    if (
+        int(session.get("workspace_revision") or 0) != workspace_revision
+        or session.get("workspace_id") not in {None, "", workspace.get("workspace_id")}
+        or session.get("repository") != workspace.get("repository")
+        or session.get("branch") != workspace.get("branch")
+        or session.get("head_commit_sha") != workspace.get("head_sha")
+        or session.get("tree_sha") != workspace.get("tree_sha")
+        or expected_base != str(workspace.get("base_commit_sha") or "")
+        or workspace.get("status") != "active"
+        or workspace.get("drift_reason")
+    ):
+        recovery = _transient_recovery_failure(session, "validation_workspace_session_cas_mismatch")
+        return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+
     correlations = sessions.validation_correlations(
-        str(session["session_id"]),
-        int(session["session_revision"]),
-        mode,
-        str(session["head_commit_sha"]),
-        str(session["tree_sha"]),
+        session_id, session_revision, mode,
+        str(session["head_commit_sha"]), str(session["tree_sha"]),
     )
-    current_revision = int(session["session_revision"])
-    current_correlations = [
-        item for item in correlations if int(item.get("session_revision") or 0) == current_revision
-    ]
-    if current_correlations:
-        eligible_correlations = current_correlations
-        correlation_source = "current_session_revision"
-    else:
-        last_job_field = "last_fast_ci_job_id" if mode == "fast" else "last_full_ci_job_id"
-        observed_job_id = str(session.get(last_job_field) or "")
-        eligible_correlations = [
-            item for item in correlations if observed_job_id and str(item.get("job_id")) == observed_job_id
-        ]
-        correlation_source = "session_last_observed_job"
-    by_job_id = {
-        str(item.get("job_id")): item for item in eligible_correlations if item.get("job_id")
-    }
-    if len(by_job_id) != 1:
+    request_ids = sorted({str(item.get("request_id")) for item in correlations if item.get("request_id")})
+    job_ids = sorted({str(item.get("job_id")) for item in correlations if item.get("job_id")})
+    if len(request_ids) > 1:
         recovery = _transient_recovery_failure(
-            session,
-            "validation_job_correlation_not_unique",
-            correlation_count=len(by_job_id),
-            correlation_source=correlation_source,
+            session, "validation_request_correlation_not_unique",
+            correlation_count=len(request_ids), request_ids=request_ids,
         )
         return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
 
-    job_id, correlation = next(iter(by_job_id.items()))
-    job = db_get_job(job_id)
-    if not job:
-        recovery = _transient_recovery_failure(session, "validation_job_not_found", job_id=job_id)
+    correlation_source = "persisted_request_id"
+    if request_ids:
+        request_id = request_ids[0]
+        request = ci_request_store.get_ci_request(request_id)
+    else:
+        if len(job_ids) != 1:
+            recovery = _transient_recovery_failure(
+                session, "validation_request_correlation_missing",
+                strict_job_correlation_count=len(job_ids),
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+        request = ci_request_store.get_ci_request_by_worker_job_id(job_ids[0])
+        request_id = str((request or {}).get("request_id") or "")
+        correlation_source = "legacy_exact_job_to_request"
+    if not request or not request_id:
+        recovery = _transient_recovery_failure(
+            session, "validation_request_not_found", request_id=request_id or None,
+        )
         return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
-    identity_matches = (
-        job.get("repository") == session.get("repository")
+
+    payload = ci_request_store.get_ci_request_payload(request_id)
+    request_tree = str(request.get("tree_sha") or "")
+    request_identity_matches = (
+        request.get("repository") == session.get("repository")
+        and request.get("branch") == session.get("branch")
+        and request.get("commit_sha") == session.get("head_commit_sha")
+        and request.get("profile") == expected_profile
+        and request_tree == session.get("tree_sha")
+        and payload.get("repository") == session.get("repository")
+        and payload.get("branch") == session.get("branch")
+        and payload.get("commit_sha") == session.get("head_commit_sha")
+        and payload.get("tree_sha") == session.get("tree_sha")
+        and payload.get("profile") == expected_profile
+        and payload.get("mode") == mode
+        and payload.get("base_sha") == expected_base
+        and payload.get("development_session_id") in {None, "", session_id}
+        and payload.get("workspace_id") in {None, "", workspace.get("workspace_id")}
+    )
+    if not request_identity_matches:
+        recovery = _transient_recovery_failure(
+            session, "validation_request_identity_mismatch",
+            request_id=request_id, expected_profile=expected_profile,
+        )
+        return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+
+    worker_job_id = str(request.get("worker_job_id") or "")
+    if not worker_job_id:
+        if job_ids:
+            recovery = _transient_recovery_failure(
+                session, "validation_request_worker_pair_mismatch",
+                request_id=request_id, persisted_job_ids=job_ids,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+        request_phase = str(request.get("phase") or request.get("status") or "")
+        if request_phase not in {"accepted", "preparing", "queued"}:
+            recovery = _transient_recovery_failure(
+                session, "validation_request_worker_missing_terminal",
+                request_id=request_id, request_phase=request_phase,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+        return session, {
+            "transient_validation": True,
+            "reconciled": False,
+            "validation_in_progress": True,
+            "mode": mode,
+            "correlation_source": correlation_source,
+            "request": {"request_id": request_id, "phase": request_phase, "worker_job_id": None},
+        }, "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS"
+
+    if job_ids and any(job_id != worker_job_id for job_id in job_ids):
+        recovery = _transient_recovery_failure(
+            session, "validation_request_worker_pair_mismatch",
+            request_id=request_id, worker_job_id=worker_job_id, persisted_job_ids=job_ids,
+        )
+        return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    job = db_get_job(worker_job_id)
+    if not job:
+        recovery = _transient_recovery_failure(
+            session, "validation_job_not_found", request_id=request_id, job_id=worker_job_id,
+        )
+        return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    worker_identity_matches = (
+        job.get("job_id") == worker_job_id
+        and job.get("repository") == session.get("repository")
         and job.get("branch") == session.get("branch")
         and job.get("commit_sha") == session.get("head_commit_sha")
         and job.get("profile") == expected_profile
+        and job.get("base_sha") == expected_base
     )
     job_tree = (job.get("summary") or {}).get("git_tree_sha") if isinstance(job.get("summary"), dict) else None
-    if not identity_matches or (job_tree and job_tree != session.get("tree_sha")):
+    tree_proven = bool(job_tree == session.get("tree_sha")) if job_tree else bool(
+        request_tree == session.get("tree_sha")
+        and job.get("commit_sha") == request.get("commit_sha")
+        and request.get("worker_job_id") == worker_job_id
+    )
+    if (
+        not worker_identity_matches
+        or not tree_proven
+        or job.get("superseded_by_job_id")
+        or str(job.get("status") or "") == "superseded"
+    ):
         recovery = _transient_recovery_failure(
-            session,
-            "validation_job_identity_mismatch",
-            job_id=job_id,
-            expected_profile=expected_profile,
+            session, "validation_job_identity_mismatch",
+            request_id=request_id, job_id=worker_job_id, expected_profile=expected_profile,
         )
         return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
 
     status = str(job.get("status") or "")
+    reusable_attestation = None
+    if status == "passed" and mode == "full":
+        if job.get("exit_code") != 0:
+            recovery = _transient_recovery_failure(
+                session, "validation_full_pass_exit_code_invalid", job_id=worker_job_id,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+        attestation_validation = attestation_registry.find_reusable_attestation_for_job(worker_job_id)
+        reusable_attestation = (
+            attestation_validation.get("attestation")
+            if isinstance(attestation_validation, dict) else None
+        )
+        attestation_matches = bool(
+            attestation_validation.get("ok") is True
+            and attestation_validation.get("reusable") is True
+            and isinstance(reusable_attestation, dict)
+            and reusable_attestation.get("repository") == session.get("repository")
+            and reusable_attestation.get("tested_commit_sha") == session.get("head_commit_sha")
+            and reusable_attestation.get("tested_tree_sha") == session.get("tree_sha")
+            and reusable_attestation.get("base_sha") == expected_base
+            and reusable_attestation.get("private_ci_job_id") == worker_job_id
+            and reusable_attestation.get("profile") == expected_profile
+        )
+        if not attestation_matches:
+            recovery = _transient_recovery_failure(
+                session, "validation_full_attestation_not_reusable", job_id=worker_job_id,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+
+    try:
+        binding = sessions.bind_validation_request_worker(
+            session_id, session_revision, workspace_revision, mode,
+            str(session["head_commit_sha"]), str(session["tree_sha"]), request_id, worker_job_id,
+        )
+    except MyGithub12Error as exc:
+        recovery = _transient_recovery_failure(
+            session, "validation_correlation_backfill_failed",
+            request_id=request_id, job_id=worker_job_id, error_code=exc.code,
+        )
+        return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+
     if status in VALIDATION_IN_PROGRESS_STATUSES:
         return session, {
             "transient_validation": True,
             "reconciled": False,
             "validation_in_progress": True,
             "mode": mode,
+            "correlation_source": correlation_source,
+            "correlation_backfill": binding,
+            "request": {"request_id": request_id, "worker_job_id": worker_job_id},
+            "tree_evidence": "ci_job_summary" if job_tree else "request_tree_worker_pair",
             "job": _ci_summary(job),
         }, "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS"
-    if status not in dx.VALIDATION_TERMINAL_STATUSES or not job_tree:
-        # Older fast jobs did not persist git_tree_sha. An exact Git commit is
-        # immutable, and resume_task already proved that branch, Workspace and
-        # Session all resolve that commit to the Session tree.
-        commit_proves_tree = (
-            not job_tree
-            and job.get("commit_sha") == session.get("head_commit_sha")
-            and correlation.get("tree_sha") in {"", session.get("tree_sha")}
-        )
-    else:
-        commit_proves_tree = False
-    if status not in dx.VALIDATION_TERMINAL_STATUSES or (not job_tree and not commit_proves_tree):
+    if status not in dx.VALIDATION_TERMINAL_STATUSES:
         recovery = _transient_recovery_failure(
-            session,
-            "validation_job_terminal_evidence_incomplete",
-            job_id=job_id,
-            job_status=status,
+            session, "validation_job_terminal_evidence_incomplete",
+            request_id=request_id, job_id=worker_job_id, job_status=status,
         )
         return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
 
+    correlation = next(
+        (
+            item for item in correlations
+            if str(item.get("request_id") or "") == request_id
+            and isinstance(item.get("evidence"), dict)
+            and isinstance(item["evidence"].get("selection"), dict)
+        ),
+        correlations[0] if correlations else {},
+    )
     evidence = correlation.get("evidence") if isinstance(correlation.get("evidence"), dict) else {}
     selection = evidence.get("selection") if isinstance(evidence.get("selection"), dict) else {}
     result = dx.validation_result(
-        str(session["session_id"]), int(session["session_revision"]), mode, job, selection, True
+        session_id, session_revision, mode, job, selection, True,
+        request_id=request_id, reusable_attestation=reusable_attestation,
+        allow_attestation_creation=False,
     )
-    fields = {"last_fast_ci_job_id" if mode == "fast" else "last_full_ci_job_id": job_id}
+    if status == "passed" and mode == "full" and not result.get("merge_eligible"):
+        recovery = _transient_recovery_failure(
+            session, "validation_full_pass_not_merge_eligible", job_id=worker_job_id,
+        )
+        return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    fields = {"last_fast_ci_job_id" if mode == "fast" else "last_full_ci_job_id": worker_job_id}
     attestation = result.get("attestation")
     if isinstance(attestation, dict) and attestation.get("attestation_id"):
         fields["last_attestation_id"] = attestation["attestation_id"]
     failure = result.get("failure_pack")
     if isinstance(failure, dict) and failure.get("resource_uri"):
         fields["last_failure_resource_uri"] = failure["resource_uri"]
-    next_status = "pr_ready" if result.get("merge_eligible") else "active"
+    next_status = "pr_ready" if mode == "full" and result.get("merge_eligible") else "active"
     recovered_session = sessions.transition(
-        str(session["session_id"]),
-        int(session["session_revision"]),
-        next_status,
-        event_type="validation_reconciled",
-        allowed_from={str(session["status"])},
-        fields=fields,
+        session_id, session_revision, next_status,
+        event_type="validation_reconciled", allowed_from={str(session["status"])}, fields=fields,
     )
     return recovered_session, {
         "transient_validation": True,
         "reconciled": True,
         "mode": mode,
         "correlation_source": correlation_source,
-        "tree_evidence": "ci_job_summary" if job_tree else "exact_immutable_commit_identity",
+        "correlation_backfill": binding,
+        "request": {"request_id": request_id, "worker_job_id": worker_job_id},
+        "tree_evidence": "ci_job_summary" if job_tree else "request_tree_worker_pair",
         "job": _ci_summary(job),
         "validation_result": result,
     }, None
@@ -1195,7 +1327,7 @@ def resume_task(
             and session.get("status") in TRANSIENT_VALIDATION_STATUSES
             and recover_stale_session
         ):
-            session, transient_recovery, transient_blocker = _reconcile_transient_validation(session)
+            session, transient_recovery, transient_blocker = _reconcile_transient_validation(session, workspace)
             recovery = {**(recovery or {}), "transient": transient_recovery}
             if transient_blocker:
                 blockers.append(transient_blocker)

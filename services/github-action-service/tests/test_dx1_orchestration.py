@@ -167,6 +167,33 @@ def test_validation_correlation_is_restart_durable_and_idempotent(tmp_path, monk
     assert correlations[0]["finished_at"] is not None
 
 
+def test_validation_request_anchor_late_worker_binding_is_one_logical_row(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "validation-request-anchor.db"))
+    created = sessions.create_session(_workspace(), idempotency_key="request-anchor")
+    validating = sessions.transition(
+        created["session_id"], created["session_revision"], "validating_fast", allowed_from={"active"}
+    )
+    first_id = sessions.record_validation(
+        validating["session_id"], validating["session_revision"], "fast", SHA_B, SHA_C,
+        request_id="ci_req_exact", status="preparing",
+        evidence={"selection": {"complete": True}, "request_id": "ci_req_exact"},
+    )
+    second_id = sessions.record_validation(
+        validating["session_id"], validating["session_revision"], "fast", SHA_B, SHA_C,
+        request_id="ci_req_exact", job_id="job-late", status="passed",
+        evidence={"selection": {"complete": True}, "request_id": "ci_req_exact"}, finished=True,
+    )
+    correlations = sessions.validation_correlations(
+        validating["session_id"], validating["session_revision"], "fast", SHA_B, SHA_C,
+    )
+
+    assert second_id == first_id
+    assert len(correlations) == 1
+    assert correlations[0]["request_id"] == "ci_req_exact"
+    assert correlations[0]["request_id_source"] == "column"
+    assert correlations[0]["job_id"] == "job-late"
+
+
 def test_atomic_session_workspace_auto_renew_syncs_revisions_and_audit(tmp_path, monkeypatch):
     monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "auto-renew.db"))
     monkeypatch.setattr(sessions, "_now", lambda: 1000.0)

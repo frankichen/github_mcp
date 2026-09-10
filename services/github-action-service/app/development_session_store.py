@@ -79,6 +79,7 @@ def init_session_db() -> None:
               mode TEXT NOT NULL,
               commit_sha TEXT NOT NULL,
               tree_sha TEXT NOT NULL,
+              request_id TEXT,
               job_id TEXT,
               status TEXT NOT NULL,
               merge_eligible INTEGER NOT NULL DEFAULT 0,
@@ -90,6 +91,21 @@ def init_session_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_development_session_validations_session
               ON development_session_validations(session_id,id);
             """
+        )
+        validation_columns = {
+            row[1] for row in db.execute("PRAGMA table_info(development_session_validations)").fetchall()
+        }
+        if "request_id" not in validation_columns:
+            db.execute("ALTER TABLE development_session_validations ADD COLUMN request_id TEXT")
+        db.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_development_session_validation_request
+               ON development_session_validations(session_id,request_id)
+               WHERE request_id IS NOT NULL AND request_id <> ''"""
+        )
+        db.execute(
+            """CREATE INDEX IF NOT EXISTS idx_development_session_validation_job
+               ON development_session_validations(session_id,job_id)
+               WHERE job_id IS NOT NULL AND job_id <> ''"""
         )
 
 
@@ -567,34 +583,118 @@ def finalize_merged_session_workspace(
     workspace_value["index_pin_grace_expires_at"] = 0.0
     return {"session": _public(updated), "workspace": workspace_value, "audit": audit}
 
-def record_validation(session_id: str, session_revision: int, mode: str, commit_sha: str, tree_sha: str, *, job_id: str = "", status: str = "queued", merge_eligible: bool = False, attestation_id: str = "", evidence: dict[str, Any] | None = None, finished: bool = False) -> int:
+def _validation_request_id(row: sqlite3.Row | dict[str, Any], evidence: dict[str, Any] | None = None) -> str:
+    value = dict(row)
+    first_class = str(value.get("request_id") or "")
+    if first_class:
+        return first_class
+    if evidence is None:
+        try:
+            evidence = json.loads(value.get("evidence_json") or "{}")
+        except (TypeError, ValueError):
+            evidence = {}
+    return str((evidence or {}).get("request_id") or "")
+
+
+def record_validation(
+    session_id: str, session_revision: int, mode: str, commit_sha: str, tree_sha: str, *,
+    request_id: str = "", job_id: str = "", status: str = "queued", merge_eligible: bool = False,
+    attestation_id: str = "", evidence: dict[str, Any] | None = None, finished: bool = False,
+) -> int:
+    """Persist one logical managed validation without creating NULL-job duplicates."""
     init_session_db()
-    get_session(session_id)
+    payload = dict(evidence or {})
+    logical_request_id = str(request_id or payload.get("request_id") or "")
+    logical_job_id = str(job_id or "")
+    if logical_request_id:
+        payload["request_id"] = logical_request_id
     with _LOCK, _db() as db:
-        existing = db.execute(
-            """SELECT id FROM development_session_validations
-               WHERE session_id=? AND session_revision=? AND mode=? AND commit_sha=?
-                 AND tree_sha=? AND job_id=? ORDER BY id DESC LIMIT 1""",
-            (session_id, session_revision, mode, commit_sha, tree_sha, job_id or None),
+        session_row = db.execute(
+            "SELECT * FROM development_sessions WHERE session_id=?", (session_id,)
         ).fetchone()
+        if not session_row:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_NOT_FOUND", "development session was not found",
+                {"development_session_id": session_id},
+            )
+        if int(session_row["session_revision"]) != int(session_revision):
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_REVISION_MISMATCH", "development session revision changed",
+                {"expected": int(session_revision), "actual": int(session_row["session_revision"])},
+            )
+        if session_row["status"] in TERMINAL_STATES:
+            raise MyGithub12Error("DEVELOPMENT_SESSION_CLOSED", "development session is not active")
+
+        existing = None
+        if logical_request_id:
+            existing = db.execute(
+                """SELECT * FROM development_session_validations
+                   WHERE session_id=? AND request_id=? ORDER BY id DESC LIMIT 1""",
+                (session_id, logical_request_id),
+            ).fetchone()
+            if existing and (
+                existing["mode"] != mode
+                or existing["commit_sha"] != commit_sha
+                or (tree_sha and existing["tree_sha"] not in {"", tree_sha})
+                or int(existing["session_revision"]) > int(session_revision)
+            ):
+                raise MyGithub12Error(
+                    "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                    "validation request_id is already bound to another validation identity",
+                    {"request_id": logical_request_id},
+                )
+        elif logical_job_id:
+            existing = db.execute(
+                """SELECT * FROM development_session_validations
+                   WHERE session_id=? AND session_revision=? AND mode=? AND commit_sha=?
+                     AND tree_sha=? AND job_id=? ORDER BY id DESC LIMIT 1""",
+                (session_id, session_revision, mode, commit_sha, tree_sha, logical_job_id),
+            ).fetchone()
+        else:
+            existing = db.execute(
+                """SELECT * FROM development_session_validations
+                   WHERE session_id=? AND session_revision=? AND mode=? AND commit_sha=?
+                     AND tree_sha=? AND job_id IS NULL AND request_id IS NULL
+                   ORDER BY id DESC LIMIT 1""",
+                (session_id, session_revision, mode, commit_sha, tree_sha),
+            ).fetchone()
+
         if existing:
+            existing_job_id = str(existing["job_id"] or "")
+            if existing_job_id and logical_job_id and existing_job_id != logical_job_id:
+                raise MyGithub12Error(
+                    "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                    "validation request is already bound to another Worker job",
+                    {"request_id": logical_request_id or None, "existing_job_id": existing_job_id, "job_id": logical_job_id},
+                )
             db.execute(
                 """UPDATE development_session_validations
-                   SET status=?,merge_eligible=?,attestation_id=?,evidence_json=?,finished_at=?
+                   SET request_id=?,job_id=?,status=?,merge_eligible=?,attestation_id=?,evidence_json=?,finished_at=?
                    WHERE id=?""",
                 (
+                    logical_request_id or existing["request_id"],
+                    logical_job_id or existing["job_id"],
                     status,
                     1 if merge_eligible else 0,
                     attestation_id or None,
-                    json.dumps(evidence or {}, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
                     _now() if finished else None,
                     int(existing["id"]),
                 ),
             )
             return int(existing["id"])
         cur = db.execute(
-            """INSERT INTO development_session_validations(session_id,session_revision,mode,commit_sha,tree_sha,job_id,status,merge_eligible,attestation_id,evidence_json,created_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (session_id, session_revision, mode, commit_sha, tree_sha, job_id or None, status, 1 if merge_eligible else 0, attestation_id or None, json.dumps(evidence or {}, ensure_ascii=False, separators=(",", ":")), _now(), _now() if finished else None),
+            """INSERT INTO development_session_validations(
+               session_id,session_revision,mode,commit_sha,tree_sha,request_id,job_id,status,
+               merge_eligible,attestation_id,evidence_json,created_at,finished_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                session_id, session_revision, mode, commit_sha, tree_sha,
+                logical_request_id or None, logical_job_id or None, status,
+                1 if merge_eligible else 0, attestation_id or None,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                _now(), _now() if finished else None,
+            ),
         )
         return int(cur.lastrowid)
 
@@ -606,14 +706,14 @@ def validation_correlations(
     commit_sha: str,
     tree_sha: str,
 ) -> list[dict[str, Any]]:
-    """Return exact persisted validation/job correlations for reconciliation."""
+    """Return exact persisted request/job anchors, including legacy NULL-job placeholders."""
     init_session_db()
     get_session(session_id)
     with _db() as db:
         rows = db.execute(
             """SELECT * FROM development_session_validations
                WHERE session_id=? AND session_revision<=? AND mode=?
-                 AND commit_sha=? AND (tree_sha=? OR tree_sha='') AND job_id IS NOT NULL
+                 AND commit_sha=? AND (tree_sha=? OR tree_sha='')
                ORDER BY id DESC""",
             (session_id, session_revision, mode, commit_sha, tree_sha),
         ).fetchall()
@@ -621,9 +721,170 @@ def validation_correlations(
     for row in rows:
         item = dict(row)
         item["merge_eligible"] = bool(item["merge_eligible"])
-        item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+        try:
+            evidence_value = json.loads(item.pop("evidence_json") or "{}")
+        except (TypeError, ValueError):
+            evidence_value = {}
+        item["evidence"] = evidence_value
+        first_class_request_id = str(item.get("request_id") or "")
+        logical_request_id = first_class_request_id or str(evidence_value.get("request_id") or "")
+        item["request_id"] = logical_request_id or None
+        item["request_id_source"] = (
+            "column" if first_class_request_id else "legacy_evidence" if logical_request_id
+            else "legacy_job" if item.get("job_id") else "missing"
+        )
         result.append(item)
     return result
+
+
+def bind_validation_request_worker(
+    session_id: str,
+    expected_session_revision: int,
+    expected_workspace_revision: int,
+    mode: str,
+    commit_sha: str,
+    tree_sha: str,
+    request_id: str,
+    job_id: str,
+) -> dict[str, Any]:
+    """CAS-bind one proven durable CI Request/Worker pair to its logical validation row."""
+    if mode not in {"fast", "full"} or not request_id or not job_id:
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "validation correlation identity is incomplete"
+        )
+    expected_status = "validating_fast" if mode == "fast" else "validating_full"
+    init_session_db()
+    with _LOCK, _db() as db:
+        session_row = db.execute(
+            "SELECT * FROM development_sessions WHERE session_id=?", (session_id,)
+        ).fetchone()
+        if not session_row:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_NOT_FOUND", "development session was not found",
+                {"development_session_id": session_id},
+            )
+        if int(session_row["session_revision"]) != int(expected_session_revision):
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_REVISION_MISMATCH", "development session revision changed",
+                {"expected": int(expected_session_revision), "actual": int(session_row["session_revision"])},
+            )
+        if session_row["status"] != expected_status:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_STATE_INVALID", "development session validation phase changed",
+                {"expected_status": expected_status, "actual_status": session_row["status"]},
+            )
+        if session_row["head_commit_sha"] != commit_sha or session_row["tree_sha"] != tree_sha:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "development session Git identity changed during validation recovery"
+            )
+        if int(session_row["workspace_revision"]) != int(expected_workspace_revision):
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "session does not reference the expected Workspace revision"
+            )
+        workspace_row = db.execute(
+            "SELECT * FROM workspaces WHERE workspace_id=?", (session_row["workspace_id"],)
+        ).fetchone()
+        if not workspace_row:
+            raise MyGithub12Error("WORKSPACE_NOT_FOUND", "validation recovery Workspace was not found")
+        if int(workspace_row["revision"]) != int(expected_workspace_revision):
+            raise MyGithub12Error(
+                "WORKSPACE_REVISION_MISMATCH", "Workspace revision changed during validation recovery",
+                {"expected": int(expected_workspace_revision), "actual": int(workspace_row["revision"])},
+            )
+        if workspace_row["status"] != "active" or workspace_row["drift_reason"]:
+            raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED", "validation recovery requires an active non-drifted Workspace")
+        if float(workspace_row["lease_expires_at"] or 0) <= _now():
+            raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED", "validation recovery requires a live Workspace lease")
+        workspace_identity = (
+            workspace_row["repository"] == session_row["repository"]
+            and workspace_row["branch"] == session_row["branch"]
+            and workspace_row["base_branch"] == session_row["base_branch"]
+            and workspace_row["base_commit_sha"] == session_row["base_commit_sha"]
+            and workspace_row["head_sha"] == session_row["head_commit_sha"]
+            and workspace_row["tree_sha"] == session_row["tree_sha"]
+        )
+        if not workspace_identity:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "Session and Workspace identities differ during validation recovery"
+            )
+
+        rows = db.execute(
+            """SELECT * FROM development_session_validations
+               WHERE session_id=? AND session_revision<=? AND mode=? AND commit_sha=?
+                 AND (tree_sha=? OR tree_sha='') ORDER BY id DESC""",
+            (session_id, expected_session_revision, mode, commit_sha, tree_sha),
+        ).fetchall()
+        if not rows:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "validation recovery has no persisted correlation row"
+            )
+        decorated = []
+        distinct_request_ids: set[str] = set()
+        for row in rows:
+            try:
+                evidence_value = json.loads(row["evidence_json"] or "{}")
+            except (TypeError, ValueError):
+                evidence_value = {}
+            logical_request_id = _validation_request_id(row, evidence_value)
+            if logical_request_id:
+                distinct_request_ids.add(logical_request_id)
+            decorated.append((row, evidence_value, logical_request_id, str(row["job_id"] or "")))
+        if distinct_request_ids and distinct_request_ids != {request_id}:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "multiple logical validation request_ids are persisted",
+                {"request_ids": sorted(distinct_request_ids)},
+            )
+        strict_job_ids = {item[3] for item in decorated if item[3]}
+        if any(value != job_id for value in strict_job_ids):
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "persisted validation Worker correlation conflicts with the durable Request",
+                {"job_ids": sorted(strict_job_ids), "expected_job_id": job_id},
+            )
+        unowned = [int(item[0]["id"]) for item in decorated if not item[2] and not item[3]]
+        if unowned:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "legacy validation placeholder has neither request_id nor strict job correlation",
+                {"validation_ids": unowned},
+            )
+        candidates = [
+            item for item in decorated
+            if item[2] == request_id or (not item[2] and item[3] == job_id)
+        ]
+        if not candidates:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "durable Request/Worker pair does not own a persisted validation row"
+            )
+        first_class = [item for item in candidates if str(item[0]["request_id"] or "") == request_id]
+        canonical = (first_class or candidates)[0]
+        canonical_row = canonical[0]
+        existing_job_id = str(canonical_row["job_id"] or "")
+        if existing_job_id and existing_job_id != job_id:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "canonical validation row is bound to another Worker job"
+            )
+        try:
+            db.execute(
+                "UPDATE development_session_validations SET request_id=?,job_id=? WHERE id=?",
+                (request_id, job_id, int(canonical_row["id"])),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "request_id uniqueness changed during validation recovery"
+            ) from exc
+        duplicate_ids = [int(item[0]["id"]) for item in candidates if int(item[0]["id"]) != int(canonical_row["id"])]
+        audit = {
+            "mode": mode,
+            "request_id": request_id,
+            "job_id": job_id,
+            "canonical_validation_id": int(canonical_row["id"]),
+            "duplicate_validation_ids": duplicate_ids,
+            "logical_duplicate_count": len(duplicate_ids),
+        }
+        _append_event(
+            db, session_row, "validation_correlation_backfilled",
+            session_row["status"], session_row["status"], int(session_row["session_revision"]), audit,
+        )
+    return audit
 
 
 def list_events(session_id: str, limit: int = 100) -> list[dict[str, Any]]:
