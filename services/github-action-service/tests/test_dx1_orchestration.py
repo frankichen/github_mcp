@@ -194,6 +194,65 @@ def test_validation_request_anchor_late_worker_binding_is_one_logical_row(tmp_pa
     assert correlations[0]["job_id"] == "job-late"
 
 
+def test_legacy_evidence_request_is_promoted_without_creating_a_second_logical_row(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "validation-legacy-promotion.db"))
+    created = sessions.create_session(_workspace(), idempotency_key="legacy-promotion")
+    validating = sessions.transition(
+        created["session_id"], created["session_revision"], "validating_fast", allowed_from={"active"}
+    )
+
+    placeholder_id = sessions.record_validation(
+        validating["session_id"], validating["session_revision"], "fast", SHA_B, SHA_C,
+        status="accepted", evidence={"request_id": "ci_req_legacy", "selection": {"complete": True}},
+    )
+    promoted_id = sessions.record_validation(
+        validating["session_id"], validating["session_revision"], "fast", SHA_B, SHA_C,
+        request_id="ci_req_legacy", job_id="job-late", status="passed",
+        evidence={"request_id": "ci_req_legacy", "selection": {"complete": True}}, finished=True,
+    )
+
+    correlations = sessions.validation_correlations(
+        validating["session_id"], validating["session_revision"], "fast", SHA_B, SHA_C,
+    )
+
+    assert promoted_id == placeholder_id
+    assert len(correlations) == 1
+    assert correlations[0]["request_id"] == "ci_req_legacy"
+    assert correlations[0]["request_id_source"] == "column"
+    assert correlations[0]["job_id"] == "job-late"
+    assert correlations[0]["status"] == "passed"
+
+
+def test_terminal_validation_replay_preserves_reusable_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "validation-terminal-replay.db"))
+    created = sessions.create_session(_workspace(), idempotency_key="terminal-replay")
+    validating = sessions.transition(
+        created["session_id"], created["session_revision"], "validating_full", allowed_from={"active"}
+    )
+
+    first_id = sessions.record_validation(
+        validating["session_id"], validating["session_revision"], "full", SHA_B, SHA_C,
+        request_id="ci_req_terminal", job_id="job-terminal", status="passed",
+        merge_eligible=True, attestation_id="att-terminal",
+        evidence={"request_id": "ci_req_terminal", "selection": {"complete": True}}, finished=True,
+    )
+    replay_id = sessions.record_validation(
+        validating["session_id"], validating["session_revision"], "full", SHA_B, SHA_C,
+        request_id="ci_req_terminal", job_id="job-terminal", status="passed",
+        merge_eligible=False,
+        evidence={"request_id": "ci_req_terminal", "selection": {"complete": True}}, finished=True,
+    )
+
+    correlations = sessions.validation_correlations(
+        validating["session_id"], validating["session_revision"], "full", SHA_B, SHA_C,
+    )
+
+    assert replay_id == first_id
+    assert correlations[0]["status"] == "passed"
+    assert correlations[0]["merge_eligible"] is True
+    assert correlations[0]["attestation_id"] == "att-terminal"
+
+
 def test_validation_request_bind_backfills_legacy_duplicate_null_job_rows(tmp_path, monkeypatch):
     monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "validation-request-backfill.db"))
     monkeypatch.setattr(sessions, "_now", lambda: 1000.0)
@@ -879,6 +938,153 @@ async def test_validate_invalid_mode_fails_before_session_state_transition(monke
     assert result["ok"] is False
     assert result["error"]["code"] == "DEVELOPMENT_SESSION_STATE_INVALID"
     assert transitions == []
+
+
+@pytest.mark.asyncio
+async def test_validate_transient_terminal_evidence_is_reused_without_duplicate_request(monkeypatch):
+    mcp = StructuredFastMCP("dx-validation-reuse-terminal")
+    service = SimpleNamespace()
+    session = {
+        "session_id": "dev_test", "workspace_id": "ws_test", "repository": "owner/repo",
+        "branch": "ai/task", "base_branch": "main", "base_commit_sha": SHA_A,
+        "head_commit_sha": SHA_B, "tree_sha": SHA_C, "status": "validating_fast",
+        "session_revision": 12, "workspace_revision": 4,
+    }
+    workspace = {
+        "workspace_id": "ws_test", "repository": "owner/repo", "branch": "ai/task",
+        "base_branch": "main", "base_commit_sha": SHA_A, "head_sha": SHA_B,
+        "tree_sha": SHA_C, "revision": 4, "status": "active", "drift_reason": None,
+    }
+    recovered = {**session, "status": "active", "session_revision": 13}
+    request = {
+        "request_id": "ci_req_existing", "repository": "owner/repo", "branch": "ai/task",
+        "commit_sha": SHA_B, "tree_sha": SHA_C, "profile": "repo-fast-check",
+        "phase": "queued", "status": "queued", "revision": 2, "worker_job_id": "job-existing",
+    }
+    evidence = {
+        "transient_validation": True, "reconciled": True, "mode": "fast",
+        "request": request, "job": {"job_id": "job-existing", "status": "passed"},
+        "validation_result": {
+            "terminal": True, "merge_eligible": False, "attestation": None,
+            "failure_pack": None, "job": {"job_id": "job-existing", "status": "passed"},
+        },
+    }
+    reconcile_calls = []
+    monkeypatch.setattr(sessions, "get_session", lambda *_args: dict(session))
+    monkeypatch.setattr(
+        dx, "maybe_auto_renew_session_workspace",
+        lambda *args, **kwargs: {"renewed": False, "session": dict(session), "workspace": workspace, "remaining_seconds": 3600.0, "audit": None, "recovery": None},
+    )
+    monkeypatch.setattr(mygithub12, "workspace_write_preflight", lambda *args, **kwargs: workspace)
+
+    def reconcile(current_session, current_workspace):
+        reconcile_calls.append((current_session["session_id"], current_workspace["revision"]))
+        return recovered, evidence, None
+
+    monkeypatch.setattr(dx_mcp.resume, "_reconcile_transient_validation", reconcile)
+    monkeypatch.setattr(
+        dx, "start_validation_request",
+        lambda *args, **kwargs: pytest.fail("transient validation must not create another Request"),
+    )
+
+    async def github_call(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    dx_mcp.register_dx_tools(mcp, github_call, service, lambda *args: None)
+    result = _structured_result(await mcp.call_tool("validate_development_task", {
+        "development_session_id": session["session_id"], "expected_session_revision": 12,
+        "mode": "fast", "force_rerun": True, "supersede_previous": True,
+    }))
+
+    assert result["ok"] is True
+    assert result["validation_reused"] is True
+    assert result["validation_started"] is False
+    assert result["request"]["request_id"] == "ci_req_existing"
+    assert result["development_session"]["status"] == "active"
+    assert reconcile_calls == [("dev_test", 4)]
+
+
+@pytest.mark.asyncio
+async def test_validate_transient_running_evidence_is_reused_without_new_request(monkeypatch):
+    mcp = StructuredFastMCP("dx-validation-reuse-running")
+    service = SimpleNamespace()
+    session = {
+        "session_id": "dev_test", "workspace_id": "ws_test", "repository": "owner/repo",
+        "branch": "ai/task", "base_branch": "main", "base_commit_sha": SHA_A,
+        "head_commit_sha": SHA_B, "tree_sha": SHA_C, "status": "validating_full",
+        "session_revision": 12, "workspace_revision": 4,
+    }
+    workspace = {
+        "workspace_id": "ws_test", "repository": "owner/repo", "branch": "ai/task",
+        "base_branch": "main", "base_commit_sha": SHA_A, "head_sha": SHA_B,
+        "tree_sha": SHA_C, "revision": 4, "status": "active", "drift_reason": None,
+    }
+    request = {"request_id": "ci_req_running", "phase": "queued", "status": "queued", "worker_job_id": "job-running"}
+    evidence = {
+        "transient_validation": True, "reconciled": False, "validation_in_progress": True,
+        "mode": "full", "request": request, "job": {"job_id": "job-running", "status": "running"},
+    }
+    monkeypatch.setattr(sessions, "get_session", lambda *_args: dict(session))
+    monkeypatch.setattr(
+        dx, "maybe_auto_renew_session_workspace",
+        lambda *args, **kwargs: {"renewed": False, "session": dict(session), "workspace": workspace, "remaining_seconds": 3600.0, "audit": None, "recovery": None},
+    )
+    monkeypatch.setattr(mygithub12, "workspace_write_preflight", lambda *args, **kwargs: workspace)
+    monkeypatch.setattr(dx_mcp.resume, "_reconcile_transient_validation", lambda *_args: (session, evidence, "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS"))
+    monkeypatch.setattr(dx, "start_validation_request", lambda *args, **kwargs: pytest.fail("running validation must be reused"))
+
+    async def github_call(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    dx_mcp.register_dx_tools(mcp, github_call, service, lambda *args: None)
+    result = _structured_result(await mcp.call_tool("validate_development_task", {
+        "development_session_id": session["session_id"], "expected_session_revision": 12,
+        "mode": "full", "force_rerun": False,
+    }))
+
+    assert result["ok"] is True
+    assert result["validation_reused"] is True
+    assert result["continuation_required"] is True
+    assert result["request"]["request_id"] == "ci_req_running"
+
+
+@pytest.mark.asyncio
+async def test_validate_transient_ambiguity_fails_closed_even_with_force_rerun(monkeypatch):
+    mcp = StructuredFastMCP("dx-validation-ambiguous")
+    service = SimpleNamespace()
+    session = {
+        "session_id": "dev_test", "workspace_id": "ws_test", "repository": "owner/repo",
+        "branch": "ai/task", "base_branch": "main", "base_commit_sha": SHA_A,
+        "head_commit_sha": SHA_B, "tree_sha": SHA_C, "status": "validating_fast",
+        "session_revision": 12, "workspace_revision": 4,
+    }
+    workspace = {
+        "workspace_id": "ws_test", "repository": "owner/repo", "branch": "ai/task",
+        "base_branch": "main", "base_commit_sha": SHA_A, "head_sha": SHA_B,
+        "tree_sha": SHA_C, "revision": 4, "status": "active", "drift_reason": None,
+    }
+    recovery = {"transient_validation": True, "reconciled": False, "reason": "validation_request_correlation_not_unique", "request_ids": ["ci_req_a", "ci_req_b"]}
+    monkeypatch.setattr(sessions, "get_session", lambda *_args: dict(session))
+    monkeypatch.setattr(
+        dx, "maybe_auto_renew_session_workspace",
+        lambda *args, **kwargs: {"renewed": False, "session": dict(session), "workspace": workspace, "remaining_seconds": 3600.0, "audit": None, "recovery": None},
+    )
+    monkeypatch.setattr(mygithub12, "workspace_write_preflight", lambda *args, **kwargs: workspace)
+    monkeypatch.setattr(dx_mcp.resume, "_reconcile_transient_validation", lambda *_args: (session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"))
+    monkeypatch.setattr(dx, "start_validation_request", lambda *args, **kwargs: pytest.fail("ambiguous transient state must not start CI"))
+
+    async def github_call(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    dx_mcp.register_dx_tools(mcp, github_call, service, lambda *args: None)
+    result = _structured_result(await mcp.call_tool("validate_development_task", {
+        "development_session_id": session["session_id"], "expected_session_revision": 12,
+        "mode": "fast", "force_rerun": True,
+    }))
+
+    assert result["ok"] is False
+    assert result["recovery_required"] is True
+    assert result["error"]["code"] == "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
 
 
 @pytest.mark.asyncio

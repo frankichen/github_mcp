@@ -890,6 +890,42 @@ def _transient_recovery_failure(session: dict[str, Any], reason: str, **details:
     }
 
 
+def _session_workspace_identity_exact(
+    session: dict[str, Any], workspace: dict[str, Any],
+) -> bool:
+    """Return whether a revision/lease-only recovery is safe to attempt."""
+    return all(
+        session.get(session_key) not in (None, "")
+        and workspace.get(workspace_key) not in (None, "")
+        and session.get(session_key) == workspace.get(workspace_key)
+        for session_key, workspace_key in (
+            ("workspace_id", "workspace_id"),
+            ("repository", "repository"),
+            ("branch", "branch"),
+            ("base_branch", "base_branch"),
+            ("base_commit_sha", "base_commit_sha"),
+            ("head_commit_sha", "head_sha"),
+            ("tree_sha", "tree_sha"),
+        )
+    )
+
+
+def _validation_request_summary(request: dict[str, Any], worker_job_id: str = "") -> dict[str, Any]:
+    """Expose the durable Request identity without making its phase authoritative."""
+    return {
+        "request_id": request.get("request_id"),
+        "repository": request.get("repository"),
+        "branch": request.get("branch"),
+        "commit_sha": request.get("commit_sha"),
+        "tree_sha": request.get("tree_sha"),
+        "profile": request.get("profile"),
+        "phase": request.get("phase"),
+        "status": request.get("status"),
+        "revision": request.get("revision"),
+        "worker_job_id": worker_job_id or request.get("worker_job_id"),
+    }
+
+
 def _reconcile_transient_validation(
     session: dict[str, Any], workspace: dict[str, Any]
 ) -> tuple[dict[str, Any], dict[str, Any], str | None]:
@@ -902,11 +938,7 @@ def _reconcile_transient_validation(
     workspace_revision = int(workspace.get("revision") or 0)
     if (
         int(session.get("workspace_revision") or 0) != workspace_revision
-        or session.get("workspace_id") not in {None, "", workspace.get("workspace_id")}
-        or session.get("repository") != workspace.get("repository")
-        or session.get("branch") != workspace.get("branch")
-        or session.get("head_commit_sha") != workspace.get("head_sha")
-        or session.get("tree_sha") != workspace.get("tree_sha")
+        or not _session_workspace_identity_exact(session, workspace)
         or expected_base != str(workspace.get("base_commit_sha") or "")
         or workspace.get("status") != "active"
         or workspace.get("drift_reason")
@@ -924,6 +956,12 @@ def _reconcile_transient_validation(
         recovery = _transient_recovery_failure(
             session, "validation_request_correlation_not_unique",
             correlation_count=len(request_ids), request_ids=request_ids,
+        )
+        return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    if len(job_ids) > 1:
+        recovery = _transient_recovery_failure(
+            session, "validation_worker_correlation_not_unique",
+            correlation_count=len(job_ids), job_ids=job_ids,
         )
         return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
 
@@ -962,8 +1000,9 @@ def _reconcile_transient_validation(
         and payload.get("profile") == expected_profile
         and payload.get("mode") == mode
         and payload.get("base_sha") == expected_base
-        and payload.get("development_session_id") in {None, "", session_id}
-        and payload.get("workspace_id") in {None, "", workspace.get("workspace_id")}
+        and payload.get("base_branch") in (None, "", session.get("base_branch"))
+        and payload.get("development_session_id") in (None, "", session_id)
+        and payload.get("workspace_id") in (None, "", workspace.get("workspace_id"))
     )
     if not request_identity_matches:
         recovery = _transient_recovery_failure(
@@ -993,7 +1032,7 @@ def _reconcile_transient_validation(
             "validation_in_progress": True,
             "mode": mode,
             "correlation_source": correlation_source,
-            "request": {"request_id": request_id, "phase": request_phase, "worker_job_id": None},
+            "request": _validation_request_summary(request),
         }, "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS"
 
     if job_ids and any(job_id != worker_job_id for job_id in job_ids):
@@ -1035,6 +1074,11 @@ def _reconcile_transient_validation(
         return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
 
     status = str(job.get("status") or "")
+    if status == "passed" and job.get("exit_code") not in {None, 0}:
+        recovery = _transient_recovery_failure(
+            session, "validation_pass_exit_code_invalid", job_id=worker_job_id,
+        )
+        return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
     reusable_attestation = None
     if status == "passed" and mode == "full":
         if job.get("exit_code") != 0:
@@ -1084,7 +1128,7 @@ def _reconcile_transient_validation(
             "mode": mode,
             "correlation_source": correlation_source,
             "correlation_backfill": binding,
-            "request": {"request_id": request_id, "worker_job_id": worker_job_id},
+            "request": _validation_request_summary(request, worker_job_id),
             "tree_evidence": "ci_job_summary" if job_tree else "request_tree_worker_pair",
             "job": _ci_summary(job),
         }, "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS"
@@ -1134,7 +1178,7 @@ def _reconcile_transient_validation(
         "mode": mode,
         "correlation_source": correlation_source,
         "correlation_backfill": binding,
-        "request": {"request_id": request_id, "worker_job_id": worker_job_id},
+        "request": _validation_request_summary(request, worker_job_id),
         "tree_evidence": "ci_job_summary" if job_tree else "request_tree_worker_pair",
         "job": _ci_summary(job),
         "validation_result": result,
@@ -1304,21 +1348,38 @@ def resume_task(
         )
         if session and stale and not branch_drift:
             if recover_stale_session and workspace.get("status") == "active":
-                recovery_result = dx.recover_stale_session(
-                    service,
-                    str(session["session_id"]),
-                    int(session["session_revision"]),
-                    int(workspace["revision"]),
-                    str(workspace["head_sha"]),
-                    idempotency_key or f"resume:{session['session_id']}:{workspace['revision']}",
-                )
-                recovery = {**(recovery or {}), "session": recovery_result}
-                session = recovery_result["session"]
-                workspace = recovery_result["workspace"]
+                transient_state = session.get("status") in TRANSIENT_VALIDATION_STATUSES
+                if transient_state and not _session_workspace_identity_exact(session, workspace):
+                    # A transient validation may only cross a Workspace revision/
+                    # lease boundary when its code/base identity is unchanged.
+                    # A changed identity must remain fail-closed; the generic
+                    # stale-session forward recovery is for non-validation work.
+                    blockers.append("DEVELOPMENT_SESSION_RECOVERY_REQUIRED")
+                else:
+                    recovery_result = dx.recover_stale_session(
+                        service,
+                        str(session["session_id"]),
+                        int(session["session_revision"]),
+                        int(workspace["revision"]),
+                        str(workspace["head_sha"]),
+                        idempotency_key or f"resume:{session['session_id']}:{workspace['revision']}",
+                    )
+                    recovery = {**(recovery or {}), "session": recovery_result}
+                    session = recovery_result["session"]
+                    workspace = recovery_result["workspace"]
             else:
                 blockers.append("DEVELOPMENT_SESSION_RECOVERY_REQUIRED")
         if branch_drift:
             blockers.append("WORKSPACE_BRANCH_DRIFTED")
+        # recover_stale_session() may have advanced only the Session/Workspace
+        # revision and lease. Recompute stale before attempting to reconcile the
+        # durable Request -> Worker pair; the old boolean would skip recovery.
+        stale = bool(session) and (
+            int(session.get("workspace_revision") or 0) != int(workspace.get("revision") or 0)
+            or session.get("head_commit_sha") != workspace.get("head_sha")
+            or session.get("tree_sha") != workspace.get("tree_sha")
+            or abs(float(session.get("lease_expires_at") or 0) - float(workspace.get("lease_expires_at") or 0)) > 0.001
+        )
         if (
             session
             and not stale

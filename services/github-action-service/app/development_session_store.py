@@ -632,6 +632,28 @@ def record_validation(
                    WHERE session_id=? AND request_id=? ORDER BY id DESC LIMIT 1""",
                 (session_id, logical_request_id),
             ).fetchone()
+            if not existing:
+                # Before request_id became first-class, the same logical
+                # Request was persisted only in evidence_json while the
+                # Worker was still absent. Reuse that placeholder instead of
+                # inserting a second row when late binding supplies the
+                # first-class request_id.
+                legacy_rows = db.execute(
+                    """SELECT * FROM development_session_validations
+                       WHERE session_id=? AND mode=? AND commit_sha=?
+                         AND (tree_sha=? OR tree_sha='')
+                         AND (request_id IS NULL OR request_id='')
+                       ORDER BY id DESC""",
+                    (session_id, mode, commit_sha, tree_sha),
+                ).fetchall()
+                for legacy_row in legacy_rows:
+                    try:
+                        legacy_evidence = json.loads(legacy_row["evidence_json"] or "{}")
+                    except (TypeError, ValueError):
+                        legacy_evidence = {}
+                    if _validation_request_id(legacy_row, legacy_evidence) == logical_request_id:
+                        existing = legacy_row
+                        break
             if existing and (
                 existing["mode"] != mode
                 or existing["commit_sha"] != commit_sha
@@ -667,18 +689,68 @@ def record_validation(
                     "validation request is already bound to another Worker job",
                     {"request_id": logical_request_id or None, "existing_job_id": existing_job_id, "job_id": logical_job_id},
                 )
+            existing_status = str(existing["status"] or "")
+            existing_terminal = existing_status in {
+                "passed", "failed", "timed_out", "cancelled", "superseded",
+                "worker_lost", "internal_error", "preflight_failed",
+            }
+            incoming_terminal = status in {
+                "passed", "failed", "timed_out", "cancelled", "superseded",
+                "worker_lost", "internal_error", "preflight_failed",
+            }
+            if existing_terminal and incoming_terminal and existing_status != status:
+                raise MyGithub12Error(
+                    "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                    "logical validation has conflicting terminal Worker statuses",
+                    {
+                        "request_id": logical_request_id or existing["request_id"],
+                        "existing_status": existing_status,
+                        "status": status,
+                    },
+                )
+            if existing_terminal and not incoming_terminal:
+                # A stale Request snapshot must not overwrite terminal Worker
+                # truth during a replay or a late correlation backfill.
+                effective_status = existing_status
+                effective_merge_eligible = bool(existing["merge_eligible"])
+                effective_attestation_id = str(existing["attestation_id"] or "")
+                effective_finished_at = existing["finished_at"] or _now()
+            elif existing_terminal and incoming_terminal:
+                # Terminal evidence is monotonic for one logical validation:
+                # retain an earlier reusable attestation/eligibility while
+                # allowing a later backfill to add it when it was absent.
+                effective_status = existing_status
+                effective_merge_eligible = bool(existing["merge_eligible"]) or bool(merge_eligible)
+                effective_attestation_id = attestation_id or str(existing["attestation_id"] or "")
+                effective_finished_at = existing["finished_at"] or _now()
+            else:
+                effective_status = status
+                effective_merge_eligible = bool(merge_eligible)
+                effective_attestation_id = attestation_id or str(existing["attestation_id"] or "")
+                effective_finished_at = (
+                    _now() if finished or incoming_terminal else existing["finished_at"]
+                )
+            try:
+                existing_evidence = json.loads(existing["evidence_json"] or "{}")
+            except (TypeError, ValueError):
+                existing_evidence = {}
+            if not isinstance(existing_evidence, dict):
+                existing_evidence = {}
+            merged_payload = {**existing_evidence, **payload}
             db.execute(
                 """UPDATE development_session_validations
-                   SET request_id=?,job_id=?,status=?,merge_eligible=?,attestation_id=?,evidence_json=?,finished_at=?
+                   SET request_id=?,job_id=?,tree_sha=CASE WHEN tree_sha='' THEN ? ELSE tree_sha END,
+                       status=?,merge_eligible=?,attestation_id=?,evidence_json=?,finished_at=?
                    WHERE id=?""",
                 (
                     logical_request_id or existing["request_id"],
                     logical_job_id or existing["job_id"],
-                    status,
-                    1 if merge_eligible else 0,
-                    attestation_id or None,
-                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                    _now() if finished else None,
+                    tree_sha,
+                    effective_status,
+                    1 if effective_merge_eligible else 0,
+                    effective_attestation_id or None,
+                    json.dumps(merged_payload, ensure_ascii=False, separators=(",", ":")),
+                    effective_finished_at,
                     int(existing["id"]),
                 ),
             )
