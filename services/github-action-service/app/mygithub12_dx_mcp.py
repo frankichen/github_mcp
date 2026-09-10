@@ -117,9 +117,10 @@ def register_dx_tools(
     @mcp.tool(
         name="recover_base_synced_development_task",
         description=(
-            "Explicitly adopt a freshly verified conflict-free base synchronization into a drifted "
-            "Workspace/Development Session. Requires exact old/new base, old Session HEAD and current "
-            "HEAD/Tree identities; never moves Git refs or writes repository files."
+            "Explicitly adopt a freshly verified base synchronization into a drifted Workspace/Development "
+            "Session. Overlap remains fail-closed unless reviewed_overlap_paths_json exactly equals the "
+            "server-recomputed rename-aware overlap path set. Requires exact old/new base, old Session HEAD "
+            "and current HEAD/Tree identities; never moves Git refs or writes repository files."
         ),
         annotations=_ORCHESTRATION,
     )
@@ -138,13 +139,14 @@ def register_dx_tools(
         expected_current_tree_sha: str,
         idempotency_key: str,
         lease_seconds: int=mygithub12.DEFAULT_LEASE_SECONDS,
+        reviewed_overlap_paths_json: str="[]",
     ) -> str:
         try:
             result=await github_call(
                 base_sync_recovery.recover_base_synced_task,service,repository,branch,workspace_id,development_session_id,
                 expected_workspace_revision,expected_session_revision,expected_old_base_sha,expected_new_base_sha,
                 expected_base_branch,expected_old_session_head_sha,expected_current_head_sha,expected_current_tree_sha,
-                idempotency_key,lease_seconds,
+                idempotency_key,lease_seconds,reviewed_overlap_paths_json,
             )
             return json.dumps(result,ensure_ascii=False)
         except Exception as exc: return _error(exc)

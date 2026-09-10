@@ -99,6 +99,10 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
         "expected_current_tree_sha", "idempotency_key",
     } <= set(base_sync_schema["required"])
     assert base_sync_schema["properties"]["lease_seconds"]["default"] == 7200
+    assert "reviewed_overlap_paths_json" not in set(base_sync_schema["required"])
+    assert base_sync_schema["properties"]["reviewed_overlap_paths_json"]["default"] == "[]"
+    assert base_sync_schema["properties"]["reviewed_overlap_paths_json"]["type"] == "string"
+    assert "exactly equals" in tools["recover_base_synced_development_task"].description
     change_set_tool = tools["apply_development_change_set"]
     change_set_schema = change_set_tool.inputSchema
     assert set(change_set_schema["required"]) == {
