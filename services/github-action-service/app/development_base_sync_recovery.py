@@ -188,14 +188,19 @@ def _verify_base_sync_deltas(
     new_base_ancestry, new_task_delta_paths = _compare_delta(
         repo, new_base_sha, current_head_sha, label="new_base_to_current_head",
     )
-    overlap = sorted(set(old_task_delta_paths) & set(base_delta_paths))
+    historical_base_overlap = sorted(set(old_task_delta_paths) & set(base_delta_paths))
+    current_base_overlap = sorted(set(new_task_delta_paths) & set(base_delta_paths))
+    overlap = sorted(set(historical_base_overlap) | set(current_base_overlap))
     if overlap:
         raise MyGithub12Error(
             "RECOVERY_BASE_SYNC_OVERLAP",
-            "base synchronization overlaps the task's pre-sync changed paths",
+            "base synchronization overlaps task-owned changed paths",
             {
                 "overlapping_paths": overlap,
+                "historical_base_overlap_paths": historical_base_overlap,
+                "current_base_overlap_paths": current_base_overlap,
                 "old_task_delta_paths": old_task_delta_paths,
+                "new_task_delta_paths": new_task_delta_paths,
                 "base_delta_paths": base_delta_paths,
             },
         )
@@ -215,6 +220,13 @@ def _verify_base_sync_deltas(
                 "unexplained_task_path_changes": unexplained_task_path_changes,
             },
         )
+    forward_paths = set(forward_task_delta_paths)
+    base_paths = set(base_delta_paths)
+    excluded_imported_base_paths = sorted(forward_paths & base_paths)
+    recovery_scope_delta_paths = sorted(forward_paths - base_paths)
+    excluded_unchanged_historical_cumulative_paths = sorted(
+        set(old_task_delta_paths) - forward_paths
+    )
     return {
         "base_ancestry": base_ancestry,
         "old_task_ancestry": old_task_ancestry,
@@ -224,8 +236,15 @@ def _verify_base_sync_deltas(
         "old_task_delta_paths": old_task_delta_paths,
         "new_task_delta_paths": new_task_delta_paths,
         "forward_task_delta_paths": forward_task_delta_paths,
+        "historical_cumulative_task_delta_paths": old_task_delta_paths,
+        "external_forward_delta_paths": forward_task_delta_paths,
+        "recovery_scope_delta_paths": recovery_scope_delta_paths,
+        "excluded_imported_base_paths": excluded_imported_base_paths,
+        "excluded_unchanged_historical_cumulative_paths": excluded_unchanged_historical_cumulative_paths,
         "task_path_changes": task_path_changes,
         "unexplained_task_path_changes": unexplained_task_path_changes,
+        "historical_base_overlap_paths": historical_base_overlap,
+        "current_base_overlap_paths": current_base_overlap,
         "base_task_overlap_paths": overlap,
     }
 
@@ -569,15 +588,24 @@ def _atomic_recover_base_sync(
                 "adopted_head": current_head,
                 "adopted_tree": current_tree,
                 "base_ancestry": verification["deltas"]["base_ancestry"],
+                "old_task_ancestry": verification["deltas"]["old_task_ancestry"],
                 "task_ancestry": verification["deltas"]["task_ancestry"],
                 "new_base_ancestry": verification["deltas"]["new_base_ancestry"],
                 "base_delta_paths": verification["deltas"]["base_delta_paths"],
                 "old_task_delta_paths": verification["deltas"]["old_task_delta_paths"],
                 "new_task_delta_paths": verification["deltas"]["new_task_delta_paths"],
                 "forward_task_delta_paths": verification["deltas"]["forward_task_delta_paths"],
+                "historical_cumulative_task_delta_paths": verification["deltas"]["historical_cumulative_task_delta_paths"],
+                "external_forward_delta_paths": verification["deltas"]["external_forward_delta_paths"],
+                "recovery_scope_delta_paths": verification["deltas"]["recovery_scope_delta_paths"],
+                "excluded_imported_base_paths": verification["deltas"]["excluded_imported_base_paths"],
+                "excluded_unchanged_historical_cumulative_paths": verification["deltas"]["excluded_unchanged_historical_cumulative_paths"],
                 "task_path_changes": verification["deltas"]["task_path_changes"],
                 "unexplained_task_path_changes": verification["deltas"]["unexplained_task_path_changes"],
+                "outside_scope_paths": verification["scope"].get("outside_scope_paths", []),
                 "overlap_result": {
+                    "historical_base_overlap_paths": verification["deltas"]["historical_base_overlap_paths"],
+                    "current_base_overlap_paths": verification["deltas"]["current_base_overlap_paths"],
                     "base_task_overlap_paths": verification["deltas"]["base_task_overlap_paths"],
                     "workspace": verification["ownership"],
                 },
@@ -827,10 +855,10 @@ def recover_base_synced_task(
         expected_old_session_head_sha,
         expected_current_head_sha,
     )
-    # Scope belongs to the task under the new base, never to the imported base delta.
-    scope = _verify_base_sync_scope(workspace, deltas["new_task_delta_paths"])
+    # Scope/ownership apply only to task-owned changes after the old Session HEAD.
+    scope = _verify_base_sync_scope(workspace, deltas["recovery_scope_delta_paths"])
     ownership = _verify_base_sync_ownership(
-        service, repo, workspace, expected_new_base_sha, deltas["new_task_delta_paths"],
+        service, repo, workspace, expected_new_base_sha, deltas["recovery_scope_delta_paths"],
     )
     verification = {
         "github": github_identity,
