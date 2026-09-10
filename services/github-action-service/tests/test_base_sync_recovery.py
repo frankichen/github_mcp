@@ -524,10 +524,12 @@ def test_exact_824_cumulative_pr_late_phase_workspace_base_sync_recovery_passes(
 
 def test_external_advance_adds_outside_scope_task_path_fails_closed(tmp_path, monkeypatch):
     service, session, _ = _seed(tmp_path, monkeypatch)
+    task_paths = ["allowed/feature.py", "base/region.py"]
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=task_paths)
     service.repo.set_compare(OLD_HEAD, CURRENT_HEAD, paths=["base/region.py", "outside/new.py"])
-    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=["allowed/feature.py", "outside/new.py"])
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=task_paths + ["outside/new.py"])
     with pytest.raises(recovery.MyGithub12Error) as exc:
-        _call(service, session)
+        _call(service, session, reviewed_overlap_paths_json=json.dumps(["base/region.py"]))
     assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
     assert exc.value.details["outside_scope_paths"] == ["outside/new.py"]
 
@@ -824,6 +826,9 @@ def test_t16_legacy_merged_workspace_high_overlap_is_ignored_only_with_exact_mer
 
 def test_t16_active_overlapping_writer_is_never_ignored_without_terminal_merged_evidence(tmp_path, monkeypatch):
     service, session, _ = _seed(tmp_path, monkeypatch)
+    task_paths = ["allowed/feature.py", "base/region.py"]
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=task_paths)
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=task_paths)
     with sessions._LOCK, sessions._db() as db:
         db.execute(
             "INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -850,7 +855,7 @@ def test_t16_active_overlapping_writer_is_never_ignored_without_terminal_merged_
         },
     )
     with pytest.raises(recovery.MyGithub12Error) as exc:
-        _call(service, session)
+        _call(service, session, reviewed_overlap_paths_json=json.dumps(["base/region.py"]))
     assert exc.value.code == "RECOVERY_WORKSPACE_OVERLAP"
 
 
