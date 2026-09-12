@@ -825,7 +825,7 @@ def bind_validation_request_worker(
 ) -> dict[str, Any]:
     """CAS-bind one durable Request/Worker pair or proven request-only terminal."""
     request_only_terminal = bool(
-        not job_id and request_terminal_status in {"preflight_failed", "cancelled", "superseded", "internal_error"}
+        not job_id and request_terminal_status in REQUEST_ONLY_TERMINAL_STATUSES
     )
     if mode not in {"fast", "full"} or not request_id or (not job_id and not request_only_terminal):
         raise MyGithub12Error(
