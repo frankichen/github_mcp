@@ -51,6 +51,14 @@ class CIRequestStatus(str, Enum):
     PREFLIGHT_FAILED = "preflight_failed"
 
 
+REQUEST_ONLY_TERMINAL_STATUSES = frozenset({
+    CIRequestStatus.PREFLIGHT_FAILED.value,
+    CIRequestStatus.CANCELLED.value,
+    CIRequestStatus.SUPERSEDED.value,
+    CIRequestStatus.INTERNAL_ERROR.value,
+})
+
+
 ALLOWED_PRIORITIES = {"normal": 50, "high": 40}
 
 
