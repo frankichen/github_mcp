@@ -117,6 +117,7 @@ class TestMCPTools:
         assert capabilities["supports_generated_files_put_v2"] is True
         assert capabilities["supports_drifted_development_recovery"] is True
         assert capabilities["supports_base_synced_development_recovery"] is True
+        assert capabilities["supports_retargeted_development_recovery"] is True
         assert capabilities["generated_files_put_semantics"]["bundle_format_version"] == 1
         assert capabilities["generated_files_put_semantics"]["unsupported"] == ["binary", "delete"]
         assert capabilities["generated_files_put_semantics"]["max_file_bytes"] == 1024 * 1024
