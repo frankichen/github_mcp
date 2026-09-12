@@ -1255,6 +1255,16 @@ def _reconcile_transient_validation(
 
     payload = ci_request_store.get_ci_request_payload(request_id)
     request_tree = str(request.get("tree_sha") or "")
+    historical_generation = generation_revision != session_revision
+    payload_generation_matches = bool(
+        not historical_generation
+        or (
+            payload.get("development_session_id") == session_id
+            and payload.get("workspace_id") == workspace.get("workspace_id")
+            and int(payload.get("expected_session_revision") or -1) == generation_revision
+            and int(payload.get("workspace_revision") or -1) == generation_workspace_revision
+        )
+    )
     request_identity_matches = (
         request.get("repository") == session.get("repository")
         and request.get("branch") == session.get("branch")
