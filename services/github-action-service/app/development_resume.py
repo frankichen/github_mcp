@@ -1323,6 +1323,8 @@ def _reconcile_transient_validation(
             binding = sessions.bind_validation_request_worker(
                 session_id, session_revision, workspace_revision, mode,
                 str(session["head_commit_sha"]), str(session["tree_sha"]), request_id, "",
+                validation_generation_revision=generation_revision,
+                validation_generation_workspace_revision=generation_workspace_revision,
                 allow_branch_drift=drift_reconciliation,
                 request_terminal_status=request_status,
             )
