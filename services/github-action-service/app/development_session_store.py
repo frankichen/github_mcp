@@ -912,15 +912,17 @@ def _validation_generation_context_db(
             },
         )
 
-    maintenance_events = [row for row in events if generation_revision < int(row["session_revision"]) <= current_revision]
+    events_after_generation = [
+        row for row in events if generation_revision < int(row["session_revision"]) <= current_revision
+    ]
     by_revision: dict[int, list[sqlite3.Row]] = {}
-    for row in maintenance_events:
+    for row in events_after_generation:
         by_revision.setdefault(int(row["session_revision"]), []).append(row)
     expected_revisions = list(range(generation_revision + 1, current_revision + 1))
-    if sorted(by_revision) != expected_revisions or any(len(by_revision[revision]) != 1 for revision in expected_revisions):
+    if sorted(by_revision) != expected_revisions:
         raise MyGithub12Error(
             "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
-            "validation generation maintenance audit chain is incomplete or ambiguous",
+            "validation generation maintenance audit chain is incomplete",
             {
                 "generation_revision": generation_revision,
                 "current_session_revision": current_revision,
@@ -931,16 +933,33 @@ def _validation_generation_context_db(
     generation_workspace_revision = int(session_row["workspace_revision"])
     maintenance_audit: list[dict[str, Any]] = []
     for revision in reversed(expected_revisions):
-        event = by_revision[revision][0]
-        event_type = str(event["event_type"] or "")
-        if (
-            event_type not in _VALIDATION_MAINTENANCE_EVENTS
-            or event["from_status"] != expected_status
-            or event["to_status"] != expected_status
-        ):
+        revision_events = by_revision[revision]
+        maintenance = [
+            row for row in revision_events if str(row["event_type"] or "") in _VALIDATION_MAINTENANCE_EVENTS
+        ]
+        benign_audits = [
+            row for row in revision_events
+            if str(row["event_type"] or "") in _VALIDATION_NONMUTATING_AUDIT_EVENTS
+            and row["from_status"] == expected_status
+            and row["to_status"] == expected_status
+        ]
+        unknown_events = [row for row in revision_events if row not in maintenance and row not in benign_audits]
+        if len(maintenance) != 1 or unknown_events:
             raise MyGithub12Error(
                 "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
-                "validation generation was advanced by a non-maintenance Session event",
+                "validation generation maintenance audit chain is ambiguous",
+                {
+                    "session_revision": revision,
+                    "maintenance_events": [str(row["event_type"] or "") for row in maintenance],
+                    "unknown_events": [str(row["event_type"] or "") for row in unknown_events],
+                },
+            )
+        event = maintenance[0]
+        event_type = str(event["event_type"] or "")
+        if event["from_status"] != expected_status or event["to_status"] != expected_status:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                "validation generation maintenance changed Session status",
                 {"session_revision": revision, "event_type": event_type},
             )
         data = _event_data(event)
