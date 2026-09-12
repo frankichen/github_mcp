@@ -242,5 +242,5 @@ async def test_readme_current_state_matches_candidate_runtime_and_manifest(monke
     assert f"compatibility registration 仍为 {runtime['compatibility_tool_count']} 个工具" in current_state
     assert f"canonical production Schema 仍为 {runtime['tool_count']} 个可见工具" in current_state
     assert f"隐藏 {runtime['hidden_deprecated_tool_count']} 个 deprecated/compatibility-only 工具" in current_state
-    if runtime["tool_count"] == 164:
-        assert "165 个可见工具" not in current_state
+    if runtime["tool_count"] == 165:
+        assert "164 个可见工具" not in current_state
