@@ -820,9 +820,13 @@ def bind_validation_request_worker(
     job_id: str,
     *,
     allow_branch_drift: bool = False,
+    request_terminal_status: str = "",
 ) -> dict[str, Any]:
-    """CAS-bind one proven durable CI Request/Worker pair to its logical validation row."""
-    if mode not in {"fast", "full"} or not request_id or not job_id:
+    """CAS-bind one durable Request/Worker pair or proven request-only terminal."""
+    request_only_terminal = bool(
+        not job_id and request_terminal_status in {"preflight_failed", "cancelled", "superseded", "internal_error"}
+    )
+    if mode not in {"fast", "full"} or not request_id or (not job_id and not request_only_terminal):
         raise MyGithub12Error(
             "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "validation correlation identity is incomplete"
         )
