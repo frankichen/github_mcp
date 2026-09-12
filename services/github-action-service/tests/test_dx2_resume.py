@@ -226,7 +226,7 @@ def _stub_request_only_transient_recovery(monkeypatch, *, mode="fast", status="p
         "commit_sha": session["head_commit_sha"], "tree_sha": session["tree_sha"],
         "profile": request["profile"], "mode": mode, "base_sha": session["base_commit_sha"],
     }
-    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: rows)
+    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args, **kwargs: rows)
     monkeypatch.setattr(resume.ci_request_store, "get_ci_request", lambda request_id: request if request_id == "ci_req_exact" else None)
     monkeypatch.setattr(resume.ci_request_store, "get_ci_request_payload", lambda request_id: payload if request_id == "ci_req_exact" else {})
     monkeypatch.setattr(resume, "db_get_job", lambda *args: pytest.fail("request-only terminal must not read a Worker job"))
