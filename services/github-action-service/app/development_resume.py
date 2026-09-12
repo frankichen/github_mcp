@@ -1905,6 +1905,7 @@ def resume_task(
         current_main=current_main,
         current_base=recovery_base,
         branch_state=branch_state,
+        pr=pr,
     )
     response = {
         "ok": True,
