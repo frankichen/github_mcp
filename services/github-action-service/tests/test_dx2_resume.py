@@ -568,6 +568,48 @@ def test_validation_correlation_store_allows_only_verified_branch_drift_cas(tmp_
     assert binding["workspace_drift_reconciliation"] is True
 
 
+def test_validation_correlation_store_request_only_terminal_is_cas_bound(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "request-terminal.db"))
+    resume.mygithub12.init_db()
+    now = resume.mygithub12._now()
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            "INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "ws_resume", "owner/repo", "ai/resume", "main", SHA_A,
+                SHA_A, TREE_A, "active", 1, "test", now + 600,
+                SHA_A, "{}", None, None, now, now,
+            ),
+        )
+    created = sessions.create_session(_workspace(revision=1, lease=now + 600), idempotency_key="request-terminal")
+    validating = sessions.transition(
+        created["session_id"], created["session_revision"], "validating_fast", allowed_from={"active"},
+    )
+    sessions.record_validation(
+        validating["session_id"], validating["session_revision"], "fast", SHA_A, TREE_A,
+        request_id="ci_req_terminal", status="preparing",
+        evidence={"request_id": "ci_req_terminal", "selection": {"complete": False}},
+    )
+
+    with pytest.raises(resume.MyGithub12Error):
+        sessions.bind_validation_request_worker(
+            validating["session_id"], validating["session_revision"], 1, "fast",
+            SHA_A, TREE_A, "ci_req_terminal", "", request_terminal_status="failed",
+        )
+
+    binding = sessions.bind_validation_request_worker(
+        validating["session_id"], validating["session_revision"], 1, "fast",
+        SHA_A, TREE_A, "ci_req_terminal", "", request_terminal_status="preflight_failed",
+    )
+    assert binding["request_only_terminal"] is True
+    assert binding["request_terminal_status"] == "preflight_failed"
+    correlations = sessions.validation_correlations(
+        validating["session_id"], validating["session_revision"], "fast", SHA_A, TREE_A,
+    )
+    assert correlations[0]["status"] == "preflight_failed"
+    assert correlations[0]["job_id"] is None
+
+
 def test_resume_transient_recovery_preserves_session_revision_cas(monkeypatch):
     _stub_transient_recovery(monkeypatch)
 
