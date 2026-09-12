@@ -958,15 +958,26 @@ def bind_validation_request_worker(
         canonical = (first_class or candidates)[0]
         canonical_row = canonical[0]
         existing_job_id = str(canonical_row["job_id"] or "")
-        if existing_job_id and existing_job_id != job_id:
+        if request_only_terminal and existing_job_id:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "request-only terminal is already bound to a Worker job"
+            )
+        if not request_only_terminal and existing_job_id and existing_job_id != job_id:
             raise MyGithub12Error(
                 "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "canonical validation row is bound to another Worker job"
             )
         try:
-            db.execute(
-                "UPDATE development_session_validations SET request_id=?,job_id=? WHERE id=?",
-                (request_id, job_id, int(canonical_row["id"])),
-            )
+            if request_only_terminal:
+                db.execute(
+                    """UPDATE development_session_validations
+                       SET request_id=?,status=?,finished_at=COALESCE(finished_at,?) WHERE id=?""",
+                    (request_id, request_terminal_status, _now(), int(canonical_row["id"])),
+                )
+            else:
+                db.execute(
+                    "UPDATE development_session_validations SET request_id=?,job_id=? WHERE id=?",
+                    (request_id, job_id, int(canonical_row["id"])),
+                )
         except sqlite3.IntegrityError as exc:
             raise MyGithub12Error(
                 "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "request_id uniqueness changed during validation recovery"
@@ -975,11 +986,13 @@ def bind_validation_request_worker(
         audit = {
             "mode": mode,
             "request_id": request_id,
-            "job_id": job_id,
+            "job_id": job_id or None,
             "canonical_validation_id": int(canonical_row["id"]),
             "duplicate_validation_ids": duplicate_ids,
             "logical_duplicate_count": len(duplicate_ids),
             "workspace_drift_reconciliation": drift_reconciliation,
+            "request_only_terminal": request_only_terminal,
+            "request_terminal_status": request_terminal_status or None,
         }
         _append_event(
             db, session_row, "validation_correlation_backfilled",
