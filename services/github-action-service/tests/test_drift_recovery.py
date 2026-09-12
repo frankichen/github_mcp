@@ -903,6 +903,13 @@ def test_two_terminal_cancelled_correlations_then_forward_drift_recovers_same_wr
     transient = resumed["recovery"]["transient"]
     assert transient["reconciled"] is True
     assert transient["correlation_source"] == "persisted_terminal_set"
+    assert transient["validation_generation"]["generation_revision"] == validating["session_revision"]
+    assert transient["validation_generation"]["generation_workspace_revision"] == validating["workspace_revision"]
+    assert transient["validation_generation"]["current_session_revision"] == maintained_session["session_revision"]
+    assert transient["validation_generation"]["current_workspace_revision"] == maintained_session["workspace_revision"]
+    assert [
+        event["event_type"] for event in transient["validation_generation"]["maintenance_events"]
+    ] == ["session_recovered"]
     assert transient["correlation_set"]["request_ids"] == expected_request_ids
     assert transient["correlation_set"]["job_ids"] == expected_job_ids
     assert transient["validation_result"]["merge_eligible"] is False
