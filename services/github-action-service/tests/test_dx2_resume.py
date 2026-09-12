@@ -886,7 +886,10 @@ def test_validation_terminal_correlation_set_store_is_atomic_and_idempotent(tmp_
 
     settled = sessions.reconcile_terminal_validation_set(
         validating["session_id"], validating["session_revision"], 2, "full",
-        SHA_A, TREE_A, pairs, allow_branch_drift=True,
+        SHA_A, TREE_A, pairs,
+        validation_generation_revision=validating["session_revision"],
+        validation_generation_workspace_revision=validating["workspace_revision"],
+        allow_branch_drift=True,
     )
 
     recovered = settled["session"]
