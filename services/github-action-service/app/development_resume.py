@@ -927,7 +927,7 @@ def _validation_request_summary(request: dict[str, Any], worker_job_id: str = ""
 
 
 def _reconcile_transient_validation(
-    session: dict[str, Any], workspace: dict[str, Any]
+    session: dict[str, Any], workspace: dict[str, Any], *, allow_branch_drift: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], str | None]:
     """Reconcile exactly one persisted Request -> Worker pair without starting CI."""
     mode = TRANSIENT_VALIDATION_STATUSES[str(session["status"])]
@@ -936,13 +936,38 @@ def _reconcile_transient_validation(
     session_id = str(session["session_id"])
     session_revision = int(session["session_revision"])
     workspace_revision = int(workspace.get("revision") or 0)
-    if (
+    session_workspace_revision = int(session.get("workspace_revision") or 0)
+    static_identity_matches = all(
+        session.get(session_key) not in (None, "")
+        and workspace.get(workspace_key) not in (None, "")
+        and session.get(session_key) == workspace.get(workspace_key)
+        for session_key, workspace_key in (
+            ("workspace_id", "workspace_id"),
+            ("repository", "repository"),
+            ("branch", "branch"),
+            ("base_branch", "base_branch"),
+            ("base_commit_sha", "base_commit_sha"),
+        )
+    )
+    drift_reconciliation = bool(
+        allow_branch_drift
+        and workspace.get("status") == "drifted"
+        and workspace.get("drift_reason") == "branch_moved_externally"
+        and static_identity_matches
+        and session_workspace_revision < workspace_revision
+        and (
+            session.get("head_commit_sha") != workspace.get("head_sha")
+            or session.get("tree_sha") != workspace.get("tree_sha")
+        )
+    )
+    active_exact_reconciliation = not (
         int(session.get("workspace_revision") or 0) != workspace_revision
         or not _session_workspace_identity_exact(session, workspace)
         or expected_base != str(workspace.get("base_commit_sha") or "")
         or workspace.get("status") != "active"
         or workspace.get("drift_reason")
-    ):
+    )
+    if not active_exact_reconciliation and not drift_reconciliation:
         recovery = _transient_recovery_failure(session, "validation_workspace_session_cas_mismatch")
         return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
 
@@ -1112,6 +1137,7 @@ def _reconcile_transient_validation(
         binding = sessions.bind_validation_request_worker(
             session_id, session_revision, workspace_revision, mode,
             str(session["head_commit_sha"]), str(session["tree_sha"]), request_id, worker_job_id,
+            allow_branch_drift=drift_reconciliation,
         )
     except MyGithub12Error as exc:
         recovery = _transient_recovery_failure(
@@ -1167,7 +1193,12 @@ def _reconcile_transient_validation(
     failure = result.get("failure_pack")
     if isinstance(failure, dict) and failure.get("resource_uri"):
         fields["last_failure_resource_uri"] = failure["resource_uri"]
-    next_status = "pr_ready" if mode == "full" and result.get("merge_eligible") else "active"
+    # A Full PASS belongs to the old Session HEAD while branch drift is pending.
+    # Keep it as historical evidence only; formal drift/base-sync recovery must
+    # adopt the new HEAD and invalidate the old merge evidence.
+    next_status = (
+        "pr_ready" if not drift_reconciliation and mode == "full" and result.get("merge_eligible") else "active"
+    )
     recovered_session = sessions.transition(
         session_id, session_revision, next_status,
         event_type="validation_reconciled", allowed_from={str(session["status"])}, fields=fields,
@@ -1182,6 +1213,7 @@ def _reconcile_transient_validation(
         "tree_evidence": "ci_job_summary" if job_tree else "request_tree_worker_pair",
         "job": _ci_summary(job),
         "validation_result": result,
+        "workspace_drift_pending_recovery": drift_reconciliation,
     }, None
 
 
@@ -1208,6 +1240,8 @@ def _next_actions(
         and "MANAGED_MERGE_RECONCILIATION_REQUIRED" in blockers
     ):
         return ["resume_development_task"]
+    if "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS" in blockers:
+        return ["get_private_ci_job", "resume_development_task"]
     if workspace.get("status") == "expired":
         return ["resume_development_workspace", "recovery_required"]
     if workspace.get("status") == "drifted":
@@ -1215,8 +1249,6 @@ def _next_actions(
         return [action, "recovery_required"]
     if not session:
         return ["recovery_required", "prepare_development_task"]
-    if "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS" in blockers:
-        return ["get_private_ci_job", "resume_development_task"]
     if session.get("status") in BLOCKED_SESSION_STATUSES:
         return ["recovery_required"]
     if index and index.get("status") != "ready":
@@ -1346,8 +1378,21 @@ def resume_task(
         branch_drift = bool(workspace) and (
             workspace.get("head_sha") != branch_head or workspace.get("tree_sha") != branch_tree
         )
+        persisted_branch_drift = bool(
+            not branch_drift
+            and workspace.get("status") == "drifted"
+            and workspace.get("drift_reason") == "branch_moved_externally"
+            and workspace.get("head_sha") == branch_head
+            and workspace.get("tree_sha") == branch_tree
+        )
+        drifted_validation_candidate = bool(
+            session and stale and persisted_branch_drift
+            and session.get("status") in TRANSIENT_VALIDATION_STATUSES
+        )
         if session and stale and not branch_drift:
-            if recover_stale_session and workspace.get("status") == "active":
+            if recover_stale_session and drifted_validation_candidate:
+                pass
+            elif recover_stale_session and workspace.get("status") == "active":
                 transient_state = session.get("status") in TRANSIENT_VALIDATION_STATUSES
                 if transient_state and not _session_workspace_identity_exact(session, workspace):
                     # A transient validation may only cross a Workspace revision/
@@ -1380,15 +1425,24 @@ def resume_task(
             or session.get("tree_sha") != workspace.get("tree_sha")
             or abs(float(session.get("lease_expires_at") or 0) - float(workspace.get("lease_expires_at") or 0)) > 0.001
         )
-        if (
+        active_validation_reconciliation = bool(
             session
             and not stale
             and not branch_drift
             and workspace.get("status") == "active"
+        )
+        drifted_validation_reconciliation = bool(
+            session and stale and persisted_branch_drift
+        )
+        if (
+            session
             and session.get("status") in TRANSIENT_VALIDATION_STATUSES
             and recover_stale_session
+            and (active_validation_reconciliation or drifted_validation_reconciliation)
         ):
-            session, transient_recovery, transient_blocker = _reconcile_transient_validation(session, workspace)
+            session, transient_recovery, transient_blocker = _reconcile_transient_validation(
+                session, workspace, allow_branch_drift=drifted_validation_reconciliation,
+            )
             recovery = {**(recovery or {}), "transient": transient_recovery}
             if transient_blocker:
                 blockers.append(transient_blocker)
