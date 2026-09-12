@@ -260,7 +260,7 @@ DX-2 所有功能均必须保持：
 
 当同一 `validating_fast` / `validating_full` Session 因历史重试留下多个 persisted validation correlation 时，不得按创建时间选择单个 Request/Job。只有服务端能够逐项证明这些 correlation 全部属于同一个 validation generation 的 Session revision、mode/profile、repository/branch、HEAD/Tree/Base、Workspace identity，且每个 durable Request→Worker pair 完整、所有 Worker 均已 terminal、没有 supersede 或其它仍可能执行的 validation 时，才允许把整个集合一次性收敛为审计证据并将 Session 恢复到 `active`。
 
-terminal correlation set recovery 必须保持 `merge_eligible=false`，不得生成或复用其中任意 passed Job 的 Attestation，不得把任意单个 Job 记录为当前权威 Full PASS，并必须清空旧 validation merge evidence。集合中任一 identity 冲突、Session/Workspace revision 不一致、Request/Worker 缺失、queued/preparing/running/cancel_requested 成员或不同 validation operation 都必须 fail-closed。重复 resume 在第一次成功 transition 后必须幂等，不得重复增加 Session revision 或重复写 audit。
+terminal correlation set recovery 必须保持 `merge_eligible=false`，不得生成或复用其中任意 passed Job 的 Attestation，不得把任意单个 Job 记录为当前权威 Full PASS，并必须清空旧 validation merge evidence。集合中任一 identity 冲突、validation generation 内 Session/Workspace revision identity 不一致、Request/Worker 缺失、queued/preparing/running/cancel_requested 成员或不同 validation operation 都必须 fail-closed。重复 resume 在第一次成功 transition 后必须幂等，不得重复增加 Session revision 或重复写 audit。
 
 - AC-RESUME-SET-01：两条 exact cancelled terminal correlation 可一次性恢复同一 canonical Session；
 - AC-RESUME-SET-02：failed+cancelled 或 passed+cancelled 的同 identity terminal set 可恢复到 `active`，但不得声称 PASS 或复用 Attestation；
