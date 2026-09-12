@@ -1795,7 +1795,7 @@ def test_no_request_id_and_no_strict_job_correlation_fails_closed(monkeypatch):
     )
     monkeypatch.setattr(
         resume.sessions, "validation_correlations",
-        lambda *args: [{"request_id": None, "job_id": None, "session_revision": 7, "tree_sha": TREE_A, "evidence": {}}],
+        lambda *args, **kwargs: [{"request_id": None, "job_id": None, "session_revision": 7, "tree_sha": TREE_A, "evidence": {}}],
     )
 
     recovered, evidence, blocker = resume._reconcile_transient_validation(session, ws)
