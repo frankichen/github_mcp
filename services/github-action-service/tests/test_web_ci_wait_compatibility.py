@@ -142,9 +142,9 @@ async def test_capabilities_report_wait_deprecation_and_schema_visibility(monkey
     monkeypatch.setenv("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", "true")
     compatibility = json.loads(await get_mygithub_capabilities())
 
-    assert compatibility["tool_count"] == 175
-    assert compatibility["tool_manifest_count"] == 175
-    assert compatibility["compatibility_tool_count"] == 175
+    assert compatibility["tool_count"] == 176
+    assert compatibility["tool_manifest_count"] == 176
+    assert compatibility["compatibility_tool_count"] == 176
     assert compatibility["hidden_deprecated_tool_count"] == 0
     assert "wait_private_ci_job" not in compatibility["hidden_deprecated_tools"]
     assert compatibility["tool_schema_sha256"] != production_schema_sha
