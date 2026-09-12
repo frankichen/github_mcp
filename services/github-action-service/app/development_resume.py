@@ -96,23 +96,55 @@ def _resolve_recovery_base(
     pr: dict[str, Any] | None,
     current_main: dict[str, Any],
 ) -> dict[str, Any]:
-    """Resolve the exact live base branch for drift recovery, not just repository main."""
-    candidates = {
+    """Resolve the exact live base, including a fail-closed stacked-PR retarget shape."""
+    control_candidates = {
         str(value)
         for value in (
             (workspace or {}).get("base_branch"),
             (session or {}).get("base_branch"),
-            (pr or {}).get("base_branch"),
         )
         if value
     }
-    if len(candidates) > 1:
+    if len(control_candidates) > 1:
         raise MyGithub12Error(
             "RECOVERY_IDENTITY_MISMATCH",
-            "Workspace, Development Session and Pull Request disagree on the recovery base branch",
-            {"base_branches": sorted(candidates)},
+            "Workspace and Development Session disagree on the recovery base branch",
+            {"base_branches": sorted(control_candidates)},
         )
-    base_branch = next(iter(candidates), str(current_main.get("branch") or ""))
+    control_base = next(iter(control_candidates), "")
+    pr_base = str((pr or {}).get("base_branch") or "")
+    if control_base and pr_base and control_base != pr_base:
+        retarget_shape = bool(
+            workspace
+            and session
+            and workspace.get("status") == "drifted"
+            and workspace.get("drift_reason") == "branch_moved_externally"
+            and (pr or {}).get("state") == "open"
+            and (pr or {}).get("merged") is not True
+        )
+        if not retarget_shape:
+            raise MyGithub12Error(
+                "RECOVERY_IDENTITY_MISMATCH",
+                "Workspace/Session base differs from Pull Request base outside an allowed retarget recovery shape",
+                {"control_base_branch": control_base, "pull_request_base_branch": pr_base},
+            )
+        try:
+            identity = mygithub12.resolve_identity(service, repository, ref=pr_base)
+        except Exception as exc:
+            raise MyGithub12Error(
+                "RECOVERY_BASE_CHANGED",
+                "retargeted Pull Request base branch could not be resolved",
+                {"base_branch": pr_base, "cause_type": type(exc).__name__},
+            ) from exc
+        if (pr or {}).get("base_sha") != identity.get("commit_sha"):
+            raise MyGithub12Error(
+                "RECOVERY_BASE_CHANGED",
+                "retargeted Pull Request base SHA does not equal the live base branch HEAD",
+                {"base_branch": pr_base, "pull_request_base_sha": (pr or {}).get("base_sha"), "live_base_sha": identity.get("commit_sha")},
+            )
+        return {**identity, "branch": pr_base, "retargeted_from_branch": control_base}
+
+    base_branch = pr_base or control_base or str(current_main.get("branch") or "")
     if not base_branch:
         raise MyGithub12Error("RECOVERY_BASE_CHANGED", "recovery base branch is unavailable")
     if base_branch == current_main.get("branch"):
