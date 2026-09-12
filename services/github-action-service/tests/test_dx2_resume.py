@@ -817,6 +817,90 @@ def test_validation_correlation_store_request_only_terminal_is_cas_bound(tmp_pat
     assert correlations[0]["job_id"] is None
 
 
+def test_validation_terminal_correlation_set_store_is_atomic_and_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "terminal-set.db"))
+    resume.mygithub12.init_db()
+    now = resume.mygithub12._now()
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            "INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "ws_resume", "owner/repo", "ai/resume", "main", SHA_A,
+                SHA_A, TREE_A, "active", 1, "test", now + 600,
+                SHA_A, "{}", None, None, now, now,
+            ),
+        )
+    created = sessions.create_session(
+        _workspace(revision=1, lease=now + 600), idempotency_key="terminal-set-store",
+    )
+    validating = sessions.transition(
+        created["session_id"],
+        created["session_revision"],
+        "validating_full",
+        allowed_from={"active"},
+        fields={
+            "last_full_ci_job_id": "old-job",
+            "last_attestation_id": "old-attestation",
+            "last_failure_resource_uri": "mygithub12://response/old-failure",
+        },
+    )
+    pairs = [
+        {"request_id": "ci_req_set_a", "job_id": "job-set-a", "status": "cancelled"},
+        {"request_id": "ci_req_set_b", "job_id": "job-set-b", "status": "failed"},
+    ]
+    for pair in pairs:
+        sessions.record_validation(
+            validating["session_id"], validating["session_revision"], "full", SHA_A, TREE_A,
+            request_id=pair["request_id"], job_id=pair["job_id"], status="running",
+            evidence={"request_id": pair["request_id"], "selection": {"complete": True}},
+        )
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            """UPDATE workspaces
+               SET head_sha=?,tree_sha=?,status='drifted',drift_reason='branch_moved_externally',revision=2,
+                   index_commit_sha=NULL,lease_expires_at=0
+               WHERE workspace_id=?""",
+            (SHA_B, TREE_B, "ws_resume"),
+        )
+
+    settled = sessions.reconcile_terminal_validation_set(
+        validating["session_id"], validating["session_revision"], 2, "full",
+        SHA_A, TREE_A, pairs, allow_branch_drift=True,
+    )
+
+    recovered = settled["session"]
+    assert recovered["session_id"] == validating["session_id"]
+    assert recovered["status"] == "active"
+    assert recovered["session_revision"] == validating["session_revision"] + 1
+    assert recovered["head_commit_sha"] == SHA_A
+    assert recovered["tree_sha"] == TREE_A
+    assert recovered["last_full_ci_job_id"] is None
+    assert recovered["last_attestation_id"] is None
+    assert recovered["last_failure_resource_uri"] is None
+    assert settled["audit"]["request_ids"] == ["ci_req_set_a", "ci_req_set_b"]
+    assert settled["audit"]["job_ids"] == ["job-set-a", "job-set-b"]
+    assert settled["audit"]["workspace_drift_reconciliation"] is True
+    correlations = sessions.validation_correlations(
+        validating["session_id"], recovered["session_revision"], "full", SHA_A, TREE_A,
+    )
+    assert {item["request_id"]: item["status"] for item in correlations} == {
+        "ci_req_set_a": "cancelled",
+        "ci_req_set_b": "failed",
+    }
+    events = sessions.list_events(validating["session_id"], limit=20)
+    event = next(item for item in events if item["event_type"] == "validation_terminal_correlation_set_reconciled")
+    assert event["data"]["request_ids"] == ["ci_req_set_a", "ci_req_set_b"]
+
+    with pytest.raises(resume.MyGithub12Error) as exc:
+        sessions.reconcile_terminal_validation_set(
+            validating["session_id"], validating["session_revision"], 2, "full",
+            SHA_A, TREE_A, pairs, allow_branch_drift=True,
+        )
+    assert exc.value.code == "DEVELOPMENT_SESSION_REVISION_MISMATCH"
+    unchanged = sessions.get_session(validating["session_id"])
+    assert unchanged["session_revision"] == recovered["session_revision"]
+
+
 def test_resume_transient_recovery_preserves_session_revision_cas(monkeypatch):
     _stub_transient_recovery(monkeypatch)
 
