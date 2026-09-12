@@ -162,8 +162,8 @@ async def test_static_manifests_keep_wait_as_hidden_compatibility_tool(monkeypat
 
     assert legacy_wait["description"] == registered["wait_private_ci_job"].description
     assert "compatibility-only" in legacy_wait["description"]
-    assert canonical["tool_count"] == 164
-    assert canonical["compatibility_tool_count"] == 175
+    assert canonical["tool_count"] == 165
+    assert canonical["compatibility_tool_count"] == 176
     assert "wait_private_ci_job" in canonical["hidden_deprecated_tools"]
 
 
