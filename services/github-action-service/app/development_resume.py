@@ -1281,6 +1281,7 @@ def _reconcile_transient_validation(
         and payload.get("base_branch") in (None, "", session.get("base_branch"))
         and payload.get("development_session_id") in (None, "", session_id)
         and payload.get("workspace_id") in (None, "", workspace.get("workspace_id"))
+        and payload_generation_matches
     )
     if not request_identity_matches:
         recovery = _transient_recovery_failure(
