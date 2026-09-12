@@ -1226,14 +1226,16 @@ def reconcile_terminal_validation_set(
     tree_sha: str,
     correlations: list[dict[str, Any]],
     *,
+    validation_generation_revision: int,
+    validation_generation_workspace_revision: int,
     allow_branch_drift: bool = False,
 ) -> dict[str, Any]:
-    """Atomically settle one exact set of terminal Request/Worker correlations.
+    """Atomically settle one exact terminal validation generation.
 
-    The set is deliberately conservative: it is only valid when every persisted
-    correlation for the current validation Session revision belongs to the same
-    mode/HEAD/Tree identity and every supplied Request/Worker pair is distinct
-    and terminal.  No member becomes authoritative merge evidence.
+    The current Session CAS may be newer than the validation rows only when a
+    server-proven identity-preserving maintenance event chain bridges the exact
+    generation revision to the current transient Session.  No member becomes
+    authoritative merge evidence.
     """
     terminal_statuses = {
         "passed", "failed", "timed_out", "cancelled", "worker_lost", "internal_error",
