@@ -1196,9 +1196,21 @@ def _reconcile_transient_validation(
         recovery = _transient_recovery_failure(session, "validation_workspace_session_cas_mismatch")
         return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
 
+    try:
+        validation_generation = sessions.validation_generation_context(
+            session_id, session_revision, mode,
+            str(session["head_commit_sha"]), str(session["tree_sha"]),
+        )
+    except MyGithub12Error as exc:
+        recovery = _transient_recovery_failure(
+            session, "validation_generation_resolution_failed", error_code=exc.code,
+        )
+        return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    generation_revision = int(validation_generation["generation_revision"])
+    generation_workspace_revision = int(validation_generation["generation_workspace_revision"])
     correlations = sessions.validation_correlations(
-        session_id, session_revision, mode,
-        str(session["head_commit_sha"]), str(session["tree_sha"]),
+        session_id, generation_revision, mode,
+        str(session["head_commit_sha"]), str(session["tree_sha"]), exact_revision=True,
     )
     request_ids = sorted({str(item.get("request_id")) for item in correlations if item.get("request_id")})
     job_ids = sorted({str(item.get("job_id")) for item in correlations if item.get("job_id")})
@@ -1211,6 +1223,7 @@ def _reconcile_transient_validation(
             expected_profile=expected_profile,
             expected_base=expected_base,
             workspace_revision=workspace_revision,
+            validation_generation=validation_generation,
             drift_reconciliation=drift_reconciliation,
         )
     if len(job_ids) > 1:
