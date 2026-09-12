@@ -21,6 +21,7 @@ from app.github_policy import repository_is_allowed
 from app.ci_repository_config import is_private_ci_enabled, is_test_deploy_enabled, is_self_deploy_enabled
 from app.ci_database import get_job as db_get_job, list_jobs as db_list_jobs
 from app.ci_mcp import build_private_ci_job_list_item
+from app.ci_models import REQUEST_ONLY_TERMINAL_STATUSES
 
 MyGithub12Error = mygithub12.MyGithub12Error
 ACTIVE_SESSION_STATUSES = {"active", "pr_ready"}
