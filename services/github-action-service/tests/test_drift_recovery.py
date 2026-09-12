@@ -745,7 +745,8 @@ def test_two_terminal_cancelled_correlations_then_forward_drift_recovers_same_wr
     initial_workspace = mygithub12.get_workspace(service, WORKSPACE_ID)
     created = sessions.create_session(initial_workspace, idempotency_key="terminal-set-drift-e2e")
     validating = sessions.transition(
-        created["session_id"], created["session_revision"], "validating_full", allowed_from={"active"},
+        created["session_id"], created["session_revision"], "validating_full",
+        event_type="validation_started", allowed_from={"active"},
     )
 
     requests = []
@@ -810,9 +811,33 @@ def test_two_terminal_cancelled_correlations_then_forward_drift_recovers_same_wr
         requests.append(request)
         jobs.append(job)
 
+    # Reproduce the real #823 shape: after the validation generation was
+    # created, a same-HEAD Session recovery advanced only the control-plane
+    # revision.  The original Request payloads and validation rows therefore
+    # remain anchored to the prior validation generation.
     with sessions._LOCK, sessions._db() as db:
         db.execute(
-            """UPDATE workspaces SET head_sha=?,tree_sha=?,status='drifted',revision=5,
+            "UPDATE workspaces SET revision=5,updated_at=? WHERE workspace_id=?",
+            (sessions._now(), WORKSPACE_ID),
+        )
+    maintained_workspace = mygithub12.get_workspace(service, WORKSPACE_ID)
+    maintenance = sessions.recover_stale_session_from_workspace(
+        validating["session_id"], validating["session_revision"], maintained_workspace,
+        idempotency_key="terminal-set-validation-maintenance",
+        index_commit_sha=OLD_HEAD,
+        recovery_evidence={"reason": "identity_preserving_workspace_revision_sync"},
+    )
+    maintained_session = maintenance["session"]
+    assert maintenance["recovered"] is True
+    assert maintained_session["session_revision"] == validating["session_revision"] + 1
+    assert maintained_session["workspace_revision"] == 5
+    assert maintained_session["status"] == "validating_full"
+    assert maintained_session["head_commit_sha"] == OLD_HEAD
+    assert maintained_session["tree_sha"] == OLD_TREE
+
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            """UPDATE workspaces SET head_sha=?,tree_sha=?,status='drifted',revision=6,
                drift_reason='branch_moved_externally',index_commit_sha=NULL,lease_expires_at=0
                WHERE workspace_id=?""",
             (NEW_HEAD, NEW_TREE, WORKSPACE_ID),
@@ -878,6 +903,13 @@ def test_two_terminal_cancelled_correlations_then_forward_drift_recovers_same_wr
     transient = resumed["recovery"]["transient"]
     assert transient["reconciled"] is True
     assert transient["correlation_source"] == "persisted_terminal_set"
+    assert transient["validation_generation"]["generation_revision"] == validating["session_revision"]
+    assert transient["validation_generation"]["generation_workspace_revision"] == validating["workspace_revision"]
+    assert transient["validation_generation"]["current_session_revision"] == maintained_session["session_revision"]
+    assert transient["validation_generation"]["current_workspace_revision"] == maintained_session["workspace_revision"]
+    assert [
+        event["event_type"] for event in transient["validation_generation"]["maintenance_events"]
+    ] == ["session_recovered"]
     assert transient["correlation_set"]["request_ids"] == expected_request_ids
     assert transient["correlation_set"]["job_ids"] == expected_job_ids
     assert transient["validation_result"]["merge_eligible"] is False
@@ -907,7 +939,7 @@ def test_two_terminal_cancelled_correlations_then_forward_drift_recovers_same_wr
         branch=BRANCH,
         workspace_id=WORKSPACE_ID,
         development_session_id=resumed_session["session_id"],
-        expected_workspace_revision=5,
+        expected_workspace_revision=6,
         expected_session_revision=resumed_session["session_revision"],
         expected_current_head_sha=NEW_HEAD,
         expected_current_tree_sha=NEW_TREE,

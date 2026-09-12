@@ -172,7 +172,16 @@ def _stub_transient_recovery(monkeypatch, *, mode="fast", status="passed", corre
         "commit_sha": session["head_commit_sha"], "tree_sha": session["tree_sha"],
         "profile": job["profile"], "mode": mode, "base_sha": session["base_commit_sha"],
     }
-    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: rows)
+    generation = {
+        "generation_revision": session["session_revision"],
+        "generation_workspace_revision": session["workspace_revision"],
+        "current_session_revision": session["session_revision"],
+        "current_workspace_revision": session["workspace_revision"],
+        "source": "validation_started_event",
+        "maintenance_events": [],
+    }
+    monkeypatch.setattr(resume.sessions, "validation_generation_context", lambda *args, **kwargs: generation)
+    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args, **kwargs: rows)
     monkeypatch.setattr(resume.ci_request_store, "get_ci_request", lambda request_id: request if request_id == "ci_req_exact" else None)
     monkeypatch.setattr(resume.ci_request_store, "get_ci_request_by_worker_job_id", lambda job_id: request if job_id == job["job_id"] else None)
     monkeypatch.setattr(resume.ci_request_store, "get_ci_request_payload", lambda request_id: payload if request_id == "ci_req_exact" else {})
@@ -217,7 +226,7 @@ def _stub_request_only_transient_recovery(monkeypatch, *, mode="fast", status="p
         "commit_sha": session["head_commit_sha"], "tree_sha": session["tree_sha"],
         "profile": request["profile"], "mode": mode, "base_sha": session["base_commit_sha"],
     }
-    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: rows)
+    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args, **kwargs: rows)
     monkeypatch.setattr(resume.ci_request_store, "get_ci_request", lambda request_id: request if request_id == "ci_req_exact" else None)
     monkeypatch.setattr(resume.ci_request_store, "get_ci_request_payload", lambda request_id: payload if request_id == "ci_req_exact" else {})
     monkeypatch.setattr(resume, "db_get_job", lambda *args: pytest.fail("request-only terminal must not read a Worker job"))
@@ -435,7 +444,16 @@ def _stub_terminal_correlation_set(monkeypatch, *, statuses=("cancelled", "cance
             },
         })
 
-    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: rows)
+    generation = {
+        "generation_revision": session["session_revision"],
+        "generation_workspace_revision": session["workspace_revision"],
+        "current_session_revision": session["session_revision"],
+        "current_workspace_revision": session["workspace_revision"],
+        "source": "validation_started_event",
+        "maintenance_events": [],
+    }
+    monkeypatch.setattr(resume.sessions, "validation_generation_context", lambda *args, **kwargs: generation)
+    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args, **kwargs: rows)
     monkeypatch.setattr(resume.ci_request_store, "get_ci_request", lambda request_id: requests.get(request_id))
     monkeypatch.setattr(
         resume.ci_request_store, "get_ci_request_payload",
@@ -868,7 +886,10 @@ def test_validation_terminal_correlation_set_store_is_atomic_and_idempotent(tmp_
 
     settled = sessions.reconcile_terminal_validation_set(
         validating["session_id"], validating["session_revision"], 2, "full",
-        SHA_A, TREE_A, pairs, allow_branch_drift=True,
+        SHA_A, TREE_A, pairs,
+        validation_generation_revision=validating["session_revision"],
+        validation_generation_workspace_revision=validating["workspace_revision"],
+        allow_branch_drift=True,
     )
 
     recovered = settled["session"]
@@ -897,7 +918,10 @@ def test_validation_terminal_correlation_set_store_is_atomic_and_idempotent(tmp_
     with pytest.raises(resume.MyGithub12Error) as exc:
         sessions.reconcile_terminal_validation_set(
             validating["session_id"], validating["session_revision"], 2, "full",
-            SHA_A, TREE_A, pairs, allow_branch_drift=True,
+            SHA_A, TREE_A, pairs,
+            validation_generation_revision=validating["session_revision"],
+            validation_generation_workspace_revision=validating["workspace_revision"],
+            allow_branch_drift=True,
         )
     assert exc.value.code == "DEVELOPMENT_SESSION_REVISION_MISMATCH"
     unchanged = sessions.get_session(validating["session_id"])
@@ -917,13 +941,46 @@ def test_resume_recovers_restart_after_nonterminal_observation_with_legacy_fast_
     _, session, job = _stub_transient_recovery(monkeypatch)
     session["last_fast_ci_job_id"] = job["job_id"]
     job["summary"] = {}
+    generation_revision = session["session_revision"] - 1
+    generation = {
+        "generation_revision": generation_revision,
+        "generation_workspace_revision": session["workspace_revision"],
+        "current_session_revision": session["session_revision"],
+        "current_workspace_revision": session["workspace_revision"],
+        "source": "validation_started_event",
+        "maintenance_events": [{
+            "session_revision": session["session_revision"],
+            "event_type": "validation_observed",
+            "before_workspace_revision": session["workspace_revision"],
+            "after_workspace_revision": session["workspace_revision"],
+        }],
+    }
+    monkeypatch.setattr(resume.sessions, "validation_generation_context", lambda *args, **kwargs: generation)
     monkeypatch.setattr(
         resume.sessions,
         "validation_correlations",
-        lambda *args: [{
-            "job_id": job["job_id"], "session_revision": session["session_revision"] - 1,
+        lambda *args, **kwargs: [{
+            "job_id": job["job_id"], "session_revision": generation_revision,
             "tree_sha": "", "evidence": {"selection": {"complete": True}},
         }],
+    )
+    monkeypatch.setattr(
+        resume.ci_request_store,
+        "get_ci_request_payload",
+        lambda request_id: {
+            "development_session_id": session["session_id"],
+            "expected_session_revision": generation_revision,
+            "workspace_id": session["workspace_id"],
+            "workspace_revision": session["workspace_revision"],
+            "repository": session["repository"],
+            "branch": session["branch"],
+            "commit_sha": session["head_commit_sha"],
+            "tree_sha": session["tree_sha"],
+            "profile": "repo-fast-check",
+            "mode": "fast",
+            "base_branch": session["base_branch"],
+            "base_sha": session["base_commit_sha"],
+        },
     )
     monkeypatch.setattr(resume.dx, "validation_result", lambda *args, **kwargs: {"terminal": True, "merge_eligible": False, "attestation": None, "failure_pack": None})
     monkeypatch.setattr(resume.sessions, "transition", lambda *args, **kwargs: {**session, "status": "active", "session_revision": session["session_revision"] + 1})
@@ -1438,9 +1495,30 @@ def _production_validation_case(monkeypatch, *, mode, repository, branch, head, 
         "exit_code": 0 if status == "passed" else 1, "superseded_by_job_id": None,
         "summary": {"git_tree_sha": tree} if worker_tree else {},
     }
-    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: [correlation])
+    monkeypatch.setattr(
+        resume.sessions, "validation_generation_context",
+        lambda *args, **kwargs: {
+            "generation_revision": session["session_revision"],
+            "generation_workspace_revision": session["workspace_revision"],
+            "current_session_revision": session["session_revision"],
+            "current_workspace_revision": session["workspace_revision"],
+            "source": "validation_started_event",
+            "maintenance_events": [],
+        },
+    )
+    monkeypatch.setattr(
+        resume.sessions, "validation_correlations",
+        lambda *args, **kwargs: [{**correlation, "session_revision": session["session_revision"]}],
+    )
     monkeypatch.setattr(resume.ci_request_store, "get_ci_request", lambda value: request if value == request_id else None)
-    monkeypatch.setattr(resume.ci_request_store, "get_ci_request_payload", lambda value: payload if value == request_id else {})
+    monkeypatch.setattr(
+        resume.ci_request_store, "get_ci_request_payload",
+        lambda value: {
+            **payload,
+            "expected_session_revision": session["session_revision"],
+            "workspace_revision": session["workspace_revision"],
+        } if value == request_id else {},
+    )
     monkeypatch.setattr(resume, "db_get_job", lambda value: job if value == job_id else None)
     monkeypatch.setattr(
         resume.sessions, "bind_validation_request_worker",
@@ -1626,7 +1704,7 @@ def test_same_request_legacy_duplicate_placeholders_are_one_logical_correlation(
         {"request_id": "ci_req_dup", "job_id": None, "session_revision": 6, "tree_sha": TREE_A,
          "evidence": {"request_id": "ci_req_dup", "selection": {"complete": True}}},
     ]
-    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: duplicate_rows)
+    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args, **kwargs: duplicate_rows)
     monkeypatch.setattr(
         resume.sessions, "bind_validation_request_worker",
         lambda *args, **kwargs: {"request_id": request["request_id"], "job_id": job["job_id"], "logical_duplicate_count": 1},
@@ -1673,8 +1751,8 @@ def test_request_worker_recovery_identity_matrix_fails_closed(monkeypatch, mutat
     elif mutation == "worker_pair":
         monkeypatch.setattr(
             resume.sessions, "validation_correlations",
-            lambda *args: [{"request_id": request["request_id"], "job_id": "job-other", "session_revision": 7,
-                           "tree_sha": TREE_A, "evidence": {"request_id": request["request_id"]}},],
+            lambda *args, **kwargs: [{"request_id": request["request_id"], "job_id": "job-other", "session_revision": 7,
+                                     "tree_sha": TREE_A, "evidence": {"request_id": request["request_id"]}},],
         )
     elif mutation == "worker_repository": job["repository"] = "owner/other"
     elif mutation == "worker_branch": job["branch"] = "ai/other"
@@ -1717,7 +1795,7 @@ def test_no_request_id_and_no_strict_job_correlation_fails_closed(monkeypatch):
     )
     monkeypatch.setattr(
         resume.sessions, "validation_correlations",
-        lambda *args: [{"request_id": None, "job_id": None, "session_revision": 7, "tree_sha": TREE_A, "evidence": {}}],
+        lambda *args, **kwargs: [{"request_id": None, "job_id": None, "session_revision": 7, "tree_sha": TREE_A, "evidence": {}}],
     )
 
     recovered, evidence, blocker = resume._reconcile_transient_validation(session, ws)
@@ -1771,7 +1849,7 @@ def test_same_head_unowned_historical_worker_is_never_claimed(monkeypatch):
     )
     monkeypatch.setattr(
         resume.sessions, "validation_correlations",
-        lambda *args: [{
+        lambda *args, **kwargs: [{
             "request_id": None, "job_id": None, "session_revision": 7,
             "tree_sha": TREE_A, "evidence": {},
         }],

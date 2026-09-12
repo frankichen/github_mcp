@@ -258,15 +258,29 @@ DX-2 所有功能均必须保持：
 
 ### 9.4 Transient validation terminal correlation-set recovery
 
-当同一 `validating_fast` / `validating_full` Session 因历史重试留下多个 persisted validation correlation 时，不得按创建时间选择单个 Request/Job。只有服务端能够逐项证明这些 correlation 全部属于同一个 Session revision、mode/profile、repository/branch、HEAD/Tree/Base、Workspace identity，且每个 durable Request→Worker pair 完整、所有 Worker 均已 terminal、没有 supersede 或其它仍可能执行的 validation 时，才允许把整个集合一次性收敛为审计证据并将 Session 恢复到 `active`。
+当同一 `validating_fast` / `validating_full` Session 因历史重试留下多个 persisted validation correlation 时，不得按创建时间选择单个 Request/Job。只有服务端能够逐项证明这些 correlation 全部属于同一个 validation generation 的 Session revision、mode/profile、repository/branch、HEAD/Tree/Base、Workspace identity，且每个 durable Request→Worker pair 完整、所有 Worker 均已 terminal、没有 supersede 或其它仍可能执行的 validation 时，才允许把整个集合一次性收敛为审计证据并将 Session 恢复到 `active`。
 
-terminal correlation set recovery 必须保持 `merge_eligible=false`，不得生成或复用其中任意 passed Job 的 Attestation，不得把任意单个 Job 记录为当前权威 Full PASS，并必须清空旧 validation merge evidence。集合中任一 identity 冲突、Session/Workspace revision 不一致、Request/Worker 缺失、queued/preparing/running/cancel_requested 成员或不同 validation operation 都必须 fail-closed。重复 resume 在第一次成功 transition 后必须幂等，不得重复增加 Session revision 或重复写 audit。
+terminal correlation set recovery 必须保持 `merge_eligible=false`，不得生成或复用其中任意 passed Job 的 Attestation，不得把任意单个 Job 记录为当前权威 Full PASS，并必须清空旧 validation merge evidence。集合中任一 identity 冲突、validation generation 内 Session/Workspace revision identity 不一致、Request/Worker 缺失、queued/preparing/running/cancel_requested 成员或不同 validation operation 都必须 fail-closed。重复 resume 在第一次成功 transition 后必须幂等，不得重复增加 Session revision 或重复写 audit。
 
 - AC-RESUME-SET-01：两条 exact cancelled terminal correlation 可一次性恢复同一 canonical Session；
 - AC-RESUME-SET-02：failed+cancelled 或 passed+cancelled 的同 identity terminal set 可恢复到 `active`，但不得声称 PASS 或复用 Attestation；
 - AC-RESUME-SET-03：terminal identity 冲突或 terminal+running/queued/preparing 必须 fail-closed；
 - AC-RESUME-SET-04：branch forward drift 场景必须先完成 terminal set reconciliation，再继续既有 drift/base-sync recovery，不能绕过 CAS、ancestry、scope、overlap 或 evidence invalidation；
 - AC-RESUME-SET-05：生产原始 stale Session 回归必须证明 `validation_request_correlation_not_unique` 不再永久阻塞可证明安全的 exact terminal set。
+
+### 9.5 Historical validation generation recovery
+
+当 terminal correlation set 仍属于较早 Session revision，而当前 Session 仍停留在同一 `validating_fast` / `validating_full` 状态时，不得简单忽略 revision mismatch。服务端必须从最近一次 `validation_started` 事件确定 validation generation，并逐 revision 证明从 generation 到 current Session 之间只有 identity-preserving maintenance。
+
+允许跨越 revision 的 maintenance bump 仅包括 `session_recovered`、`workspace_lease_auto_renewed` 与 `validation_observed`：`session_recovered` 必须证明 `head_changed=false` 且 before/after HEAD/Tree 完全等于 validation identity；lease renewal 必须证明 Workspace revision 连续；`validation_observed` 只能改变 validation evidence 字段，不能改变 Git/Workspace identity。`validation_correlation_backfilled`、`external_drift_detected`、`recovery_refused` 可以作为同状态 non-mutating audit 共存，但不能替代每个 revision 必须存在的唯一 maintenance bump。
+
+历史 generation recovery 还必须要求 durable Request payload 精确绑定 generation Session revision 与 generation Workspace revision，并只读取该 exact generation 的 correlation rows。generation anchor 之后存在任何新 validation correlation、未知/mutating event、HEAD/Tree/status 改变、不连续 Workspace revision、Request payload generation CAS 不匹配，都必须返回 `DEVELOPMENT_SESSION_RECOVERY_REQUIRED`。最终 terminal-set transition 前必须在同一持久化事务中重新解析 generation 与完整 correlation set，避免读后竞态。
+
+- AC-RESUME-GEN-01：`validation_started@revN -> identity-preserving maintenance -> validating_*@revN+1` 可安全解析回 revN generation；
+- AC-RESUME-GEN-02：与生产 #823 一致的 historical generation 双 cancelled terminal set 可恢复到同一 canonical Session `active`，但不得复用 Attestation 或声称 PASS；
+- AC-RESUME-GEN-03：`validation_observed` 只允许 validation evidence 字段变化，任何 identity 字段变化必须 fail-closed；
+- AC-RESUME-GEN-04：generation 之后新增 validation row、maintenance audit 缺口、重复 bump event 或未知事件必须 fail-closed；
+- AC-RESUME-GEN-05：成功 generation reconciliation 后仍必须通过既有 drift/base-sync CAS、ancestry、scope、overlap 与 evidence invalidation 门禁。
 
 ## 10. FR-DX2-CONVERGE-01：`converge_development_task`
 

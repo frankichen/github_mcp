@@ -936,6 +936,7 @@ def _reconcile_terminal_validation_set(
     expected_profile: str,
     expected_base: str,
     workspace_revision: int,
+    validation_generation: dict[str, Any],
     drift_reconciliation: bool,
 ) -> tuple[dict[str, Any], dict[str, Any], str | None]:
     """Reconcile an exact set of terminal Request -> Worker correlations.
@@ -946,7 +947,8 @@ def _reconcile_terminal_validation_set(
     """
     session_id = str(session["session_id"])
     session_revision = int(session["session_revision"])
-    session_workspace_revision = int(session.get("workspace_revision") or 0)
+    generation_revision = int(validation_generation["generation_revision"])
+    generation_workspace_revision = int(validation_generation["generation_workspace_revision"])
     request_ids = sorted({str(item.get("request_id") or "") for item in correlations if item.get("request_id")})
     if len(request_ids) < 2:
         recovery = _transient_recovery_failure(
@@ -954,10 +956,12 @@ def _reconcile_terminal_validation_set(
             correlation_count=len(request_ids), request_ids=request_ids,
         )
         return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
-    if any(int(item.get("session_revision") or -1) != session_revision for item in correlations):
+    if any(int(item.get("session_revision") or -1) != generation_revision for item in correlations):
         recovery = _transient_recovery_failure(
             session, "validation_terminal_correlation_set_revision_mismatch",
-            request_ids=request_ids, expected_session_revision=session_revision,
+            request_ids=request_ids,
+            expected_generation_revision=generation_revision,
+            current_session_revision=session_revision,
         )
         return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
     if any(not item.get("request_id") for item in correlations):
@@ -1003,8 +1007,8 @@ def _reconcile_terminal_validation_set(
             and payload.get("base_branch") in (None, "", session.get("base_branch"))
             and payload.get("development_session_id") == session_id
             and payload.get("workspace_id") == workspace.get("workspace_id")
-            and int(payload.get("expected_session_revision") or -1) == session_revision
-            and int(payload.get("workspace_revision") or -1) == session_workspace_revision
+            and int(payload.get("expected_session_revision") or -1) == generation_revision
+            and int(payload.get("workspace_revision") or -1) == generation_workspace_revision
         )
         if not request_identity_matches:
             recovery = _transient_recovery_failure(
@@ -1112,6 +1116,8 @@ def _reconcile_terminal_validation_set(
             str(session["head_commit_sha"]),
             str(session["tree_sha"]),
             pair_bindings,
+            validation_generation_revision=generation_revision,
+            validation_generation_workspace_revision=generation_workspace_revision,
             allow_branch_drift=drift_reconciliation,
         )
     except MyGithub12Error as exc:
@@ -1128,6 +1134,7 @@ def _reconcile_terminal_validation_set(
         "reconciled": True,
         "mode": mode,
         "correlation_source": "persisted_terminal_set",
+        "validation_generation": validation_generation,
         "correlation_set": {
             "request_ids": audit.get("request_ids", request_ids),
             "job_ids": audit.get("job_ids", []),
@@ -1190,9 +1197,21 @@ def _reconcile_transient_validation(
         recovery = _transient_recovery_failure(session, "validation_workspace_session_cas_mismatch")
         return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
 
+    try:
+        validation_generation = sessions.validation_generation_context(
+            session_id, session_revision, mode,
+            str(session["head_commit_sha"]), str(session["tree_sha"]),
+        )
+    except MyGithub12Error as exc:
+        recovery = _transient_recovery_failure(
+            session, "validation_generation_resolution_failed", error_code=exc.code,
+        )
+        return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    generation_revision = int(validation_generation["generation_revision"])
+    generation_workspace_revision = int(validation_generation["generation_workspace_revision"])
     correlations = sessions.validation_correlations(
-        session_id, session_revision, mode,
-        str(session["head_commit_sha"]), str(session["tree_sha"]),
+        session_id, generation_revision, mode,
+        str(session["head_commit_sha"]), str(session["tree_sha"]), exact_revision=True,
     )
     request_ids = sorted({str(item.get("request_id")) for item in correlations if item.get("request_id")})
     job_ids = sorted({str(item.get("job_id")) for item in correlations if item.get("job_id")})
@@ -1205,6 +1224,7 @@ def _reconcile_transient_validation(
             expected_profile=expected_profile,
             expected_base=expected_base,
             workspace_revision=workspace_revision,
+            validation_generation=validation_generation,
             drift_reconciliation=drift_reconciliation,
         )
     if len(job_ids) > 1:
@@ -1236,6 +1256,16 @@ def _reconcile_transient_validation(
 
     payload = ci_request_store.get_ci_request_payload(request_id)
     request_tree = str(request.get("tree_sha") or "")
+    historical_generation = generation_revision != session_revision
+    payload_generation_matches = bool(
+        not historical_generation
+        or (
+            payload.get("development_session_id") == session_id
+            and payload.get("workspace_id") == workspace.get("workspace_id")
+            and int(payload.get("expected_session_revision") or -1) == generation_revision
+            and int(payload.get("workspace_revision") or -1) == generation_workspace_revision
+        )
+    )
     request_identity_matches = (
         request.get("repository") == session.get("repository")
         and request.get("branch") == session.get("branch")
@@ -1252,6 +1282,7 @@ def _reconcile_transient_validation(
         and payload.get("base_branch") in (None, "", session.get("base_branch"))
         and payload.get("development_session_id") in (None, "", session_id)
         and payload.get("workspace_id") in (None, "", workspace.get("workspace_id"))
+        and payload_generation_matches
     )
     if not request_identity_matches:
         recovery = _transient_recovery_failure(
@@ -1293,6 +1324,8 @@ def _reconcile_transient_validation(
             binding = sessions.bind_validation_request_worker(
                 session_id, session_revision, workspace_revision, mode,
                 str(session["head_commit_sha"]), str(session["tree_sha"]), request_id, "",
+                validation_generation_revision=generation_revision,
+                validation_generation_workspace_revision=generation_workspace_revision,
                 allow_branch_drift=drift_reconciliation,
                 request_terminal_status=request_status,
             )
@@ -1406,6 +1439,8 @@ def _reconcile_transient_validation(
         binding = sessions.bind_validation_request_worker(
             session_id, session_revision, workspace_revision, mode,
             str(session["head_commit_sha"]), str(session["tree_sha"]), request_id, worker_job_id,
+            validation_generation_revision=generation_revision,
+            validation_generation_workspace_revision=generation_workspace_revision,
             allow_branch_drift=drift_reconciliation,
         )
     except MyGithub12Error as exc:
