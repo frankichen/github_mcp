@@ -766,6 +766,7 @@ def _workspace_recovery_plan(
     current_main: dict[str, Any] | None = None,
     current_base: dict[str, Any] | None = None,
     branch_state: dict[str, Any] | None = None,
+    pr: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if not workspace:
         return None
