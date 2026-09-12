@@ -1352,6 +1352,7 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "prepared_change_set_ttl_seconds": PREPARED_CHANGE_SET_TTL_SECONDS,
         "supports_drifted_development_recovery": True,
         "supports_base_synced_development_recovery": True,
+        "supports_retargeted_development_recovery": True,
         "supports_local_git_mirror_reads": True,
         "supports_context_pack_v2": True,
         "supports_fast_feedback_ci": True,
