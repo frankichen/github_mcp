@@ -282,6 +282,35 @@ terminal correlation set recovery 必须保持 `merge_eligible=false`，不得�
 - AC-RESUME-GEN-04：generation 之后新增 validation row、maintenance audit 缺口、重复 bump event 或未知事件必须 fail-closed；
 - AC-RESUME-GEN-05：成功 generation reconciliation 后仍必须通过既有 drift/base-sync CAS、ancestry、scope、overlap 与 evidence invalidation 门禁。
 
+### 9.6 Retargeted stacked PR canonical Writer recovery
+
+当 stacked PR 的历史 base PR 已经合并，而当前 task PR 已被 retarget 到新的 live base（典型为 `old stacked branch@old SHA -> main@current SHA`）时，same-base `recover_base_synced_development_task` 不得通过伪造“同一 base branch 的 old/new SHA”来恢复。必须使用独立的 `recover_retargeted_development_task`，并保持以下合同：
+
+1. 必须精确绑定 repository、task branch、task PR number、canonical Workspace ID、canonical Session ID、Workspace revision CAS 与 Session revision CAS；
+2. 必须同时提供 historical old base branch/SHA、current new base branch/SHA、explicit old Session HEAD、current task HEAD/Tree；
+3. current task PR 必须 fresh-read 为 open/unmerged，且 head branch/SHA、base branch/SHA 全部与调用参数及 live branch/base 完全一致；
+4. historical old base 必须由一个 exact merged upstream PR 证明：其 head branch/SHA 精确等于 historical old base，base branch 等于 current new base；
+5. normal merge 可直接使用 merge commit ancestry；squash merge 不要求 historical upstream HEAD 本身成为 new base ancestor，但必须证明 upstream PR 的 `merge_commit_sha` 是 current new base 的 ancestor；
+6. `old stacked base -> new base` compare 只用于 imported-base delta/rename 分类，不得冒充 Git ancestry；
+7. task-owned delta、imported-base delta 与 overlap 必须分别计算；Workspace scope 只允许 task-owned forward delta，不能因为 imported base 自动扩大 scope；
+8. overlap 必须 rename-aware。只有 caller 显式提供的 `reviewed_overlap_paths_json` 与服务端重算完整集合精确相等时才允许继续；少报、多报、重复、rename identity 不一致都 fail closed；
+9. PR HEAD drift、PR base drift、live base drift、historical base branch drift、upstream merge proof 缺失、scope violation、duplicate active Writer、Workspace/Session revision mismatch、mixed old/new pinned state 全部 fail closed；
+10. recovery API 不移动 Git ref、不 merge/rebase/force push/reset、不写 repository 文件；
+11. 成功时仅原子更新原 canonical Workspace/Session 的 base identity，保留 current task HEAD/Tree，恢复 active lease、清除 drift，并把 task PR number 回填到 Workspace/Session；
+12. 任何旧 Index、fast/full CI、attestation、failure evidence 必须失效，不得自动作为 retarget 后 merge evidence；
+13. 同一 idempotency payload 重放必须返回同一 recovery audit，payload 变化必须 `IDEMPOTENCY_CONFLICT`；
+14. `resume_development_task` 必须识别该形态：Workspace/Session 仍绑定 old stacked base，而 current PR 已精确 retarget 到 live new base时，不得先以普通 `RECOVERY_IDENTITY_MISMATCH` 终止；若 Workspace HEAD/Tree 尚未 refresh 到 current branch，则先返回 `refresh_development_workspace`，随后返回可直接消费的 retarget recovery plan；
+15. 生产完成标准必须是原 canonical Workspace/Session 被恢复后真实 `write dry-run` 可通过，而不是 synthetic 单测或新 API 存在。
+
+- AC-RETARGET-01：squash merged upstream + exact task PR retarget 可恢复同一 Workspace/Session，HEAD/Tree 不被 recovery 修改；
+- AC-RETARGET-02：normal merged upstream 同样通过；
+- AC-RETARGET-03：imported-base scope 外 path 不误报 task scope violation，但 old Session HEAD 之后真实 task scope 外 path 必须拒绝；
+- AC-RETARGET-04：rename-aware overlap mismatch 拒绝，exact reviewed overlap 可通过且其它门禁不放宽；
+- AC-RETARGET-05：PR HEAD/base drift、old/new base drift、Workspace/Session CAS mismatch、duplicate Writer 全部有负向测试；
+- AC-RETARGET-06：成功 recovery 后旧 CI/attestation evidence 清零且不得被 readiness 复用；
+- AC-RETARGET-07：重复同一 recovery 不增加第二个 Writer、不重复推进 revision、不重复写 recovery event；
+- AC-RETARGET-08：真实生产 `frankichen/sxt` PR #823 的原 canonical Workspace/Session 完成 retarget recovery 后，base=当前 main、status/lease/drift 正常，并通过 normal MyGithut12 write dry-run。
+
 ## 10. FR-DX2-CONVERGE-01：`converge_development_task`
 
 ### 10.1 功能需求
