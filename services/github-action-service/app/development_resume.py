@@ -1134,6 +1134,7 @@ def _reconcile_terminal_validation_set(
         "reconciled": True,
         "mode": mode,
         "correlation_source": "persisted_terminal_set",
+        "validation_generation": validation_generation,
         "correlation_set": {
             "request_ids": audit.get("request_ids", request_ids),
             "job_ids": audit.get("job_ids", []),
