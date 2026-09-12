@@ -104,6 +104,20 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert base_sync_schema["properties"]["reviewed_overlap_paths_json"]["default"] == "[]"
     assert base_sync_schema["properties"]["reviewed_overlap_paths_json"]["type"] == "string"
     assert "exactly equals" in tools["recover_base_synced_development_task"].description
+    retarget_schema = tools["recover_retargeted_development_task"].inputSchema
+    assert {
+        "repository", "branch", "pull_number", "upstream_pull_number",
+        "workspace_id", "development_session_id", "expected_workspace_revision",
+        "expected_session_revision", "expected_old_base_branch", "expected_old_base_sha",
+        "expected_new_base_branch", "expected_new_base_sha", "expected_old_session_head_sha",
+        "expected_current_head_sha", "expected_current_tree_sha", "idempotency_key",
+    } <= set(retarget_schema["required"])
+    assert retarget_schema["properties"]["lease_seconds"]["default"] == 7200
+    assert "reviewed_overlap_paths_json" not in set(retarget_schema["required"])
+    assert retarget_schema["properties"]["reviewed_overlap_paths_json"]["default"] == "[]"
+    assert retarget_schema["properties"]["reviewed_overlap_paths_json"]["type"] == "string"
+    assert "squash-aware" in tools["recover_retargeted_development_task"].description
+    assert "exact reviewed overlap equality" in tools["recover_retargeted_development_task"].description
     change_set_tool = tools["apply_development_change_set"]
     change_set_schema = change_set_tool.inputSchema
     assert set(change_set_schema["required"]) == {
