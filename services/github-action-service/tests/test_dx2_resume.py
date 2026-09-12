@@ -6,6 +6,7 @@ from app import development_session_store as sessions
 SHA_A = "a" * 40
 SHA_B = "b" * 40
 TREE_A = "1" * 40
+TREE_B = "2" * 40
 
 
 def _workspace(status="active", revision=2, lease=9999999999.0):
@@ -277,6 +278,190 @@ def test_resume_transient_recovery_does_not_bypass_live_branch_drift(monkeypatch
 
     assert "WORKSPACE_BRANCH_DRIFTED" in result["blockers"]
     assert result["development_session"] == session
+
+
+def _stub_drifted_transient_recovery(monkeypatch, *, mode="full", status="cancelled"):
+    ws, session, job = _stub_transient_recovery(monkeypatch, mode=mode, status=status)
+    ws.update({
+        "status": "drifted",
+        "revision": int(session["workspace_revision"]) + 1,
+        "head_sha": SHA_B,
+        "tree_sha": TREE_B,
+        "drift_reason": "branch_moved_externally",
+        "lease_valid": False,
+    })
+    _stub_resume_context(
+        monkeypatch, ws=ws, session=session, branch_head=SHA_B, branch_tree=TREE_B,
+    )
+    monkeypatch.setattr(
+        resume,
+        "_current_main",
+        lambda service, repository: {
+            "branch": "main", "repository": repository,
+            "commit_sha": SHA_A, "tree_sha": TREE_A,
+        },
+    )
+    return ws, session, job
+
+
+@pytest.mark.parametrize(
+    ("mode", "status"),
+    [("full", "cancelled"), ("full", "failed"), ("fast", "cancelled"), ("fast", "failed")],
+)
+def test_resume_drifted_terminal_validation_reconciles_before_formal_recovery(monkeypatch, mode, status):
+    ws, session, job = _stub_drifted_transient_recovery(monkeypatch, mode=mode, status=status)
+    failure = {"resource_uri": f"mygithub12://response/{mode}-{status}"}
+    monkeypatch.setattr(
+        resume.dx,
+        "validation_result",
+        lambda *args, **kwargs: {
+            "terminal": True, "merge_eligible": False,
+            "attestation": None, "failure_pack": failure,
+        },
+    )
+    captured = {}
+
+    def transition(_session_id, _revision, to_status, **kwargs):
+        captured.update(to_status=to_status, **kwargs)
+        job_field = "last_fast_ci_job_id" if mode == "fast" else "last_full_ci_job_id"
+        return {
+            **session,
+            "status": to_status,
+            "session_revision": session["session_revision"] + 1,
+            job_field: job["job_id"],
+            "last_failure_resource_uri": failure["resource_uri"],
+        }
+
+    monkeypatch.setattr(resume.sessions, "transition", transition)
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert captured["to_status"] == "active"
+    assert result["workspace"]["workspace_id"] == ws["workspace_id"]
+    assert result["development_session"]["session_id"] == session["session_id"]
+    assert result["development_session"]["status"] == "active"
+    assert result["recovery"]["transient"]["reconciled"] is True
+    assert result["recovery"]["transient"]["workspace_drift_pending_recovery"] is True
+    assert "WORKSPACE_DRIFTED" in result["blockers"]
+    assert result["next_allowed_actions"][0] == "recover_drifted_development_task"
+    assert "continue_write" not in result["next_allowed_actions"]
+
+
+def test_resume_drifted_terminal_full_pass_keeps_attestation_historical(monkeypatch):
+    _, session, job = _stub_drifted_transient_recovery(monkeypatch, status="passed")
+    attestation = {"attestation_id": "att-exact"}
+    monkeypatch.setattr(
+        resume.dx,
+        "validation_result",
+        lambda *args, **kwargs: {
+            "terminal": True, "merge_eligible": True,
+            "attestation": attestation, "failure_pack": None,
+        },
+    )
+    captured = {}
+
+    def transition(_session_id, _revision, to_status, **kwargs):
+        captured.update(to_status=to_status, **kwargs)
+        return {
+            **session,
+            "status": to_status,
+            "session_revision": session["session_revision"] + 1,
+            "last_full_ci_job_id": job["job_id"],
+            "last_attestation_id": "att-exact",
+        }
+
+    monkeypatch.setattr(resume.sessions, "transition", transition)
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert captured["to_status"] == "active"
+    assert result["development_session"]["last_attestation_id"] == "att-exact"
+    assert result["development_session"]["status"] != "pr_ready"
+    assert result["recovery"]["transient"]["validation_result"]["merge_eligible"] is True
+    assert result["recovery"]["transient"]["workspace_drift_pending_recovery"] is True
+    assert result["next_allowed_actions"][0] == "recover_drifted_development_task"
+
+
+@pytest.mark.parametrize("status", ["preparing", "queued", "running"])
+def test_resume_drifted_live_validation_stays_fail_closed(monkeypatch, status):
+    _, session, _ = _stub_drifted_transient_recovery(monkeypatch, status=status)
+    monkeypatch.setattr(
+        resume.dx, "validation_result",
+        lambda *args, **kwargs: pytest.fail("non-terminal validation cannot be finalized"),
+    )
+    monkeypatch.setattr(
+        resume.sessions, "transition",
+        lambda *args, **kwargs: pytest.fail("non-terminal validation cannot change Session state"),
+    )
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["development_session"] == session
+    assert "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS" in result["blockers"]
+    assert "WORKSPACE_DRIFTED" in result["blockers"]
+    assert result["next_allowed_actions"] == ["get_private_ci_job", "resume_development_task"]
+    assert "recover_drifted_development_task" not in result["next_allowed_actions"]
+
+
+def test_resume_drifted_validation_identity_mismatch_remains_fail_closed(monkeypatch):
+    _, session, job = _stub_drifted_transient_recovery(monkeypatch, status="cancelled")
+    job["commit_sha"] = SHA_B
+    monkeypatch.setattr(
+        resume.dx, "validation_result",
+        lambda *args, **kwargs: pytest.fail("identity mismatch cannot finalize"),
+    )
+    monkeypatch.setattr(
+        resume.sessions, "transition",
+        lambda *args, **kwargs: pytest.fail("identity mismatch cannot change Session state"),
+    )
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["development_session"] == session
+    assert result["recovery"]["transient"]["reason"] == "validation_job_identity_mismatch"
+    assert "DEVELOPMENT_SESSION_RECOVERY_REQUIRED" in result["blockers"]
+    assert "continue_write" not in result["next_allowed_actions"]
+
+
+def test_validation_correlation_store_allows_only_verified_branch_drift_cas(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "drift-validation.db"))
+    resume.mygithub12.init_db()
+    now = resume.mygithub12._now()
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            "INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "ws_resume", "owner/repo", "ai/resume", "main", SHA_A,
+                SHA_A, TREE_A, "active", 1, "test", now + 600,
+                SHA_A, "{}", None, None, now, now,
+            ),
+        )
+    created = sessions.create_session(_workspace(revision=1, lease=now + 600), idempotency_key="drift-store")
+    validating = sessions.transition(
+        created["session_id"], created["session_revision"], "validating_fast", allowed_from={"active"},
+    )
+    sessions.record_validation(
+        validating["session_id"], validating["session_revision"], "fast", SHA_A, TREE_A,
+        request_id="ci_req_drift", evidence={"request_id": "ci_req_drift", "selection": {"complete": True}},
+    )
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            "UPDATE workspaces SET head_sha=?,tree_sha=?,status='drifted',drift_reason='branch_moved_externally',revision=2 WHERE workspace_id=?",
+            (SHA_B, TREE_B, "ws_resume"),
+        )
+
+    with pytest.raises(resume.MyGithub12Error):
+        sessions.bind_validation_request_worker(
+            validating["session_id"], validating["session_revision"], 2, "fast",
+            SHA_A, TREE_A, "ci_req_drift", "job-drift",
+        )
+
+    binding = sessions.bind_validation_request_worker(
+        validating["session_id"], validating["session_revision"], 2, "fast",
+        SHA_A, TREE_A, "ci_req_drift", "job-drift", allow_branch_drift=True,
+    )
+    assert binding["request_id"] == "ci_req_drift"
+    assert binding["job_id"] == "job-drift"
+    assert binding["workspace_drift_reconciliation"] is True
 
 
 def test_resume_transient_recovery_preserves_session_revision_cas(monkeypatch):
