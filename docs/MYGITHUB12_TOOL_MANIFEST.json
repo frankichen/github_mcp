@@ -185,9 +185,9 @@
   },
   "schema_snapshots": {
     "canonical": {
-      "tool_count": 164,
-      "tool_manifest_count": 164,
-      "compatibility_tool_count": 175,
+      "tool_count": 165,
+      "tool_manifest_count": 165,
+      "compatibility_tool_count": 176,
       "hidden_deprecated_tool_count": 11,
       "tool_schema_sha256": "4ce0017e0e57db52a7758e15bda3003a4eda3386a4657d4e1b2c67eabeda564e",
       "schema_generation_id": "schema-v1:4ce0017e0e57db52"
