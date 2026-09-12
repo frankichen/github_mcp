@@ -120,9 +120,9 @@ async def test_capabilities_report_wait_deprecation_and_schema_visibility(monkey
     production = json.loads(await get_mygithub_capabilities())
     deprecated = {item["name"]: item for item in production["deprecated_tools"]}
 
-    assert production["tool_count"] == 164
-    assert production["tool_manifest_count"] == 164
-    assert production["compatibility_tool_count"] == 175
+    assert production["tool_count"] == 165
+    assert production["tool_manifest_count"] == 165
+    assert production["compatibility_tool_count"] == 176
     assert production["hidden_deprecated_tool_count"] == 11
     assert "wait_private_ci_job" in production["hidden_deprecated_tools"]
     assert deprecated["wait_private_ci_job"] == {
