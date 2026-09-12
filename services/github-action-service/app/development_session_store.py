@@ -1118,12 +1118,36 @@ def bind_validation_request_worker(
                 "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "Session and Workspace identities differ during validation recovery"
             )
 
-        rows = db.execute(
-            """SELECT * FROM development_session_validations
-               WHERE session_id=? AND session_revision<=? AND mode=? AND commit_sha=?
-                 AND (tree_sha=? OR tree_sha='') ORDER BY id DESC""",
-            (session_id, expected_session_revision, mode, commit_sha, tree_sha),
-        ).fetchall()
+        exact_generation = int(validation_generation_revision or 0) > 0
+        if exact_generation:
+            generation = _validation_generation_context_db(db, session_row, mode, commit_sha, tree_sha)
+            if (
+                int(generation["generation_revision"]) != int(validation_generation_revision)
+                or int(generation["generation_workspace_revision"]) != int(validation_generation_workspace_revision)
+            ):
+                raise MyGithub12Error(
+                    "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                    "validation generation identity changed during correlation binding",
+                    {
+                        "expected_generation_revision": int(validation_generation_revision),
+                        "actual_generation_revision": int(generation["generation_revision"]),
+                        "expected_generation_workspace_revision": int(validation_generation_workspace_revision),
+                        "actual_generation_workspace_revision": int(generation["generation_workspace_revision"]),
+                    },
+                )
+            rows = db.execute(
+                """SELECT * FROM development_session_validations
+                   WHERE session_id=? AND session_revision=? AND mode=? AND commit_sha=?
+                     AND (tree_sha=? OR tree_sha='') ORDER BY id DESC""",
+                (session_id, int(validation_generation_revision), mode, commit_sha, tree_sha),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """SELECT * FROM development_session_validations
+                   WHERE session_id=? AND session_revision<=? AND mode=? AND commit_sha=?
+                     AND (tree_sha=? OR tree_sha='') ORDER BY id DESC""",
+                (session_id, expected_session_revision, mode, commit_sha, tree_sha),
+            ).fetchall()
         if not rows:
             raise MyGithub12Error(
                 "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "validation recovery has no persisted correlation row"
