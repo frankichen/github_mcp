@@ -200,18 +200,18 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.9.9"
+    assert manifest["service_version"] == "12.9.10"
     assert manifest["manifest_format"] == "composed-v2"
     assert manifest["legacy_tool_count"] == 120
-    assert manifest["new_tool_count"] == 55
+    assert manifest["new_tool_count"] == 56
     assert manifest["tool_count"] == EXPECTED_CANONICAL_TOOL_COUNT
     assert manifest["compatibility_tool_count"] == EXPECTED_REGISTERED_TOOL_COUNT
     assert set(manifest["hidden_deprecated_tools"]) == HIDDEN_DEPRECATED_TOOLS
     assert manifest["schema_identity_algorithm"] == "sha256-canonical-mcp-tools-v1"
-    assert manifest["new_tools"][-15:-11] == HIGH_LEVEL_PUT_TOOLS
-    assert manifest["new_tools"][-11:-3] == DX1_TOOLS
+    assert manifest["new_tools"][-16:-12] == HIGH_LEVEL_PUT_TOOLS
+    assert manifest["new_tools"][-12:-3] == DX1_TOOLS
     assert manifest["new_tools"][-3:] == INFRASTRUCTURE_DEPLOY_TOOLS
-    assert set(manifest["new_tools"][:-15]) == MYGITHUB12_BASE_TOOLS
+    assert set(manifest["new_tools"][:-16]) == MYGITHUB12_BASE_TOOLS
     legacy = json.loads((root / "docs" / "MYGITHUB10_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert [tool["name"] for tool in legacy["tools"]].count("apply_github_patch_from_ref") == 1
     apply_tool = next(tool for tool in legacy["tools"] if tool["name"] == "apply_github_patch_from_ref")
