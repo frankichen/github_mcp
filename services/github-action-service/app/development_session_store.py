@@ -1035,6 +1035,8 @@ def bind_validation_request_worker(
     request_id: str,
     job_id: str,
     *,
+    validation_generation_revision: int = 0,
+    validation_generation_workspace_revision: int = 0,
     allow_branch_drift: bool = False,
     request_terminal_status: str = "",
 ) -> dict[str, Any]:
