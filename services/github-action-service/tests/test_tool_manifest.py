@@ -77,8 +77,8 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     tools = {tool.name: tool for tool in actual}
     assert MYGITHUB12_BASE_TOOLS <= set(actual_names)
     assert len(MYGITHUB12_BASE_TOOLS) == 40
-    assert actual_names[-15:-11] == HIGH_LEVEL_PUT_TOOLS
-    assert actual_names[-11:-3] == DX1_TOOLS
+    assert actual_names[-16:-12] == HIGH_LEVEL_PUT_TOOLS
+    assert actual_names[-12:-3] == DX1_TOOLS
     assert actual_names[-3:] == INFRASTRUCTURE_DEPLOY_TOOLS
     for name in DX1_TOOLS:
         assert tools[name].annotations.readOnlyHint is False
