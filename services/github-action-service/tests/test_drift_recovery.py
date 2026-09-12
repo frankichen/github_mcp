@@ -745,7 +745,8 @@ def test_two_terminal_cancelled_correlations_then_forward_drift_recovers_same_wr
     initial_workspace = mygithub12.get_workspace(service, WORKSPACE_ID)
     created = sessions.create_session(initial_workspace, idempotency_key="terminal-set-drift-e2e")
     validating = sessions.transition(
-        created["session_id"], created["session_revision"], "validating_full", allowed_from={"active"},
+        created["session_id"], created["session_revision"], "validating_full",
+        event_type="validation_started", allowed_from={"active"},
     )
 
     requests = []
