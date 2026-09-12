@@ -819,6 +819,9 @@ def validation_correlations(
 
 
 _VALIDATION_MAINTENANCE_EVENTS = frozenset({"session_recovered", "workspace_lease_auto_renewed"})
+_VALIDATION_NONMUTATING_AUDIT_EVENTS = frozenset({
+    "validation_correlation_backfilled", "external_drift_detected", "recovery_refused",
+})
 
 
 def _event_data(row: sqlite3.Row) -> dict[str, Any]:
