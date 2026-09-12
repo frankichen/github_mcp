@@ -197,6 +197,69 @@ def _stub_transient_recovery(monkeypatch, *, mode="fast", status="passed", corre
     return ws, session, job
 
 
+def _stub_request_only_transient_recovery(monkeypatch, *, mode="fast", status="preflight_failed"):
+    ws, session, _ = _stub_transient_recovery(monkeypatch, mode=mode, status="queued")
+    rows = [{
+        "request_id": "ci_req_exact", "request_id_source": "column", "job_id": None,
+        "session_revision": session["session_revision"], "tree_sha": session["tree_sha"],
+        "evidence": {"selection": {"complete": False}, "request_id": "ci_req_exact"},
+    }]
+    request = {
+        "request_id": "ci_req_exact", "repository": session["repository"], "branch": session["branch"],
+        "commit_sha": session["head_commit_sha"], "tree_sha": session["tree_sha"],
+        "profile": "repo-fast-check" if mode == "fast" else "repo-auto-check",
+        "worker_job_id": None, "phase": "terminal", "status": status,
+        "preflight_error_code": "CI_PREFLIGHT_TEST" if status == "preflight_failed" else None,
+    }
+    payload = {
+        "development_session_id": session["session_id"], "workspace_id": ws["workspace_id"],
+        "repository": session["repository"], "branch": session["branch"],
+        "commit_sha": session["head_commit_sha"], "tree_sha": session["tree_sha"],
+        "profile": request["profile"], "mode": mode, "base_sha": session["base_commit_sha"],
+    }
+    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: rows)
+    monkeypatch.setattr(resume.ci_request_store, "get_ci_request", lambda request_id: request if request_id == "ci_req_exact" else None)
+    monkeypatch.setattr(resume.ci_request_store, "get_ci_request_payload", lambda request_id: payload if request_id == "ci_req_exact" else {})
+    monkeypatch.setattr(resume, "db_get_job", lambda *args: pytest.fail("request-only terminal must not read a Worker job"))
+    return ws, session, request
+
+
+@pytest.mark.parametrize("status", ["preflight_failed", "cancelled", "superseded", "internal_error"])
+def test_resume_reconciles_proven_request_only_terminal(monkeypatch, status):
+    _, session, request = _stub_request_only_transient_recovery(monkeypatch, status=status)
+    captured = {}
+    monkeypatch.setattr(
+        resume.sessions, "bind_validation_request_worker",
+        lambda *args, **kwargs: captured.update(kwargs) or {
+            "request_id": request["request_id"], "job_id": None,
+            "request_only_terminal": True, "request_terminal_status": status,
+        },
+    )
+    monkeypatch.setattr(
+        resume.sessions, "transition",
+        lambda *args, **kwargs: {**session, "status": "active", "session_revision": session["session_revision"] + 1},
+    )
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["development_session"]["status"] == "active"
+    assert result["recovery"]["transient"]["reconciled"] is True
+    assert result["recovery"]["transient"]["job"] is None
+    assert result["recovery"]["transient"]["validation_result"]["status"] == status
+    assert captured["request_terminal_status"] == status
+    assert "continue_write" in result["next_allowed_actions"]
+
+
+@pytest.mark.parametrize("status", ["passed", "failed", "timed_out", "worker_lost"])
+def test_resume_rejects_worker_required_terminal_without_worker(monkeypatch, status):
+    _, session, _ = _stub_request_only_transient_recovery(monkeypatch, status=status)
+    monkeypatch.setattr(resume.sessions, "transition", lambda *args, **kwargs: pytest.fail("unproven terminal must not change Session"))
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+    assert result["development_session"] == session
+    assert result["recovery"]["transient"]["reason"] == "validation_request_worker_missing_terminal"
+    assert "DEVELOPMENT_SESSION_RECOVERY_REQUIRED" in result["blockers"]
+
+
 def test_resume_reconciles_exact_terminal_fast_validation(monkeypatch):
     _, session, job = _stub_transient_recovery(monkeypatch)
     result_payload = {"terminal": True, "merge_eligible": False, "attestation": None, "failure_pack": None}
