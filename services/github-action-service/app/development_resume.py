@@ -969,6 +969,87 @@ def _workspace_recovery_plan(
     return None
 
 
+def _resume_retarget_recovery_from_plan(
+    service: Any,
+    plan: dict[str, Any] | None,
+    *,
+    expected_workspace_revision: int,
+    expected_session_revision: int,
+    idempotency_key: str,
+    lease_seconds: int,
+) -> dict[str, Any] | None:
+    """Execute a zero-overlap retarget plan through the stable resume schema.
+
+    This is a compatibility path for clients whose connector schema has not yet
+    exposed ``recover_retargeted_development_task``. It deliberately requires
+    caller-supplied exact Workspace/Session CAS and an idempotency key, and it
+    never auto-accepts a non-empty overlap review set.
+    """
+    if not isinstance(plan, dict) or plan.get("action") != "recover_retargeted_development_task":
+        return None
+    if (
+        int(expected_workspace_revision or 0) <= 0
+        or int(expected_session_revision or 0) <= 0
+        or not str(idempotency_key or "")
+    ):
+        return None
+    if bool(plan.get("reviewed_overlap_required")) or list(plan.get("actual_overlap_paths") or []):
+        return None
+
+    plan_workspace_revision = int(plan.get("expected_workspace_revision") or 0)
+    plan_session_revision = int(plan.get("expected_session_revision") or 0)
+    if plan_workspace_revision != int(expected_workspace_revision):
+        raise MyGithub12Error(
+            "WORKSPACE_REVISION_MISMATCH",
+            "retarget resume recovery plan Workspace revision changed",
+            {"expected": int(expected_workspace_revision), "actual": plan_workspace_revision},
+        )
+    if plan_session_revision != int(expected_session_revision):
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_REVISION_MISMATCH",
+            "retarget resume recovery plan Session revision changed",
+            {"expected": int(expected_session_revision), "actual": plan_session_revision},
+        )
+
+    required = (
+        "repository", "branch", "pull_number", "upstream_pull_number",
+        "workspace_id", "development_session_id",
+        "expected_old_base_branch", "expected_old_base_sha",
+        "expected_new_base_branch", "expected_new_base_sha",
+        "expected_old_session_head_sha", "expected_current_head_sha",
+        "expected_current_tree_sha",
+    )
+    missing = [name for name in required if plan.get(name) in (None, "")]
+    if missing:
+        raise MyGithub12Error(
+            "RECOVERY_IDENTITY_MISMATCH",
+            "retarget resume recovery plan is missing exact identity fields",
+            {"missing_fields": missing},
+        )
+
+    return retarget_recovery.recover_retargeted_task(
+        service=service,
+        repository=str(plan["repository"]),
+        branch=str(plan["branch"]),
+        pull_number=int(plan["pull_number"]),
+        upstream_pull_number=int(plan["upstream_pull_number"]),
+        workspace_id=str(plan["workspace_id"]),
+        development_session_id=str(plan["development_session_id"]),
+        expected_workspace_revision=plan_workspace_revision,
+        expected_session_revision=plan_session_revision,
+        expected_old_base_branch=str(plan["expected_old_base_branch"]),
+        expected_old_base_sha=str(plan["expected_old_base_sha"]),
+        expected_new_base_branch=str(plan["expected_new_base_branch"]),
+        expected_new_base_sha=str(plan["expected_new_base_sha"]),
+        expected_old_session_head_sha=str(plan["expected_old_session_head_sha"]),
+        expected_current_head_sha=str(plan["expected_current_head_sha"]),
+        expected_current_tree_sha=str(plan["expected_current_tree_sha"]),
+        idempotency_key=f"{idempotency_key}:retarget",
+        lease_seconds=int(lease_seconds),
+        reviewed_overlap_paths_json="[]",
+    )
+
+
 def _transient_recovery_failure(session: dict[str, Any], reason: str, **details: Any) -> dict[str, Any]:
     return {
         "transient_validation": True,
@@ -1907,6 +1988,34 @@ def resume_task(
         branch_state=branch_state,
         pr=pr,
     )
+    retarget_resume_recovery = _resume_retarget_recovery_from_plan(
+        service,
+        workspace_recovery,
+        expected_workspace_revision=expected_workspace_revision,
+        expected_session_revision=expected_session_revision,
+        idempotency_key=idempotency_key,
+        lease_seconds=lease_seconds,
+    )
+    if retarget_resume_recovery is not None:
+        resumed = resume_task(
+            service,
+            repository,
+            branch=effective_branch,
+            pull_number=int((pr or {}).get("pull_number") or pull_number or 0),
+            recover_stale_session=False,
+            renew_lease=False,
+            expected_workspace_revision=0,
+            expected_session_revision=0,
+            lease_seconds=lease_seconds,
+            idempotency_key="",
+        )
+        resumed["recovery"] = {
+            "retarget": retarget_resume_recovery,
+            "compatibility_entrypoint": "resume_development_task",
+            "expected_workspace_revision": int(expected_workspace_revision),
+            "expected_session_revision": int(expected_session_revision),
+        }
+        return resumed
     response = {
         "ok": True,
         "repository": repository,
