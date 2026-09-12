@@ -1969,3 +1969,104 @@ def test_workspace_recovery_plan_routes_exact_retarget_to_dedicated_tool(monkeyp
     )
 
     assert plan == expected
+
+
+def _resume_retarget_plan(*, overlap=None):
+    return {
+        "reason": "WORKSPACE_BASE_RETARGETED_EXTERNALLY",
+        "action": "recover_retargeted_development_task",
+        "recovery_tool": "recover_retargeted_development_task",
+        "repository": "owner/repo",
+        "branch": "ai/resume",
+        "pull_number": 823,
+        "upstream_pull_number": 820,
+        "workspace_id": "ws_resume",
+        "development_session_id": "dev_resume",
+        "expected_workspace_revision": 23,
+        "expected_session_revision": 25,
+        "expected_old_base_branch": "ai/upstream",
+        "expected_old_base_sha": SHA_A,
+        "expected_new_base_branch": "main",
+        "expected_new_base_sha": SHA_B,
+        "expected_old_session_head_sha": "c" * 40,
+        "expected_current_head_sha": "d" * 40,
+        "expected_current_tree_sha": "3" * 40,
+        "actual_overlap_paths": list(overlap or []),
+        "reviewed_overlap_required": bool(overlap),
+    }
+
+
+def test_resume_retarget_compat_executes_exact_zero_overlap_plan(monkeypatch):
+    captured = {}
+
+    def recover(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True, "writer_ready": True}
+
+    monkeypatch.setattr(resume.retarget_recovery, "recover_retargeted_task", recover)
+    result = resume._resume_retarget_recovery_from_plan(
+        FakeService(),
+        _resume_retarget_plan(),
+        expected_workspace_revision=23,
+        expected_session_revision=25,
+        idempotency_key="resume-retarget-once",
+        lease_seconds=7200,
+    )
+
+    assert result == {"ok": True, "writer_ready": True}
+    assert captured["repository"] == "owner/repo"
+    assert captured["pull_number"] == 823
+    assert captured["upstream_pull_number"] == 820
+    assert captured["expected_workspace_revision"] == 23
+    assert captured["expected_session_revision"] == 25
+    assert captured["expected_old_base_branch"] == "ai/upstream"
+    assert captured["expected_new_base_branch"] == "main"
+    assert captured["idempotency_key"] == "resume-retarget-once:retarget"
+    assert captured["reviewed_overlap_paths_json"] == "[]"
+
+
+def test_resume_retarget_compat_requires_explicit_cas_key_and_zero_overlap(monkeypatch):
+    monkeypatch.setattr(
+        resume.retarget_recovery,
+        "recover_retargeted_task",
+        lambda **kwargs: pytest.fail("unsafe compatibility recovery must not execute"),
+    )
+    plan = _resume_retarget_plan()
+    assert resume._resume_retarget_recovery_from_plan(
+        FakeService(), plan,
+        expected_workspace_revision=0,
+        expected_session_revision=25,
+        idempotency_key="resume-retarget-once",
+        lease_seconds=7200,
+    ) is None
+    assert resume._resume_retarget_recovery_from_plan(
+        FakeService(), plan,
+        expected_workspace_revision=23,
+        expected_session_revision=25,
+        idempotency_key="",
+        lease_seconds=7200,
+    ) is None
+    assert resume._resume_retarget_recovery_from_plan(
+        FakeService(), _resume_retarget_plan(overlap=["shared/path.py"]),
+        expected_workspace_revision=23,
+        expected_session_revision=25,
+        idempotency_key="resume-retarget-once",
+        lease_seconds=7200,
+    ) is None
+
+
+def test_resume_retarget_compat_rejects_cas_mismatch_before_execution(monkeypatch):
+    monkeypatch.setattr(
+        resume.retarget_recovery,
+        "recover_retargeted_task",
+        lambda **kwargs: pytest.fail("CAS mismatch must fail before recovery execution"),
+    )
+    with pytest.raises(resume.MyGithub12Error) as exc:
+        resume._resume_retarget_recovery_from_plan(
+            FakeService(), _resume_retarget_plan(),
+            expected_workspace_revision=22,
+            expected_session_revision=25,
+            idempotency_key="resume-retarget-once",
+            lease_seconds=7200,
+        )
+    assert exc.value.code == "WORKSPACE_REVISION_MISMATCH"

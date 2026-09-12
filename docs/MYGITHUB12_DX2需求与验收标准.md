@@ -301,6 +301,7 @@ terminal correlation set recovery 必须保持 `merge_eligible=false`，不得�
 13. 同一 idempotency payload 重放必须返回同一 recovery audit，payload 变化必须 `IDEMPOTENCY_CONFLICT`；
 14. `resume_development_task` 必须识别该形态：Workspace/Session 仍绑定 old stacked base，而 current PR 已精确 retarget 到 live new base时，不得先以普通 `RECOVERY_IDENTITY_MISMATCH` 终止；若 Workspace HEAD/Tree 尚未 refresh 到 current branch，则先返回 `refresh_development_workspace`，随后返回可直接消费的 retarget recovery plan；
 15. 生产完成标准必须是原 canonical Workspace/Session 被恢复后真实 `write dry-run` 可通过，而不是 synthetic 单测或新 API 存在。
+16. 对 connector schema 尚未刷新、暂时看不到 canonical retarget recovery tool 的已连接客户端，`resume_development_task` 只允许在 caller 显式提供与 server retarget plan 完全一致的 Workspace/Session revision CAS、非空 idempotency key 且 `actual_overlap_paths=[]` 时复用同一个 retarget recovery state machine；任何非空 overlap 都继续要求 canonical tool 的显式 reviewed path set，不允许 resume compatibility 自动豁免。
 
 - AC-RETARGET-01：squash merged upstream + exact task PR retarget 可恢复同一 Workspace/Session，HEAD/Tree 不被 recovery 修改；
 - AC-RETARGET-02：normal merged upstream 同样通过；
@@ -310,6 +311,7 @@ terminal correlation set recovery 必须保持 `merge_eligible=false`，不得�
 - AC-RETARGET-06：成功 recovery 后旧 CI/attestation evidence 清零且不得被 readiness 复用；
 - AC-RETARGET-07：重复同一 recovery 不增加第二个 Writer、不重复推进 revision、不重复写 recovery event；
 - AC-RETARGET-08：真实生产 `frankichen/sxt` PR #823 的原 canonical Workspace/Session 完成 retarget recovery 后，base=当前 main、status/lease/drift 正常，并通过 normal MyGithut12 write dry-run。
+- AC-RETARGET-09：schema-stale client 可通过 `resume_development_task + exact Workspace/Session CAS + idempotency key` 执行零 overlap retarget recovery；缺 CAS/key 或出现任何 overlap 时 compatibility path 必须保持只读 plan/fail-closed。
 
 ## 10. FR-DX2-CONVERGE-01：`converge_development_task`
 
