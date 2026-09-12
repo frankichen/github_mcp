@@ -927,7 +927,12 @@ def bind_validation_request_worker(
                 {"request_ids": sorted(distinct_request_ids)},
             )
         strict_job_ids = {item[3] for item in decorated if item[3]}
-        if any(value != job_id for value in strict_job_ids):
+        if request_only_terminal and strict_job_ids:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "request-only terminal conflicts with a persisted Worker correlation",
+                {"job_ids": sorted(strict_job_ids)},
+            )
+        if not request_only_terminal and any(value != job_id for value in strict_job_ids):
             raise MyGithub12Error(
                 "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "persisted validation Worker correlation conflicts with the durable Request",
                 {"job_ids": sorted(strict_job_ids), "expected_job_id": job_id},
@@ -938,10 +943,13 @@ def bind_validation_request_worker(
                 "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "legacy validation placeholder has neither request_id nor strict job correlation",
                 {"validation_ids": unowned},
             )
-        candidates = [
-            item for item in decorated
-            if item[2] == request_id or (not item[2] and item[3] == job_id)
-        ]
+        if request_only_terminal:
+            candidates = [item for item in decorated if item[2] == request_id]
+        else:
+            candidates = [
+                item for item in decorated
+                if item[2] == request_id or (not item[2] and item[3] == job_id)
+            ]
         if not candidates:
             raise MyGithub12Error(
                 "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "durable Request/Worker pair does not own a persisted validation row"
