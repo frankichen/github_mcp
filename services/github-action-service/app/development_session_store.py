@@ -12,6 +12,7 @@ import uuid
 from typing import Any
 
 from app import mygithub12 as core
+from app.ci_models import REQUEST_ONLY_TERMINAL_STATUSES
 
 MyGithub12Error = core.MyGithub12Error
 _db = core._db
@@ -818,9 +819,15 @@ def bind_validation_request_worker(
     tree_sha: str,
     request_id: str,
     job_id: str,
+    *,
+    allow_branch_drift: bool = False,
+    request_terminal_status: str = "",
 ) -> dict[str, Any]:
-    """CAS-bind one proven durable CI Request/Worker pair to its logical validation row."""
-    if mode not in {"fast", "full"} or not request_id or not job_id:
+    """CAS-bind one durable Request/Worker pair or proven request-only terminal."""
+    request_only_terminal = bool(
+        not job_id and request_terminal_status in REQUEST_ONLY_TERMINAL_STATUSES
+    )
+    if mode not in {"fast", "full"} or not request_id or (not job_id and not request_only_terminal):
         raise MyGithub12Error(
             "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "validation correlation identity is incomplete"
         )
@@ -849,10 +856,7 @@ def bind_validation_request_worker(
             raise MyGithub12Error(
                 "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "development session Git identity changed during validation recovery"
             )
-        if int(session_row["workspace_revision"]) != int(expected_workspace_revision):
-            raise MyGithub12Error(
-                "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "session does not reference the expected Workspace revision"
-            )
+        session_workspace_revision = int(session_row["workspace_revision"])
         workspace_row = db.execute(
             "SELECT * FROM workspaces WHERE workspace_id=?", (session_row["workspace_id"],)
         ).fetchone()
@@ -863,19 +867,36 @@ def bind_validation_request_worker(
                 "WORKSPACE_REVISION_MISMATCH", "Workspace revision changed during validation recovery",
                 {"expected": int(expected_workspace_revision), "actual": int(workspace_row["revision"])},
             )
-        if workspace_row["status"] != "active" or workspace_row["drift_reason"]:
-            raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED", "validation recovery requires an active non-drifted Workspace")
-        if float(workspace_row["lease_expires_at"] or 0) <= _now():
-            raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED", "validation recovery requires a live Workspace lease")
-        workspace_identity = (
+        drift_reconciliation = bool(
+            allow_branch_drift
+            and workspace_row["status"] == "drifted"
+            and workspace_row["drift_reason"] == "branch_moved_externally"
+            and session_workspace_revision < int(expected_workspace_revision)
+            and (
+                workspace_row["head_sha"] != session_row["head_commit_sha"]
+                or workspace_row["tree_sha"] != session_row["tree_sha"]
+            )
+        )
+        if session_workspace_revision != int(expected_workspace_revision) and not drift_reconciliation:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "session does not reference the expected Workspace revision"
+            )
+        if not drift_reconciliation:
+            if workspace_row["status"] != "active" or workspace_row["drift_reason"]:
+                raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED", "validation recovery requires an active non-drifted Workspace")
+            if float(workspace_row["lease_expires_at"] or 0) <= _now():
+                raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED", "validation recovery requires a live Workspace lease")
+        static_identity = (
             workspace_row["repository"] == session_row["repository"]
             and workspace_row["branch"] == session_row["branch"]
             and workspace_row["base_branch"] == session_row["base_branch"]
             and workspace_row["base_commit_sha"] == session_row["base_commit_sha"]
-            and workspace_row["head_sha"] == session_row["head_commit_sha"]
+        )
+        code_identity = (
+            workspace_row["head_sha"] == session_row["head_commit_sha"]
             and workspace_row["tree_sha"] == session_row["tree_sha"]
         )
-        if not workspace_identity:
+        if not static_identity or (not drift_reconciliation and not code_identity):
             raise MyGithub12Error(
                 "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "Session and Workspace identities differ during validation recovery"
             )
@@ -907,7 +928,12 @@ def bind_validation_request_worker(
                 {"request_ids": sorted(distinct_request_ids)},
             )
         strict_job_ids = {item[3] for item in decorated if item[3]}
-        if any(value != job_id for value in strict_job_ids):
+        if request_only_terminal and strict_job_ids:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "request-only terminal conflicts with a persisted Worker correlation",
+                {"job_ids": sorted(strict_job_ids)},
+            )
+        if not request_only_terminal and any(value != job_id for value in strict_job_ids):
             raise MyGithub12Error(
                 "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "persisted validation Worker correlation conflicts with the durable Request",
                 {"job_ids": sorted(strict_job_ids), "expected_job_id": job_id},
@@ -918,10 +944,13 @@ def bind_validation_request_worker(
                 "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "legacy validation placeholder has neither request_id nor strict job correlation",
                 {"validation_ids": unowned},
             )
-        candidates = [
-            item for item in decorated
-            if item[2] == request_id or (not item[2] and item[3] == job_id)
-        ]
+        if request_only_terminal:
+            candidates = [item for item in decorated if item[2] == request_id]
+        else:
+            candidates = [
+                item for item in decorated
+                if item[2] == request_id or (not item[2] and item[3] == job_id)
+            ]
         if not candidates:
             raise MyGithub12Error(
                 "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "durable Request/Worker pair does not own a persisted validation row"
@@ -930,15 +959,26 @@ def bind_validation_request_worker(
         canonical = (first_class or candidates)[0]
         canonical_row = canonical[0]
         existing_job_id = str(canonical_row["job_id"] or "")
-        if existing_job_id and existing_job_id != job_id:
+        if request_only_terminal and existing_job_id:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "request-only terminal is already bound to a Worker job"
+            )
+        if not request_only_terminal and existing_job_id and existing_job_id != job_id:
             raise MyGithub12Error(
                 "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "canonical validation row is bound to another Worker job"
             )
         try:
-            db.execute(
-                "UPDATE development_session_validations SET request_id=?,job_id=? WHERE id=?",
-                (request_id, job_id, int(canonical_row["id"])),
-            )
+            if request_only_terminal:
+                db.execute(
+                    """UPDATE development_session_validations
+                       SET request_id=?,status=?,finished_at=COALESCE(finished_at,?) WHERE id=?""",
+                    (request_id, request_terminal_status, _now(), int(canonical_row["id"])),
+                )
+            else:
+                db.execute(
+                    "UPDATE development_session_validations SET request_id=?,job_id=? WHERE id=?",
+                    (request_id, job_id, int(canonical_row["id"])),
+                )
         except sqlite3.IntegrityError as exc:
             raise MyGithub12Error(
                 "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "request_id uniqueness changed during validation recovery"
@@ -947,10 +987,13 @@ def bind_validation_request_worker(
         audit = {
             "mode": mode,
             "request_id": request_id,
-            "job_id": job_id,
+            "job_id": job_id or None,
             "canonical_validation_id": int(canonical_row["id"]),
             "duplicate_validation_ids": duplicate_ids,
             "logical_duplicate_count": len(duplicate_ids),
+            "workspace_drift_reconciliation": drift_reconciliation,
+            "request_only_terminal": request_only_terminal,
+            "request_terminal_status": request_terminal_status or None,
         }
         _append_event(
             db, session_row, "validation_correlation_backfilled",

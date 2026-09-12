@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from app import ci_database
+from app import ci_request_store
 from app import development_drift_recovery as recovery
 from app import development_orchestrator as dx
 from app import development_resume as resume
@@ -520,3 +522,207 @@ def test_index_failure_does_not_undo_completed_control_plane_recovery(tmp_path, 
     assert workspace["status"] == "active"
     assert stored_session["status"] == "active"
     assert workspace["head_sha"] == stored_session["head_commit_sha"] == NEW_HEAD
+
+
+def test_terminal_cancelled_full_validation_then_forward_drift_recovers_same_writer(tmp_path, monkeypatch):
+    """Regression for terminal CI + stale validating_full + branch_moved_externally deadlock."""
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "managed-recovery.db"))
+    monkeypatch.setattr(ci_database, "DB_PATH", str(tmp_path / "private-ci.db"))
+    connection = getattr(ci_database._local, "db", None)
+    if connection is not None:
+        connection.close()
+    ci_database._local.db = None
+    ci_database.init_db()
+    sessions.init_session_db()
+    service = FakeService()
+
+    with sessions._LOCK, sessions._db() as db:
+        db.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", _workspace_row())
+    initial_workspace = mygithub12.get_workspace(service, WORKSPACE_ID)
+    created = sessions.create_session(initial_workspace, idempotency_key="terminal-drift-e2e")
+    validating = sessions.transition(
+        created["session_id"], created["session_revision"], "validating_full", allowed_from={"active"},
+    )
+
+    request_payload = {
+        "schema": "development-validation-v1",
+        "development_session_id": validating["session_id"],
+        "expected_session_revision": validating["session_revision"],
+        "workspace_id": WORKSPACE_ID,
+        "workspace_revision": validating["workspace_revision"],
+        "repository": REPO,
+        "branch": BRANCH,
+        "commit_sha": OLD_HEAD,
+        "tree_sha": OLD_TREE,
+        "profile": "repo-auto-check",
+        "mode": "full",
+        "base_sha": BASE_SHA,
+    }
+    request_hash = ci_request_store.compute_normalized_request_hash(request_payload)
+    request = ci_request_store.create_or_get_ci_request(
+        repository=REPO,
+        branch=BRANCH,
+        commit_sha=OLD_HEAD,
+        tree_sha=OLD_TREE,
+        profile="repo-auto-check",
+        effective_config_digest="d" * 64,
+        idempotency_key="terminal-drift-ci-request",
+        normalized_request_hash=request_hash,
+        request_payload=request_payload,
+    )
+    request = ci_request_store.transition_ci_request(
+        request["request_id"], request["revision"], "preparing", "preparing",
+    )
+    job = ci_database.create_or_get_job(
+        REPO, BRANCH, OLD_HEAD, "repo-auto-check", 100, 900, True, False,
+        BASE_SHA, ["allowed/feature.py"], 1, False,
+    )
+    request = ci_request_store.transition_ci_request(
+        request["request_id"], request["revision"], "queued", "queued", worker_job_id=job["job_id"],
+    )
+    request = ci_request_store.transition_ci_request(
+        request["request_id"], request["revision"], "running", "running",
+    )
+    sessions.record_validation(
+        validating["session_id"], validating["session_revision"], "full", OLD_HEAD, OLD_TREE,
+        request_id=request["request_id"], job_id=job["job_id"], status="running",
+        evidence={
+            "request_id": request["request_id"],
+            "selection": {"complete": True, "changed_paths": ["allowed/feature.py"]},
+        },
+    )
+    assert ci_database.complete_job(
+        job["job_id"], -1, "cancelled", summary={"git_tree_sha": OLD_TREE},
+    ) is True
+    request = ci_request_store.transition_ci_request(
+        request["request_id"], request["revision"], "terminal", "cancelled",
+        terminal_reason="regression_cancelled",
+    )
+    assert request["phase"] == "terminal" and request["status"] == "cancelled"
+
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            """UPDATE workspaces SET head_sha=?,tree_sha=?,status='drifted',revision=5,
+               drift_reason='branch_moved_externally',index_commit_sha=NULL,lease_expires_at=0
+               WHERE workspace_id=?""",
+            (NEW_HEAD, NEW_TREE, WORKSPACE_ID),
+        )
+
+    monkeypatch.setattr(
+        resume, "_repository_policy",
+        lambda repository: {"ok": True, "repository": repository, "policy": {"github": True, "private_ci": True}},
+    )
+    monkeypatch.setattr(resume, "_discover_pr_by_branch", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        resume, "_current_main",
+        lambda _service, repository: {
+            "branch": BASE, "repository": repository, "commit_sha": BASE_SHA, "tree_sha": "4" * 40,
+        },
+    )
+    monkeypatch.setattr(
+        resume, "_resolve_branch",
+        lambda _service, repository, branch, base_branch: {
+            "ok": True, "repository": repository, "branch": branch, "base_branch": base_branch,
+            "commit_sha": NEW_HEAD, "tree_sha": NEW_TREE,
+        },
+    )
+    monkeypatch.setattr(
+        resume, "_select_workspace",
+        lambda _service, repository, branch: (
+            mygithub12.get_workspace(service, WORKSPACE_ID),
+            [mygithub12.get_workspace(service, WORKSPACE_ID)],
+        ),
+    )
+    monkeypatch.setattr(
+        resume.mygithub12, "get_index_status",
+        lambda _service, repository, commit_sha="", ref="": {
+            "ok": True, "repository": repository, "commit_sha": commit_sha,
+            "tree_sha": NEW_TREE, "status": "ready",
+        },
+    )
+    monkeypatch.setattr(
+        resume.mygithub12, "workspace_overlap",
+        lambda _service, workspace_id: {"ok": True, "workspace_id": workspace_id, "items": []},
+    )
+
+    resumed = resume.resume_task(service, REPO, branch=BRANCH, recover_stale_session=True)
+    resumed_session = resumed["development_session"]
+    assert resumed["workspace"]["workspace_id"] == WORKSPACE_ID
+    assert resumed["workspace"]["status"] == "drifted"
+    assert resumed_session["session_id"] == validating["session_id"]
+    assert resumed_session["status"] == "active"
+    assert resumed_session["head_commit_sha"] == OLD_HEAD
+    assert resumed_session["last_full_ci_job_id"] == job["job_id"]
+    assert resumed["recovery"]["transient"]["reconciled"] is True
+    assert resumed["recovery"]["transient"]["workspace_drift_pending_recovery"] is True
+    assert resumed["next_allowed_actions"][0] == "recover_drifted_development_task"
+    assert "continue_write" not in resumed["next_allowed_actions"]
+
+    monkeypatch.setattr(
+        recovery.mygithub12, "workspace_overlap",
+        lambda _service, workspace_id: {"ok": True, "workspace_id": workspace_id, "items": []},
+    )
+    monkeypatch.setattr(
+        recovery.mygithub12, "get_index_status",
+        lambda _service, repository, commit_sha="", ref="": {
+            "ok": True, "repository": repository, "commit_sha": commit_sha,
+            "tree_sha": NEW_TREE, "status": "ready",
+        },
+    )
+    monkeypatch.setattr(
+        recovery.mygithub12, "request_index_build",
+        lambda *args, **kwargs: pytest.fail("ready exact-head index must be reused"),
+    )
+    recovered = recovery.recover_drifted_task(
+        service,
+        repository=REPO,
+        branch=BRANCH,
+        workspace_id=WORKSPACE_ID,
+        development_session_id=resumed_session["session_id"],
+        expected_workspace_revision=5,
+        expected_session_revision=resumed_session["session_revision"],
+        expected_current_head_sha=NEW_HEAD,
+        expected_current_tree_sha=NEW_TREE,
+        expected_base_branch=BASE,
+        expected_base_sha=BASE_SHA,
+        idempotency_key="terminal-drift-recover",
+        lease_seconds=7200,
+    )
+    recovered_session = recovered["development_session"]
+    assert recovered["workspace"]["workspace_id"] == WORKSPACE_ID
+    assert recovered_session["session_id"] == validating["session_id"]
+    assert recovered["workspace"]["status"] == recovered_session["status"] == "active"
+    assert recovered_session["head_commit_sha"] == NEW_HEAD
+    assert recovered_session["tree_sha"] == NEW_TREE
+    assert recovered_session["last_full_ci_job_id"] is None
+    assert recovered_session["last_attestation_id"] is None
+
+    context = dx.resolve_generated_write_context(service, REPO, BRANCH, NEW_HEAD)
+    assert context["managed"] is True
+    assert context["workspace"]["workspace_id"] == WORKSPACE_ID
+    assert context["session"]["session_id"] == validating["session_id"]
+    write_preflight = mygithub12.workspace_write_preflight(
+        service, REPO, BRANCH, NEW_HEAD, WORKSPACE_ID, recovered["workspace"]["revision"],
+    )
+    assert write_preflight["workspace_id"] == WORKSPACE_ID
+    assert write_preflight["head_sha"] == NEW_HEAD
+    assert write_preflight["tree_sha"] == NEW_TREE
+    with pytest.raises(sessions.MyGithub12Error) as exc:
+        sessions._require_revision(resumed_session["session_id"], resumed_session["session_revision"])
+    assert exc.value.code == "DEVELOPMENT_SESSION_REVISION_MISMATCH"
+    with pytest.raises(mygithub12.MyGithub12Error) as exc:
+        mygithub12.workspace_write_preflight(service, REPO, BRANCH, NEW_HEAD, WORKSPACE_ID, 5)
+    assert exc.value.code == "WORKSPACE_REVISION_MISMATCH"
+
+    with sessions._db() as db:
+        active_workspaces = db.execute(
+            "SELECT COUNT(*) FROM workspaces WHERE repository=? AND branch=? AND status='active'",
+            (REPO, BRANCH),
+        ).fetchone()[0]
+        active_sessions = db.execute(
+            """SELECT COUNT(*) FROM development_sessions WHERE workspace_id=?
+               AND status IN ('preparing','active','validating_fast','validating_full','pr_ready','drifted','blocked','closing')""",
+            (WORKSPACE_ID,),
+        ).fetchone()[0]
+    assert active_workspaces == 1
+    assert active_sessions == 1
