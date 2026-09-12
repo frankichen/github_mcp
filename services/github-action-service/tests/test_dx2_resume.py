@@ -444,7 +444,16 @@ def _stub_terminal_correlation_set(monkeypatch, *, statuses=("cancelled", "cance
             },
         })
 
-    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: rows)
+    generation = {
+        "generation_revision": session["session_revision"],
+        "generation_workspace_revision": session["workspace_revision"],
+        "current_session_revision": session["session_revision"],
+        "current_workspace_revision": session["workspace_revision"],
+        "source": "validation_started_event",
+        "maintenance_events": [],
+    }
+    monkeypatch.setattr(resume.sessions, "validation_generation_context", lambda *args, **kwargs: generation)
+    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args, **kwargs: rows)
     monkeypatch.setattr(resume.ci_request_store, "get_ci_request", lambda request_id: requests.get(request_id))
     monkeypatch.setattr(
         resume.ci_request_store, "get_ci_request_payload",
