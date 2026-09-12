@@ -927,6 +927,224 @@ def _validation_request_summary(request: dict[str, Any], worker_job_id: str = ""
     }
 
 
+def _reconcile_terminal_validation_set(
+    session: dict[str, Any],
+    workspace: dict[str, Any],
+    correlations: list[dict[str, Any]],
+    *,
+    mode: str,
+    expected_profile: str,
+    expected_base: str,
+    workspace_revision: int,
+    drift_reconciliation: bool,
+) -> tuple[dict[str, Any], dict[str, Any], str | None]:
+    """Reconcile an exact set of terminal Request -> Worker correlations.
+
+    No member is selected as authoritative merge evidence.  Every persisted
+    correlation must belong to this exact validation operation and prove a
+    terminal durable Worker before one atomic Session transition is allowed.
+    """
+    session_id = str(session["session_id"])
+    session_revision = int(session["session_revision"])
+    session_workspace_revision = int(session.get("workspace_revision") or 0)
+    request_ids = sorted({str(item.get("request_id") or "") for item in correlations if item.get("request_id")})
+    if len(request_ids) < 2:
+        recovery = _transient_recovery_failure(
+            session, "validation_terminal_correlation_set_incomplete",
+            correlation_count=len(request_ids), request_ids=request_ids,
+        )
+        return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    if any(int(item.get("session_revision") or -1) != session_revision for item in correlations):
+        recovery = _transient_recovery_failure(
+            session, "validation_terminal_correlation_set_revision_mismatch",
+            request_ids=request_ids, expected_session_revision=session_revision,
+        )
+        return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    if any(not item.get("request_id") for item in correlations):
+        recovery = _transient_recovery_failure(
+            session, "validation_terminal_correlation_set_unowned",
+            request_ids=request_ids,
+        )
+        return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+
+    members: list[dict[str, Any]] = []
+    pair_bindings: list[dict[str, str]] = []
+    for request_id in request_ids:
+        owned = [item for item in correlations if str(item.get("request_id") or "") == request_id]
+        persisted_job_ids = sorted({str(item.get("job_id") or "") for item in owned if item.get("job_id")})
+        if len(persisted_job_ids) > 1:
+            recovery = _transient_recovery_failure(
+                session, "validation_worker_correlation_not_unique",
+                request_id=request_id, job_ids=persisted_job_ids,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+
+        request = ci_request_store.get_ci_request(request_id)
+        if not request:
+            recovery = _transient_recovery_failure(
+                session, "validation_request_not_found", request_id=request_id,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+        payload = ci_request_store.get_ci_request_payload(request_id)
+        request_tree = str(request.get("tree_sha") or "")
+        request_identity_matches = (
+            request.get("repository") == session.get("repository")
+            and request.get("branch") == session.get("branch")
+            and request.get("commit_sha") == session.get("head_commit_sha")
+            and request.get("profile") == expected_profile
+            and request_tree == session.get("tree_sha")
+            and payload.get("repository") == session.get("repository")
+            and payload.get("branch") == session.get("branch")
+            and payload.get("commit_sha") == session.get("head_commit_sha")
+            and payload.get("tree_sha") == session.get("tree_sha")
+            and payload.get("profile") == expected_profile
+            and payload.get("mode") == mode
+            and payload.get("base_sha") == expected_base
+            and payload.get("base_branch") in (None, "", session.get("base_branch"))
+            and payload.get("development_session_id") == session_id
+            and payload.get("workspace_id") == workspace.get("workspace_id")
+            and int(payload.get("expected_session_revision") or -1) == session_revision
+            and int(payload.get("workspace_revision") or -1) == session_workspace_revision
+        )
+        if not request_identity_matches:
+            recovery = _transient_recovery_failure(
+                session, "validation_request_identity_mismatch",
+                request_id=request_id, expected_profile=expected_profile,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+
+        worker_job_id = str(request.get("worker_job_id") or "")
+        if not worker_job_id:
+            recovery = _transient_recovery_failure(
+                session, "validation_request_worker_missing_in_set",
+                request_id=request_id,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+        request_phase = str(request.get("phase") or request.get("status") or "")
+        if request_phase not in {"queued", "running", "terminal"}:
+            recovery = _transient_recovery_failure(
+                session, "validation_request_worker_pair_mismatch",
+                request_id=request_id, request_phase=request_phase, worker_job_id=worker_job_id,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+        if persisted_job_ids and persisted_job_ids != [worker_job_id]:
+            recovery = _transient_recovery_failure(
+                session, "validation_request_worker_pair_mismatch",
+                request_id=request_id, worker_job_id=worker_job_id,
+                persisted_job_ids=persisted_job_ids,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+
+        job = db_get_job(worker_job_id)
+        if not job:
+            recovery = _transient_recovery_failure(
+                session, "validation_job_not_found", request_id=request_id, job_id=worker_job_id,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+        job_tree = (job.get("summary") or {}).get("git_tree_sha") if isinstance(job.get("summary"), dict) else None
+        worker_identity_matches = (
+            job.get("job_id") == worker_job_id
+            and job.get("repository") == session.get("repository")
+            and job.get("branch") == session.get("branch")
+            and job.get("commit_sha") == session.get("head_commit_sha")
+            and job.get("profile") == expected_profile
+            and job.get("base_sha") == expected_base
+        )
+        tree_proven = bool(job_tree == session.get("tree_sha")) if job_tree else bool(
+            request_tree == session.get("tree_sha")
+            and job.get("commit_sha") == request.get("commit_sha")
+            and request.get("worker_job_id") == worker_job_id
+        )
+        if (
+            not worker_identity_matches
+            or not tree_proven
+            or job.get("superseded_by_job_id")
+            or str(job.get("status") or "") == "superseded"
+        ):
+            recovery = _transient_recovery_failure(
+                session, "validation_job_identity_mismatch",
+                request_id=request_id, job_id=worker_job_id, expected_profile=expected_profile,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+
+        status = str(job.get("status") or "")
+        if status in VALIDATION_IN_PROGRESS_STATUSES:
+            return session, {
+                "transient_validation": True,
+                "reconciled": False,
+                "validation_in_progress": True,
+                "mode": mode,
+                "correlation_source": "persisted_terminal_set",
+                "correlation_set": {
+                    "request_ids": request_ids,
+                    "members": members + [{
+                        "request": _validation_request_summary(request, worker_job_id),
+                        "job": _ci_summary(job),
+                    }],
+                },
+            }, "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS"
+        if status not in dx.VALIDATION_TERMINAL_STATUSES or status == "superseded":
+            recovery = _transient_recovery_failure(
+                session, "validation_job_terminal_evidence_incomplete",
+                request_id=request_id, job_id=worker_job_id, job_status=status,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+        if status == "passed" and job.get("exit_code") != 0:
+            recovery = _transient_recovery_failure(
+                session, "validation_pass_exit_code_invalid",
+                request_id=request_id, job_id=worker_job_id,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+
+        members.append({
+            "request": _validation_request_summary(request, worker_job_id),
+            "job": _ci_summary(job),
+            "tree_evidence": "ci_job_summary" if job_tree else "request_tree_worker_pair",
+        })
+        pair_bindings.append({"request_id": request_id, "job_id": worker_job_id, "status": status})
+
+    try:
+        settlement = sessions.reconcile_terminal_validation_set(
+            session_id,
+            session_revision,
+            workspace_revision,
+            mode,
+            str(session["head_commit_sha"]),
+            str(session["tree_sha"]),
+            pair_bindings,
+            allow_branch_drift=drift_reconciliation,
+        )
+    except MyGithub12Error as exc:
+        recovery = _transient_recovery_failure(
+            session, "validation_terminal_correlation_set_bind_failed",
+            request_ids=request_ids, error_code=exc.code,
+        )
+        return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+
+    recovered_session = settlement["session"]
+    audit = settlement["audit"]
+    return recovered_session, {
+        "transient_validation": True,
+        "reconciled": True,
+        "mode": mode,
+        "correlation_source": "persisted_terminal_set",
+        "correlation_set": {
+            "request_ids": audit.get("request_ids", request_ids),
+            "job_ids": audit.get("job_ids", []),
+            "members": members,
+        },
+        "correlation_set_audit": audit,
+        "validation_result": {
+            "terminal": True,
+            "merge_eligible": False,
+            "attestation": None,
+            "failure_pack": None,
+            "correlation_set": True,
+        },
+        "workspace_drift_pending_recovery": drift_reconciliation,
+    }, None
+
+
 def _reconcile_transient_validation(
     session: dict[str, Any], workspace: dict[str, Any], *, allow_branch_drift: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], str | None]:
