@@ -1751,8 +1751,8 @@ def test_request_worker_recovery_identity_matrix_fails_closed(monkeypatch, mutat
     elif mutation == "worker_pair":
         monkeypatch.setattr(
             resume.sessions, "validation_correlations",
-            lambda *args: [{"request_id": request["request_id"], "job_id": "job-other", "session_revision": 7,
-                           "tree_sha": TREE_A, "evidence": {"request_id": request["request_id"]}},],
+            lambda *args, **kwargs: [{"request_id": request["request_id"], "job_id": "job-other", "session_revision": 7,
+                                     "tree_sha": TREE_A, "evidence": {"request_id": request["request_id"]}},],
         )
     elif mutation == "worker_repository": job["repository"] = "owner/other"
     elif mutation == "worker_branch": job["branch"] = "ai/other"
