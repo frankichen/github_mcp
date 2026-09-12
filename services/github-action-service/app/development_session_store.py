@@ -818,6 +818,8 @@ def bind_validation_request_worker(
     tree_sha: str,
     request_id: str,
     job_id: str,
+    *,
+    allow_branch_drift: bool = False,
 ) -> dict[str, Any]:
     """CAS-bind one proven durable CI Request/Worker pair to its logical validation row."""
     if mode not in {"fast", "full"} or not request_id or not job_id:
@@ -849,10 +851,7 @@ def bind_validation_request_worker(
             raise MyGithub12Error(
                 "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "development session Git identity changed during validation recovery"
             )
-        if int(session_row["workspace_revision"]) != int(expected_workspace_revision):
-            raise MyGithub12Error(
-                "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "session does not reference the expected Workspace revision"
-            )
+        session_workspace_revision = int(session_row["workspace_revision"])
         workspace_row = db.execute(
             "SELECT * FROM workspaces WHERE workspace_id=?", (session_row["workspace_id"],)
         ).fetchone()
@@ -863,19 +862,36 @@ def bind_validation_request_worker(
                 "WORKSPACE_REVISION_MISMATCH", "Workspace revision changed during validation recovery",
                 {"expected": int(expected_workspace_revision), "actual": int(workspace_row["revision"])},
             )
-        if workspace_row["status"] != "active" or workspace_row["drift_reason"]:
-            raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED", "validation recovery requires an active non-drifted Workspace")
-        if float(workspace_row["lease_expires_at"] or 0) <= _now():
-            raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED", "validation recovery requires a live Workspace lease")
-        workspace_identity = (
+        drift_reconciliation = bool(
+            allow_branch_drift
+            and workspace_row["status"] == "drifted"
+            and workspace_row["drift_reason"] == "branch_moved_externally"
+            and session_workspace_revision < int(expected_workspace_revision)
+            and (
+                workspace_row["head_sha"] != session_row["head_commit_sha"]
+                or workspace_row["tree_sha"] != session_row["tree_sha"]
+            )
+        )
+        if session_workspace_revision != int(expected_workspace_revision) and not drift_reconciliation:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "session does not reference the expected Workspace revision"
+            )
+        if not drift_reconciliation:
+            if workspace_row["status"] != "active" or workspace_row["drift_reason"]:
+                raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED", "validation recovery requires an active non-drifted Workspace")
+            if float(workspace_row["lease_expires_at"] or 0) <= _now():
+                raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED", "validation recovery requires a live Workspace lease")
+        static_identity = (
             workspace_row["repository"] == session_row["repository"]
             and workspace_row["branch"] == session_row["branch"]
             and workspace_row["base_branch"] == session_row["base_branch"]
             and workspace_row["base_commit_sha"] == session_row["base_commit_sha"]
-            and workspace_row["head_sha"] == session_row["head_commit_sha"]
+        )
+        code_identity = (
+            workspace_row["head_sha"] == session_row["head_commit_sha"]
             and workspace_row["tree_sha"] == session_row["tree_sha"]
         )
-        if not workspace_identity:
+        if not static_identity or (not drift_reconciliation and not code_identity):
             raise MyGithub12Error(
                 "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "Session and Workspace identities differ during validation recovery"
             )
@@ -951,6 +967,7 @@ def bind_validation_request_worker(
             "canonical_validation_id": int(canonical_row["id"]),
             "duplicate_validation_ids": duplicate_ids,
             "logical_duplicate_count": len(duplicate_ids),
+            "workspace_drift_reconciliation": drift_reconciliation,
         }
         _append_event(
             db, session_row, "validation_correlation_backfilled",
