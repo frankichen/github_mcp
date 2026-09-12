@@ -250,6 +250,7 @@
     "resume_development_task",
     "recover_drifted_development_task",
     "recover_base_synced_development_task",
+    "recover_retargeted_development_task",
     "apply_development_change_set",
     "validate_development_task",
     "converge_development_task",
