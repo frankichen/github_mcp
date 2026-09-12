@@ -704,7 +704,9 @@ def test_terminal_cancelled_full_validation_then_forward_drift_recovers_same_wri
     write_preflight = mygithub12.workspace_write_preflight(
         service, REPO, BRANCH, NEW_HEAD, WORKSPACE_ID, recovered["workspace"]["revision"],
     )
-    assert write_preflight["ok"] is True
+    assert write_preflight["workspace_id"] == WORKSPACE_ID
+    assert write_preflight["head_sha"] == NEW_HEAD
+    assert write_preflight["tree_sha"] == NEW_TREE
     with pytest.raises(sessions.MyGithub12Error) as exc:
         sessions._require_revision(resumed_session["session_id"], resumed_session["session_revision"])
     assert exc.value.code == "DEVELOPMENT_SESSION_REVISION_MISMATCH"
