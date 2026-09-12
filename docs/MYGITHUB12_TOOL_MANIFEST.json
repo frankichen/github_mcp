@@ -193,9 +193,9 @@
       "schema_generation_id": "schema-v1:4ce0017e0e57db52"
     },
     "compatibility": {
-      "tool_count": 175,
-      "tool_manifest_count": 175,
-      "compatibility_tool_count": 175,
+      "tool_count": 176,
+      "tool_manifest_count": 176,
+      "compatibility_tool_count": 176,
       "hidden_deprecated_tool_count": 0,
       "tool_schema_sha256": "74246f8bc615dac5867ea9f522a482fce653668c2c1ee5ed5d57bfd30701a427",
       "schema_generation_id": "schema-v1:74246f8bc615dac5"
