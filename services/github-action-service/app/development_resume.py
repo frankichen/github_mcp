@@ -936,6 +936,7 @@ def _reconcile_terminal_validation_set(
     expected_profile: str,
     expected_base: str,
     workspace_revision: int,
+    validation_generation: dict[str, Any],
     drift_reconciliation: bool,
 ) -> tuple[dict[str, Any], dict[str, Any], str | None]:
     """Reconcile an exact set of terminal Request -> Worker correlations.
