@@ -918,7 +918,10 @@ def test_validation_terminal_correlation_set_store_is_atomic_and_idempotent(tmp_
     with pytest.raises(resume.MyGithub12Error) as exc:
         sessions.reconcile_terminal_validation_set(
             validating["session_id"], validating["session_revision"], 2, "full",
-            SHA_A, TREE_A, pairs, allow_branch_drift=True,
+            SHA_A, TREE_A, pairs,
+            validation_generation_revision=validating["session_revision"],
+            validation_generation_workspace_revision=validating["workspace_revision"],
+            allow_branch_drift=True,
         )
     assert exc.value.code == "DEVELOPMENT_SESSION_REVISION_MISMATCH"
     unchanged = sessions.get_session(validating["session_id"])
