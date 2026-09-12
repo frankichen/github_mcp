@@ -1058,7 +1058,7 @@ def _reconcile_transient_validation(
             }, "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS"
         request_only_terminal = bool(
             request_phase == "terminal"
-            and request_status in {"preflight_failed", "cancelled", "superseded", "internal_error"}
+            and request_status in REQUEST_ONLY_TERMINAL_STATUSES
         )
         if not request_only_terminal:
             recovery = _transient_recovery_failure(
