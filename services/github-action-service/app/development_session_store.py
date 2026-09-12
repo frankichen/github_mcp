@@ -987,7 +987,7 @@ def _validation_generation_context_db(
                     "Session recovery changed validation identity",
                     {"session_revision": revision},
                 )
-        else:
+        elif event_type == "workspace_lease_auto_renewed":
             before_workspace_revision = int(data.get("before_workspace_revision") or -1)
             after_workspace_revision = int(data.get("after_workspace_revision") or -1)
             if before_workspace_revision < 0 or after_workspace_revision != before_workspace_revision + 1:
@@ -996,6 +996,20 @@ def _validation_generation_context_db(
                     "Workspace lease maintenance revision chain is invalid",
                     {"session_revision": revision},
                 )
+        else:
+            allowed_observation_fields = {
+                "last_fast_ci_job_id", "last_full_ci_job_id",
+                "last_attestation_id", "last_failure_resource_uri",
+            }
+            unexpected_fields = sorted(set(data) - allowed_observation_fields)
+            if unexpected_fields:
+                raise MyGithub12Error(
+                    "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                    "validation observation changed unsupported Session fields",
+                    {"session_revision": revision, "unexpected_fields": unexpected_fields},
+                )
+            before_workspace_revision = generation_workspace_revision
+            after_workspace_revision = generation_workspace_revision
         if after_workspace_revision != generation_workspace_revision:
             raise MyGithub12Error(
                 "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
