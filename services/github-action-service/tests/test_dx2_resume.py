@@ -1849,7 +1849,7 @@ def test_same_head_unowned_historical_worker_is_never_claimed(monkeypatch):
     )
     monkeypatch.setattr(
         resume.sessions, "validation_correlations",
-        lambda *args: [{
+        lambda *args, **kwargs: [{
             "request_id": None, "job_id": None, "session_revision": 7,
             "tree_sha": TREE_A, "evidence": {},
         }],
