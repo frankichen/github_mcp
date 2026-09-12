@@ -1116,6 +1116,8 @@ def _reconcile_terminal_validation_set(
             str(session["head_commit_sha"]),
             str(session["tree_sha"]),
             pair_bindings,
+            validation_generation_revision=generation_revision,
+            validation_generation_workspace_revision=generation_workspace_revision,
             allow_branch_drift=drift_reconciliation,
         )
     except MyGithub12Error as exc:
