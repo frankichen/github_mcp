@@ -947,7 +947,8 @@ def _reconcile_terminal_validation_set(
     """
     session_id = str(session["session_id"])
     session_revision = int(session["session_revision"])
-    session_workspace_revision = int(session.get("workspace_revision") or 0)
+    generation_revision = int(validation_generation["generation_revision"])
+    generation_workspace_revision = int(validation_generation["generation_workspace_revision"])
     request_ids = sorted({str(item.get("request_id") or "") for item in correlations if item.get("request_id")})
     if len(request_ids) < 2:
         recovery = _transient_recovery_failure(
@@ -955,10 +956,12 @@ def _reconcile_terminal_validation_set(
             correlation_count=len(request_ids), request_ids=request_ids,
         )
         return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
-    if any(int(item.get("session_revision") or -1) != session_revision for item in correlations):
+    if any(int(item.get("session_revision") or -1) != generation_revision for item in correlations):
         recovery = _transient_recovery_failure(
             session, "validation_terminal_correlation_set_revision_mismatch",
-            request_ids=request_ids, expected_session_revision=session_revision,
+            request_ids=request_ids,
+            expected_generation_revision=generation_revision,
+            current_session_revision=session_revision,
         )
         return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
     if any(not item.get("request_id") for item in correlations):
