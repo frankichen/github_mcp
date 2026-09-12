@@ -1007,8 +1007,8 @@ def _reconcile_terminal_validation_set(
             and payload.get("base_branch") in (None, "", session.get("base_branch"))
             and payload.get("development_session_id") == session_id
             and payload.get("workspace_id") == workspace.get("workspace_id")
-            and int(payload.get("expected_session_revision") or -1) == session_revision
-            and int(payload.get("workspace_revision") or -1) == session_workspace_revision
+            and int(payload.get("expected_session_revision") or -1) == generation_revision
+            and int(payload.get("workspace_revision") or -1) == generation_workspace_revision
         )
         if not request_identity_matches:
             recovery = _transient_recovery_failure(
