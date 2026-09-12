@@ -12,6 +12,7 @@ import uuid
 from typing import Any
 
 from app import mygithub12 as core
+from app.ci_models import REQUEST_ONLY_TERMINAL_STATUSES
 
 MyGithub12Error = core.MyGithub12Error
 _db = core._db
