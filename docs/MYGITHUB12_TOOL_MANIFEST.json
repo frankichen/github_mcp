@@ -197,8 +197,8 @@
       "tool_manifest_count": 176,
       "compatibility_tool_count": 176,
       "hidden_deprecated_tool_count": 0,
-      "tool_schema_sha256": "74246f8bc615dac5867ea9f522a482fce653668c2c1ee5ed5d57bfd30701a427",
-      "schema_generation_id": "schema-v1:74246f8bc615dac5"
+      "tool_schema_sha256": "3edbd73e0a56a218a3b02751796fc01230471591602a9bced248c5055d4bbeba",
+      "schema_generation_id": "schema-v1:3edbd73e0a56a218"
     }
   },
   "new_tools": [
