@@ -260,6 +260,47 @@ def test_resume_rejects_worker_required_terminal_without_worker(monkeypatch, sta
     assert "DEVELOPMENT_SESSION_RECOVERY_REQUIRED" in result["blockers"]
 
 
+def test_resume_reconciles_request_only_terminal_before_drift_recovery(monkeypatch):
+    ws, session, request = _stub_request_only_transient_recovery(monkeypatch, status="preflight_failed")
+    ws.update({
+        "status": "drifted",
+        "revision": int(session["workspace_revision"]) + 1,
+        "head_sha": SHA_B,
+        "tree_sha": TREE_B,
+        "drift_reason": "branch_moved_externally",
+        "lease_valid": False,
+    })
+    _stub_resume_context(monkeypatch, ws=ws, session=session, branch_head=SHA_B, branch_tree=TREE_B)
+    monkeypatch.setattr(
+        resume, "_current_main",
+        lambda service, repository: {"branch": "main", "repository": repository, "commit_sha": SHA_A, "tree_sha": TREE_A},
+    )
+    captured = {}
+    monkeypatch.setattr(
+        resume.sessions, "bind_validation_request_worker",
+        lambda *args, **kwargs: captured.update(kwargs) or {
+            "request_id": request["request_id"], "job_id": None,
+            "request_only_terminal": True, "request_terminal_status": "preflight_failed",
+            "workspace_drift_reconciliation": True,
+        },
+    )
+    monkeypatch.setattr(
+        resume.sessions, "transition",
+        lambda *args, **kwargs: {**session, "status": "active", "session_revision": session["session_revision"] + 1},
+    )
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert captured["allow_branch_drift"] is True
+    assert result["development_session"]["session_id"] == session["session_id"]
+    assert result["development_session"]["status"] == "active"
+    assert result["workspace"]["workspace_id"] == ws["workspace_id"]
+    assert result["workspace"]["status"] == "drifted"
+    assert result["recovery"]["transient"]["workspace_drift_pending_recovery"] is True
+    assert result["next_allowed_actions"][0] == "recover_drifted_development_task"
+    assert "continue_write" not in result["next_allowed_actions"]
+
+
 def test_resume_reconciles_exact_terminal_fast_validation(monkeypatch):
     _, session, job = _stub_transient_recovery(monkeypatch)
     result_payload = {"terminal": True, "merge_eligible": False, "attestation": None, "failure_pack": None}
