@@ -1704,7 +1704,7 @@ def test_same_request_legacy_duplicate_placeholders_are_one_logical_correlation(
         {"request_id": "ci_req_dup", "job_id": None, "session_revision": 6, "tree_sha": TREE_A,
          "evidence": {"request_id": "ci_req_dup", "selection": {"complete": True}}},
     ]
-    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: duplicate_rows)
+    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args, **kwargs: duplicate_rows)
     monkeypatch.setattr(
         resume.sessions, "bind_validation_request_worker",
         lambda *args, **kwargs: {"request_id": request["request_id"], "job_id": job["job_id"], "logical_duplicate_count": 1},
