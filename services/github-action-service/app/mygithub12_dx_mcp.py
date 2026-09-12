@@ -13,6 +13,7 @@ from mcp.types import ToolAnnotations
 from app import artifact_store
 from app import development_drift_recovery as drift_recovery
 from app import development_base_sync_recovery as base_sync_recovery
+from app import development_retarget_recovery as retarget_recovery
 from app import development_managed_merge as managed_merge
 from app import development_converge as converge
 from app import development_orchestrator as dx
