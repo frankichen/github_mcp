@@ -788,6 +788,61 @@ def _workspace_recovery_plan(
         old_head = str((session or {}).get("head_commit_sha") or "")
         current_head = str((branch_state or {}).get("commit_sha") or "")
         repository = str(workspace.get("repository") or "")
+        retarget_shape = bool(
+            service
+            and session
+            and pr
+            and live_base
+            and branch_state
+            and workspace.get("drift_reason") == "branch_moved_externally"
+            and base_branch
+            and live_base_branch
+            and live_base_branch != base_branch
+            and session.get("base_branch") == base_branch
+            and session_base == old_base
+            and pr.get("state") == "open"
+            and pr.get("merged") is not True
+            and pr.get("head_branch") == workspace.get("branch")
+            and pr.get("head_sha") == current_head
+            and pr.get("base_branch") == live_base_branch
+            and pr.get("base_sha") == new_base
+        )
+        if retarget_shape:
+            workspace_has_current_identity = (
+                workspace.get("head_sha") == current_head
+                and workspace.get("tree_sha") == branch_state.get("tree_sha")
+            )
+            if not workspace_has_current_identity:
+                return {
+                    "reason": "WORKSPACE_REFRESH_REQUIRED_BEFORE_RETARGET_RECOVERY",
+                    "action": "refresh_development_workspace",
+                    "manual_recovery_required": True,
+                    "workspace_id": workspace.get("workspace_id"),
+                    "development_session_id": session.get("session_id"),
+                    "expected_workspace_revision": workspace.get("revision"),
+                    "expected_current_head_sha": current_head,
+                    "expected_current_tree_sha": branch_state.get("tree_sha"),
+                    "next_action": "recover_retargeted_development_task",
+                    "recovery_sequence": [
+                        "refresh_development_workspace",
+                        "recover_retargeted_development_task",
+                    ],
+                }
+            try:
+                return retarget_recovery.plan_retargeted_task(
+                    service, workspace, session, pr, live_base, branch_state,
+                )
+            except MyGithub12Error as exc:
+                return {
+                    "reason": exc.code,
+                    "action": "recovery_required",
+                    "manual_recovery_required": True,
+                    "candidate_recovery_tool": "recover_retargeted_development_task",
+                    "workspace_id": workspace.get("workspace_id"),
+                    "development_session_id": session.get("session_id"),
+                    "drift_reason": workspace.get("drift_reason"),
+                    "error_details": exc.details,
+                }
         base_sync_shape = bool(
             service
             and session
