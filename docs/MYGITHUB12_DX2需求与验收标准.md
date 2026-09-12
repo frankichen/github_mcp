@@ -256,6 +256,18 @@ DX-2 所有功能均必须保持：
 - AC-RESUME-06：返回结果中明确区分 live fact、historical evidence、candidate next action；
 - AC-RESUME-07：常规 warm resume P95 目标小于 5 秒，不包括新 Index 构建等待。
 
+### 9.4 Transient validation terminal correlation-set recovery
+
+当同一 `validating_fast` / `validating_full` Session 因历史重试留下多个 persisted validation correlation 时，不得按创建时间选择单个 Request/Job。只有服务端能够逐项证明这些 correlation 全部属于同一个 Session revision、mode/profile、repository/branch、HEAD/Tree/Base、Workspace identity，且每个 durable Request→Worker pair 完整、所有 Worker 均已 terminal、没有 supersede 或其它仍可能执行的 validation 时，才允许把整个集合一次性收敛为审计证据并将 Session 恢复到 `active`。
+
+terminal correlation set recovery 必须保持 `merge_eligible=false`，不得生成或复用其中任意 passed Job 的 Attestation，不得把任意单个 Job 记录为当前权威 Full PASS，并必须清空旧 validation merge evidence。集合中任一 identity 冲突、Session/Workspace revision 不一致、Request/Worker 缺失、queued/preparing/running/cancel_requested 成员或不同 validation operation 都必须 fail-closed。重复 resume 在第一次成功 transition 后必须幂等，不得重复增加 Session revision 或重复写 audit。
+
+- AC-RESUME-SET-01：两条 exact cancelled terminal correlation 可一次性恢复同一 canonical Session；
+- AC-RESUME-SET-02：failed+cancelled 或 passed+cancelled 的同 identity terminal set 可恢复到 `active`，但不得声称 PASS 或复用 Attestation；
+- AC-RESUME-SET-03：terminal identity 冲突或 terminal+running/queued/preparing 必须 fail-closed；
+- AC-RESUME-SET-04：branch forward drift 场景必须先完成 terminal set reconciliation，再继续既有 drift/base-sync recovery，不能绕过 CAS、ancestry、scope、overlap 或 evidence invalidation；
+- AC-RESUME-SET-05：生产原始 stale Session 回归必须证明 `validation_request_correlation_not_unique` 不再永久阻塞可证明安全的 exact terminal set。
+
 ## 10. FR-DX2-CONVERGE-01：`converge_development_task`
 
 ### 10.1 功能需求
