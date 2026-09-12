@@ -564,7 +564,10 @@ def test_resume_terminal_correlation_set_retry_is_idempotent_after_single_transi
     assert second["development_session"]["session_id"] == recovered["session_id"]
     assert second["development_session"]["session_revision"] == recovered["session_revision"]
     assert second["development_session"]["status"] == "active"
-    assert second["next_allowed_actions"][0] == "recover_drifted_development_task"
+    # The idempotency contract is the absence of a second validation
+    # reconciliation/Session revision bump. Recovery-plan reconstruction is
+    # covered separately by the production-shaped drift regression.
+    assert "continue_write" not in second["next_allowed_actions"]
 
 
 def test_resume_fails_stop_when_validation_job_is_not_unique(monkeypatch):
