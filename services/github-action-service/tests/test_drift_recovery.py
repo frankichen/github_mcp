@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from app import ci_database
+from app import ci_request_store
 from app import development_drift_recovery as recovery
 from app import development_orchestrator as dx
 from app import development_resume as resume
