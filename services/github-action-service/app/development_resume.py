@@ -1197,11 +1197,16 @@ def _reconcile_transient_validation(
     request_ids = sorted({str(item.get("request_id")) for item in correlations if item.get("request_id")})
     job_ids = sorted({str(item.get("job_id")) for item in correlations if item.get("job_id")})
     if len(request_ids) > 1:
-        recovery = _transient_recovery_failure(
-            session, "validation_request_correlation_not_unique",
-            correlation_count=len(request_ids), request_ids=request_ids,
+        return _reconcile_terminal_validation_set(
+            session,
+            workspace,
+            correlations,
+            mode=mode,
+            expected_profile=expected_profile,
+            expected_base=expected_base,
+            workspace_revision=workspace_revision,
+            drift_reconciliation=drift_reconciliation,
         )
-        return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
     if len(job_ids) > 1:
         recovery = _transient_recovery_failure(
             session, "validation_worker_correlation_not_unique",
