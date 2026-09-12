@@ -360,6 +360,213 @@ def test_resume_reconciles_terminal_full_pass_to_pr_ready(monkeypatch):
     assert result["development_session"]["last_attestation_id"] == "att-exact"
 
 
+def _stub_terminal_correlation_set(monkeypatch, *, statuses=("cancelled", "cancelled"), mode="full"):
+    ws, session, _ = _stub_transient_recovery(monkeypatch, mode=mode, status=statuses[0])
+    ws.update({
+        "status": "drifted",
+        "revision": int(session["workspace_revision"]) + 1,
+        "head_sha": SHA_B,
+        "tree_sha": TREE_B,
+        "drift_reason": "branch_moved_externally",
+        "lease_valid": False,
+    })
+    _stub_resume_context(
+        monkeypatch, ws=ws, session=session, branch_head=SHA_B, branch_tree=TREE_B,
+    )
+    monkeypatch.setattr(
+        resume,
+        "_current_main",
+        lambda service, repository: {
+            "branch": "main", "repository": repository,
+            "commit_sha": SHA_A, "tree_sha": TREE_A,
+        },
+    )
+
+    requests = {}
+    payloads = {}
+    jobs = {}
+    rows = []
+    for index, status in enumerate(statuses):
+        suffix = chr(ord("a") + index)
+        request_id = f"ci_req_set_{suffix}"
+        job_id = f"job-set-{suffix}"
+        job = _validation_job(mode=mode, status=status, job_id=job_id)
+        request = {
+            "request_id": request_id,
+            "repository": session["repository"],
+            "branch": session["branch"],
+            "commit_sha": session["head_commit_sha"],
+            "tree_sha": session["tree_sha"],
+            "profile": job["profile"],
+            "worker_job_id": job_id,
+            # Reproduce the durable Request lag seen in production: the Worker
+            # is terminal even though the Request phase can still read queued.
+            "phase": "queued",
+            "status": "queued",
+            "revision": 2,
+        }
+        payload = {
+            "schema": "development-validation-v1",
+            "development_session_id": session["session_id"],
+            "expected_session_revision": session["session_revision"],
+            "workspace_id": ws["workspace_id"],
+            "workspace_revision": session["workspace_revision"],
+            "repository": session["repository"],
+            "branch": session["branch"],
+            "commit_sha": session["head_commit_sha"],
+            "tree_sha": session["tree_sha"],
+            "profile": job["profile"],
+            "mode": mode,
+            "base_branch": session["base_branch"],
+            "base_sha": session["base_commit_sha"],
+        }
+        requests[request_id] = request
+        payloads[request_id] = payload
+        jobs[job_id] = job
+        rows.append({
+            "request_id": request_id,
+            "request_id_source": "column",
+            "job_id": job_id,
+            "session_revision": session["session_revision"],
+            "tree_sha": session["tree_sha"],
+            "evidence": {
+                "request_id": request_id,
+                "selection": {"complete": True, "changed_paths": ["x.py"]},
+            },
+        })
+
+    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: rows)
+    monkeypatch.setattr(resume.ci_request_store, "get_ci_request", lambda request_id: requests.get(request_id))
+    monkeypatch.setattr(
+        resume.ci_request_store, "get_ci_request_payload",
+        lambda request_id: payloads.get(request_id, {}),
+    )
+    monkeypatch.setattr(resume, "db_get_job", lambda job_id: jobs.get(job_id))
+    monkeypatch.setattr(
+        resume.attestation_registry,
+        "find_reusable_attestation_for_job",
+        lambda *args, **kwargs: pytest.fail("a terminal correlation set must never reuse an attestation"),
+    )
+    captured = {}
+
+    def reconcile_set(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        bindings = args[6]
+        recovered = {
+            **session,
+            "status": "active",
+            "session_revision": session["session_revision"] + 1,
+            "last_fast_ci_job_id": None,
+            "last_full_ci_job_id": None,
+            "last_attestation_id": None,
+            "last_failure_resource_uri": None,
+        }
+        return {
+            "session": recovered,
+            "audit": {
+                "mode": mode,
+                "request_ids": sorted(requests),
+                "job_ids": sorted(jobs),
+                "terminal_correlations": bindings,
+                "workspace_drift_reconciliation": True,
+            },
+        }
+
+    monkeypatch.setattr(resume.sessions, "reconcile_terminal_validation_set", reconcile_set)
+    return ws, session, {"requests": requests, "payloads": payloads, "jobs": jobs, "rows": rows}, captured
+
+
+@pytest.mark.parametrize(
+    "statuses",
+    [
+        ("cancelled", "cancelled"),
+        ("failed", "cancelled"),
+        ("passed", "cancelled"),
+    ],
+)
+def test_resume_reconciles_exact_terminal_correlation_set_without_merge_evidence(monkeypatch, statuses):
+    ws, session, state, captured = _stub_terminal_correlation_set(monkeypatch, statuses=statuses)
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    recovered = result["development_session"]
+    transient = result["recovery"]["transient"]
+    assert recovered["session_id"] == session["session_id"]
+    assert recovered["status"] == "active"
+    assert recovered["session_revision"] == session["session_revision"] + 1
+    assert recovered["last_full_ci_job_id"] is None
+    assert recovered["last_attestation_id"] is None
+    assert recovered["last_failure_resource_uri"] is None
+    assert result["workspace"]["workspace_id"] == ws["workspace_id"]
+    assert result["workspace"]["status"] == "drifted"
+    assert transient["reconciled"] is True
+    assert transient["correlation_source"] == "persisted_terminal_set"
+    assert transient["validation_result"]["merge_eligible"] is False
+    assert transient["validation_result"]["attestation"] is None
+    assert transient["correlation_set"]["request_ids"] == sorted(state["requests"])
+    assert transient["correlation_set"]["job_ids"] == sorted(state["jobs"])
+    assert captured["kwargs"]["allow_branch_drift"] is True
+    assert result["next_allowed_actions"][0] == "recover_drifted_development_task"
+    assert "continue_write" not in result["next_allowed_actions"]
+
+
+def test_resume_terminal_correlation_set_identity_conflict_remains_fail_closed(monkeypatch):
+    _, session, state, captured = _stub_terminal_correlation_set(monkeypatch)
+    state["payloads"]["ci_req_set_b"]["tree_sha"] = TREE_B
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["development_session"] == session
+    assert result["recovery"]["transient"]["reason"] == "validation_request_identity_mismatch"
+    assert "DEVELOPMENT_SESSION_RECOVERY_REQUIRED" in result["blockers"]
+    assert captured == {}
+
+
+@pytest.mark.parametrize("live_status", ["running", "queued", "preparing"])
+def test_resume_terminal_correlation_set_with_live_worker_remains_fail_closed(monkeypatch, live_status):
+    _, session, _state, captured = _stub_terminal_correlation_set(
+        monkeypatch, statuses=("cancelled", live_status),
+    )
+
+    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert result["development_session"] == session
+    assert result["recovery"]["transient"]["validation_in_progress"] is True
+    assert "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS" in result["blockers"]
+    assert result["next_allowed_actions"] == ["get_private_ci_job", "resume_development_task"]
+    assert captured == {}
+
+
+def test_resume_terminal_correlation_set_retry_is_idempotent_after_single_transition(monkeypatch):
+    ws, _session, _state, _captured = _stub_terminal_correlation_set(monkeypatch)
+    first = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+    recovered = first["development_session"]
+
+    _stub_resume_context(
+        monkeypatch, ws=ws, session=recovered, branch_head=SHA_B, branch_tree=TREE_B,
+    )
+    monkeypatch.setattr(
+        resume,
+        "_current_main",
+        lambda service, repository: {
+            "branch": "main", "repository": repository,
+            "commit_sha": SHA_A, "tree_sha": TREE_A,
+        },
+    )
+    monkeypatch.setattr(
+        resume,
+        "_reconcile_transient_validation",
+        lambda *args, **kwargs: pytest.fail("an active Session must not reconcile the terminal set twice"),
+    )
+    second = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume")
+
+    assert second["development_session"]["session_id"] == recovered["session_id"]
+    assert second["development_session"]["session_revision"] == recovered["session_revision"]
+    assert second["development_session"]["status"] == "active"
+    assert second["next_allowed_actions"][0] == "recover_drifted_development_task"
+
+
 def test_resume_fails_stop_when_validation_job_is_not_unique(monkeypatch):
     _, session, _ = _stub_transient_recovery(monkeypatch, correlations=2)
     monkeypatch.setattr(resume.dx, "validation_result", lambda *args, **kwargs: pytest.fail("ambiguous CI must not be observed"))
