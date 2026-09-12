@@ -1495,9 +1495,30 @@ def _production_validation_case(monkeypatch, *, mode, repository, branch, head, 
         "exit_code": 0 if status == "passed" else 1, "superseded_by_job_id": None,
         "summary": {"git_tree_sha": tree} if worker_tree else {},
     }
-    monkeypatch.setattr(resume.sessions, "validation_correlations", lambda *args: [correlation])
+    monkeypatch.setattr(
+        resume.sessions, "validation_generation_context",
+        lambda *args, **kwargs: {
+            "generation_revision": session["session_revision"],
+            "generation_workspace_revision": session["workspace_revision"],
+            "current_session_revision": session["session_revision"],
+            "current_workspace_revision": session["workspace_revision"],
+            "source": "validation_started_event",
+            "maintenance_events": [],
+        },
+    )
+    monkeypatch.setattr(
+        resume.sessions, "validation_correlations",
+        lambda *args, **kwargs: [{**correlation, "session_revision": session["session_revision"]}],
+    )
     monkeypatch.setattr(resume.ci_request_store, "get_ci_request", lambda value: request if value == request_id else None)
-    monkeypatch.setattr(resume.ci_request_store, "get_ci_request_payload", lambda value: payload if value == request_id else {})
+    monkeypatch.setattr(
+        resume.ci_request_store, "get_ci_request_payload",
+        lambda value: {
+            **payload,
+            "expected_session_revision": session["session_revision"],
+            "workspace_revision": session["workspace_revision"],
+        } if value == request_id else {},
+    )
     monkeypatch.setattr(resume, "db_get_job", lambda value: job if value == job_id else None)
     monkeypatch.setattr(
         resume.sessions, "bind_validation_request_worker",
