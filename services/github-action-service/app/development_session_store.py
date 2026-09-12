@@ -1343,14 +1343,30 @@ def reconcile_terminal_validation_set(
                 "Session and Workspace identities differ during validation recovery",
             )
 
+        generation = _validation_generation_context_db(db, session_row, mode, commit_sha, tree_sha)
+        if (
+            int(generation["generation_revision"]) != int(validation_generation_revision)
+            or int(generation["generation_workspace_revision"]) != int(validation_generation_workspace_revision)
+        ):
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                "validation generation identity changed during terminal-set recovery",
+                {
+                    "expected_generation_revision": int(validation_generation_revision),
+                    "actual_generation_revision": int(generation["generation_revision"]),
+                    "expected_generation_workspace_revision": int(validation_generation_workspace_revision),
+                    "actual_generation_workspace_revision": int(generation["generation_workspace_revision"]),
+                },
+            )
+
         rows = db.execute(
             """SELECT * FROM development_session_validations
                WHERE session_id=? AND session_revision=? ORDER BY id DESC""",
-            (session_id, int(expected_session_revision)),
+            (session_id, int(validation_generation_revision)),
         ).fetchall()
         if not rows:
             raise MyGithub12Error(
-                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "validation recovery has no current-revision correlations",
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "validation recovery has no generation correlations",
             )
         decorated: list[tuple[sqlite3.Row, dict[str, Any], str, str]] = []
         persisted_request_ids: set[str] = set()
