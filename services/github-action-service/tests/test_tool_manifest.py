@@ -8,13 +8,14 @@ from app.mcp_server import get_mygithub_capabilities, mcp
 from app.version import SERVICE_VERSION
 
 
-EXPECTED_REGISTERED_TOOL_COUNT = 175
-EXPECTED_CANONICAL_TOOL_COUNT = 164
+EXPECTED_REGISTERED_TOOL_COUNT = 176
+EXPECTED_CANONICAL_TOOL_COUNT = 165
 DX1_TOOLS = [
     "prepare_development_task",
     "resume_development_task",
     "recover_drifted_development_task",
     "recover_base_synced_development_task",
+    "recover_retargeted_development_task",
     "apply_development_change_set",
     "validate_development_task",
     "converge_development_task",
@@ -76,8 +77,8 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     tools = {tool.name: tool for tool in actual}
     assert MYGITHUB12_BASE_TOOLS <= set(actual_names)
     assert len(MYGITHUB12_BASE_TOOLS) == 40
-    assert actual_names[-15:-11] == HIGH_LEVEL_PUT_TOOLS
-    assert actual_names[-11:-3] == DX1_TOOLS
+    assert actual_names[-16:-12] == HIGH_LEVEL_PUT_TOOLS
+    assert actual_names[-12:-3] == DX1_TOOLS
     assert actual_names[-3:] == INFRASTRUCTURE_DEPLOY_TOOLS
     for name in DX1_TOOLS:
         assert tools[name].annotations.readOnlyHint is False
@@ -103,6 +104,20 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert base_sync_schema["properties"]["reviewed_overlap_paths_json"]["default"] == "[]"
     assert base_sync_schema["properties"]["reviewed_overlap_paths_json"]["type"] == "string"
     assert "exactly equals" in tools["recover_base_synced_development_task"].description
+    retarget_schema = tools["recover_retargeted_development_task"].inputSchema
+    assert {
+        "repository", "branch", "pull_number", "upstream_pull_number",
+        "workspace_id", "development_session_id", "expected_workspace_revision",
+        "expected_session_revision", "expected_old_base_branch", "expected_old_base_sha",
+        "expected_new_base_branch", "expected_new_base_sha", "expected_old_session_head_sha",
+        "expected_current_head_sha", "expected_current_tree_sha", "idempotency_key",
+    } <= set(retarget_schema["required"])
+    assert retarget_schema["properties"]["lease_seconds"]["default"] == 7200
+    assert "reviewed_overlap_paths_json" not in set(retarget_schema["required"])
+    assert retarget_schema["properties"]["reviewed_overlap_paths_json"]["default"] == "[]"
+    assert retarget_schema["properties"]["reviewed_overlap_paths_json"]["type"] == "string"
+    assert "squash-aware" in tools["recover_retargeted_development_task"].description
+    assert "exact reviewed overlap equality" in tools["recover_retargeted_development_task"].description
     change_set_tool = tools["apply_development_change_set"]
     change_set_schema = change_set_tool.inputSchema
     assert set(change_set_schema["required"]) == {
@@ -185,18 +200,18 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.9.9"
+    assert manifest["service_version"] == "12.9.10"
     assert manifest["manifest_format"] == "composed-v2"
     assert manifest["legacy_tool_count"] == 120
-    assert manifest["new_tool_count"] == 55
+    assert manifest["new_tool_count"] == 56
     assert manifest["tool_count"] == EXPECTED_CANONICAL_TOOL_COUNT
     assert manifest["compatibility_tool_count"] == EXPECTED_REGISTERED_TOOL_COUNT
     assert set(manifest["hidden_deprecated_tools"]) == HIDDEN_DEPRECATED_TOOLS
     assert manifest["schema_identity_algorithm"] == "sha256-canonical-mcp-tools-v1"
-    assert manifest["new_tools"][-15:-11] == HIGH_LEVEL_PUT_TOOLS
-    assert manifest["new_tools"][-11:-3] == DX1_TOOLS
+    assert manifest["new_tools"][-16:-12] == HIGH_LEVEL_PUT_TOOLS
+    assert manifest["new_tools"][-12:-3] == DX1_TOOLS
     assert manifest["new_tools"][-3:] == INFRASTRUCTURE_DEPLOY_TOOLS
-    assert set(manifest["new_tools"][:-15]) == MYGITHUB12_BASE_TOOLS
+    assert set(manifest["new_tools"][:-16]) == MYGITHUB12_BASE_TOOLS
     legacy = json.loads((root / "docs" / "MYGITHUB10_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert [tool["name"] for tool in legacy["tools"]].count("apply_github_patch_from_ref") == 1
     apply_tool = next(tool for tool in legacy["tools"] if tool["name"] == "apply_github_patch_from_ref")
@@ -227,5 +242,5 @@ async def test_readme_current_state_matches_candidate_runtime_and_manifest(monke
     assert f"compatibility registration 仍为 {runtime['compatibility_tool_count']} 个工具" in current_state
     assert f"canonical production Schema 仍为 {runtime['tool_count']} 个可见工具" in current_state
     assert f"隐藏 {runtime['hidden_deprecated_tool_count']} 个 deprecated/compatibility-only 工具" in current_state
-    if runtime["tool_count"] == 164:
-        assert "165 个可见工具" not in current_state
+    if runtime["tool_count"] == 165:
+        assert "164 个可见工具" not in current_state

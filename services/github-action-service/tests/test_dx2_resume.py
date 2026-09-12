@@ -1873,3 +1873,99 @@ def test_same_head_unowned_historical_worker_is_never_claimed(monkeypatch):
     assert blocker == "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
     assert evidence["reason"] == "validation_request_correlation_missing"
     assert no_new_ci == {"requests": 0, "workers": 0}
+
+
+def test_resolve_recovery_base_allows_exact_stacked_pr_retarget(monkeypatch):
+    old_base_branch = "ai/upstream"
+    ws = {
+        **_workspace(status="drifted"),
+        "base_branch": old_base_branch,
+        "base_commit_sha": SHA_A,
+        "drift_reason": "branch_moved_externally",
+    }
+    session = {
+        **_ready_session(),
+        "base_branch": old_base_branch,
+        "base_commit_sha": SHA_A,
+    }
+    pr = {
+        "state": "open", "merged": False,
+        "head_branch": ws["branch"], "head_sha": SHA_A,
+        "base_branch": "main", "base_sha": SHA_B,
+    }
+    current_main = {"branch": "main", "repository": "owner/repo", "commit_sha": SHA_B, "tree_sha": TREE_B}
+    monkeypatch.setattr(
+        resume.mygithub12,
+        "resolve_identity",
+        lambda service, repository, ref="", commit_sha="": {
+            "repository": repository, "commit_sha": SHA_B, "tree_sha": TREE_B,
+        },
+    )
+
+    resolved = resume._resolve_recovery_base(FakeService(), "owner/repo", ws, session, pr, current_main)
+
+    assert resolved["branch"] == "main"
+    assert resolved["commit_sha"] == SHA_B
+    assert resolved["tree_sha"] == TREE_B
+    assert resolved["retargeted_from_branch"] == old_base_branch
+
+
+def test_resolve_recovery_base_rejects_base_mismatch_outside_retarget_shape():
+    ws = {**_workspace(), "base_branch": "ai/upstream", "base_commit_sha": SHA_A}
+    session = {**_ready_session(), "base_branch": "ai/upstream", "base_commit_sha": SHA_A}
+    pr = {"state": "open", "merged": False, "base_branch": "main", "base_sha": SHA_B}
+    current_main = {"branch": "main", "repository": "owner/repo", "commit_sha": SHA_B, "tree_sha": TREE_B}
+
+    with pytest.raises(resume.MyGithub12Error) as exc:
+        resume._resolve_recovery_base(FakeService(), "owner/repo", ws, session, pr, current_main)
+
+    assert exc.value.code == "RECOVERY_IDENTITY_MISMATCH"
+
+
+def test_workspace_recovery_plan_routes_exact_retarget_to_dedicated_tool(monkeypatch):
+    current_head = "c" * 40
+    current_tree = "3" * 40
+    old_base_branch = "ai/upstream"
+    ws = {
+        **_workspace(status="drifted"),
+        "base_branch": old_base_branch,
+        "base_commit_sha": SHA_A,
+        "head_sha": current_head,
+        "tree_sha": current_tree,
+        "drift_reason": "branch_moved_externally",
+    }
+    session = {
+        **_ready_session(head=SHA_A, tree=TREE_A),
+        "workspace_id": ws["workspace_id"],
+        "base_branch": old_base_branch,
+        "base_commit_sha": SHA_A,
+    }
+    pr = {
+        "state": "open", "merged": False,
+        "head_branch": ws["branch"], "head_sha": current_head,
+        "base_branch": "main", "base_sha": SHA_B,
+    }
+    current_base = {"branch": "main", "repository": "owner/repo", "commit_sha": SHA_B, "tree_sha": TREE_B}
+    branch_state = {"commit_sha": current_head, "tree_sha": current_tree}
+    expected = {
+        "reason": "WORKSPACE_RETARGETED_EXTERNALLY",
+        "action": "recover_retargeted_development_task",
+        "recovery_tool": "recover_retargeted_development_task",
+    }
+    monkeypatch.setattr(
+        resume.retarget_recovery,
+        "plan_retargeted_task",
+        lambda service, workspace, current_session, current_pr, live_base, current_branch: expected,
+    )
+
+    plan = resume._workspace_recovery_plan(
+        ws,
+        service=FakeService(),
+        session=session,
+        current_main=current_base,
+        current_base=current_base,
+        branch_state=branch_state,
+        pr=pr,
+    )
+
+    assert plan == expected

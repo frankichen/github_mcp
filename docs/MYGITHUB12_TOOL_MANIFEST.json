@@ -1,12 +1,12 @@
 {
   "service_name": "MyGithut12",
-  "service_version": "12.9.9",
+  "service_version": "12.9.10",
   "manifest_format": "composed-v2",
   "legacy_manifest": "MYGITHUB10_TOOL_MANIFEST.json",
   "legacy_tool_count": 120,
-  "new_tool_count": 55,
-  "tool_count": 164,
-  "compatibility_tool_count": 175,
+  "new_tool_count": 56,
+  "tool_count": 165,
+  "compatibility_tool_count": 176,
   "hidden_deprecated_tools": [
     "get_github_file",
     "commit_github_files",
@@ -185,20 +185,20 @@
   },
   "schema_snapshots": {
     "canonical": {
-      "tool_count": 164,
-      "tool_manifest_count": 164,
-      "compatibility_tool_count": 175,
+      "tool_count": 165,
+      "tool_manifest_count": 165,
+      "compatibility_tool_count": 176,
       "hidden_deprecated_tool_count": 11,
-      "tool_schema_sha256": "4ce0017e0e57db52a7758e15bda3003a4eda3386a4657d4e1b2c67eabeda564e",
-      "schema_generation_id": "schema-v1:4ce0017e0e57db52"
+      "tool_schema_sha256": "3ef2e32640e2e5d604a4d1849a207c4a77cea46ee37ca1a542ee383ff37cf413",
+      "schema_generation_id": "schema-v1:3ef2e32640e2e5d6"
     },
     "compatibility": {
-      "tool_count": 175,
-      "tool_manifest_count": 175,
-      "compatibility_tool_count": 175,
+      "tool_count": 176,
+      "tool_manifest_count": 176,
+      "compatibility_tool_count": 176,
       "hidden_deprecated_tool_count": 0,
-      "tool_schema_sha256": "74246f8bc615dac5867ea9f522a482fce653668c2c1ee5ed5d57bfd30701a427",
-      "schema_generation_id": "schema-v1:74246f8bc615dac5"
+      "tool_schema_sha256": "3edbd73e0a56a218a3b02751796fc01230471591602a9bced248c5055d4bbeba",
+      "schema_generation_id": "schema-v1:3edbd73e0a56a218"
     }
   },
   "new_tools": [
@@ -250,6 +250,7 @@
     "resume_development_task",
     "recover_drifted_development_task",
     "recover_base_synced_development_task",
+    "recover_retargeted_development_task",
     "apply_development_change_set",
     "validate_development_task",
     "converge_development_task",
