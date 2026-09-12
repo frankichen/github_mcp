@@ -778,14 +778,22 @@ def validation_correlations(
     mode: str,
     commit_sha: str,
     tree_sha: str,
+    *,
+    exact_revision: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return exact persisted request/job anchors, including legacy NULL-job placeholders."""
+    """Return persisted request/job anchors for one validation identity.
+
+    Recovery normally resolves the active validation generation first and then
+    requests only that exact Session revision.  The legacy <= behavior remains
+    available for existing callers that only need historical inspection.
+    """
     init_session_db()
     get_session(session_id)
+    revision_operator = "=" if exact_revision else "<="
     with _db() as db:
         rows = db.execute(
-            """SELECT * FROM development_session_validations
-               WHERE session_id=? AND session_revision<=? AND mode=?
+            f"""SELECT * FROM development_session_validations
+               WHERE session_id=? AND session_revision{revision_operator}? AND mode=?
                  AND commit_sha=? AND (tree_sha=? OR tree_sha='')
                ORDER BY id DESC""",
             (session_id, session_revision, mode, commit_sha, tree_sha),
@@ -808,6 +816,213 @@ def validation_correlations(
         )
         result.append(item)
     return result
+
+
+_VALIDATION_MAINTENANCE_EVENTS = frozenset({"session_recovered", "workspace_lease_auto_renewed"})
+
+
+def _event_data(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        value = json.loads(row["data_json"] or "{}")
+    except (TypeError, ValueError):
+        value = {}
+    return value if isinstance(value, dict) else {}
+
+
+def _validation_generation_context_db(
+    db: sqlite3.Connection,
+    session_row: sqlite3.Row,
+    mode: str,
+    commit_sha: str,
+    tree_sha: str,
+) -> dict[str, Any]:
+    """Prove the validation revision that still owns a transient Session.
+
+    A validation may legitimately remain active while revision-only Workspace
+    maintenance advances the Session CAS.  Only a contiguous, identity-
+    preserving maintenance event chain may bridge that historical validation
+    generation to the current transient Session.
+    """
+    if mode not in {"fast", "full"}:
+        raise MyGithub12Error("DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "validation mode is invalid")
+    expected_status = "validating_fast" if mode == "fast" else "validating_full"
+    current_revision = int(session_row["session_revision"])
+    if session_row["status"] != expected_status:
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_STATE_INVALID",
+            "development session validation phase changed",
+            {"expected_status": expected_status, "actual_status": session_row["status"]},
+        )
+    if session_row["head_commit_sha"] != commit_sha or session_row["tree_sha"] != tree_sha:
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+            "development session Git identity changed during validation generation recovery",
+        )
+
+    events = db.execute(
+        """SELECT * FROM development_session_events
+           WHERE session_id=? AND session_revision<=? ORDER BY id""",
+        (session_row["session_id"], current_revision),
+    ).fetchall()
+    anchors = [
+        row for row in events
+        if row["event_type"] == "validation_started" and row["to_status"] == expected_status
+    ]
+    if anchors:
+        anchor = anchors[-1]
+        generation_revision = int(anchor["session_revision"])
+        if generation_revision > current_revision:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                "validation generation revision is ahead of the current Session",
+            )
+        generation_source = "validation_started_event"
+    else:
+        current_rows = db.execute(
+            """SELECT id FROM development_session_validations
+               WHERE session_id=? AND session_revision=? AND mode=? AND commit_sha=?
+                 AND (tree_sha=? OR tree_sha='') LIMIT 1""",
+            (session_row["session_id"], current_revision, mode, commit_sha, tree_sha),
+        ).fetchone()
+        if not current_rows:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                "validation generation anchor is missing",
+            )
+        generation_revision = current_revision
+        generation_source = "legacy_current_revision"
+
+    later_validation = db.execute(
+        """SELECT id,session_revision,mode,commit_sha,tree_sha,request_id,job_id
+           FROM development_session_validations
+           WHERE session_id=? AND session_revision>? AND session_revision<=?
+           ORDER BY id""",
+        (session_row["session_id"], generation_revision, current_revision),
+    ).fetchall()
+    if later_validation:
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+            "a later validation correlation exists after the active generation anchor",
+            {
+                "generation_revision": generation_revision,
+                "later_validation_ids": [int(row["id"]) for row in later_validation],
+            },
+        )
+
+    maintenance_events = [row for row in events if generation_revision < int(row["session_revision"]) <= current_revision]
+    by_revision: dict[int, list[sqlite3.Row]] = {}
+    for row in maintenance_events:
+        by_revision.setdefault(int(row["session_revision"]), []).append(row)
+    expected_revisions = list(range(generation_revision + 1, current_revision + 1))
+    if sorted(by_revision) != expected_revisions or any(len(by_revision[revision]) != 1 for revision in expected_revisions):
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+            "validation generation maintenance audit chain is incomplete or ambiguous",
+            {
+                "generation_revision": generation_revision,
+                "current_session_revision": current_revision,
+                "event_revisions": sorted(by_revision),
+            },
+        )
+
+    generation_workspace_revision = int(session_row["workspace_revision"])
+    maintenance_audit: list[dict[str, Any]] = []
+    for revision in reversed(expected_revisions):
+        event = by_revision[revision][0]
+        event_type = str(event["event_type"] or "")
+        if (
+            event_type not in _VALIDATION_MAINTENANCE_EVENTS
+            or event["from_status"] != expected_status
+            or event["to_status"] != expected_status
+        ):
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                "validation generation was advanced by a non-maintenance Session event",
+                {"session_revision": revision, "event_type": event_type},
+            )
+        data = _event_data(event)
+        before_workspace_revision: int
+        after_workspace_revision: int
+        if event_type == "session_recovered":
+            before = data.get("before") if isinstance(data.get("before"), dict) else {}
+            after = data.get("after") if isinstance(data.get("after"), dict) else {}
+            before_workspace_revision = int(before.get("workspace_revision") or -1)
+            after_workspace_revision = int(after.get("workspace_revision") or -1)
+            identity_preserved = bool(
+                data.get("head_changed") is False
+                and int(before.get("session_revision") or -1) == revision - 1
+                and int(after.get("session_revision") or -1) == revision
+                and before.get("head_commit_sha") == commit_sha
+                and after.get("head_commit_sha") == commit_sha
+                and before.get("tree_sha") == tree_sha
+                and after.get("tree_sha") == tree_sha
+            )
+            if not identity_preserved:
+                raise MyGithub12Error(
+                    "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                    "Session recovery changed validation identity",
+                    {"session_revision": revision},
+                )
+        else:
+            before_workspace_revision = int(data.get("before_workspace_revision") or -1)
+            after_workspace_revision = int(data.get("after_workspace_revision") or -1)
+            if before_workspace_revision < 0 or after_workspace_revision != before_workspace_revision + 1:
+                raise MyGithub12Error(
+                    "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                    "Workspace lease maintenance revision chain is invalid",
+                    {"session_revision": revision},
+                )
+        if after_workspace_revision != generation_workspace_revision:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                "validation generation Workspace revision chain is discontinuous",
+                {
+                    "session_revision": revision,
+                    "expected_after_workspace_revision": generation_workspace_revision,
+                    "actual_after_workspace_revision": after_workspace_revision,
+                },
+            )
+        maintenance_audit.append({
+            "session_revision": revision,
+            "event_type": event_type,
+            "before_workspace_revision": before_workspace_revision,
+            "after_workspace_revision": after_workspace_revision,
+        })
+        generation_workspace_revision = before_workspace_revision
+
+    return {
+        "generation_revision": generation_revision,
+        "generation_workspace_revision": generation_workspace_revision,
+        "current_session_revision": current_revision,
+        "current_workspace_revision": int(session_row["workspace_revision"]),
+        "source": generation_source,
+        "maintenance_events": list(reversed(maintenance_audit)),
+    }
+
+
+def validation_generation_context(
+    session_id: str,
+    current_session_revision: int,
+    mode: str,
+    commit_sha: str,
+    tree_sha: str,
+) -> dict[str, Any]:
+    init_session_db()
+    with _db() as db:
+        session_row = db.execute(
+            "SELECT * FROM development_sessions WHERE session_id=?", (session_id,),
+        ).fetchone()
+        if not session_row:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_NOT_FOUND", "development session was not found",
+                {"development_session_id": session_id},
+            )
+        if int(session_row["session_revision"]) != int(current_session_revision):
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_REVISION_MISMATCH", "development session revision changed",
+                {"expected": int(current_session_revision), "actual": int(session_row["session_revision"])},
+            )
+        return _validation_generation_context_db(db, session_row, mode, commit_sha, tree_sha)
 
 
 def bind_validation_request_worker(
