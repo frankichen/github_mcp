@@ -939,7 +939,7 @@ def test_two_terminal_cancelled_correlations_then_forward_drift_recovers_same_wr
         branch=BRANCH,
         workspace_id=WORKSPACE_ID,
         development_session_id=resumed_session["session_id"],
-        expected_workspace_revision=5,
+        expected_workspace_revision=6,
         expected_session_revision=resumed_session["session_revision"],
         expected_current_head_sha=NEW_HEAD,
         expected_current_tree_sha=NEW_TREE,
