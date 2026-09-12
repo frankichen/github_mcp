@@ -8,13 +8,14 @@ from app.mcp_server import get_mygithub_capabilities, mcp
 from app.version import SERVICE_VERSION
 
 
-EXPECTED_REGISTERED_TOOL_COUNT = 175
-EXPECTED_CANONICAL_TOOL_COUNT = 164
+EXPECTED_REGISTERED_TOOL_COUNT = 176
+EXPECTED_CANONICAL_TOOL_COUNT = 165
 DX1_TOOLS = [
     "prepare_development_task",
     "resume_development_task",
     "recover_drifted_development_task",
     "recover_base_synced_development_task",
+    "recover_retargeted_development_task",
     "apply_development_change_set",
     "validate_development_task",
     "converge_development_task",
