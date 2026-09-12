@@ -153,6 +153,46 @@ def register_dx_tools(
         except Exception as exc: return _error(exc)
 
     @mcp.tool(
+        name="recover_retargeted_development_task",
+        description=(
+            "Explicitly adopt an exact canonical Writer after its stacked Pull Request was retargeted to a different base branch. "
+            "Requires exact current task PR, exact merged upstream PR proof (squash-aware), old/new base branch+SHA, Workspace/Session CAS, "
+            "old/current HEAD/Tree, rename-aware scope/overlap classification and exact reviewed overlap equality. Never moves Git refs or writes repository files."
+        ),
+        annotations=_ORCHESTRATION,
+    )
+    async def recover_retargeted_development_task(
+        repository: str,
+        branch: str,
+        pull_number: int,
+        upstream_pull_number: int,
+        workspace_id: str,
+        development_session_id: str,
+        expected_workspace_revision: int,
+        expected_session_revision: int,
+        expected_old_base_branch: str,
+        expected_old_base_sha: str,
+        expected_new_base_branch: str,
+        expected_new_base_sha: str,
+        expected_old_session_head_sha: str,
+        expected_current_head_sha: str,
+        expected_current_tree_sha: str,
+        idempotency_key: str,
+        lease_seconds: int=mygithub12.DEFAULT_LEASE_SECONDS,
+        reviewed_overlap_paths_json: str="[]",
+    ) -> str:
+        try:
+            result=await github_call(
+                retarget_recovery.recover_retargeted_task,service,repository,branch,pull_number,upstream_pull_number,
+                workspace_id,development_session_id,expected_workspace_revision,expected_session_revision,
+                expected_old_base_branch,expected_old_base_sha,expected_new_base_branch,expected_new_base_sha,
+                expected_old_session_head_sha,expected_current_head_sha,expected_current_tree_sha,idempotency_key,
+                lease_seconds,reviewed_overlap_paths_json,
+            )
+            return json.dumps(result,ensure_ascii=False)
+        except Exception as exc: return _error(exc)
+
+    @mcp.tool(
         name="apply_development_change_set",
         description=(
             "Strictly validate/apply a versioned patch/range/upload ChangeSet with Session, Workspace, "
