@@ -1045,20 +1045,65 @@ def _reconcile_transient_validation(
             )
             return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
         request_phase = str(request.get("phase") or request.get("status") or "")
-        if request_phase not in {"accepted", "preparing", "queued"}:
+        request_status = str(request.get("status") or "")
+        if request_phase in {"accepted", "preparing", "queued"}:
+            return session, {
+                "transient_validation": True,
+                "reconciled": False,
+                "validation_in_progress": True,
+                "mode": mode,
+                "correlation_source": correlation_source,
+                "request": _validation_request_summary(request),
+            }, "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS"
+        request_only_terminal = bool(
+            request_phase == "terminal"
+            and request_status in {"preflight_failed", "cancelled", "superseded", "internal_error"}
+        )
+        if not request_only_terminal:
             recovery = _transient_recovery_failure(
                 session, "validation_request_worker_missing_terminal",
-                request_id=request_id, request_phase=request_phase,
+                request_id=request_id, request_phase=request_phase, request_status=request_status,
             )
             return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
-        return session, {
+        try:
+            binding = sessions.bind_validation_request_worker(
+                session_id, session_revision, workspace_revision, mode,
+                str(session["head_commit_sha"]), str(session["tree_sha"]), request_id, "",
+                allow_branch_drift=drift_reconciliation,
+                request_terminal_status=request_status,
+            )
+        except MyGithub12Error as exc:
+            recovery = _transient_recovery_failure(
+                session, "validation_request_terminal_bind_failed",
+                request_id=request_id, request_status=request_status, error_code=exc.code,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+        result = {
+            "terminal": True,
+            "merge_eligible": False,
+            "attestation": None,
+            "failure_pack": None,
+            "request_terminal": True,
+            "status": request_status,
+            "preflight_error_code": request.get("preflight_error_code"),
+        }
+        recovered_session = sessions.transition(
+            session_id, session_revision, "active",
+            event_type="validation_request_terminal_reconciled",
+            allowed_from={str(session["status"])},
+        )
+        return recovered_session, {
             "transient_validation": True,
-            "reconciled": False,
-            "validation_in_progress": True,
+            "reconciled": True,
             "mode": mode,
             "correlation_source": correlation_source,
+            "correlation_backfill": binding,
             "request": _validation_request_summary(request),
-        }, "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS"
+            "job": None,
+            "tree_evidence": "request_payload",
+            "validation_result": result,
+            "workspace_drift_pending_recovery": drift_reconciliation,
+        }, None
 
     if job_ids and any(job_id != worker_job_id for job_id in job_ids):
         recovery = _transient_recovery_failure(
