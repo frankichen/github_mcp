@@ -941,13 +941,46 @@ def test_resume_recovers_restart_after_nonterminal_observation_with_legacy_fast_
     _, session, job = _stub_transient_recovery(monkeypatch)
     session["last_fast_ci_job_id"] = job["job_id"]
     job["summary"] = {}
+    generation_revision = session["session_revision"] - 1
+    generation = {
+        "generation_revision": generation_revision,
+        "generation_workspace_revision": session["workspace_revision"],
+        "current_session_revision": session["session_revision"],
+        "current_workspace_revision": session["workspace_revision"],
+        "source": "validation_started_event",
+        "maintenance_events": [{
+            "session_revision": session["session_revision"],
+            "event_type": "validation_observed",
+            "before_workspace_revision": session["workspace_revision"],
+            "after_workspace_revision": session["workspace_revision"],
+        }],
+    }
+    monkeypatch.setattr(resume.sessions, "validation_generation_context", lambda *args, **kwargs: generation)
     monkeypatch.setattr(
         resume.sessions,
         "validation_correlations",
-        lambda *args: [{
-            "job_id": job["job_id"], "session_revision": session["session_revision"] - 1,
+        lambda *args, **kwargs: [{
+            "job_id": job["job_id"], "session_revision": generation_revision,
             "tree_sha": "", "evidence": {"selection": {"complete": True}},
         }],
+    )
+    monkeypatch.setattr(
+        resume.ci_request_store,
+        "get_ci_request_payload",
+        lambda request_id: {
+            "development_session_id": session["session_id"],
+            "expected_session_revision": generation_revision,
+            "workspace_id": session["workspace_id"],
+            "workspace_revision": session["workspace_revision"],
+            "repository": session["repository"],
+            "branch": session["branch"],
+            "commit_sha": session["head_commit_sha"],
+            "tree_sha": session["tree_sha"],
+            "profile": "repo-fast-check",
+            "mode": "fast",
+            "base_branch": session["base_branch"],
+            "base_sha": session["base_commit_sha"],
+        },
     )
     monkeypatch.setattr(resume.dx, "validation_result", lambda *args, **kwargs: {"terminal": True, "merge_eligible": False, "attestation": None, "failure_pack": None})
     monkeypatch.setattr(resume.sessions, "transition", lambda *args, **kwargs: {**session, "status": "active", "session_revision": session["session_revision"] + 1})
