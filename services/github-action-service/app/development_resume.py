@@ -17,6 +17,7 @@ from app import development_session_store as sessions
 from app import attestation_registry, ci_request_store, github_utils, mygithub12
 from app import development_convergence_store as convergence_store
 from app import development_managed_merge as managed_merge
+from app import development_retarget_recovery as retarget_recovery
 from app.github_policy import repository_is_allowed
 from app.ci_repository_config import is_private_ci_enabled, is_test_deploy_enabled, is_self_deploy_enabled
 from app.ci_database import get_job as db_get_job, list_jobs as db_list_jobs
