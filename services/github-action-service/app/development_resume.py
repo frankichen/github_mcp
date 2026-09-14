@@ -1047,6 +1047,15 @@ def _workspace_recovery_plan(
                 "reviewed_scope_expansion_required": bool(outside_scope_current_paths),
                 "preflight": preflight,
             }
+        drift_paths: list[str] = []
+        outside_scope_paths: list[str] = []
+        if service and session and old_head and current_head and old_head != current_head:
+            try:
+                drift_delta = _resume_authoritative_current_delta(service, repository, old_head, current_head)
+                drift_paths = list(drift_delta["paths"])
+                outside_scope_paths = _resume_outside_scope_paths(workspace, drift_paths)
+            except MyGithub12Error:
+                pass
         return {
             "reason": "WORKSPACE_BRANCH_DRIFTED",
             "action": "recover_drifted_development_task",
@@ -1064,6 +1073,9 @@ def _workspace_recovery_plan(
             "expected_base_branch": live_base_branch or base_branch,
             "expected_base_sha": old_base,
             "base_identity_normalization_required": bool((live_base or {}).get("base_identity_normalization_required")),
+            "authoritative_forward_delta_paths": drift_paths,
+            "required_scope_expansion_paths": outside_scope_paths,
+            "reviewed_scope_expansion_required": bool(outside_scope_paths),
         }
     return None
 

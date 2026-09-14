@@ -91,6 +91,9 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     recovery_schema = tools["recover_drifted_development_task"].inputSchema
     assert {"repository", "branch", "workspace_id", "development_session_id", "expected_workspace_revision", "expected_session_revision", "expected_current_head_sha", "expected_current_tree_sha", "expected_base_branch", "expected_base_sha", "idempotency_key"} <= set(recovery_schema["required"])
     assert recovery_schema["properties"]["lease_seconds"]["default"] == 7200
+    assert recovery_schema["properties"]["reviewed_scope_expansion_paths_json"]["default"] == "[]"
+    assert recovery_schema["properties"]["reviewed_scope_expansion_paths_json"]["type"] == "string"
+    assert "exactly equal" in tools["recover_drifted_development_task"].description
     base_sync_schema = tools["recover_base_synced_development_task"].inputSchema
     assert {
         "repository", "branch", "workspace_id", "development_session_id",
@@ -203,7 +206,7 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.9.15"
+    assert manifest["service_version"] == "12.9.16"
     assert manifest["manifest_format"] == "composed-v2"
     assert manifest["legacy_tool_count"] == 120
     assert manifest["new_tool_count"] == 56
