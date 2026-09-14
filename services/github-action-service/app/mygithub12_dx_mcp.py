@@ -89,7 +89,12 @@ def register_dx_tools(
 
     @mcp.tool(
         name="recover_drifted_development_task",
-        description="Explicitly adopt a freshly verified forward-only externally advanced branch into drifted Workspace/Development Session control-plane state; never moves Git refs or writes repository files.",
+        description=(
+            "Explicitly adopt a freshly verified forward-only externally advanced branch into drifted "
+            "Workspace/Development Session control-plane state. reviewed_scope_expansion_paths_json must "
+            "exactly equal server-computed changed paths outside the declared scope; accepted paths are "
+            "appended atomically. Never moves Git refs or writes repository files."
+        ),
         annotations=_ORCHESTRATION,
     )
     async def recover_drifted_development_task(
@@ -105,12 +110,14 @@ def register_dx_tools(
         expected_base_sha: str,
         idempotency_key: str,
         lease_seconds: int=mygithub12.DEFAULT_LEASE_SECONDS,
+        reviewed_scope_expansion_paths_json: str="[]",
     ) -> str:
         try:
             result=await github_call(
                 drift_recovery.recover_drifted_task,service,repository,branch,workspace_id,development_session_id,
                 expected_workspace_revision,expected_session_revision,expected_current_head_sha,expected_current_tree_sha,
                 expected_base_branch,expected_base_sha,idempotency_key,lease_seconds,
+                reviewed_scope_expansion_paths_json,
             )
             return json.dumps(result,ensure_ascii=False)
         except Exception as exc: return _error(exc)

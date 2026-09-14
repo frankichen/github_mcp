@@ -458,6 +458,42 @@ def test_changed_paths_must_stay_inside_declared_workspace_scope(tmp_path, monke
         _call(service, session)
     assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
     assert exc.value.details["outside_scope_paths"] == ["outside/secret.py"]
+    assert exc.value.details["required_scope_expansion_paths"] == ["outside/secret.py"]
+
+
+def test_exact_reviewed_scope_expansion_is_atomic_audited_and_idempotent(tmp_path, monkeypatch):
+    service, session = _seed(tmp_path, monkeypatch)
+    service.repo.changed_paths = ["allowed/feature.py", "outside/secret.py"]
+
+    result = _call(
+        service,
+        session,
+        reviewed_scope_expansion_paths_json=json.dumps(["outside/secret.py"]),
+    )
+
+    assert result["workspace"]["scope"]["paths"] == ["allowed/**", "outside/secret.py"]
+    assert result["audit"]["scope"]["required_scope_expansion_paths"] == ["outside/secret.py"]
+    assert result["audit"]["scope"]["reviewed_scope_expansion_paths"] == ["outside/secret.py"]
+    revision = result["workspace"]["revision"]
+    replay = _call(
+        service,
+        session,
+        reviewed_scope_expansion_paths_json=json.dumps(["outside/secret.py"]),
+    )
+    assert replay["replayed"] is True
+    assert replay["workspace"]["revision"] == revision
+
+
+@pytest.mark.parametrize("reviewed", [[], ["outside/other.py"], ["outside/secret.py", "outside/other.py"]])
+def test_scope_expansion_review_must_exactly_match_server_delta(tmp_path, monkeypatch, reviewed):
+    service, session = _seed(tmp_path, monkeypatch)
+    service.repo.changed_paths = ["allowed/feature.py", "outside/secret.py"]
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session, reviewed_scope_expansion_paths_json=json.dumps(reviewed))
+
+    assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
+    assert exc.value.details["required_scope_expansion_paths"] == ["outside/secret.py"]
 
 
 def test_renamed_previous_path_must_also_stay_inside_workspace_scope(tmp_path, monkeypatch):

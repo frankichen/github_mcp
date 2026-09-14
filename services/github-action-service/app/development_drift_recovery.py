@@ -68,6 +68,7 @@ def _request_identity(
     expected_base_branch: str,
     expected_base_sha: str,
     lease_seconds: int,
+    reviewed_scope_expansion_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "repository": repository,
@@ -81,6 +82,7 @@ def _request_identity(
         "expected_base_branch": expected_base_branch,
         "expected_base_sha": expected_base_sha,
         "lease_seconds": int(lease_seconds),
+        "reviewed_scope_expansion_paths": sorted(reviewed_scope_expansion_paths or []),
     }
 
 
@@ -116,6 +118,7 @@ def _replay_result(
         and session.get("base_branch") == after.get("base_branch")
         and workspace.get("base_commit_sha") == after.get("base_commit_sha")
         and session.get("base_commit_sha") == after.get("base_commit_sha")
+        and workspace.get("scope") == after.get("scope")
     )
     if not matches:
         raise MyGithub12Error(
@@ -231,21 +234,70 @@ def _verify_forward_only(repo: Any, session: dict[str, Any], current_head: str) 
     return evidence, changed_paths
 
 
-def _verify_scope(workspace: dict[str, Any], changed_paths: list[str]) -> dict[str, Any]:
+def _parse_reviewed_scope_expansion_paths(value: str) -> list[str]:
+    try:
+        paths = json.loads(value or "[]")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise MyGithub12Error(
+            "SEARCH_QUERY_INVALID",
+            "reviewed_scope_expansion_paths_json must be a JSON array of exact Git paths",
+        ) from exc
+    if not isinstance(paths, list):
+        raise MyGithub12Error(
+            "SEARCH_QUERY_INVALID",
+            "reviewed_scope_expansion_paths_json must be a JSON array of exact Git paths",
+        )
+    reviewed: list[str] = []
+    for path in paths:
+        if not isinstance(path, str) or not path or path in reviewed:
+            raise MyGithub12Error(
+                "SEARCH_QUERY_INVALID",
+                "reviewed_scope_expansion_paths_json must contain unique non-empty exact Git paths",
+            )
+        mygithub12._safe_path(path)
+        reviewed.append(path)
+    return sorted(reviewed)
+
+
+def _verify_scope(
+    workspace: dict[str, Any], changed_paths: list[str], reviewed_scope_expansion_paths: list[str] | None = None,
+) -> dict[str, Any]:
     scope = workspace.get("scope") if isinstance(workspace.get("scope"), dict) else {}
     declared = [str(value).strip().strip("/") for value in (scope.get("paths") or []) if str(value).strip().strip("/")]
     outside = [
         path for path in changed_paths
         if not any(workspace_scope.scope_path_matches(path, declaration) for declaration in declared)
     ]
-    evidence = {"verified": not outside, "declared_paths": declared, "changed_paths": changed_paths, "outside_scope_paths": outside}
-    if outside:
+    reviewed = sorted(reviewed_scope_expansion_paths or [])
+    if reviewed != outside:
         raise MyGithub12Error(
             "RECOVERY_SCOPE_VIOLATION",
-            "external branch advance changed paths outside the Workspace declared scope",
-            {"workspace_id": workspace.get("workspace_id"), "outside_scope_paths": outside},
+            "reviewed recovery scope expansion must exactly equal changed paths outside the Workspace declared scope",
+            {
+                "workspace_id": workspace.get("workspace_id"),
+                "outside_scope_paths": outside,
+                "required_scope_expansion_paths": outside,
+                "reviewed_scope_expansion_paths": reviewed,
+                "missing_reviewed_scope_expansion_paths": sorted(set(outside) - set(reviewed)),
+                "unexpected_reviewed_scope_expansion_paths": sorted(set(reviewed) - set(outside)),
+            },
         )
-    return evidence
+    previous_scope = json.loads(json.dumps(scope, ensure_ascii=False))
+    resulting_scope = json.loads(json.dumps(scope, ensure_ascii=False))
+    existing_paths = list(resulting_scope.get("paths") or [])
+    if reviewed:
+        resulting_scope["paths"] = existing_paths + [path for path in reviewed if path not in existing_paths]
+    return {
+        "verified": True,
+        "declared_paths": declared,
+        "changed_paths": changed_paths,
+        "outside_scope_paths": outside,
+        "required_scope_expansion_paths": outside,
+        "reviewed_scope_expansion_paths": reviewed,
+        "previous_scope": previous_scope,
+        "resulting_scope": resulting_scope,
+        "enforcement": "exact_reviewed_scope_expansion",
+    }
 
 
 def _verify_ownership(service: Any, workspace: dict[str, Any]) -> dict[str, Any]:
@@ -337,6 +389,7 @@ def _atomic_recover(
                     and session_row["base_branch"] == after.get("base_branch")
                     and workspace_row["base_commit_sha"] == after.get("base_commit_sha")
                     and session_row["base_commit_sha"] == after.get("base_commit_sha")
+                    and json.loads(workspace_row["scope_json"] or "{}") == after.get("scope")
                 )
                 if not replay_state_matches:
                     raise MyGithub12Error(
@@ -421,6 +474,7 @@ def _atomic_recover(
                 "lease_expires_at": lease_expires_at,
                 "base_branch": base_branch,
                 "base_commit_sha": base_sha,
+                "scope": verification["scope"]["resulting_scope"],
             }
             audit = {
                 "repository": repository,
@@ -457,10 +511,19 @@ def _atomic_recover(
                 "audit": audit,
             }
             ws_update = db.execute(
-                """UPDATE workspaces SET base_branch=?,head_sha=?,tree_sha=?,status='active',drift_reason=NULL,lease_expires_at=?,
+                """UPDATE workspaces SET base_branch=?,head_sha=?,tree_sha=?,scope_json=?,status='active',drift_reason=NULL,lease_expires_at=?,
                 index_commit_sha=NULL,revision=revision+1,updated_at=?
                 WHERE workspace_id=? AND revision=? AND status='drifted' AND drift_reason='branch_moved_externally'""",
-                (base_branch, current_head, current_tree, lease_expires_at, now, workspace_id, expected_workspace_revision),
+                (
+                    base_branch,
+                    current_head,
+                    current_tree,
+                    json.dumps(after["scope"], ensure_ascii=False, separators=(",", ":")),
+                    lease_expires_at,
+                    now,
+                    workspace_id,
+                    expected_workspace_revision,
+                ),
             )
             if ws_update.rowcount != 1:
                 raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH", "Workspace changed while applying drift recovery")
@@ -544,6 +607,7 @@ def recover_drifted_task(
     expected_base_sha: str,
     idempotency_key: str,
     lease_seconds: int = mygithub12.DEFAULT_LEASE_SECONDS,
+    reviewed_scope_expansion_paths_json: str = "[]",
 ) -> dict[str, Any]:
     """Recover one drifted Workspace/Session pair without changing GitHub refs."""
     if not repository or "/" not in repository or not branch:
@@ -554,6 +618,7 @@ def recover_drifted_task(
         raise MyGithub12Error("SEARCH_QUERY_INVALID", "positive expected Workspace/Session revisions are required")
     if not expected_current_head_sha or not expected_current_tree_sha or not expected_base_branch or not expected_base_sha:
         raise MyGithub12Error("SEARCH_QUERY_INVALID", "exact current HEAD/Tree and base identity are required")
+    reviewed_scope_expansion_paths = _parse_reviewed_scope_expansion_paths(reviewed_scope_expansion_paths_json)
     workspace = mygithub12.get_workspace(service, workspace_id)
     session = sessions.get_session(development_session_id)
     request = _request_identity(
@@ -568,6 +633,7 @@ def recover_drifted_task(
         expected_base_branch,
         expected_base_sha,
         lease_seconds,
+        reviewed_scope_expansion_paths,
     )
     identity_ok = (
         workspace.get("repository") == repository
@@ -652,7 +718,7 @@ def recover_drifted_task(
         expected_base_sha,
     )
     ancestry, changed_paths = _verify_forward_only(repo, session, expected_current_head_sha)
-    scope = _verify_scope(workspace, changed_paths)
+    scope = _verify_scope(workspace, changed_paths, reviewed_scope_expansion_paths)
     ownership = _verify_ownership(service, workspace)
     verification = {"github": github_identity, "ancestry": ancestry, "scope": scope, "ownership": ownership}
     recovered = _atomic_recover(service, request=request, idempotency_key=idempotency_key, verification=verification)
