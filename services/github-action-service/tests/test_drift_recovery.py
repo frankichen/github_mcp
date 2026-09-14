@@ -187,6 +187,12 @@ def _db_state(session_id):
     return workspace, session, events
 
 
+def _make_base_branch_malformed(session_id):
+    with sessions._LOCK, sessions._db() as db:
+        db.execute("UPDATE workspaces SET base_branch=? WHERE workspace_id=?", (BASE_SHA, WORKSPACE_ID))
+        db.execute("UPDATE development_sessions SET base_branch=? WHERE session_id=?", (BASE_SHA, session_id))
+
+
 @pytest.mark.parametrize(
     ("declaration", "path", "expected"),
     [
@@ -280,6 +286,105 @@ def test_forward_only_external_branch_advance_recovers_atomically(tmp_path, monk
     _, _, events = _db_state(session["session_id"])
     audit_event = next(item for item in events if item["event_type"] == "manual_branch_recovery")
     assert json.loads(audit_event["data_json"])["adopted_head"] == NEW_HEAD
+
+
+def test_malformed_commit_base_is_normalized_in_place_during_recovery(tmp_path, monkeypatch):
+    service, session = _seed(tmp_path, monkeypatch)
+    _make_base_branch_malformed(session["session_id"])
+
+    result = _call(service, session)
+
+    assert result["workspace"]["workspace_id"] == WORKSPACE_ID
+    assert result["development_session"]["session_id"] == session["session_id"]
+    assert result["workspace"]["base_branch"] == BASE
+    assert result["development_session"]["base_branch"] == BASE
+    assert result["workspace"]["base_commit_sha"] == BASE_SHA
+    assert result["development_session"]["base_commit_sha"] == BASE_SHA
+    assert result["workspace"]["head_sha"] == NEW_HEAD
+    assert result["workspace"]["tree_sha"] == NEW_TREE
+    assert result["audit"]["base_identity_normalization"]["performed"] is True
+    assert result["audit"]["base_identity_normalization"]["old_workspace_base_branch"] == BASE_SHA
+    workspace_row, session_row, events = _db_state(session["session_id"])
+    assert workspace_row["base_branch"] == session_row["base_branch"] == BASE
+    event = next(item for item in events if item["event_type"] == "manual_branch_recovery")
+    assert json.loads(event["data_json"])["base_identity_normalization"]["performed"] is True
+
+    replay = _call(service, session)
+    assert replay["replayed"] is True
+    assert replay["workspace"]["revision"] == result["workspace"]["revision"]
+    assert replay["development_session"]["session_revision"] == result["development_session"]["session_revision"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error_code"),
+    [
+        ("base_advanced", "RECOVERY_BASE_CHANGED"),
+        ("base_deleted", "RECOVERY_BASE_CHANGED"),
+        ("malformed_mismatch", "RECOVERY_IDENTITY_MISMATCH"),
+        ("owner_mismatch", "RECOVERY_OWNER_MISMATCH"),
+    ],
+)
+def test_malformed_base_normalization_fail_closed(tmp_path, monkeypatch, mutation, error_code):
+    service, session = _seed(tmp_path, monkeypatch)
+    _make_base_branch_malformed(session["session_id"])
+    if mutation == "base_advanced":
+        service.client.heads[BASE] = OTHER_HEAD
+    elif mutation == "base_deleted":
+        service.client.heads[BASE] = None
+    elif mutation == "malformed_mismatch":
+        with sessions._LOCK, sessions._db() as db:
+            db.execute("UPDATE workspaces SET base_branch=? WHERE workspace_id=?", (OTHER_HEAD, WORKSPACE_ID))
+            db.execute("UPDATE development_sessions SET base_branch=? WHERE session_id=?", (OTHER_HEAD, session["session_id"]))
+    else:
+        with sessions._LOCK, sessions._db() as db:
+            db.execute("UPDATE development_sessions SET owner='other-worker' WHERE session_id=?", (session["session_id"],))
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+
+    assert exc.value.code == error_code
+    workspace_row, session_row, _ = _db_state(session["session_id"])
+    assert workspace_row["status"] == "drifted"
+    assert workspace_row["revision"] == 5
+    assert session_row["session_revision"] == session["session_revision"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error_code"),
+    [
+        ("head", "RECOVERY_HEAD_MISMATCH"),
+        ("tree", "RECOVERY_TREE_MISMATCH"),
+        ("workspace_revision", "WORKSPACE_REVISION_MISMATCH"),
+        ("session_revision", "DEVELOPMENT_SESSION_REVISION_MISMATCH"),
+        ("overlap", "RECOVERY_WORKSPACE_OVERLAP"),
+    ],
+)
+def test_malformed_base_normalization_preserves_existing_recovery_gates(tmp_path, monkeypatch, mutation, error_code):
+    service, session = _seed(tmp_path, monkeypatch)
+    _make_base_branch_malformed(session["session_id"])
+    overrides = {}
+    if mutation == "head":
+        service.client.heads[BRANCH] = OTHER_HEAD
+    elif mutation == "tree":
+        service.repo.trees[NEW_HEAD] = OTHER_TREE
+    elif mutation == "workspace_revision":
+        overrides["expected_workspace_revision"] = 4
+    elif mutation == "session_revision":
+        overrides["expected_session_revision"] = 99
+    else:
+        monkeypatch.setattr(
+            recovery.mygithub12,
+            "workspace_overlap",
+            lambda *args, **kwargs: {
+                "ok": True,
+                "items": [{"workspace_id": "ws_other", "level": "high", "evidence": ["path"]}],
+            },
+        )
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session, **overrides)
+
+    assert exc.value.code == error_code
 
 
 @pytest.mark.parametrize(

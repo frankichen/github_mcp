@@ -22,6 +22,7 @@ _compare=core._compare
 init_db=core.init_db
 
 _GLOB_MAGIC = frozenset("*?[")
+_EXACT_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
 
 
 def scope_path_matches(path: str, declaration: str) -> bool:
@@ -81,6 +82,28 @@ def _branch_create_error(exc: Exception, branch: str, base_ref: str) -> MyGithub
     return MyGithub12Error("WORKSPACE_BRANCH_CREATE_FAILED","workspace branch could not be created",details)
 
 
+def _logical_base_branch(service: Any, repository: str, base_ref: str, pinned_sha: str) -> str:
+    """Resolve a real branch identity without ever persisting a commit as one."""
+    if not _EXACT_COMMIT_SHA.fullmatch(str(base_ref or "")):
+        return base_ref
+    repo = _service_repo(service, repository)
+    default_branch = str(getattr(repo, "default_branch", "") or "")
+    state = service.client.get_branch(repository, default_branch) if default_branch else None
+    actual = str(state.commit.sha) if state else ""
+    if default_branch and actual == pinned_sha:
+        return default_branch
+    raise MyGithub12Error(
+        "BASE_BRANCH_IDENTITY_UNRESOLVED",
+        "exact base commit does not prove a logical base branch identity",
+        {
+            "base_ref_kind": "commit",
+            "base_commit_sha": pinned_sha,
+            "default_branch": default_branch or None,
+            "default_branch_head_sha": actual or None,
+        },
+    )
+
+
 def _converge_expired_branch_owner(repository: str, branch: str, *, now: float) -> None:
     with _LOCK,_db() as db:
         db.execute(
@@ -90,7 +113,7 @@ def _converge_expired_branch_owner(repository: str, branch: str, *, now: float) 
 
 
 def create_workspace(service: Any, repository: str, task_name: str, base_ref: str="main", branch: str="", owner: str="chatgpt", create_branch: bool=True, lease_seconds: int=DEFAULT_LEASE_SECONDS) -> dict[str,Any]:
-    identity=resolve_identity(service,repository,ref=base_ref); slug=re.sub(r"[^a-z0-9-]+","-",task_name.lower()).strip("-")[:40] or "task"; workspace_id="ws_"+uuid.uuid4().hex[:16]; branch=branch or f"ai/{slug}-{workspace_id[-8:]}"
+    identity=resolve_identity(service,repository,ref=base_ref); base_branch=_logical_base_branch(service,repository,base_ref,identity["commit_sha"]); slug=re.sub(r"[^a-z0-9-]+","-",task_name.lower()).strip("-")[:40] or "task"; workspace_id="ws_"+uuid.uuid4().hex[:16]; branch=branch or f"ai/{slug}-{workspace_id[-8:]}"
     if not branch.startswith("ai/"): raise MyGithub12Error("WORKSPACE_SCOPE_CONFLICT","workspace branches must use ai/ prefix")
     if create_branch:
         try: service.create_branch(repository,branch,identity["commit_sha"])
@@ -101,7 +124,7 @@ def create_workspace(service: Any, repository: str, task_name: str, base_ref: st
     head=str(branch_state.commit.sha); tree=_tree_sha(_service_repo(service,repository).get_commit(head)); lease_seconds=max(60,min(lease_seconds,MAX_LEASE_SECONDS)); init_db(); now=_now()
     _converge_expired_branch_owner(repository,branch,now=now)
     try:
-        with _LOCK,_db() as db: db.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(workspace_id,repository,branch,base_ref,identity["commit_sha"],head,tree,"active",1,owner,now+lease_seconds,head,"{}",None,None,now,now))
+        with _LOCK,_db() as db: db.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(workspace_id,repository,branch,base_branch,identity["commit_sha"],head,tree,"active",1,owner,now+lease_seconds,head,"{}",None,None,now,now))
     except sqlite3.IntegrityError as exc: raise MyGithub12Error("WORKSPACE_LEASE_CONFLICT","another active workspace already owns this branch",{"branch":branch}) from exc
     return {"ok":True,**get_workspace(service,workspace_id),"index_reused":get_index_status(service,repository,head)["status"]=="ready"}
 

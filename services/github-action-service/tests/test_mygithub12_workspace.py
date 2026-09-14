@@ -18,10 +18,73 @@ class FailingBranchService:
     def __init__(self, error):
         self.error = error
         self.base_ref = None
+        repo = SimpleNamespace(default_branch="main")
+        self.client = SimpleNamespace(
+            _pygithub=SimpleNamespace(get_repo=lambda repository: repo),
+            get_branch=lambda repository, branch: SimpleNamespace(commit=SimpleNamespace(sha=RESOLVED_SHA)),
+        )
+
+    def _check_repository_allowed(self, repository):
+        assert repository == "owner/repo"
 
     def create_branch(self, repository, branch, base_ref):
         self.base_ref = base_ref
         raise self.error
+
+
+class SuccessfulWorkspaceService:
+    def __init__(self, *, default_head=RESOLVED_SHA):
+        self.created = []
+        self.heads = {"main": default_head}
+        self.repo = SimpleNamespace(
+            default_branch="main",
+            get_commit=lambda sha: SimpleNamespace(
+                sha=self.heads.get(sha, sha), tree=SimpleNamespace(sha="b" * 40),
+            ),
+        )
+        self.client = SimpleNamespace(
+            _pygithub=SimpleNamespace(get_repo=lambda repository: self.repo),
+            get_branch=self.get_branch,
+        )
+
+    def _check_repository_allowed(self, repository):
+        assert repository == "owner/repo"
+
+    def create_branch(self, repository, branch, base_ref):
+        self.created.append((repository, branch, base_ref))
+        self.heads[branch] = base_ref
+
+    def get_branch(self, repository, branch):
+        sha = self.heads.get(branch)
+        return SimpleNamespace(commit=SimpleNamespace(sha=sha)) if sha else None
+
+
+@pytest.mark.parametrize("base_ref", ["main", RESOLVED_SHA])
+def test_create_workspace_persists_logical_branch_and_pinned_commit(tmp_path, monkeypatch, base_ref):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "workspace.db"))
+    monkeypatch.setattr(workspace, "get_index_status", lambda *args, **kwargs: {"status": "not_found"})
+    service = SuccessfulWorkspaceService()
+
+    created = workspace.create_workspace(
+        service, "owner/repo", "workspace test", base_ref=base_ref, branch="ai/workspace-test",
+    )
+
+    assert created["base_branch"] == "main"
+    assert created["base_commit_sha"] == RESOLVED_SHA
+    assert service.created == [("owner/repo", "ai/workspace-test", RESOLVED_SHA)]
+
+
+def test_exact_commit_without_default_branch_identity_fails_before_git_write(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "workspace.db"))
+    service = SuccessfulWorkspaceService(default_head="c" * 40)
+
+    with pytest.raises(workspace.MyGithub12Error) as exc:
+        workspace.create_workspace(
+            service, "owner/repo", "workspace test", base_ref=RESOLVED_SHA, branch="ai/workspace-test",
+        )
+
+    assert exc.value.code == "BASE_BRANCH_IDENTITY_UNRESOLVED"
+    assert service.created == []
 
 
 def test_create_workspace_uses_resolved_commit_sha_and_preserves_ref_error(monkeypatch):

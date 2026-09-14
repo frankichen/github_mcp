@@ -40,6 +40,51 @@ class FakeService:
     client = FakeClient()
 
 
+def test_resume_plans_guarded_default_branch_normalization_for_malformed_commit_base():
+    workspace = {
+        **_workspace(status="drifted", revision=5, lease=0),
+        "base_branch": SHA_A,
+        "base_commit_sha": SHA_A,
+        "head_sha": SHA_B,
+        "tree_sha": TREE_B,
+        "drift_reason": "branch_moved_externally",
+    }
+    session = {
+        **_ready_session(head=SHA_A, tree=TREE_A, workspace_revision=4, lease=0),
+        "base_branch": SHA_A,
+        "base_commit_sha": SHA_A,
+    }
+    current_main = {
+        "branch": "main", "repository": "owner/repo",
+        "commit_sha": SHA_A, "tree_sha": TREE_A,
+    }
+    live_base = resume._resolve_recovery_base(
+        FakeService(), "owner/repo", workspace, session, None, current_main,
+    )
+
+    plan = resume._workspace_recovery_plan(
+        workspace,
+        service=FakeService(),
+        session=session,
+        current_main=current_main,
+        current_base=live_base,
+        branch_state={"commit_sha": SHA_B, "tree_sha": TREE_B},
+        pr=None,
+    )
+
+    assert live_base["branch"] == "main"
+    assert live_base["base_identity_normalization_required"] is True
+    assert plan["action"] == "recover_drifted_development_task"
+    assert plan["workspace_id"] == workspace["workspace_id"]
+    assert plan["development_session_id"] == session["session_id"]
+    assert plan["expected_workspace_revision"] == 5
+    assert plan["expected_session_revision"] == session["session_revision"]
+    assert plan["expected_current_head_sha"] == SHA_B
+    assert plan["expected_current_tree_sha"] == TREE_B
+    assert plan["expected_base_branch"] == "main"
+    assert plan["expected_base_sha"] == SHA_A
+
+
 def test_find_sessions_for_workspace_returns_active_sessions(tmp_path, monkeypatch):
     monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "resume.db"))
     ws = _workspace()
