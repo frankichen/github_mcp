@@ -103,7 +103,10 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert "reviewed_overlap_paths_json" not in set(base_sync_schema["required"])
     assert base_sync_schema["properties"]["reviewed_overlap_paths_json"]["default"] == "[]"
     assert base_sync_schema["properties"]["reviewed_overlap_paths_json"]["type"] == "string"
+    assert base_sync_schema["properties"]["reviewed_scope_expansion_paths_json"]["default"] == "[]"
+    assert base_sync_schema["properties"]["reviewed_scope_expansion_paths_json"]["type"] == "string"
     assert "exactly equals" in tools["recover_base_synced_development_task"].description
+    assert "outside the declared scope" in tools["recover_base_synced_development_task"].description
     retarget_schema = tools["recover_retargeted_development_task"].inputSchema
     assert {
         "repository", "branch", "pull_number", "upstream_pull_number",
@@ -200,7 +203,7 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.9.13"
+    assert manifest["service_version"] == "12.9.14"
     assert manifest["manifest_format"] == "composed-v2"
     assert manifest["legacy_tool_count"] == 120
     assert manifest["new_tool_count"] == 56

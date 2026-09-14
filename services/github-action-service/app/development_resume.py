@@ -13,8 +13,10 @@ import sqlite3
 from typing import Any
 
 from app import development_orchestrator as dx
+from app import development_base_sync_recovery as base_sync_recovery
 from app import development_session_store as sessions
 from app import attestation_registry, ci_request_store, github_utils, mygithub12
+from app import mygithub12_workspace
 from app import development_convergence_store as convergence_store
 from app import development_managed_merge as managed_merge
 from app import development_retarget_recovery as retarget_recovery
@@ -578,6 +580,34 @@ def _resume_ancestry_evidence(service: Any, repository: str, ancestor: str, desc
         }
 
 
+def _resume_authoritative_current_delta(
+    service: Any, repository: str, new_base_sha: str, current_head_sha: str,
+) -> dict[str, Any]:
+    """Use the same strict new-base -> current-head delta model as recovery."""
+    repo = getattr(service, "repo", None)
+    if repo is None:
+        repo = (
+            mygithub12._service_repo(service, repository)
+            if hasattr(service, "_check_repository_allowed")
+            else service.client.get_repo(repository)
+        )
+    if not hasattr(repo, "compare"):
+        return {"ancestry": {"verified": True, "source": "test_double_without_repository"}, "paths": []}
+    ancestry, paths = base_sync_recovery._compare_delta(
+        repo, new_base_sha, current_head_sha, label="new_base_to_current_head",
+    )
+    return {"ancestry": ancestry, "paths": paths}
+
+
+def _resume_outside_scope_paths(workspace: dict[str, Any], paths: list[str]) -> list[str]:
+    scope = workspace.get("scope") if isinstance(workspace.get("scope"), dict) else {}
+    declared = [str(value).strip().strip("/") for value in (scope.get("paths") or []) if str(value).strip().strip("/")]
+    if not declared:
+        return []
+    return sorted(
+        path for path in paths
+        if not any(mygithub12_workspace.scope_path_matches(path, declaration) for declaration in declared)
+    )
 def _resume_exact_commit_sha(value: Any) -> str:
     sha = str(value or "").strip()
     if len(sha) != 40:
@@ -924,6 +954,26 @@ def _workspace_recovery_plan(
                     "historical_old_base_evidence": historical_evidence,
                     "preflight": preflight,
                 }
+            try:
+                authoritative_delta = _resume_authoritative_current_delta(
+                    service, repository, new_base, current_head,
+                )
+                authoritative_paths = list(authoritative_delta["paths"])
+            except MyGithub12Error as exc:
+                return {
+                    "reason": exc.code,
+                    "action": "recovery_required",
+                    "manual_recovery_required": True,
+                    "candidate_recovery_tool": "recover_base_synced_development_task",
+                    "workspace_id": workspace.get("workspace_id"),
+                    "development_session_id": session.get("session_id"),
+                    "drift_reason": workspace.get("drift_reason"),
+                    "preflight": preflight,
+                    "authoritative_current_task_delta_paths": [],
+                    "outside_scope_current_paths": [],
+                    "required_scope_expansion_paths": [],
+                }
+            outside_scope_current_paths = _resume_outside_scope_paths(workspace, authoritative_paths)
             workspace_has_current_identity = (
                 workspace.get("head_sha") == current_head
                 and workspace.get("tree_sha") == branch_state.get("tree_sha")
@@ -944,6 +994,11 @@ def _workspace_recovery_plan(
                         "refresh_development_workspace",
                         "recover_base_synced_development_task",
                     ],
+                    "task_delta_authority": "new_base_to_current_head",
+                    "authoritative_current_task_delta_paths": authoritative_paths,
+                    "outside_scope_current_paths": outside_scope_current_paths,
+                    "required_scope_expansion_paths": outside_scope_current_paths,
+                    "reviewed_scope_expansion_required": bool(outside_scope_current_paths),
                     "preflight": preflight,
                 }
             return {
@@ -964,6 +1019,11 @@ def _workspace_recovery_plan(
                 "expected_old_session_head_sha": old_head,
                 "expected_current_head_sha": current_head,
                 "expected_current_tree_sha": branch_state.get("tree_sha"),
+                "task_delta_authority": "new_base_to_current_head",
+                "authoritative_current_task_delta_paths": authoritative_paths,
+                "outside_scope_current_paths": outside_scope_current_paths,
+                "required_scope_expansion_paths": outside_scope_current_paths,
+                "reviewed_scope_expansion_required": bool(outside_scope_current_paths),
                 "preflight": preflight,
             }
         return {

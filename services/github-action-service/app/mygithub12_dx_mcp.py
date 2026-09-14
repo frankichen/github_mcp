@@ -121,7 +121,9 @@ def register_dx_tools(
             "Explicitly adopt a freshly verified base synchronization into a drifted Workspace/Development "
             "Session. Overlap remains fail-closed unless reviewed_overlap_paths_json exactly equals the "
             "server-recomputed rename-aware overlap path set. Requires exact old/new base, old Session HEAD "
-            "and current HEAD/Tree identities; never moves Git refs or writes repository files."
+            "and current HEAD/Tree identities. reviewed_scope_expansion_paths_json must exactly equal the "
+            "server-computed authoritative current paths outside the declared scope; those paths are appended "
+            "atomically to Workspace scope. Never moves Git refs or writes repository files."
         ),
         annotations=_ORCHESTRATION,
     )
@@ -141,13 +143,14 @@ def register_dx_tools(
         idempotency_key: str,
         lease_seconds: int=mygithub12.DEFAULT_LEASE_SECONDS,
         reviewed_overlap_paths_json: str="[]",
+        reviewed_scope_expansion_paths_json: str="[]",
     ) -> str:
         try:
             result=await github_call(
                 base_sync_recovery.recover_base_synced_task,service,repository,branch,workspace_id,development_session_id,
                 expected_workspace_revision,expected_session_revision,expected_old_base_sha,expected_new_base_sha,
                 expected_base_branch,expected_old_session_head_sha,expected_current_head_sha,expected_current_tree_sha,
-                idempotency_key,lease_seconds,reviewed_overlap_paths_json,
+                idempotency_key,lease_seconds,reviewed_overlap_paths_json,reviewed_scope_expansion_paths_json,
             )
             return json.dumps(result,ensure_ascii=False)
         except Exception as exc: return _error(exc)
