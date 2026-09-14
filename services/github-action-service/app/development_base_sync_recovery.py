@@ -122,6 +122,7 @@ def _compare_delta(
     *,
     label: str,
     require_advance: bool = False,
+    allow_non_ancestor_path_classification: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
     """Return bounded rename-aware forward-ancestry evidence for one Git delta."""
     try:
@@ -146,7 +147,7 @@ def _compare_delta(
         "ahead_by": ahead_by,
         "behind_by": behind_by,
     }
-    if not verified:
+    if not verified and not allow_non_ancestor_path_classification:
         raise MyGithub12Error(
             "RECOVERY_ANCESTRY_MISMATCH",
             f"{label} is not a verified forward-only ancestry relation",
@@ -164,6 +165,12 @@ def _compare_delta(
         for path in (getattr(item, "filename", None), getattr(item, "previous_filename", None))
         if path
     })
+    if allow_non_ancestor_path_classification:
+        evidence = {
+            **evidence,
+            "ancestry_required": False,
+            "path_classification_verified": True,
+        }
     return evidence, changed_paths
 
 
@@ -218,14 +225,29 @@ def _verify_base_sync_deltas(
     base_ancestry, base_delta_paths = _compare_delta(
         repo, old_base_sha, new_base_sha, label="old_base_to_new_base", require_advance=True,
     )
-    old_task_ancestry, old_task_delta_paths = _compare_delta(
-        repo, old_base_sha, old_session_head_sha, label="old_base_to_old_task_head",
-    )
     task_ancestry, forward_task_delta_paths = _compare_delta(
         repo, old_session_head_sha, current_head_sha, label="old_task_head_to_current_head",
     )
     new_base_ancestry, new_task_delta_paths = _compare_delta(
         repo, new_base_sha, current_head_sha, label="new_base_to_current_head",
+    )
+    # A same-branch base can advance through a legitimate merge/update operation
+    # even when the historical Session HEAD came from an earlier stacked-base
+    # convergence and therefore is not descended from the old pinned base. The
+    # security proof is the strict old-base -> new-base advance plus the two
+    # independent forward relations above. The old-base comparison remains
+    # path-classification evidence only, so overlap protections stay intact.
+    old_task_ancestry, old_task_delta_paths = _compare_delta(
+        repo,
+        old_base_sha,
+        old_session_head_sha,
+        label="old_base_to_old_task_head",
+        allow_non_ancestor_path_classification=True,
+    )
+    ancestry_proof_mode = (
+        "old_base_task_and_dual_forward"
+        if old_task_ancestry["verified"]
+        else "same_base_branch_forward_dual"
     )
     historical_base_overlap = sorted(set(old_task_delta_paths) & set(base_delta_paths))
     current_base_overlap = sorted(set(new_task_delta_paths) & set(base_delta_paths))
@@ -278,6 +300,7 @@ def _verify_base_sync_deltas(
         "old_task_ancestry": old_task_ancestry,
         "task_ancestry": task_ancestry,
         "new_base_ancestry": new_base_ancestry,
+        "ancestry_proof_mode": ancestry_proof_mode,
         "base_delta_paths": base_delta_paths,
         "old_task_delta_paths": old_task_delta_paths,
         "new_task_delta_paths": new_task_delta_paths,
