@@ -1262,6 +1262,7 @@ def test_same_base_branch_forward_resume_does_not_require_old_base_to_old_sessio
     assert plan["action"] == "recover_base_synced_development_task"
     assert plan["preflight"]["verified"] is True
     assert plan["preflight"]["ancestry_proof_mode"] == "same_base_branch_forward_dual"
+    assert plan["preflight"]["task_delta_authority"] == "new_base_to_current_head"
     assert plan["preflight"]["old_task_base_ancestry"]["verified"] is False
     assert plan["preflight"]["old_task_base_ancestry"]["required"] is False
     assert plan["preflight"]["task_ancestry"]["verified"] is True

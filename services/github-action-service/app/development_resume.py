@@ -897,9 +897,10 @@ def _workspace_recovery_plan(
             preflight["old_task_base_ancestry"] = {
                 **preflight["old_task_base_ancestry"],
                 "required": False,
-                "purpose": "path_classification_only",
+                "purpose": "rename_aware_overlap_and_diagnostic_classification",
             }
             preflight["ancestry_proof_mode"] = "same_base_branch_forward_dual"
+            preflight["task_delta_authority"] = "new_base_to_current_head"
             preflight["verified"] = all(
                 preflight[name].get("verified")
                 for name in ("base_ancestry", "task_ancestry", "new_base_ancestry")

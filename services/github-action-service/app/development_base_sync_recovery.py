@@ -170,6 +170,7 @@ def _compare_delta(
             **evidence,
             "ancestry_required": False,
             "path_classification_verified": True,
+            "purpose": "rename_aware_overlap_and_diagnostic_classification",
         }
     return evidence, changed_paths
 
@@ -272,38 +273,57 @@ def _verify_base_sync_deltas(
                 "base_delta_paths": base_delta_paths,
             },
         )
-    # A canonical task may continue forward after the base sync. Path-set
-    # changes are therefore valid only when the verified H0 -> H1 comparison
-    # explains every difference.
-    task_path_changes = sorted(set(old_task_delta_paths) ^ set(new_task_delta_paths))
-    unexplained_task_path_changes = sorted(set(task_path_changes) - set(forward_task_delta_paths))
-    if unexplained_task_path_changes:
-        raise MyGithub12Error(
-            "RECOVERY_TASK_DIFF_MISMATCH",
-            "task path-set changes are not explained by the verified forward task advance",
-            {
-                "old_task_delta_paths": old_task_delta_paths,
-                "new_task_delta_paths": new_task_delta_paths,
-                "forward_task_delta_paths": forward_task_delta_paths,
-                "unexplained_task_path_changes": unexplained_task_path_changes,
-            },
-        )
     forward_paths = set(forward_task_delta_paths)
     base_paths = set(base_delta_paths)
-    excluded_imported_base_paths = sorted(forward_paths & base_paths)
-    recovery_scope_delta_paths = sorted(forward_paths - base_paths)
-    excluded_unchanged_historical_cumulative_paths = sorted(
-        set(old_task_delta_paths) - forward_paths
-    )
+    if ancestry_proof_mode == "same_base_branch_forward_dual":
+        # A non-ancestor compare is merge-base-relative and may include paths
+        # from the other side of the divergence. Keep it for rename-aware
+        # overlap and diagnostics, but never let it define task continuity or
+        # declared-scope enforcement. The exact live new-base -> current-HEAD
+        # delta is authoritative in this mode.
+        authoritative_task_delta_paths = list(new_task_delta_paths)
+        task_path_changes: list[str] = []
+        unexplained_task_path_changes: list[str] = []
+        task_diff_enforcement = "current_base_delta_authoritative"
+        recovery_scope_delta_paths = list(authoritative_task_delta_paths)
+        excluded_imported_base_paths = sorted(forward_paths & base_paths)
+        excluded_unchanged_historical_cumulative_paths: list[str] = []
+    else:
+        # A canonical task may continue forward after the base sync. When the
+        # historical task delta is ancestry-backed, every path-set difference
+        # must still be explained by the verified H0 -> H1 comparison.
+        authoritative_task_delta_paths = list(new_task_delta_paths)
+        task_path_changes = sorted(set(old_task_delta_paths) ^ set(new_task_delta_paths))
+        unexplained_task_path_changes = sorted(set(task_path_changes) - set(forward_task_delta_paths))
+        if unexplained_task_path_changes:
+            raise MyGithub12Error(
+                "RECOVERY_TASK_DIFF_MISMATCH",
+                "task path-set changes are not explained by the verified forward task advance",
+                {
+                    "old_task_delta_paths": old_task_delta_paths,
+                    "new_task_delta_paths": new_task_delta_paths,
+                    "forward_task_delta_paths": forward_task_delta_paths,
+                    "unexplained_task_path_changes": unexplained_task_path_changes,
+                },
+            )
+        task_diff_enforcement = "ancestry_backed_path_set_explanation"
+        excluded_imported_base_paths = sorted(forward_paths & base_paths)
+        recovery_scope_delta_paths = sorted(forward_paths - base_paths)
+        excluded_unchanged_historical_cumulative_paths = sorted(
+            set(old_task_delta_paths) - forward_paths
+        )
     return {
         "base_ancestry": base_ancestry,
         "old_task_ancestry": old_task_ancestry,
         "task_ancestry": task_ancestry,
         "new_base_ancestry": new_base_ancestry,
         "ancestry_proof_mode": ancestry_proof_mode,
+        "task_diff_enforcement": task_diff_enforcement,
+        "task_delta_authority": "new_base_to_current_head",
         "base_delta_paths": base_delta_paths,
         "old_task_delta_paths": old_task_delta_paths,
         "new_task_delta_paths": new_task_delta_paths,
+        "authoritative_task_delta_paths": authoritative_task_delta_paths,
         "forward_task_delta_paths": forward_task_delta_paths,
         "historical_cumulative_task_delta_paths": old_task_delta_paths,
         "external_forward_delta_paths": forward_task_delta_paths,
@@ -666,9 +686,13 @@ def _atomic_recover_base_sync(
                 "old_task_ancestry": verification["deltas"]["old_task_ancestry"],
                 "task_ancestry": verification["deltas"]["task_ancestry"],
                 "new_base_ancestry": verification["deltas"]["new_base_ancestry"],
+                "ancestry_proof_mode": verification["deltas"]["ancestry_proof_mode"],
+                "task_diff_enforcement": verification["deltas"]["task_diff_enforcement"],
+                "task_delta_authority": verification["deltas"]["task_delta_authority"],
                 "base_delta_paths": verification["deltas"]["base_delta_paths"],
                 "old_task_delta_paths": verification["deltas"]["old_task_delta_paths"],
                 "new_task_delta_paths": verification["deltas"]["new_task_delta_paths"],
+                "authoritative_task_delta_paths": verification["deltas"]["authoritative_task_delta_paths"],
                 "forward_task_delta_paths": verification["deltas"]["forward_task_delta_paths"],
                 "historical_cumulative_task_delta_paths": verification["deltas"]["historical_cumulative_task_delta_paths"],
                 "external_forward_delta_paths": verification["deltas"]["external_forward_delta_paths"],
