@@ -336,6 +336,91 @@ def test_same_base_branch_dual_ancestry_still_requires_exact_overlap_review(tmp_
     assert exc.value.details["reviewed_overlap_paths"] == []
 
 
+def test_dual_ancestry_ignores_polluted_historical_paths_and_uses_current_delta_authoritatively(
+    tmp_path, monkeypatch,
+):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    polluted_historical_paths = [f"historical/noise-{index}.py" for index in range(40)]
+    polluted_historical_paths += ["allowed/overlap.py"]
+    service.repo.set_compare(
+        OLD_BASE,
+        NEW_BASE,
+        paths=["allowed/overlap.py"],
+        previous={"allowed/overlap.py": "allowed/renamed-overlap.py"},
+    )
+    service.repo.set_compare(
+        OLD_BASE,
+        OLD_HEAD,
+        merge_base=OTHER_HEAD,
+        behind_by=7,
+        paths=polluted_historical_paths,
+    )
+    service.repo.set_compare(
+        OLD_HEAD,
+        CURRENT_HEAD,
+        paths=["allowed/overlap.py", "allowed/feature.py"],
+    )
+    service.repo.set_compare(
+        NEW_BASE,
+        CURRENT_HEAD,
+        paths=["allowed/overlap.py", "allowed/feature.py"],
+    )
+    branch_heads_before = dict(service.client.heads)
+
+    result = _call(
+        service,
+        session,
+        reviewed_overlap_paths_json=json.dumps(["allowed/overlap.py"]),
+    )
+
+    deltas = result["verification"]["deltas"]
+    assert deltas["ancestry_proof_mode"] == "same_base_branch_forward_dual"
+    assert deltas["task_diff_enforcement"] == "current_base_delta_authoritative"
+    assert deltas["task_delta_authority"] == "new_base_to_current_head"
+    assert deltas["old_task_delta_paths"] == sorted(polluted_historical_paths)
+    assert deltas["authoritative_task_delta_paths"] == ["allowed/feature.py", "allowed/overlap.py"]
+    assert deltas["recovery_scope_delta_paths"] == ["allowed/feature.py", "allowed/overlap.py"]
+    assert deltas["unexplained_task_path_changes"] == []
+    assert result["audit"]["actual_overlap_paths"] == ["allowed/overlap.py"]
+    assert result["audit"]["task_diff_enforcement"] == "current_base_delta_authoritative"
+    assert result["audit"]["task_delta_authority"] == "new_base_to_current_head"
+    assert result["workspace"]["workspace_id"] == WORKSPACE_ID
+    assert result["development_session"]["session_id"] == session["session_id"]
+    assert result["development_session"]["last_fast_ci_job_id"] is None
+    assert result["development_session"]["last_full_ci_job_id"] is None
+    assert result["development_session"]["last_attestation_id"] is None
+    assert service.client.heads == branch_heads_before
+
+
+def test_dual_ancestry_current_authoritative_delta_outside_scope_still_fails_closed(
+    tmp_path, monkeypatch,
+):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    service.repo.set_compare(
+        OLD_BASE,
+        OLD_HEAD,
+        merge_base=OTHER_HEAD,
+        behind_by=3,
+        paths=["historical/noise.py"],
+    )
+    service.repo.set_compare(
+        OLD_HEAD,
+        CURRENT_HEAD,
+        paths=["base/region.py", "outside/current.py"],
+    )
+    service.repo.set_compare(
+        NEW_BASE,
+        CURRENT_HEAD,
+        paths=["outside/current.py"],
+    )
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+
+    assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
+    assert exc.value.details["outside_scope_paths"] == ["outside/current.py"]
+
+
 def test_t4_old_session_head_must_be_current_head_ancestor(tmp_path, monkeypatch):
     service, session, _ = _seed(tmp_path, monkeypatch)
     service.repo.set_compare(OLD_HEAD, CURRENT_HEAD, merge_base=OTHER_HEAD)
