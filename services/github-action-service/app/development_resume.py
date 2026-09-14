@@ -10,6 +10,7 @@ than drifted.
 from __future__ import annotations
 
 import sqlite3
+import re
 from typing import Any
 
 from app import development_orchestrator as dx
@@ -29,6 +30,7 @@ from app.ci_models import REQUEST_ONLY_TERMINAL_STATUSES
 MyGithub12Error = mygithub12.MyGithub12Error
 ACTIVE_SESSION_STATUSES = {"active", "pr_ready"}
 BLOCKED_SESSION_STATUSES = {"blocked", "drifted", "closing", "validating_fast", "validating_full"}
+_EXACT_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
 TRANSIENT_VALIDATION_STATUSES = {"validating_fast": "fast", "validating_full": "full"}
 VALIDATION_IN_PROGRESS_STATUSES = {"queued", "leased", "downloading", "preparing", "running", "cancel_requested"}
 CONVERGENCE_RESUME_MODES = ("full", "fast")
@@ -115,6 +117,25 @@ def _resolve_recovery_base(
         )
     control_base = next(iter(control_candidates), "")
     pr_base = str((pr or {}).get("base_branch") or "")
+    pinned_bases = {
+        str(value)
+        for value in ((workspace or {}).get("base_commit_sha"), (session or {}).get("base_commit_sha"))
+        if value
+    }
+    malformed_default_base = bool(
+        control_base
+        and _EXACT_COMMIT_SHA.fullmatch(control_base)
+        and len(pinned_bases) == 1
+        and control_base == next(iter(pinned_bases))
+        and current_main.get("commit_sha") == control_base
+        and (not pr_base or pr_base == current_main.get("branch"))
+    )
+    if malformed_default_base:
+        return {
+            **current_main,
+            "normalizes_persisted_base_branch": control_base,
+            "base_identity_normalization_required": True,
+        }
     if control_base and pr_base and control_base != pr_base:
         retarget_shape = bool(
             workspace
@@ -1033,6 +1054,16 @@ def _workspace_recovery_plan(
             "manual_recovery_required": True,
             "workspace_id": workspace.get("workspace_id"),
             "drift_reason": workspace.get("drift_reason"),
+            "repository": workspace.get("repository"),
+            "branch": workspace.get("branch"),
+            "development_session_id": (session or {}).get("session_id"),
+            "expected_workspace_revision": workspace.get("revision"),
+            "expected_session_revision": (session or {}).get("session_revision"),
+            "expected_current_head_sha": (branch_state or {}).get("commit_sha"),
+            "expected_current_tree_sha": (branch_state or {}).get("tree_sha"),
+            "expected_base_branch": live_base_branch or base_branch,
+            "expected_base_sha": old_base,
+            "base_identity_normalization_required": bool((live_base or {}).get("base_identity_normalization_required")),
         }
     return None
 

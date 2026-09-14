@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from typing import Any
 
@@ -18,6 +19,41 @@ from app import mygithub12_workspace as workspace_scope
 MyGithub12Error = mygithub12.MyGithub12Error
 _ALLOWED_SESSION_STATES = frozenset({"active", "blocked", "drifted", "pr_ready"})
 _COMPARE_FILE_LIMIT = 300
+_EXACT_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
+
+
+def _base_identity_mode(
+    workspace: dict[str, Any], session: dict[str, Any], expected_base_branch: str, expected_base_sha: str,
+) -> str:
+    """Return exact or guarded legacy-normalization identity mode."""
+    workspace_base = str(workspace.get("base_branch") or "")
+    session_base = str(session.get("base_branch") or "")
+    if workspace_base == expected_base_branch and session_base == expected_base_branch:
+        return "exact"
+    malformed = (
+        workspace_base == session_base
+        and bool(_EXACT_COMMIT_SHA.fullmatch(workspace_base))
+        and workspace_base == expected_base_sha
+        and workspace.get("base_commit_sha") == expected_base_sha
+        and session.get("base_commit_sha") == expected_base_sha
+        and not _EXACT_COMMIT_SHA.fullmatch(str(expected_base_branch or ""))
+    )
+    if malformed:
+        if workspace.get("owner") != session.get("owner"):
+            raise MyGithub12Error(
+                "RECOVERY_OWNER_MISMATCH",
+                "Workspace and Development Session owners differ during base identity normalization",
+            )
+        return "normalize_legacy_commit_base"
+    raise MyGithub12Error(
+        "RECOVERY_IDENTITY_MISMATCH",
+        "Workspace/Development Session base identity does not match the requested branch",
+        {
+            "workspace_base_branch": workspace_base,
+            "session_base_branch": session_base,
+            "expected_base_branch": expected_base_branch,
+        },
+    )
 
 
 def _request_identity(
@@ -76,6 +112,10 @@ def _replay_result(
         and workspace.get("tree_sha") == after.get("tree_sha")
         and session.get("head_commit_sha") == after.get("head_sha")
         and session.get("tree_sha") == after.get("tree_sha")
+        and workspace.get("base_branch") == after.get("base_branch")
+        and session.get("base_branch") == after.get("base_branch")
+        and workspace.get("base_commit_sha") == after.get("base_commit_sha")
+        and session.get("base_commit_sha") == after.get("base_commit_sha")
     )
     if not matches:
         raise MyGithub12Error(
@@ -293,6 +333,10 @@ def _atomic_recover(
                     and workspace_row["tree_sha"] == after.get("tree_sha")
                     and session_row["head_commit_sha"] == after.get("head_sha")
                     and session_row["tree_sha"] == after.get("tree_sha")
+                    and workspace_row["base_branch"] == after.get("base_branch")
+                    and session_row["base_branch"] == after.get("base_branch")
+                    and workspace_row["base_commit_sha"] == after.get("base_commit_sha")
+                    and session_row["base_commit_sha"] == after.get("base_commit_sha")
                 )
                 if not replay_state_matches:
                     raise MyGithub12Error(
@@ -310,6 +354,7 @@ def _atomic_recover(
                         "another active or drifted Workspace claims the recovery branch",
                         {"conflicting_workspace_id": other["workspace_id"]},
                     )
+                _base_identity_mode(dict(workspace_row), dict(session_row), base_branch, base_sha)
                 _fresh_github_identity(service, repository, branch, current_head, current_tree, base_branch, base_sha)
                 return {"replayed": True, "before": record["before"], "after": record["after"], "audit": record["audit"]}
             if int(workspace_row["revision"]) != int(expected_workspace_revision):
@@ -333,16 +378,15 @@ def _atomic_recover(
             identity_ok = (
                 workspace_row["repository"] == repository
                 and workspace_row["branch"] == branch
-                and workspace_row["base_branch"] == base_branch
                 and workspace_row["head_sha"] == current_head
                 and workspace_row["tree_sha"] == current_tree
                 and session_row["workspace_id"] == workspace_id
                 and session_row["repository"] == repository
                 and session_row["branch"] == branch
-                and session_row["base_branch"] == base_branch
             )
             if not identity_ok:
                 raise MyGithub12Error("RECOVERY_IDENTITY_MISMATCH", "Workspace/Session identity changed before drift recovery")
+            base_identity_mode = _base_identity_mode(dict(workspace_row), dict(session_row), base_branch, base_sha)
             other = db.execute(
                 """SELECT workspace_id FROM workspaces WHERE repository=? AND branch=? AND workspace_id<>?
                 AND (status='drifted' OR (status='active' AND lease_expires_at>?)) LIMIT 1""",
@@ -365,6 +409,8 @@ def _atomic_recover(
                 "workspace_status": workspace_row["status"],
                 "session_status": session_row["status"],
                 "drift_reason": workspace_row["drift_reason"],
+                "workspace_base_branch": workspace_row["base_branch"],
+                "session_base_branch": session_row["base_branch"],
             }
             after = {
                 "workspace_revision": int(workspace_row["revision"]) + 1,
@@ -373,6 +419,8 @@ def _atomic_recover(
                 "tree_sha": current_tree,
                 "status": "active",
                 "lease_expires_at": lease_expires_at,
+                "base_branch": base_branch,
+                "base_commit_sha": base_sha,
             }
             audit = {
                 "repository": repository,
@@ -387,6 +435,14 @@ def _atomic_recover(
                 "adopted_head": current_head,
                 "adopted_tree": current_tree,
                 "base_sha": base_sha,
+                "base_identity_normalization": {
+                    "performed": base_identity_mode == "normalize_legacy_commit_base",
+                    "mode": base_identity_mode,
+                    "old_workspace_base_branch": before["workspace_base_branch"],
+                    "old_session_base_branch": before["session_base_branch"],
+                    "new_base_branch": base_branch,
+                    "pinned_base_sha": base_sha,
+                },
                 "drift_reason": before["drift_reason"],
                 "ancestry": verification["ancestry"],
                 "scope": verification["scope"],
@@ -401,19 +457,20 @@ def _atomic_recover(
                 "audit": audit,
             }
             ws_update = db.execute(
-                """UPDATE workspaces SET head_sha=?,tree_sha=?,status='active',drift_reason=NULL,lease_expires_at=?,
+                """UPDATE workspaces SET base_branch=?,head_sha=?,tree_sha=?,status='active',drift_reason=NULL,lease_expires_at=?,
                 index_commit_sha=NULL,revision=revision+1,updated_at=?
                 WHERE workspace_id=? AND revision=? AND status='drifted' AND drift_reason='branch_moved_externally'""",
-                (current_head, current_tree, lease_expires_at, now, workspace_id, expected_workspace_revision),
+                (base_branch, current_head, current_tree, lease_expires_at, now, workspace_id, expected_workspace_revision),
             )
             if ws_update.rowcount != 1:
                 raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH", "Workspace changed while applying drift recovery")
             session_update = db.execute(
-                """UPDATE development_sessions SET status='active',head_commit_sha=?,tree_sha=?,workspace_revision=?,
+                """UPDATE development_sessions SET base_branch=?,status='active',head_commit_sha=?,tree_sha=?,workspace_revision=?,
                 lease_expires_at=?,index_commit_sha=NULL,last_fast_ci_job_id=NULL,last_full_ci_job_id=NULL,
                 last_attestation_id=NULL,last_failure_resource_uri=NULL,metadata_json=?,session_revision=session_revision+1,updated_at=?
                 WHERE session_id=? AND session_revision=?""",
                 (
+                    base_branch,
                     current_head,
                     current_tree,
                     after["workspace_revision"],
@@ -515,11 +572,9 @@ def recover_drifted_task(
     identity_ok = (
         workspace.get("repository") == repository
         and workspace.get("branch") == branch
-        and workspace.get("base_branch") == expected_base_branch
         and session.get("workspace_id") == workspace_id
         and session.get("repository") == repository
         and session.get("branch") == branch
-        and session.get("base_branch") == expected_base_branch
     )
     if not identity_ok:
         raise MyGithub12Error(
@@ -533,6 +588,7 @@ def recover_drifted_task(
             "recovery base SHA differs from the Workspace/Development Session pinned base",
             {"workspace_base_sha": workspace.get("base_commit_sha"), "session_base_sha": session.get("base_commit_sha"), "expected_base_sha": expected_base_sha},
         )
+    _base_identity_mode(workspace, session, expected_base_branch, expected_base_sha)
     replay = _replay_result(session, workspace, request, idempotency_key)
     if replay:
         _fresh_github_identity(
