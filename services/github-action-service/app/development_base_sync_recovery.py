@@ -15,6 +15,7 @@ from typing import Any
 from app import development_drift_recovery as same_base
 from app import development_session_store as sessions
 from app import mygithub12
+from app import mygithub12_workspace
 
 MyGithub12Error = mygithub12.MyGithub12Error
 PINNED_BASE_HISTORICAL_OLD = "historical_old_base"
@@ -55,6 +56,21 @@ def _parse_reviewed_overlap_paths(reviewed_overlap_paths_json: str) -> list[str]
     return sorted(reviewed)
 
 
+def _parse_reviewed_scope_expansion_paths(reviewed_scope_expansion_paths_json: str) -> list[str]:
+    """Parse an exact caller-reviewed set of additional declared Git paths."""
+    reviewed = _parse_reviewed_overlap_paths(reviewed_scope_expansion_paths_json)
+    for path in reviewed:
+        try:
+            mygithub12._safe_path(path)
+        except MyGithub12Error as exc:
+            raise MyGithub12Error(
+                "SEARCH_QUERY_INVALID",
+                "reviewed_scope_expansion_paths_json entries must be safe exact Git paths",
+                {"path": path},
+            ) from exc
+    return reviewed
+
+
 def _classify_pinned_base_state(
     workspace_base_sha: str,
     session_base_sha: str,
@@ -93,6 +109,7 @@ def _base_sync_request_identity(
     expected_current_head_sha: str,
     expected_current_tree_sha: str,
     reviewed_overlap_paths: list[str],
+    reviewed_scope_expansion_paths: list[str],
     lease_seconds: int,
 ) -> dict[str, Any]:
     request = {
@@ -112,6 +129,8 @@ def _base_sync_request_identity(
     }
     if reviewed_overlap_paths:
         request["reviewed_overlap_paths"] = list(reviewed_overlap_paths)
+    if reviewed_scope_expansion_paths:
+        request["reviewed_scope_expansion_paths"] = list(reviewed_scope_expansion_paths)
     return request
 
 
@@ -340,20 +359,50 @@ def _verify_base_sync_deltas(
     }
 
 
-def _verify_base_sync_scope(workspace: dict[str, Any], changed_paths: list[str]) -> dict[str, Any]:
-    """Preserve legacy empty scope without treating it as unrestricted scope."""
+def _verify_base_sync_scope(
+    workspace: dict[str, Any], changed_paths: list[str], reviewed_scope_expansion_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Require an exact review of authoritative paths outside the current scope."""
     scope = workspace.get("scope") if isinstance(workspace.get("scope"), dict) else {}
     declared = [str(value).strip().strip("/") for value in (scope.get("paths") or []) if str(value).strip().strip("/")]
-    if declared:
-        evidence = same_base._verify_scope(workspace, changed_paths)
-        return {**evidence, "declaration_required": False, "enforcement": "declared_scope"}
+    outside = sorted(
+        path for path in changed_paths
+        if declared and not any(
+            mygithub12_workspace.scope_path_matches(path, declaration) for declaration in declared
+        )
+    )
+    reviewed = sorted(reviewed_scope_expansion_paths or [])
+    if reviewed != outside:
+        raise MyGithub12Error(
+            "RECOVERY_SCOPE_VIOLATION",
+            "reviewed recovery scope expansion must exactly equal authoritative current paths outside the Workspace scope",
+            {
+                "workspace_id": workspace.get("workspace_id"),
+                "outside_scope_current_paths": outside,
+                "outside_scope_paths": outside,
+                "required_scope_expansion_paths": outside,
+                "reviewed_scope_expansion_paths": reviewed,
+                "missing_reviewed_scope_expansion_paths": sorted(set(outside) - set(reviewed)),
+                "unexpected_reviewed_scope_expansion_paths": sorted(set(reviewed) - set(outside)),
+            },
+        )
+    previous_scope = json.loads(json.dumps(scope, ensure_ascii=False))
+    resulting_scope = json.loads(json.dumps(scope, ensure_ascii=False))
+    existing_paths = list(resulting_scope.get("paths") or [])
+    if reviewed:
+        resulting_scope["paths"] = existing_paths + [path for path in reviewed if path not in existing_paths]
     return {
         "verified": True,
-        "declared_paths": [],
+        "declared_paths": declared,
         "changed_paths": changed_paths,
-        "outside_scope_paths": [],
-        "declaration_required": True,
-        "enforcement": "actual_changed_paths_overlap_only",
+        "outside_scope_paths": outside,
+        "outside_scope_current_paths": outside,
+        "required_scope_expansion_paths": outside,
+        "reviewed_scope_expansion_paths": reviewed,
+        "previous_scope": previous_scope,
+        "resulting_scope": resulting_scope,
+        "declaration_required": not bool(declared),
+        "enforcement": "exact_reviewed_scope_expansion" if declared else "actual_changed_paths_overlap_only",
     }
 
 
@@ -512,6 +561,7 @@ def _replay_base_sync_result(
         and session.get("base_commit_sha") == after.get("base_sha")
         and workspace.get("head_sha") == after.get("head_sha")
         and workspace.get("tree_sha") == after.get("tree_sha")
+        and workspace.get("scope") == after.get("scope")
         and session.get("head_commit_sha") == after.get("head_sha")
         and session.get("tree_sha") == after.get("tree_sha")
     )
@@ -571,6 +621,7 @@ def _atomic_recover_base_sync(
                     and session_row["base_commit_sha"] == after.get("base_sha")
                     and workspace_row["head_sha"] == after.get("head_sha")
                     and workspace_row["tree_sha"] == after.get("tree_sha")
+                    and json.loads(workspace_row["scope_json"] or "{}") == after.get("scope")
                     and session_row["head_commit_sha"] == after.get("head_sha")
                     and session_row["tree_sha"] == after.get("tree_sha")
                 )
@@ -666,6 +717,7 @@ def _atomic_recover_base_sync(
                 "tree_sha": current_tree,
                 "status": "active",
                 "lease_expires_at": lease_expires_at,
+                "scope": verification["scope"].get("resulting_scope") or {},
             }
             audit = {
                 "repository": repository,
@@ -702,6 +754,9 @@ def _atomic_recover_base_sync(
                 "task_path_changes": verification["deltas"]["task_path_changes"],
                 "unexplained_task_path_changes": verification["deltas"]["unexplained_task_path_changes"],
                 "outside_scope_paths": verification["scope"].get("outside_scope_paths", []),
+                "previous_scope": verification["scope"].get("previous_scope", {}),
+                "reviewed_scope_expansion_paths": verification["scope"].get("reviewed_scope_expansion_paths", []),
+                "resulting_scope": verification["scope"].get("resulting_scope", {}),
                 "overlap_result": {
                     "historical_base_overlap_paths": verification["deltas"]["historical_base_overlap_paths"],
                     "current_base_overlap_paths": verification["deltas"]["current_base_overlap_paths"],
@@ -723,12 +778,14 @@ def _atomic_recover_base_sync(
                 "audit": audit,
             }
             ws_update = db.execute(
-                """UPDATE workspaces SET base_commit_sha=?,head_sha=?,tree_sha=?,status='active',drift_reason=NULL,
+                """UPDATE workspaces SET base_commit_sha=?,head_sha=?,tree_sha=?,scope_json=?,status='active',drift_reason=NULL,
                 lease_expires_at=?,index_commit_sha=NULL,revision=revision+1,updated_at=?
                 WHERE workspace_id=? AND revision=? AND status='drifted' AND drift_reason='branch_moved_externally'
                 AND base_commit_sha=?""",
                 (
-                    new_base_sha, current_head, current_tree, lease_expires_at, now,
+                    new_base_sha, current_head, current_tree,
+                    json.dumps(verification["scope"].get("resulting_scope") or {}, ensure_ascii=False, separators=(",", ":")),
+                    lease_expires_at, now,
                     workspace_id, expected_workspace_revision, pinned_base_before,
                 ),
             )
@@ -823,8 +880,9 @@ def recover_base_synced_task(
     idempotency_key: str,
     lease_seconds: int = mygithub12.DEFAULT_LEASE_SECONDS,
     reviewed_overlap_paths_json: str = "[]",
+    reviewed_scope_expansion_paths_json: str = "[]",
 ) -> dict[str, Any]:
-    """Adopt a verified base sync, allowing only an exact explicitly reviewed overlap set."""
+    """Adopt a verified base sync with exact reviewed overlap and scope expansion sets."""
     if not repository or "/" not in repository or not branch:
         raise MyGithub12Error("SEARCH_QUERY_INVALID", "repository and branch are required")
     if not workspace_id or not development_session_id or not idempotency_key:
@@ -843,6 +901,7 @@ def recover_base_synced_task(
             {"expected_old_base_sha": expected_old_base_sha, "expected_new_base_sha": expected_new_base_sha},
         )
     reviewed_overlap_paths = _parse_reviewed_overlap_paths(reviewed_overlap_paths_json)
+    reviewed_scope_expansion_paths = _parse_reviewed_scope_expansion_paths(reviewed_scope_expansion_paths_json)
     workspace = mygithub12.get_workspace(service, workspace_id)
     session = sessions.get_session(development_session_id)
     request = _base_sync_request_identity(
@@ -859,6 +918,7 @@ def recover_base_synced_task(
         expected_current_head_sha,
         expected_current_tree_sha,
         reviewed_overlap_paths,
+        reviewed_scope_expansion_paths,
         lease_seconds,
     )
     identity_ok = (
@@ -959,7 +1019,9 @@ def recover_base_synced_task(
         reviewed_overlap_paths,
     )
     # Scope/ownership apply only to task-owned changes after the old Session HEAD.
-    scope = _verify_base_sync_scope(workspace, deltas["recovery_scope_delta_paths"])
+    scope = _verify_base_sync_scope(
+        workspace, deltas["recovery_scope_delta_paths"], reviewed_scope_expansion_paths,
+    )
     ownership = _verify_base_sync_ownership(
         service, repo, workspace, expected_new_base_sha, deltas["recovery_scope_delta_paths"],
     )

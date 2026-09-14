@@ -327,13 +327,123 @@ def test_same_base_branch_dual_ancestry_still_requires_exact_overlap_review(tmp_
         behind_by=1,
         paths=["allowed/feature.py", "base/region.py"],
     )
-
     with pytest.raises(recovery.MyGithub12Error) as exc:
         _call(service, session)
 
     assert exc.value.code == "RECOVERY_BASE_SYNC_OVERLAP"
     assert exc.value.details["actual_overlap_paths"] == ["base/region.py"]
     assert exc.value.details["reviewed_overlap_paths"] == []
+
+def test_dual_recovery_resume_plan_and_recovery_atomically_expand_scope_for_exact_review(
+    tmp_path, monkeypatch,
+):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    service.repo.set_compare(
+        OLD_BASE, OLD_HEAD, merge_base=OTHER_HEAD, behind_by=2,
+        paths=["historical/noise.py", "api/openapi/app.yaml"],
+    )
+    service.repo.set_compare(
+        OLD_BASE, NEW_BASE, paths=["api/openapi/app.yaml"],
+    )
+    service.repo.set_compare(
+        OLD_HEAD, CURRENT_HEAD,
+        paths=["allowed/feature.py", ".env.example", "internal/platform/config/config.go"],
+    )
+    service.repo.set_compare(
+        NEW_BASE, CURRENT_HEAD,
+        paths=["allowed/feature.py", ".env.example", "internal/platform/config/config.go", "api/openapi/app.yaml"],
+    )
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            "UPDATE workspaces SET scope_json=? WHERE workspace_id=?",
+            (json.dumps({"paths": ["allowed/**", "api/openapi/app.yaml"]}), WORKSPACE_ID),
+        )
+    workspace = mygithub12.get_workspace(service, WORKSPACE_ID)
+    plan = resume._workspace_recovery_plan(
+        workspace,
+        service=service,
+        session=session,
+        current_main={"branch": BASE_BRANCH, "commit_sha": NEW_BASE},
+        branch_state={"commit_sha": CURRENT_HEAD, "tree_sha": CURRENT_TREE},
+    )
+
+    assert plan["outside_scope_current_paths"] == [
+        ".env.example", "internal/platform/config/config.go",
+    ]
+    assert plan["required_scope_expansion_paths"] == plan["outside_scope_current_paths"]
+    assert plan["preflight"]["verified"] is True
+    refs_before = dict(service.client.heads)
+
+    result = recovery.recover_base_synced_task(
+        service,
+        **_args(
+            session,
+            reviewed_overlap_paths_json=json.dumps(["api/openapi/app.yaml"]),
+            reviewed_scope_expansion_paths_json=json.dumps(plan["required_scope_expansion_paths"]),
+        ),
+    )
+
+    assert result["workspace"]["status"] == "active"
+    assert result["development_session"]["status"] == "active"
+    assert result["workspace"]["scope"]["paths"] == [
+        "allowed/**", "api/openapi/app.yaml", ".env.example", "internal/platform/config/config.go",
+    ]
+    assert result["audit"]["previous_scope"]["paths"] == ["allowed/**", "api/openapi/app.yaml"]
+    assert result["audit"]["reviewed_scope_expansion_paths"] == plan["required_scope_expansion_paths"]
+    assert result["audit"]["resulting_scope"]["paths"] == result["workspace"]["scope"]["paths"]
+    assert result["workspace"]["revision"] == 6
+    assert result["development_session"]["workspace_revision"] == 6
+    assert result["development_session"]["session_revision"] == session["session_revision"] + 1
+    assert result["development_session"]["last_fast_ci_job_id"] is None
+    assert result["development_session"]["last_full_ci_job_id"] is None
+    assert result["development_session"]["last_attestation_id"] is None
+    assert result["development_session"]["last_failure_resource_uri"] is None
+    assert service.client.heads == refs_before
+
+
+@pytest.mark.parametrize(
+    "reviewed, expected_detail",
+    [
+        ([".env.example"], "missing_reviewed_scope_expansion_paths"),
+        ([".env.example", "internal/platform/config/config.go", "unrelated.py"], "unexpected_reviewed_scope_expansion_paths"),
+        ([], "missing_reviewed_scope_expansion_paths"),
+    ],
+)
+def test_dual_recovery_requires_exact_current_scope_expansion_set(
+    tmp_path, monkeypatch, reviewed, expected_detail,
+):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    service.repo.set_compare(
+        OLD_BASE, OLD_HEAD, merge_base=OTHER_HEAD, behind_by=1, paths=["historical/noise.py"],
+    )
+    service.repo.set_compare(
+        NEW_BASE, CURRENT_HEAD,
+        paths=[".env.example", "internal/platform/config/config.go"],
+    )
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(
+            service,
+            session,
+            reviewed_scope_expansion_paths_json=json.dumps(reviewed),
+        )
+
+    assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
+    assert exc.value.details["outside_scope_current_paths"] == [
+        ".env.example", "internal/platform/config/config.go",
+    ]
+    assert expected_detail in exc.value.details
+
+
+def test_dual_recovery_rejects_scope_expansion_when_authoritative_delta_is_empty(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(
+            service,
+            session,
+            reviewed_scope_expansion_paths_json=json.dumps(["unrelated.py"]),
+        )
+    assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
+    assert exc.value.details["outside_scope_current_paths"] == []
 
 
 def test_dual_ancestry_ignores_polluted_historical_paths_and_uses_current_delta_authoritatively(
