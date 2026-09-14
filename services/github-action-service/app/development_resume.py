@@ -894,8 +894,15 @@ def _workspace_recovery_plan(
                 "task_ancestry": _resume_ancestry_evidence(service, repository, old_head, current_head),
                 "new_base_ancestry": _resume_ancestry_evidence(service, repository, new_base, current_head),
             }
+            preflight["old_task_base_ancestry"] = {
+                **preflight["old_task_base_ancestry"],
+                "required": False,
+                "purpose": "path_classification_only",
+            }
+            preflight["ancestry_proof_mode"] = "same_base_branch_forward_dual"
             preflight["verified"] = all(
-                item.get("verified") for item in preflight.values() if isinstance(item, dict)
+                preflight[name].get("verified")
+                for name in ("base_ancestry", "task_ancestry", "new_base_ancestry")
             )
             preflight["historical_old_base_evidence"] = historical_evidence
             if not preflight["verified"]:

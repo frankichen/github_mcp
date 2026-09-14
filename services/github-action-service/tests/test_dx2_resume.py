@@ -1248,6 +1248,26 @@ def test_already_pinned_new_base_stacked_resume_fails_stop_when_recorded_old_bas
     assert result["recovery"]["preflight"]["base_ancestry"]["verified"] is False
 
 
+def test_same_base_branch_forward_resume_does_not_require_old_base_to_old_session_ancestry(monkeypatch):
+    old_base = "20e8e5a5a411c55e830db33daca5cf3ab6f97db9"
+    old_head = "23aab1b9f80296d0e88c552ddbdac54c56939bc9"
+    result, _ = _stacked_pinned_new_resume_case(
+        monkeypatch,
+        ancestry_predicate=lambda ancestor, descendant: not (
+            ancestor == old_base and descendant == old_head
+        ),
+    )
+
+    plan = result["recovery"]
+    assert plan["action"] == "recover_base_synced_development_task"
+    assert plan["preflight"]["verified"] is True
+    assert plan["preflight"]["ancestry_proof_mode"] == "same_base_branch_forward_dual"
+    assert plan["preflight"]["old_task_base_ancestry"]["verified"] is False
+    assert plan["preflight"]["old_task_base_ancestry"]["required"] is False
+    assert plan["preflight"]["task_ancestry"]["verified"] is True
+    assert plan["preflight"]["new_base_ancestry"]["verified"] is True
+
+
 def test_already_pinned_new_base_stacked_resume_fails_stop_when_current_head_is_not_old_session_forward_descendant(monkeypatch):
     old_head = "23aab1b9f80296d0e88c552ddbdac54c56939bc9"
     current_head = "249f4dc68200e83b4fd73a8bbe43608beaac5d42"

@@ -291,6 +291,51 @@ def test_t3_old_base_must_be_new_base_ancestor(tmp_path, monkeypatch):
     assert exc.value.code == "RECOVERY_ANCESTRY_MISMATCH"
 
 
+def test_same_base_branch_forward_advance_uses_dual_ancestry_when_old_base_is_not_old_head_ancestor(
+    tmp_path, monkeypatch,
+):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    service.repo.set_compare(
+        OLD_BASE,
+        OLD_HEAD,
+        merge_base=OTHER_HEAD,
+        behind_by=1,
+        paths=["allowed/feature.py"],
+    )
+    branch_heads_before = dict(service.client.heads)
+
+    result = _call(service, session)
+
+    assert result["control_plane_recovery"] == "CONTROL_PLANE_BASE_SYNC_RECOVERY_SUCCESS"
+    assert result["verification"]["deltas"]["ancestry_proof_mode"] == "same_base_branch_forward_dual"
+    assert result["verification"]["deltas"]["base_ancestry"]["verified"] is True
+    assert result["verification"]["deltas"]["old_task_ancestry"]["verified"] is False
+    assert result["verification"]["deltas"]["old_task_ancestry"]["ancestry_required"] is False
+    assert result["verification"]["deltas"]["task_ancestry"]["verified"] is True
+    assert result["verification"]["deltas"]["new_base_ancestry"]["verified"] is True
+    assert result["workspace"]["workspace_id"] == WORKSPACE_ID
+    assert result["development_session"]["session_id"] == session["session_id"]
+    assert service.client.heads == branch_heads_before
+
+
+def test_same_base_branch_dual_ancestry_still_requires_exact_overlap_review(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    service.repo.set_compare(
+        OLD_BASE,
+        OLD_HEAD,
+        merge_base=OTHER_HEAD,
+        behind_by=1,
+        paths=["allowed/feature.py", "base/region.py"],
+    )
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+
+    assert exc.value.code == "RECOVERY_BASE_SYNC_OVERLAP"
+    assert exc.value.details["actual_overlap_paths"] == ["base/region.py"]
+    assert exc.value.details["reviewed_overlap_paths"] == []
+
+
 def test_t4_old_session_head_must_be_current_head_ancestor(tmp_path, monkeypatch):
     service, session, _ = _seed(tmp_path, monkeypatch)
     service.repo.set_compare(OLD_HEAD, CURRENT_HEAD, merge_base=OTHER_HEAD)
