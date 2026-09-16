@@ -205,7 +205,7 @@ def register_dx_tools(
     @mcp.tool(
         name="apply_development_change_set",
         description=(
-            "Strictly validate/apply a versioned patch/range/upload ChangeSet with Session, Workspace, "
+            "Strictly validate/apply a versioned patch/range/upload/file_mode ChangeSet with Session, Workspace, "
             "HEAD/blob CAS and durable GitHub read-back. Small payloads may use change_set_json; large or "
             "exact-byte-sensitive payloads must use change_set_file with raw size/SHA identity. Web ChatGPT "
             "may use bundle_file as a transport alias when the connector only registers that fileParam name. "

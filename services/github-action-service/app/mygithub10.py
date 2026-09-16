@@ -773,6 +773,24 @@ def _preflight_file_write(client, repository: str, branch: str, expected_head_sh
     return gh, repo, ref, actual_head, old_shas
 
 
+def _read_file_modes(gh, repository: str, branch: str, commit_sha: str, old_shas: dict[str, str | None]) -> dict[str, str | None]:
+    old_modes: dict[str, str | None] = {}
+    for path, old_sha in old_shas.items():
+        old_mode = gh.get_file_mode_fresh(repository, path, commit_sha)
+        if old_sha and old_mode not in {"100644", "100755"}:
+            raise MyGithub10Error(
+                "FILE_MODE_UNSUPPORTED", f"existing path is not a regular Git file: {path}",
+                {"path": path, "mode": old_mode, "repository": repository, "branch": branch},
+            )
+        if bool(old_sha) != bool(old_mode):
+            raise MyGithub10Error(
+                "GITHUB_READ_FAILED", f"GitHub blob/mode identity is inconsistent before write: {path}",
+                {"path": path, "blob_sha": old_sha, "mode": old_mode, "retryable": True},
+            )
+        old_modes[path] = old_mode
+    return old_modes
+
+
 def preflight_upload_targets(client, repository: str, branch: str, expected_head_sha: str, uploaded_files: list[dict[str, Any]]) -> dict[str, Any]:
     paths = [str(item["path"]) for item in uploaded_files]
     expected_blob_shas = {str(item["path"]): str(item.get("expected_blob_sha") or "") for item in uploaded_files}
@@ -780,17 +798,34 @@ def preflight_upload_targets(client, repository: str, branch: str, expected_head
     return {"head_sha": actual_head, "old_blob_shas": old_shas}
 
 
-def _commit_files(client, repository: str, branch: str, expected_head_sha: str, changed: dict[str, bytes | None], expected_blob_shas: dict[str, str], message: str) -> dict[str, Any]:
-    gh, repo, ref, actual_head, old_shas = _preflight_file_write(client, repository, branch, expected_head_sha, list(changed), expected_blob_shas)
+def _commit_files(client, repository: str, branch: str, expected_head_sha: str, changed: dict[str, bytes | None], expected_blob_shas: dict[str, str], message: str, desired_modes: dict[str, str] | None = None) -> dict[str, Any]:
+    desired_modes = desired_modes or {}
+    paths = list(dict.fromkeys([*changed, *desired_modes]))
+    gh, repo, ref, actual_head, old_shas = _preflight_file_write(client, repository, branch, expected_head_sha, paths, expected_blob_shas)
+    old_modes = _read_file_modes(gh, repository, branch, actual_head, old_shas)
     elements = []
     new_shas = {}
-    for path, content in changed.items():
+    final_modes: dict[str, str] = {}
+    for path in paths:
+        requested_mode = desired_modes.get(path)
+        if requested_mode is not None and requested_mode not in {"100644", "100755"}:
+            raise MyGithub10Error("FILE_MODE_INVALID", "file mode must be 100644 or 100755", {"path": path, "mode": requested_mode})
+        if path not in changed:
+            if not old_shas[path]:
+                raise MyGithub10Error("FILE_NOT_FOUND", f"mode-only write target does not exist: {path}", {"path": path})
+            if not expected_blob_shas.get(path):
+                raise MyGithub10Error("BLOB_EXPECTATION_REQUIRED", f"expected_blob_sha is required for mode-only write: {path}", {"path": path})
+            final_modes[path] = requested_mode or old_modes[path] or "100644"
+            elements.append({"path": path, "mode": final_modes[path], "type": "blob", "sha": old_shas[path]})
+            continue
+        content = changed[path]
+        final_modes[path] = requested_mode or old_modes[path] or "100644"
         if content is None:
-            elements.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
+            elements.append({"path": path, "mode": old_modes[path] or "100644", "type": "blob", "sha": None})
         else:
             blob = gh.create_blob(repository, content.decode("utf-8"))
             new_shas[path] = blob.sha
-            elements.append({"path": path, "mode": "100644", "type": "blob", "sha": blob.sha})
+            elements.append({"path": path, "mode": final_modes[path], "type": "blob", "sha": blob.sha})
     git_commit = repo.get_git_commit(actual_head)
     base_tree = getattr(getattr(git_commit, "tree", None), "sha", None) or git_commit.commit.tree.sha
     tree = gh.create_git_tree(repository, elements, base_tree)
@@ -821,18 +856,30 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
         # fresh branch read already sees the intended commit, so continue into
         # the full durable verification sequence instead of guessing failure.
 
-    expected_paths = {path: (None if content is None else new_shas[path]) for path, content in changed.items()}
+    expected_paths = {
+        path: (old_shas[path] if path not in changed else (None if changed[path] is None else new_shas[path]))
+        for path in paths
+    }
+    expected_modes = {path: final_modes[path] for path in paths if expected_paths[path] is not None}
     try:
         evidence = post_write_verify(
-            gh, repository, branch, actual_head, commit.sha, tree.sha, expected_paths
+            gh, repository, branch, actual_head, commit.sha, tree.sha, expected_paths, expected_modes
         )
     except WriteVerificationError as exc:
         raise MyGithub10Error("WRITE_VERIFY_FAILED", exc.message, exc.details) from exc
 
     file_results = []
-    for path, content in changed.items():
+    for path in paths:
+        if path not in changed:
+            file_results.append({
+                "path": path, "operation": "mode_change", "old_blob_sha": old_shas[path],
+                "new_blob_sha": old_shas[path], "old_mode": old_modes[path], "new_mode": final_modes[path],
+                "blob_identity_preserved": True,
+            })
+            continue
+        content = changed[path]
         if content is None:
-            file_results.append({"path": path, "operation": "delete", "old_blob_sha": old_shas[path], "new_blob_sha": None, "content_sha256": None, "size_bytes": 0})
+            file_results.append({"path": path, "operation": "delete", "old_blob_sha": old_shas[path], "new_blob_sha": None, "old_mode": old_modes[path], "new_mode": None, "content_sha256": None, "size_bytes": 0})
             continue
         try:
             actual_text, actual_blob, actual_size = gh.get_file(repository, path, commit.sha)
@@ -842,7 +889,7 @@ def _commit_files(client, repository: str, branch: str, expected_head_sha: str, 
         expected_content_sha = _sha256(content)
         if actual_blob != new_shas[path] or actual_bytes != content:
             raise MyGithub10Error("WRITE_VERIFY_FAILED", f"read-back bytes differ for {path}", {**evidence, "path": path, "failed_stage": "path_content_readback", "expected_content_sha256": expected_content_sha, "actual_content_sha256": _sha256(actual_bytes), "expected_blob_sha": new_shas[path], "actual_blob_sha": actual_blob})
-        file_results.append({"path": path, "operation": "modify" if old_shas[path] else "add", "old_blob_sha": old_shas[path], "new_blob_sha": actual_blob, "content_sha256": expected_content_sha, "size_bytes": actual_size})
+        file_results.append({"path": path, "operation": "modify" if old_shas[path] else "add", "old_blob_sha": old_shas[path], "new_blob_sha": actual_blob, "old_mode": old_modes[path], "new_mode": final_modes[path], "content_sha256": expected_content_sha, "size_bytes": actual_size})
     logger.info("mygithub10 verified_write repository=%s branch=%s expected_head_sha=%s old_head_sha=%s new_head_sha=%s tree_sha=%s files=%s", repository, branch, expected_head_sha, actual_head, commit.sha, tree.sha, [item["path"] for item in file_results])
     return {"commit_sha": commit.sha, "new_head_sha": commit.sha, "old_head_sha": actual_head, "tree_sha": tree.sha, "branch": branch, "repository": repository, "changed_files": file_results, **evidence}
 
@@ -950,7 +997,6 @@ def apply_patch(client, repository: str, branch: str, expected_head_sha: str, ex
     except MyGithub10Error as exc:
         _idempotent_finish(operation_id, "failed", error_code=exc.code, result={"failed_stage": exc.details.get("failed_stage"), "error": {"code": exc.code, "details": exc.details}})
         raise
-
 
 def apply_patch_from_ref(client, repository: str, branch: str, expected_head_sha: str,
                          expected_blob_shas_json: str, patch_repository: str, patch_ref: str,
@@ -1307,6 +1353,17 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_dry_run": True,
         "supports_expected_head_sha": True,
         "supports_expected_blob_sha": True,
+        "supports_executable_mode_write": True,
+        "executable_mode_write_semantics": {
+            "tool": "apply_development_change_set",
+            "change_set_mode": "file_mode",
+            "supported_modes": ["100644", "100755"],
+            "mode_only_commit": True,
+            "preserves_existing_blob_identity": True,
+            "requires": ["expected_head_sha", "expected_blob_sha", "development_session_revision", "workspace_revision", "writer_lease", "prepared_change_set_id"],
+            "durable_read_back": ["branch", "commit", "tree", "path_blob", "path_mode"],
+        },
+        "preserves_existing_file_mode_on_content_write": True,
         "supports_idempotency_key": True,
         "supports_operation_audit": True,
         "supports_tree_attestation": True,
@@ -2088,6 +2145,7 @@ def execute_put_files(
             fail_put_operation(operation_id, exc, "preflight")
         raise
 
+
     staged_ids: list[str] = []
     staged: list[tuple[dict[str, Any], str]] = []
     chunk_count = 0
@@ -2211,6 +2269,76 @@ def execute_put_files(
             fail_put_operation(operation_id, exc, str(getattr(exc, "details", {}).get("failed_stage") or "github_write"))
         for upload_id in staged_ids:
             abort_upload(upload_id)
+        raise
+
+
+def set_file_modes(
+    client, repository: str, branch: str, expected_head_sha: str,
+    file_modes: list[dict[str, Any]], commit_message: str, dry_run: bool,
+    idempotency_key: str = "", audit_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_head_sha or ""):
+        raise MyGithub10Error("HEAD_CHANGED", "expected_head_sha must be a full lowercase 40-character commit SHA")
+    if not isinstance(commit_message, str) or not commit_message.strip():
+        raise MyGithub10Error("PATCH_INVALID_FORMAT", "commit_message is required")
+    if not file_modes:
+        raise MyGithub10Error("PATCH_EMPTY", "at least one file mode change is required")
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(file_modes):
+        if not isinstance(item, dict):
+            raise MyGithub10Error("PATCH_INVALID_FORMAT", f"file_modes item {index} must be an object")
+        path, expected_blob_sha, executable = item.get("path"), item.get("expected_blob_sha"), item.get("executable")
+        if not isinstance(path, str):
+            raise MyGithub10Error("PATCH_INVALID_FORMAT", f"file_modes item {index} path must be a string")
+        _safe_path(path)
+        if path in seen:
+            raise MyGithub10Error("PATCH_INVALID_FORMAT", f"duplicate file mode target: {path}")
+        if not re.fullmatch(r"[0-9a-f]{40}", expected_blob_sha or ""):
+            raise MyGithub10Error("PATCH_INVALID_FORMAT", f"file_modes item {index} requires expected_blob_sha")
+        if not isinstance(executable, bool):
+            raise MyGithub10Error("PATCH_INVALID_FORMAT", f"file_modes item {index} executable must be boolean")
+        seen.add(path)
+        normalized.append({"path": path, "expected_blob_sha": expected_blob_sha, "mode": "100755" if executable else "100644"})
+    request = {
+        "tool_name": "apply_development_change_set", "change_set_mode": "file_mode",
+        "repository": repository, "branch": branch, "expected_head_sha": expected_head_sha,
+        "file_modes": normalized, "commit_message": commit_message,
+    }
+    operation_id, replay = ("", None) if dry_run else _idempotent_start(
+        "apply_development_change_set", idempotency_key, request, audit_context
+    )
+    if replay:
+        return replay
+    expected_blob_shas = {item["path"]: item["expected_blob_sha"] for item in normalized}
+    desired_modes = {item["path"]: item["mode"] for item in normalized}
+    try:
+        gh, _, _, actual_head, old_shas = _preflight_file_write(
+            client, repository, branch, expected_head_sha, list(desired_modes), expected_blob_shas
+        )
+        old_modes = _read_file_modes(gh, repository, branch, actual_head, old_shas)
+        changed_files = [{
+            "path": item["path"], "operation": "mode_change",
+            "old_blob_sha": old_shas[item["path"]], "new_blob_sha": old_shas[item["path"]],
+            "old_mode": old_modes[item["path"]], "new_mode": item["mode"],
+            "blob_identity_preserved": True,
+        } for item in normalized]
+        if not any(item["old_mode"] != item["new_mode"] for item in changed_files):
+            raise MyGithub10Error("PATCH_EMPTY", "requested file modes already match the current tree")
+        result = {
+            "ok": True, "dry_run": dry_run, "repository": repository, "branch": branch,
+            "expected_head_sha": expected_head_sha, "resolved_head_sha": actual_head,
+            "would_commit": True, "changed_files": changed_files,
+        }
+        if dry_run:
+            return result
+        result.update(_commit_files(client, repository, branch, expected_head_sha, {}, expected_blob_shas, commit_message, desired_modes))
+        _idempotent_mark_git_verified(operation_id, result)
+        result["_operation_id"] = operation_id
+        return result
+    except MyGithub10Error as exc:
+        if operation_id:
+            _idempotent_finish(operation_id, "failed", error_code=exc.code, result={"error": {"code": exc.code, "details": exc.details}})
         raise
 
 

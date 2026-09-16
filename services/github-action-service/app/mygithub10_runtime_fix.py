@@ -23,10 +23,10 @@ def _base():
 
 def _commit_files(client, repository: str, branch: str, expected_head_sha: str,
                   changed: dict[str, bytes | None], expected_blob_shas: dict[str, str],
-                  message: str) -> dict[str, Any]:
+                  message: str, desired_modes: dict[str, str] | None = None) -> dict[str, Any]:
     return _ORIGINAL_COMMIT_FILES(
         client, repository, branch, expected_head_sha, changed,
-        expected_blob_shas, message,
+        expected_blob_shas, message, desired_modes,
     )
 
 

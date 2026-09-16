@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 import uuid
 from typing import Any
@@ -384,7 +385,7 @@ def resolve_generated_write_context(service: Any, repository: str, branch: str, 
 def _validate_change_set(change: dict[str,Any]) -> dict[str,Any]:
     if change.get("schema_version")!=1: raise MyGithub12Error("PATCH_INVALID_FORMAT","change_set_json schema_version must be 1")
     mode=change.get("mode")
-    if mode not in {"patch","range","upload"}: raise MyGithub12Error("PATCH_INVALID_FORMAT","change set mode must be patch, range, or upload")
+    if mode not in {"patch","range","upload","file_mode"}: raise MyGithub12Error("PATCH_INVALID_FORMAT","change set mode must be patch, range, upload, or file_mode")
     if mode=="patch" and not isinstance(change.get("patch"),str): raise MyGithub12Error("PATCH_INVALID_FORMAT","patch mode requires patch text")
     if mode=="range" and not isinstance(change.get("range_operations"),list): raise MyGithub12Error("PATCH_INVALID_FORMAT","range mode requires range_operations")
     if mode=="upload":
@@ -399,6 +400,19 @@ def _validate_change_set(change: dict[str,Any]) -> dict[str,Any]:
             if path in paths: raise MyGithub12Error("PATCH_INVALID_FORMAT",f"duplicate upload target path: {path}")
             if upload_id in upload_ids: raise MyGithub12Error("PATCH_INVALID_FORMAT",f"duplicate upload_id: {upload_id}")
             paths.append(path); upload_ids.append(upload_id)
+    if mode=="file_mode":
+        file_modes=change.get("file_modes")
+        if not isinstance(file_modes,list) or not file_modes or not all(isinstance(item,dict) for item in file_modes):
+            raise MyGithub12Error("PATCH_INVALID_FORMAT","file_mode requires one or more file_modes items")
+        paths=[]
+        for index,item in enumerate(file_modes):
+            path=item.get("path"); expected_blob_sha=item.get("expected_blob_sha"); executable=item.get("executable")
+            if not isinstance(path,str) or not path: raise MyGithub12Error("PATCH_INVALID_FORMAT",f"file_modes item {index} requires path")
+            mygithub10._safe_path(path)
+            if path in paths: raise MyGithub12Error("PATCH_INVALID_FORMAT",f"duplicate file mode target path: {path}")
+            if not re.fullmatch(r"[0-9a-f]{40}",expected_blob_sha or ""): raise MyGithub12Error("PATCH_INVALID_FORMAT",f"file_modes item {index} requires expected_blob_sha")
+            if not isinstance(executable,bool): raise MyGithub12Error("PATCH_INVALID_FORMAT",f"file_modes item {index} executable must be boolean")
+            paths.append(path)
     canonical=json.dumps(change,ensure_ascii=False,sort_keys=True,separators=(",",":"))
     return {"change":change,"mode":mode,"canonical_hash":hashlib.sha256(canonical.encode()).hexdigest()}
 
@@ -446,7 +460,7 @@ def execute_change_set(service: Any, session: dict[str,Any], workspace: dict[str
         result=mygithub10.apply_patch(service,session["repository"],session["branch"],expected_head_sha,json.dumps(expected),change["patch"],commit_message,dry_run,idempotency_key,audit_context)
     elif mode=="range":
         result=mygithub10.edit_ranges(service,session["repository"],session["branch"],expected_head_sha,json.dumps(change["range_operations"]),commit_message,dry_run,idempotency_key,audit_context)
-    else:
+    elif mode=="upload":
         items=change["uploaded_files"]
         for item in items: mygithub10._safe_path(item["path"])
         if dry_run:
@@ -465,6 +479,11 @@ def execute_change_set(service: Any, session: dict[str,Any], workspace: dict[str
             result=mygithub10.commit_upload(service,session["repository"],session["branch"],expected_head_sha,item["path"],str(item.get("expected_blob_sha") or ""),item["upload_id"],commit_message,idempotency_key,audit_context)
         else:
             result=mygithub10.commit_uploads(service,session["repository"],session["branch"],expected_head_sha,items,commit_message,idempotency_key,audit_context)
+    else:
+        result=mygithub10.set_file_modes(
+            service,session["repository"],session["branch"],expected_head_sha,
+            change["file_modes"],commit_message,dry_run,idempotency_key,audit_context,
+        )
     result["change_set_canonical_hash"]=parsed["canonical_hash"]
     return result
 

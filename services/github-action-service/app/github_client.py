@@ -75,6 +75,30 @@ class GitHubClient:
                 return None, None, None
             self._handle_github_error(e)
 
+    def get_file_mode_fresh(self, repo_name: str, path: str, ref: str) -> str | None:
+        """Resolve one path through fresh, non-recursive Git tree reads."""
+        self._require_configured()
+        try:
+            repo = self._pygithub.get_repo(repo_name)
+            commit = repo.get_git_commit(ref)
+            tree_sha = commit.tree.sha
+            parts = path.split("/")
+            for index, part in enumerate(parts):
+                tree = repo.get_git_tree(tree_sha, recursive=False)
+                entry = next((item for item in tree.tree if item.path == part), None)
+                if entry is None:
+                    return None
+                if index == len(parts) - 1:
+                    return str(entry.mode)
+                if entry.type != "tree":
+                    return None
+                tree_sha = entry.sha
+            return None
+        except GithubException as e:
+            if e.status == 404:
+                return None
+            self._handle_github_error(e)
+
     def get_directory(self, repo_name: str, path: str, ref: str = ""):
         self._require_configured()
         try:
