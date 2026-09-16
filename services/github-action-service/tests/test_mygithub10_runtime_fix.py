@@ -80,6 +80,9 @@ class FakeGitHubClient:
     def get_file_sha_fresh(self, _repository, path, ref):
         return self.repo.get_contents(path, ref=ref).sha
 
+    def get_file_mode_fresh(self, _repository, _path, _ref):
+        return "100644"
+
     def get_file(self, _repository, path, ref=""):
         entry = self.repo.get_contents(path, ref=ref)
         data = self.repo.written_content if ref == "new-commit" and self.repo.written_content is not None else self.repo.data

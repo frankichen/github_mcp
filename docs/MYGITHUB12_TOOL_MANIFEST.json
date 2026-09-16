@@ -1,6 +1,6 @@
 {
   "service_name": "MyGithut12",
-  "service_version": "12.9.16",
+  "service_version": "12.9.17",
   "manifest_format": "composed-v2",
   "legacy_manifest": "MYGITHUB10_TOOL_MANIFEST.json",
   "legacy_tool_count": 120,
@@ -20,6 +20,33 @@
     "put_github_file_from_local_candidate",
     "wait_private_ci_job"
   ],
+  "executable_mode_write": {
+    "supported": true,
+    "tool": "apply_development_change_set",
+    "change_set_mode": "file_mode",
+    "supported_modes": [
+      "100644",
+      "100755"
+    ],
+    "mode_only_commit": true,
+    "preserves_existing_blob_identity": true,
+    "preserves_existing_file_mode_on_content_write": true,
+    "requires": [
+      "expected_head_sha",
+      "expected_blob_sha",
+      "development_session_revision",
+      "workspace_revision",
+      "writer_lease",
+      "prepared_change_set_id"
+    ],
+    "durable_read_back": [
+      "branch",
+      "commit",
+      "tree",
+      "path_blob",
+      "path_mode"
+    ]
+  },
   "web_safe_private_ci": {
     "schema_version": 1,
     "supported": true,
@@ -189,16 +216,16 @@
       "tool_manifest_count": 165,
       "compatibility_tool_count": 176,
       "hidden_deprecated_tool_count": 11,
-      "tool_schema_sha256": "9bab19c15805921819414e94147e12d2a8ef63b94f420902d7b4d432b772580f",
-      "schema_generation_id": "schema-v1:9bab19c158059218"
+      "tool_schema_sha256": "d6ceb7a4c0f95fdabb4092fdc03d7085e363313f40fd771f8ce74f5c1b5cc375",
+      "schema_generation_id": "schema-v1:d6ceb7a4c0f95fda"
     },
     "compatibility": {
       "tool_count": 176,
       "tool_manifest_count": 176,
       "compatibility_tool_count": 176,
       "hidden_deprecated_tool_count": 0,
-      "tool_schema_sha256": "947abb24eb665765552ec590873643ccc8597e4a2103859ecf9c39b94c82201a",
-      "schema_generation_id": "schema-v1:947abb24eb665765"
+      "tool_schema_sha256": "5bf83f1c1ad218f287e579544da8645972ceaa75621575972bb0250693025ed1",
+      "schema_generation_id": "schema-v1:5bf83f1c1ad218f2"
     }
   },
   "new_tools": [

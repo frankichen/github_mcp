@@ -176,6 +176,13 @@ async def main() -> int:
                 raise SystemExit("MyGithut12 current Web-CI runtime contract snapshot mismatch")
             if capability_contract.get("web_safe_private_ci") != manifest12.get("web_safe_private_ci"):
                 raise SystemExit("MyGithut12 Web-safe Private CI capability/manifest mismatch")
+            executable_contract = {
+                **capability_contract["executable_mode_write_semantics"],
+                "supported": capability_contract["supports_executable_mode_write"],
+                "preserves_existing_file_mode_on_content_write": capability_contract["preserves_existing_file_mode_on_content_write"],
+            }
+            if executable_contract != manifest12.get("executable_mode_write"):
+                raise SystemExit("MyGithut12 executable-mode capability/manifest mismatch")
 
             for name, expected in annotation_snapshot.items():
                 if not isinstance(expected, dict):

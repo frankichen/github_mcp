@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from app import mygithub10
 from app.mcp_server import get_mygithub_capabilities, mcp
 from app.version import SERVICE_VERSION
 
@@ -206,7 +207,12 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.9.16"
+    assert manifest["service_version"] == "12.9.17"
+    assert manifest["executable_mode_write"] == {
+        **mygithub10.capabilities("a" * 40)["executable_mode_write_semantics"],
+        "supported": True,
+        "preserves_existing_file_mode_on_content_write": True,
+    }
     assert manifest["manifest_format"] == "composed-v2"
     assert manifest["legacy_tool_count"] == 120
     assert manifest["new_tool_count"] == 56
