@@ -882,7 +882,8 @@ class JobExecutor:
         result = self.podman.run_command(image, job.job_id, source_dir, caches, command, self._setup_timeout(job), network=True,
                                          env=self._service_env(service_env), network_name=service_env.network if service_env else None,
                                          pass_proxy=pass_proxy, cancel_event=getattr(self, "cancel_event", None),
-                                         container_discriminator=name)
+                                         container_discriminator=name,
+                                         allow_exec_tmpfs=label.startswith("gradle:"))
         self._upload_output(job.job_id, result)
         status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else ("cancelled" if result.get("cancelled") else "failed"))
         duration = time.time() - start
@@ -910,7 +911,8 @@ class JobExecutor:
                                          network=True if service_env else False, env=env if env else None,
                                          network_name=service_env.network if service_env else None,
                                          pass_proxy=pass_proxy, cancel_event=getattr(self, "cancel_event", None),
-                                         container_discriminator=step_name)
+                                         container_discriminator=step_name,
+                                         allow_exec_tmpfs=step_name.startswith("gradle:"))
         self._upload_output(job.job_id, result)
         status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else ("cancelled" if result.get("cancelled") else "failed"))
         duration = time.time() - start

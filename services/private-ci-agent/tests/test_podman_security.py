@@ -50,6 +50,23 @@ def test_writable_checkout_uses_worker_identity(monkeypatch, tmp_path):
     assert f"{os.getuid()}:{os.getgid()}" in command
 
 
+def test_gradle_step_can_load_native_library_from_exec_tmpfs(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_run(command, **_kwargs):
+        captured.append(command)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    PodmanRunner("podman").run_command(
+        "docker.io/library/gradle:9.7.0-jdk21-jammy", "job-123", str(tmp_path), {},
+        "gradle --version", 30, allow_exec_tmpfs=True,
+    )
+
+    assert "--tmpfs=/tmp:rw,exec,nosuid,size=256m" in captured[0]
+    assert "--tmpfs=/tmp:rw,noexec,nosuid,size=256m" not in captured[0]
+
+
 def test_rootless_command_does_not_use_env_host_or_forward_tokens(monkeypatch, tmp_path):
     captured = []
 

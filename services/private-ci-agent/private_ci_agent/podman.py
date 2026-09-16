@@ -547,6 +547,7 @@ class PodmanRunner:
         source_read_only: bool = False,
         playwright_cache_writable: bool = False,
         container_discriminator: str = "",
+        allow_exec_tmpfs: bool = False,
     ) -> dict:
         """Run one command with explicit network and proxy boundaries."""
         # A repo-auto plan may intentionally run multiple stacks from the same
@@ -569,6 +570,7 @@ class PodmanRunner:
             "--userns=keep-id",
             "--user", f"{os.getuid()}:{os.getgid()}",
         ]
+        tmpfs_tmp = "--tmpfs=/tmp:rw,exec,nosuid,size=256m" if allow_exec_tmpfs else "--tmpfs=/tmp:rw,noexec,nosuid,size=256m"
 
         cmd = [
             self.podman, "run",
@@ -584,7 +586,7 @@ class PodmanRunner:
             "--memory-swap=3g",
             "--cpus=2",
             "--read-only",
-            "--tmpfs=/tmp:rw,noexec,nosuid,size=256m",
+            tmpfs_tmp,
             "--tmpfs=/run:rw,noexec,nosuid,size=64m",
             "--tmpfs=/data:rw,noexec,nosuid,size=64m",
             "-v", f"{source_dir}:/workspace:{'ro,' if source_read_only else ''}Z",
