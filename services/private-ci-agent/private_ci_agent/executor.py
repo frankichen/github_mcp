@@ -71,6 +71,10 @@ class JobExecutor:
         )
         self.log_manager = LogManager(controller_client, config.get("max_log_bytes", 10485760))
         self.services = MultiDataPlaneServiceManager(config.get("podman_binary", "/usr/bin/podman"), config)
+        # Gradle's persistent User Home has process-wide journal locks. Keep
+        # separate canonical Gradle roots from contending on that shared
+        # Worker cache while leaving other stacks parallelizable.
+        self._gradle_lock = threading.Lock()
         self.environment_cache = DependencyEnvironmentCache(
             config.get("environment_cache_root", "/srv/private-ci/cache/environments")
         )
@@ -641,6 +645,18 @@ class JobExecutor:
         return {**cache_state, **published}
 
     def _execute_workspace(self, job: Job, workspace: dict) -> dict:
+        if workspace.get("stack") == "gradle":
+            # Some embedders/tests construct the executor without __init__;
+            # keep the serialization contract valid for those instances too.
+            gradle_lock = getattr(self, "_gradle_lock", None)
+            if gradle_lock is None:
+                gradle_lock = threading.Lock()
+                self._gradle_lock = gradle_lock
+            with gradle_lock:
+                return self._execute_workspace_inner(job, workspace)
+        return self._execute_workspace_inner(job, workspace)
+
+    def _execute_workspace_inner(self, job: Job, workspace: dict) -> dict:
         path = workspace["path"]
         source_dir = job.source_dir if path == "." else f"{job.source_dir}/{path}"
         commands = self._workspace_commands(workspace, source_dir, job=job)
