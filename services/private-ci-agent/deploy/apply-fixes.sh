@@ -207,6 +207,16 @@ for worker_id in "${PRIVATE_CI_WORKER_IDS[@]}"; do
     install -d -o ciworker -g ciworker -m 0700 \
         "${worker_root}" "${worker_root}/workspaces" "${worker_root}/cache" \
         "${worker_root}/logs" "${worker_root}/run" "${worker_root}/run/tmp"
+
+    # Older Gradle preheats ran as the rootless container's mapped root and
+    # left native-platform lock/library files owned by an unmapped UID.  The
+    # runtime now deliberately executes approved containers as ciworker, so
+    # repair only this persistent, writable cache before starting jobs.
+    # Without this migration Gradle reports a misleading native-library load
+    # failure when it cannot open libnative-platform.so.lock.
+    gradle_cache="${worker_root}/cache/gradle"
+    install -d -o ciworker -g ciworker -m 0770 "${gradle_cache}"
+    chown -R ciworker:ciworker "${gradle_cache}"
 done
 systemctl daemon-reload
 
