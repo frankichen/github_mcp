@@ -209,6 +209,7 @@ MAVEN_COMMANDS = {
         {"name": "dependencies", "command": "mvn -B -ntp -DskipTests dependency:go-offline 2>&1"},
     ],
     "check": [
+        {"name": "test-lifecycle-warmup", "command": "mvn -o -B -ntp -DskipTests test 2>&1"},
         {"name": "test", "command": "mvn -o -B -ntp test 2>&1"},
     ],
     "image": MAVEN_IMAGE,
@@ -425,6 +426,117 @@ def _walk_manifest_dirs(source_dir: str):
         yield Path(current), rel, set(files)
 
 
+def _path_ancestors(rel: str):
+    """Yield a path and its parents, nearest first, using CI path syntax."""
+    normalized = str(rel or ".").strip("/") or "."
+    if normalized == ".":
+        yield "."
+        return
+    parts = normalized.split("/")
+    for end in range(len(parts), 0, -1):
+        yield "/".join(parts[:end])
+    yield "."
+
+
+def _nearest_workspace_ancestor(rel: str, candidates: set[str]) -> str | None:
+    """Return the nearest candidate root containing *rel*, if one exists."""
+    for ancestor in list(_path_ancestors(rel))[1:]:
+        if ancestor in candidates:
+            return ancestor
+    return None
+
+
+def _dotnet_test_parent(rel: str) -> str | None:
+    """Return the conventional product project path for a nested test project."""
+    parts = str(rel or ".").split("/")
+    if not parts or parts[-1] == ".":
+        return None
+    name = parts[-1]
+    lowered = name.lower()
+    for suffix in (".tests", ".test", "tests", "test"):
+        if lowered.endswith(suffix) and len(name) > len(suffix):
+            base = name[: -len(suffix)].rstrip(".")
+            return "/".join([*parts[:-1], base]) or "."
+    return None
+
+
+def _canonical_workspace_roots(manifest_dirs: dict[str, set[str]]) -> dict[str, set[str]]:
+    """Collapse nested project manifests into executable workspace roots.
+
+    A solution/settings file is the source-controlled ownership boundary for
+    .NET and Gradle respectively.  Child project manifests are inputs to that
+    root and must not become a second container root.  This is deliberately
+    derived from paths and file names only, so executable mode changes cannot
+    change the workspace plan.
+    """
+    roots: dict[str, set[str]] = {
+        "go": set(),
+        "python": set(),
+        "node": set(),
+        "rust": set(),
+        "maven": set(),
+        "gradle": set(),
+        "dotnet": set(),
+    }
+
+    def dirs_with(predicate) -> set[str]:
+        return {rel for rel, files in manifest_dirs.items() if predicate(files)}
+
+    dotnet_candidates = dirs_with(
+        lambda files: any(name.endswith((".sln", ".csproj", ".fsproj")) for name in files)
+    )
+    dotnet_solution_roots = dirs_with(lambda files: any(name.endswith(".sln") for name in files))
+    roots["dotnet"].update(dotnet_solution_roots)
+    for rel in sorted(dotnet_candidates, key=lambda value: (len(Path(value).parts), value)):
+        if rel in dotnet_solution_roots or _nearest_workspace_ancestor(rel, dotnet_solution_roots):
+            continue
+        test_parent = _dotnet_test_parent(rel)
+        if test_parent in dotnet_candidates:
+            roots["dotnet"].add(test_parent)
+            continue
+        parent = _nearest_workspace_ancestor(rel, dotnet_candidates)
+        roots["dotnet"].add(parent or rel)
+
+    gradle_candidates = dirs_with(
+        lambda files: "build.gradle" in files
+        or "build.gradle.kts" in files
+        or "settings.gradle" in files
+        or "settings.gradle.kts" in files
+    )
+    gradle_settings_roots = dirs_with(
+        lambda files: "settings.gradle" in files or "settings.gradle.kts" in files
+    )
+    roots["gradle"].update(gradle_settings_roots)
+    for rel in sorted(gradle_candidates):
+        if rel in gradle_settings_roots:
+            continue
+        roots["gradle"].add(_nearest_workspace_ancestor(rel, gradle_settings_roots) or rel)
+
+    maven_candidates = dirs_with(lambda files: "pom.xml" in files)
+    maven_roots: set[str] = set()
+    for rel in sorted(maven_candidates, key=lambda value: (len(Path(value).parts), value)):
+        parent = _nearest_workspace_ancestor(rel, maven_roots)
+        maven_roots.add(parent or rel)
+    roots["maven"] = maven_roots
+
+    go_work_roots = dirs_with(lambda files: "go.work" in files or "go.work.sum" in files)
+    go_candidates = dirs_with(lambda files: "go.mod" in files)
+    roots["go"].update(go_work_roots)
+    for rel in sorted(go_candidates):
+        roots["go"].add(_nearest_workspace_ancestor(rel, go_work_roots) or rel)
+
+    roots["node"] = dirs_with(lambda files: "package.json" in files)
+    roots["python"] = dirs_with(
+        lambda files: bool(
+            files.intersection(
+                {"pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg", "Pipfile"}
+            )
+        )
+    )
+    roots["rust"] = dirs_with(lambda files: "Cargo.toml" in files)
+    return roots
+
+
 def _load_json(path: Path) -> dict:
     try:
         with path.open(encoding="utf-8") as handle:
@@ -546,22 +658,19 @@ def discover_workspaces(source_dir: str, repository_config: dict | None = None) 
     # Operator-provided workspaces are an explicit allowlist. When present, do
     # not widen the CI plan by recursively auto-discovering unrelated manifests.
     if not configured:
-        for directory, rel, files in _walk_manifest_dirs(source_dir):
-            if "go.mod" in files:
-                add_workspace(_generic_workspace(rel or ".", "go"))
-            if "package.json" in files:
-                if not (rel in ("", ".") and "go.mod" in files and not any(lock in files for lock in LOCK_FILES)):
+        manifest_dirs = {
+            (rel or "."): files for _directory, rel, files in _walk_manifest_dirs(source_dir)
+        }
+        canonical_roots = _canonical_workspace_roots(manifest_dirs)
+        for stack, roots in canonical_roots.items():
+            for rel in sorted(roots):
+                files = manifest_dirs.get(rel, set())
+                if stack == "node":
+                    if rel == "." and "go.mod" in files and not any(lock in files for lock in LOCK_FILES):
+                        continue
                     add_workspace(_node_workspace(source_dir, rel, files))
-            if any(name in files for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg", "Pipfile")):
-                add_workspace(_generic_workspace(rel or ".", "python"))
-            if "Cargo.toml" in files:
-                add_workspace(_generic_workspace(rel or ".", "rust"))
-            if "pom.xml" in files:
-                add_workspace(_generic_workspace(rel or ".", "maven"))
-            if any(name in files for name in ("build.gradle", "build.gradle.kts")):
-                add_workspace(_generic_workspace(rel or ".", "gradle"))
-            if any(name.endswith((".sln", ".csproj", ".fsproj")) for name in files):
-                add_workspace(_generic_workspace(rel or ".", "dotnet"))
+                else:
+                    add_workspace(_generic_workspace(rel, stack))
 
     workspaces = sorted(found.values(), key=lambda value: (value["path"], value["stack"]))
     stacks = []
