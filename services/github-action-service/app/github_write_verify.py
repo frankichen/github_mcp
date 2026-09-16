@@ -32,6 +32,8 @@ def _details(
     path: str = "",
     expected_blob_sha: str | None = None,
     observed_blob_sha: str | None = None,
+    expected_mode: str | None = None,
+    observed_mode: str | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "repository": repository,
@@ -49,6 +51,9 @@ def _details(
         result["path"] = path
         result["expected_blob_sha"] = expected_blob_sha
         result["observed_blob_sha"] = observed_blob_sha
+        if expected_mode is not None:
+            result["expected_mode"] = expected_mode
+            result["observed_mode"] = observed_mode
     return result
 
 
@@ -60,6 +65,7 @@ def post_write_verify(
     new_commit_sha: str,
     expected_tree_sha: str,
     expected_paths: dict[str, str | None],
+    expected_modes: dict[str, str] | None = None,
     *,
     attempts: int = 3,
     retry_delay_seconds: float = 0.2,
@@ -155,6 +161,7 @@ def post_write_verify(
                 raise WriteVerificationError("GitHub tree read-back did not confirm the expected tree", last_details)
 
             verified_paths = []
+            expected_modes = expected_modes or {}
             for path in sorted(expected_paths):
                 expected_blob_sha = expected_paths[path]
                 observed_blob_sha = client.get_file_sha_fresh(repository, path, new_commit_sha)
@@ -191,7 +198,33 @@ def post_write_verify(
                         observed_blob_sha=observed_blob_sha,
                     )
                     raise WriteVerificationError("GitHub changed-path read-back did not confirm the expected blob", last_details)
-                verified_paths.append({"path": path, "blob_sha": observed_blob_sha})
+                verified_path = {"path": path, "blob_sha": observed_blob_sha}
+                expected_mode = expected_modes.get(path)
+                if expected_mode is not None:
+                    observed_mode = client.get_file_mode_fresh(repository, path, new_commit_sha)
+                    if observed_mode != expected_mode:
+                        last_details = _details(
+                            repository,
+                            branch,
+                            expected_previous_head,
+                            new_commit_sha,
+                            expected_tree_sha,
+                            "path_mode_readback",
+                            observed_branch_head=observed_branch_head,
+                            observed_commit_sha=observed_commit_sha,
+                            observed_tree_sha=observed_tree_sha,
+                            path=path,
+                            expected_blob_sha=expected_blob_sha,
+                            observed_blob_sha=observed_blob_sha,
+                            expected_mode=expected_mode,
+                            observed_mode=observed_mode,
+                        )
+                        raise WriteVerificationError(
+                            "GitHub changed-path read-back did not confirm the expected mode",
+                            last_details,
+                        )
+                    verified_path["mode"] = observed_mode
+                verified_paths.append(verified_path)
 
             return {
                 "write_verified": True,
