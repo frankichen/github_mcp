@@ -18,6 +18,7 @@ from private_ci_agent.environment_cache import (
     EnvironmentCacheError,
 )
 from private_ci_agent.profiles import (
+    ANDROID_GRADLE_COMMANDS,
     FAST_CHECK_COMMANDS,
     GO_COMMANDS,
     PYTHON_COMMANDS,
@@ -538,6 +539,12 @@ class JobExecutor:
         if workspace.get("configuration_error"):
             return {"error": "configuration_error", "message": workspace["configuration_error"]}
         stack = workspace["stack"]
+        runtime = workspace.get("runtime")
+        if runtime and not (stack == "gradle" and runtime == "android-gradle"):
+            return {
+                "error": "configuration_error",
+                "message": f"Runtime {runtime} is not valid for {stack}",
+            }
         if stack == "node":
             required_default = workspace.get("required_scripts") or []
             commands = node_commands_for_workspace(workspace, required_default, source_dir=source_dir)
@@ -550,6 +557,8 @@ class JobExecutor:
                 logical_workspace=workspace.get("path", "."),
                 profile=job.profile if job else "python-check",
             )
+        elif stack == "gradle" and runtime == "android-gradle":
+            commands = ANDROID_GRADLE_COMMANDS
         elif stack in {"rust", "maven", "gradle", "dotnet"}:
             commands = get_commands_for_profile(PROFILE_BY_STACK[stack], source_dir)
         else:

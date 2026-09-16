@@ -53,3 +53,20 @@ def test_checked_in_sxt_config_includes_react_console_node_workspace():
     assert react["type"] == "node"
     assert react["package_manager"] == "npm"
     assert react["required_scripts"] == ["test:run", "typecheck", "build"]
+
+
+def test_checked_in_xyzl_config_pins_six_canonical_workspaces():
+    path = Path(__file__).parents[1] / "config" / "ci_repositories.yml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    xyzl = data["repositories"]["frankichen/xyzl"]
+
+    assert xyzl["private_ci"] is True
+    assert xyzl["merge_policy"]["required_private_ci_profile"] == "repo-auto-check"
+    assert xyzl["workspaces"] == [
+        {"path": "app", "type": "gradle", "runtime": "android-gradle"},
+        {"path": "app", "type": "dotnet"},
+        {"path": "app/AiService", "type": "gradle"},
+        {"path": "bed-admin-backend", "type": "maven"},
+        {"path": "bed-admin-frontend", "type": "node", "package_manager": "npm"},
+        {"path": "isup-server", "type": "maven"},
+    ]

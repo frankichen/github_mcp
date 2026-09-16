@@ -46,6 +46,13 @@ NODE_CHROMIUM_IMAGE = os.environ.get(
 APPROVED_NODE_CHROMIUM_PREFIXES = (
     "localhost/node-chromium:",
 )
+ANDROID_GRADLE_IMAGE = os.environ.get(
+    "PRIVATE_CI_ANDROID_GRADLE_IMAGE",
+    "localhost/private-ci-gradle-android:9.7-jdk21-api36-jdk25-v3",
+)
+APPROVED_ANDROID_GRADLE_PREFIXES = (
+    "localhost/private-ci-gradle-android:",
+)
 SAFE_NODE_SCRIPTS = ("lint", "typecheck", "test:run", "test:ci", "test", "build")
 UNSAFE_SCRIPT_WORDS = ("dev", "serve", "start", "preview", "watch")
 PLAYWRIGHT_VERSION_RE = re.compile(r"\bplaywright@(?P<version>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b")
@@ -63,6 +70,15 @@ def python_ci_image() -> str:
     if not any(PYTHON_CI_IMAGE.startswith(prefix) for prefix in APPROVED_PYTHON_CI_PREFIXES):
         raise ValueError(f"unapproved Python CI image: {PYTHON_CI_IMAGE}")
     return PYTHON_CI_IMAGE
+
+
+def android_gradle_image() -> str:
+    """Return the Worker-owned Android Gradle runtime, rejecting arbitrary images."""
+    if not any(ANDROID_GRADLE_IMAGE.startswith(prefix) for prefix in APPROVED_ANDROID_GRADLE_PREFIXES):
+        raise ValueError(f"unapproved Android Gradle image: {ANDROID_GRADLE_IMAGE}")
+    return ANDROID_GRADLE_IMAGE
+
+
 PLAYWRIGHT_PACKAGE_NAMES = ("playwright", "@playwright/test")
 
 _PYTHON_PACKAGE_DIRS = ("app", "private_ci_agent", "private_deploy_agent", "src")
@@ -223,6 +239,23 @@ GRADLE_COMMANDS = {
         {"name": "test", "command": "gradle --offline --no-daemon test 2>&1"},
     ],
     "image": GRADLE_IMAGE,
+    "cache_dirs": {"gradle": "/ci-cache/gradle"},
+}
+
+ANDROID_GRADLE_COMMANDS = {
+    "setup": [
+        {
+            "name": "dependencies",
+            "command": "gradle --no-daemon assembleDebug testDebugUnitTest 2>&1",
+        },
+    ],
+    "check": [
+        {
+            "name": "test",
+            "command": "gradle --offline --no-daemon testDebugUnitTest 2>&1",
+        },
+    ],
+    "image": android_gradle_image(),
     "cache_dirs": {"gradle": "/ci-cache/gradle"},
 }
 
@@ -484,20 +517,28 @@ def _workspace_controls(explicit: dict | None) -> tuple[dict, str | None]:
         return {}, None
     services = explicit.get("services") or []
     hooks = explicit.get("hooks") or []
+    runtime = explicit.get("runtime")
     if not isinstance(services, list) or not all(isinstance(item, str) for item in services):
         return {}, "workspace services must be a list of built-in names"
     if not isinstance(hooks, list) or not all(isinstance(item, str) for item in hooks):
         return {}, "workspace hooks must be a list of built-in names"
+    if runtime is not None and not isinstance(runtime, str):
+        return {}, "workspace runtime must be a built-in name"
     invalid_services = sorted(set(services) - set(SUPPORTED_WORKSPACE_SERVICES))
     if invalid_services:
         return {}, f"unsupported workspace services: {invalid_services}"
     invalid_hooks = sorted(set(hooks) - set(SUPPORTED_WORKSPACE_HOOKS))
     if invalid_hooks:
         return {}, f"unsupported workspace hooks: {invalid_hooks}"
-    return {
+    if runtime not in (None, "android-gradle"):
+        return {}, f"unsupported workspace runtime: {runtime}"
+    result = {
         "services": list(dict.fromkeys(services)),
         "hooks": list(dict.fromkeys(hooks)),
-    }, None
+    }
+    if runtime:
+        result["runtime"] = runtime
+    return result, None
 
 
 def _generic_workspace(rel: str, stack: str, explicit: dict | None = None) -> dict:

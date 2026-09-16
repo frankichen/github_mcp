@@ -113,6 +113,8 @@ if [ -n "${EXPECTED_PARENT_BUILD_SHA}" ] && [ "${EXPECTED_PARENT_BUILD_SHA}" = "
         || die "Python CI image preheat failed"
     run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-node-chromium" \
         || die "Node Chromium image preheat failed"
+    run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-gradle-android" \
+        || die "Android Gradle image preheat failed"
     for worker_id in "${RECOVERY_WORKER_IDS[@]}"; do
         log "Recovery preheating worker-local Go cache worker=${worker_id}"
         run_ciworker_preheat --worker-id "${worker_id}" \
@@ -173,7 +175,7 @@ install -o nobody -g nogroup -m 755 \
     "${REPO_ROOT}/services/private-ci-agent/deploy/private-ci-preflight" \
     "${AGENT_DIR}/bin/private-ci-preflight"
 
-for f in prepare-python-ci prepare-node-chromium prepare-go-cache prepare-playwright-cache; do
+for f in prepare-python-ci prepare-node-chromium prepare-gradle-android prepare-go-cache prepare-playwright-cache; do
     src="${REPO_ROOT}/services/private-ci-agent/deploy/${f}"
     [ -f "${src}" ] || continue
     install -o nobody -g nogroup -m 755 "${src}" "${AGENT_DIR}/deploy/${f}"
@@ -185,6 +187,16 @@ install -o nobody -g nogroup -m 644 \
 install -o nobody -g nogroup -m 644 \
     "${REPO_ROOT}/services/private-ci-agent/deploy/Dockerfile.python-ci" \
     "${AGENT_DIR}/deploy/Dockerfile.python-ci"
+install -o nobody -g nogroup -m 644 \
+    "${REPO_ROOT}/services/private-ci-agent/deploy/Dockerfile.gradle-android" \
+    "${AGENT_DIR}/deploy/Dockerfile.gradle-android"
+
+# The XYZL workspace override becomes active as soon as the Worker restarts.
+# Preheat its operator-owned Android runtime before that protocol switch so a
+# queued job can never observe the new allowlist without its required image.
+log "Preheating shared Android Gradle image before Worker restart"
+run_ciworker_preheat "${AGENT_DIR}/deploy/prepare-gradle-android" \
+    || die "Android Gradle image preheat failed"
 
 # Worker allowlist has one Python source of truth. Reuse it for directory
 # creation, Goose preheat, and post-deployment binary verification.

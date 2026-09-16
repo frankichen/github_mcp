@@ -1176,3 +1176,32 @@ def test_hidden_github_workflow_path_is_bound_into_test_config_identity(tmp_path
     after = JobExecutor._hash_test_config(str(tmp_path))
 
     assert before != after
+
+
+def test_android_gradle_runtime_uses_controlled_image_and_commands(tmp_path):
+    executor = object.__new__(JobExecutor)
+    commands = executor._workspace_commands(
+        {"path": "app", "stack": "gradle", "runtime": "android-gradle"},
+        str(tmp_path),
+    )
+
+    assert commands["image"] == "localhost/private-ci-gradle-android:9.7-jdk21-api36-jdk25-v3"
+    assert commands["setup"] == [
+        {"name": "dependencies", "command": "gradle --no-daemon assembleDebug testDebugUnitTest 2>&1"}
+    ]
+    assert commands["check"] == [
+        {"name": "test", "command": "gradle --offline --no-daemon testDebugUnitTest 2>&1"}
+    ]
+
+
+def test_android_gradle_runtime_rejects_non_gradle_workspace(tmp_path):
+    executor = object.__new__(JobExecutor)
+    commands = executor._workspace_commands(
+        {"path": "app", "stack": "dotnet", "runtime": "android-gradle"},
+        str(tmp_path),
+    )
+
+    assert commands == {
+        "error": "configuration_error",
+        "message": "Runtime android-gradle is not valid for dotnet",
+    }

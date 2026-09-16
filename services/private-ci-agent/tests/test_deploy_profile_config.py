@@ -102,9 +102,23 @@ def test_sxt_allows_repo_fast_check_on_agent_side():
 def test_deploy_repositories_keep_runtime_overrides():
     data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
 
-    assert {"frankichen/ai_war", "frankichen/lenshub-diag-mcp", "frankichen/sxt", "frankichen/github_mcp", "frankichen/auto_gupiao"}.issubset(
+    assert {"frankichen/ai_war", "frankichen/lenshub-diag-mcp", "frankichen/sxt", "frankichen/xyzl", "frankichen/github_mcp", "frankichen/auto_gupiao"}.issubset(
         set(data["repositories"])
     )
+
+
+def test_xyzl_runtime_override_is_fixed_to_six_canonical_workspaces():
+    data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
+    xyzl = data["repositories"]["frankichen/xyzl"]
+
+    assert xyzl["workspaces"] == [
+        {"path": "app", "type": "gradle", "runtime": "android-gradle"},
+        {"path": "app", "type": "dotnet"},
+        {"path": "app/AiService", "type": "gradle"},
+        {"path": "bed-admin-backend", "type": "maven"},
+        {"path": "bed-admin-frontend", "type": "node", "package_manager": "npm"},
+        {"path": "isup-server", "type": "maven"},
+    ]
 
 
 def test_auto_gupiao_legacy_entry_is_preserved():
@@ -189,6 +203,21 @@ def test_node_chromium_dockerfile_uses_inherited_proxy():
     assert "Acquire::https::Proxy=${https_apt_proxy}" in dockerfile
     assert "proxy.runtime.conf" in preheat
     assert "PRIVATE_CI_CONTAINER_PROXY_HOST:-10.0.2.2" in preheat
+
+
+def test_android_gradle_runtime_is_repositoryized_and_preheated():
+    dockerfile = (DEPLOY_DIR / "Dockerfile.gradle-android").read_text(encoding="utf-8")
+    preheat = (DEPLOY_DIR / "prepare-gradle-android").read_text(encoding="utf-8")
+    deploy = (DEPLOY_DIR / "apply-fixes.sh").read_text(encoding="utf-8")
+
+    assert "docker.io/library/gradle:9.7.0-jdk21-jammy" in dockerfile
+    assert "platforms;android-36" in dockerfile
+    assert "build-tools;36.0.0" in dockerfile
+    assert "temurin25-binaries" in dockerfile
+    assert "localhost/private-ci-gradle-android:9.7-jdk21-api36-jdk25-v3" in preheat
+    assert "Dockerfile.gradle-android" in preheat
+    assert "prepare-gradle-android" in deploy
+    assert deploy.index("prepare-gradle-android") < deploy.index("systemctl restart private-ci-agent.service")
 
 
 def test_python_ci_runtime_explicitly_installs_and_probes_git():
@@ -498,8 +527,8 @@ def test_apply_fixes_success_path_continues_in_fail_stop_mode(tmp_path):
     assert "DONE. Workers restarted with shared images and worker-local caches preheated." in _output(result)
     broker_calls = [call for call in calls if call.startswith("systemd-run ")]
     preheat_calls = [call for call in broker_calls if "prepare-" in call]
-    assert len(broker_calls) == 8
-    assert len(preheat_calls) == 7
+    assert len(broker_calls) == 9
+    assert len(preheat_calls) == 8
     assert all("--property=User=ciworker" in call for call in broker_calls)
     assert all("--property=Group=ciworker" in call for call in broker_calls)
     assert all("--setenv=HOME=/home/ciworker" in call for call in broker_calls)

@@ -86,6 +86,44 @@ repositories:
           - typecheck
           - build
 
+  frankichen/xyzl:
+    enabled: true
+    private_ci: true
+    auto_detect: true
+    allowed_profiles:
+      - repo-auto-check
+      - repo-fast-check
+      - python-check
+      - go-check
+      - node-check
+      - rust-check
+      - maven-check
+      - gradle-check
+      - dotnet-check
+    max_timeout_seconds: 900
+    merge_policy:
+      private_ci_authoritative: true
+      required_private_ci_profile: repo-auto-check
+      github_checks_mode: required_only
+      allow_non_required_check_failures: true
+      allow_quota_or_infrastructure_failures: true
+      required_workflows: []
+    workspaces:
+      - path: app
+        type: gradle
+        runtime: android-gradle
+      - path: app
+        type: dotnet
+      - path: app/AiService
+        type: gradle
+      - path: bed-admin-backend
+        type: maven
+      - path: bed-admin-frontend
+        type: node
+        package_manager: npm
+      - path: isup-server
+        type: maven
+
   frankichen/github_mcp:
     enabled: true
     private_ci: true

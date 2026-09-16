@@ -6,6 +6,8 @@ import subprocess
 import pytest
 
 from private_ci_agent.profiles import (
+    ANDROID_GRADLE_COMMANDS,
+    ANDROID_GRADLE_IMAGE,
     DOTNET_IMAGE,
     GRADLE_IMAGE,
     MAVEN_IMAGE,
@@ -14,6 +16,7 @@ from private_ci_agent.profiles import (
     PROFILE_COMMANDS,
     PYTHON_CI_IMAGE,
     RUST_IMAGE,
+    android_gradle_image,
     apply_workspace_hooks,
     discover_workspaces,
     go_commands_for_workspace,
@@ -115,6 +118,20 @@ def test_operator_workspace_controls_are_preserved_only_for_configured_workspace
     assert "hooks" not in automatic
 
 
+def test_operator_android_gradle_runtime_is_preserved_only_when_configured(tmp_path):
+    (tmp_path / "build.gradle").write_text("plugins {}\n", encoding="utf-8")
+    config = {
+        "workspaces": [{"path": ".", "type": "gradle", "runtime": "android-gradle"}]
+    }
+
+    configured = discover_workspaces(str(tmp_path), config)["workspaces"][0]
+    automatic = discover_workspaces(str(tmp_path))["workspaces"][0]
+
+    assert configured["runtime"] == "android-gradle"
+    assert "runtime" not in automatic
+    assert android_gradle_image() == ANDROID_GRADLE_IMAGE
+    assert ANDROID_GRADLE_COMMANDS["image"] == ANDROID_GRADLE_IMAGE
+
 
 def test_operator_workspace_controls_accept_fixed_multidataplane_services(tmp_path):
     (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
@@ -149,6 +166,7 @@ def test_operator_workspace_allowlist_is_authoritative(tmp_path):
     [
         ("services", ["postgres", "shell"], "unsupported workspace services"),
         ("hooks", ["go-migrate", "echo pwned"], "unsupported workspace hooks"),
+        ("runtime", "shell", "unsupported workspace runtime"),
     ],
 )
 def test_operator_workspace_controls_reject_unknown_names(tmp_path, field, value, fragment):
