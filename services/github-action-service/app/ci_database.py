@@ -1549,9 +1549,20 @@ def add_step(
         ).fetchone()[0]
         cursor = db.execute(
             """INSERT INTO ci_job_steps
-               (job_id, step_name, status, started_at, log_start_offset)
-               VALUES (?, ?, ?, ?, ?)""",
-            (job_id, step_name, status, ts if status == "running" else None, log_start_offset),
+               (job_id, step_name, status, started_at, log_start_offset, log_end_offset)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                job_id,
+                step_name,
+                status,
+                ts if status == "running" else None,
+                log_start_offset,
+                # Persist a valid empty half-open range immediately.  A zero
+                # placeholder is inverted whenever a step starts after the
+                # job already has output, and makes live/failure log reads
+                # fail before finish_step has a chance to update the end.
+                log_start_offset,
+            ),
         )
         db.commit()
     _notify_job_change(job_id)

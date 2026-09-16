@@ -150,6 +150,26 @@ async def test_finish_step_clamps_stale_log_end_to_a_valid_half_open_range(get_m
     assert db.get_job_step(job["job_id"], next_step)["log_end_offset"] == tail_end
 
 
+@pytest.mark.asyncio
+async def test_running_step_starts_with_a_valid_empty_log_range(get_mcp):
+    job = _new_job()
+    db.append_log_chunk(job["job_id"], "before-step\n")
+    step_id = db.add_step(job["job_id"], "live-step", status="running")
+
+    step = db.get_job_step(job["job_id"], step_id)
+    assert step["log_start_offset"] == step["log_end_offset"]
+
+    result = await _get_logs(get_mcp, job_id=job["job_id"], step_id=step_id)
+    assert result["ok"] is True
+    assert result["step"]["status"] == "running"
+    assert result["step_log_range"] == {
+        "start_offset": step["log_start_offset"],
+        "end_offset": step["log_end_offset"],
+        "end_exclusive": True,
+    }
+    assert result["chunks"] == []
+
+
 def test_init_db_repairs_legacy_inverted_step_ranges(isolated_db):
     job = _new_job()
     step_id = db.add_step(job["job_id"], "legacy-failure", status="failed")
