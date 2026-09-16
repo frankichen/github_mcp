@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from private_ci_agent.profiles import (
+    ANDROID_GRADLE_IMAGE,
     DOTNET_IMAGE,
     GRADLE_IMAGE,
     MAVEN_IMAGE,
@@ -571,6 +572,7 @@ def test_xyzl_android_gradle_root_uses_variant_qualified_tasks():
         "name": "test",
         "command": "gradle --offline --no-daemon testDebugUnitTest 2>&1",
     }]
+    assert commands["image"] == ANDROID_GRADLE_IMAGE
 
 
 def test_jvm_gradle_root_keeps_standard_test_lifecycle(tmp_path):

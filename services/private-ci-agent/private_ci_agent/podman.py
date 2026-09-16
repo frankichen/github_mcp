@@ -23,7 +23,10 @@ LOOPBACK_PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 CONTAINER_PROXY_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
 PIP_TRUSTED_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]{1,5})?$")
 ROOTLESS_OUTBOUND_NETWORK = "slirp4netns:allow_host_loopback=true"
-LOCAL_ONLY_IMAGE_PREFIXES = ("localhost/node-chromium:",)
+LOCAL_ONLY_IMAGE_PREFIXES = (
+    "localhost/node-chromium:",
+    "localhost/private-ci-gradle-android:",
+)
 GO_CACHE_SUBDIRECTORIES = (
     "home", "gopath", "gomod", "gobuild", "config/go",
     "xdg-cache", "xdg-config", "tmp", ".tool-bin",

@@ -67,6 +67,7 @@ profiles:
     description: "Gradle dependency preparation and offline test"
     language: gradle
     base_image: docker.io/library/gradle:9.7.0-jdk21-jammy
+    android_base_image: localhost/private-ci-gradle-android:9.7-jdk21-api36-jdk25-v3
     cache: gradle
 
   dotnet-check:

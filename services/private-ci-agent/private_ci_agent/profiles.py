@@ -189,6 +189,9 @@ PYTHON_COMMANDS = {
 RUST_IMAGE = "docker.io/library/rust:1.97.1-bookworm"
 MAVEN_IMAGE = "docker.io/library/maven:3.9.16-eclipse-temurin-21"
 GRADLE_IMAGE = "docker.io/library/gradle:9.7.0-jdk21-jammy"
+# Android Gradle needs the pinned SDK/API 36 runtime.  This is a worker-owned
+# image and must never fall back to a registry pull when it is absent.
+ANDROID_GRADLE_IMAGE = "localhost/private-ci-gradle-android:9.7-jdk21-api36-jdk25-v3"
 DOTNET_IMAGE = "mcr.microsoft.com/dotnet/sdk:8.0.424-bookworm-slim"
 
 RUST_COMMANDS = {
@@ -237,7 +240,7 @@ GRADLE_ANDROID_COMMANDS = {
     "check": [
         {"name": "test", "command": "gradle --offline --no-daemon testDebugUnitTest 2>&1"},
     ],
-    "image": GRADLE_IMAGE,
+    "image": ANDROID_GRADLE_IMAGE,
     "cache_dirs": {"gradle": "/ci-cache/gradle"},
 }
 

@@ -165,6 +165,21 @@ def test_local_shared_node_image_never_falls_back_to_pull(monkeypatch):
     assert calls[0][:3] == ["podman", "image", "exists"]
 
 
+def test_local_android_image_never_falls_back_to_pull(monkeypatch):
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=1, stdout="", stderr="missing")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    assert not PodmanRunner("podman").image_available(
+        "localhost/private-ci-gradle-android:9.7-jdk21-api36-jdk25-v3"
+    )
+    assert len(calls) == 1
+    assert calls[0][:3] == ["podman", "image", "exists"]
+
+
 def test_go_uses_read_write_job_cache_and_controlled_environment(monkeypatch, tmp_path):
     captured = []
 
