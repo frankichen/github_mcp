@@ -102,6 +102,13 @@ repositories:
       allow_non_required_check_failures: true
       allow_quota_or_infrastructure_failures: true
       required_workflows: []
+    workspaces:
+      - path: services/github-action-service
+        type: python
+      - path: services/private-ci-agent
+        type: python
+      - path: services/private-deploy-agent
+        type: python
     infrastructure_deployment:
       enabled: true
       environment: mygithub12-production
@@ -110,6 +117,40 @@ repositories:
       profile: repo-auto-check
       executor_id: mygithub12-infrastructure-deploy-01
       heartbeat_ttl_seconds: 30
+
+  # Keep XYZL's solution/settings directories as the execution boundaries.
+  # Child .NET tests and Android modules remain in their parent workspace.
+  frankichen/xyzl:
+    enabled: true
+    private_ci: true
+    auto_detect: true
+    allowed_profiles:
+      - repo-auto-check
+      - repo-fast-check
+      - dotnet-check
+      - gradle-check
+      - maven-check
+      - node-check
+    max_timeout_seconds: 900
+    merge_policy:
+      private_ci_authoritative: true
+      required_private_ci_profile: repo-auto-check
+      github_checks_mode: required_only
+      allow_non_required_check_failures: true
+      allow_quota_or_infrastructure_failures: true
+      required_workflows: []
+    workspaces:
+      - path: app
+        type: auto
+      - path: app/AiService
+        type: gradle
+      - path: bed-admin-backend
+        type: maven
+      - path: bed-admin-frontend
+        type: node
+        package_manager: npm
+      - path: isup-server
+        type: maven
 
   frankichen/auto_gupiao:
     enabled: true
@@ -131,6 +172,6 @@ repositories:
       environment: auto-gupiao-test
       scope: reports
       private_ci: false
-      script: scripts/deploy_auto_gupiao.sh
+      script: scripts/deploy_auto_gupiao_test.sh
       workspace_env: AUTO_GUPIAO_DEPLOY_WORKSPACE
       status_file_env: AUTO_GUPIAO_DEPLOY_STATUS_FILE

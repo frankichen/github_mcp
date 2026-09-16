@@ -1,4 +1,5 @@
 import logging
+import os
 import subprocess
 import threading
 
@@ -6,6 +7,64 @@ import pytest
 from types import SimpleNamespace
 
 from private_ci_agent.podman import PodmanRunner, ROOTLESS_OUTBOUND_NETWORK
+
+
+def test_same_source_steps_get_distinct_container_names(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_run(command, **_kwargs):
+        captured.append(command)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    runner = PodmanRunner("podman")
+    runner.run_command(
+        "docker.io/library/gradle:9.7.0-jdk21-jammy", "job-123", str(tmp_path), {},
+        "true", 30, container_discriminator="dotnet:app:restore",
+    )
+    runner.run_command(
+        "docker.io/library/gradle:9.7.0-jdk21-jammy", "job-123", str(tmp_path), {},
+        "true", 30, container_discriminator="gradle:app:dependencies",
+    )
+
+    names = [command[command.index("--name") + 1] for command in captured]
+    assert names[0] != names[1]
+
+
+def test_writable_checkout_uses_worker_identity(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_run(command, **_kwargs):
+        captured.append(command)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    PodmanRunner("podman").run_command(
+        "docker.io/library/gradle:9.7.0-jdk21-jammy", "job-123", str(tmp_path), {},
+        "mkdir -p .gradle", 30,
+    )
+
+    command = captured[0]
+    assert "--userns=keep-id" in command
+    assert "--user" in command
+    assert f"{os.getuid()}:{os.getgid()}" in command
+
+
+def test_gradle_step_can_load_native_library_from_exec_tmpfs(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_run(command, **_kwargs):
+        captured.append(command)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    PodmanRunner("podman").run_command(
+        "docker.io/library/gradle:9.7.0-jdk21-jammy", "job-123", str(tmp_path), {},
+        "gradle --version", 30, allow_exec_tmpfs=True,
+    )
+
+    assert "--tmpfs=/tmp:rw,exec,nosuid,size=256m" in captured[0]
+    assert "--tmpfs=/tmp:rw,noexec,nosuid,size=256m" not in captured[0]
 
 
 def test_rootless_command_does_not_use_env_host_or_forward_tokens(monkeypatch, tmp_path):
@@ -102,6 +161,21 @@ def test_local_shared_node_image_never_falls_back_to_pull(monkeypatch):
 
     monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
     assert not PodmanRunner("podman").image_available("localhost/node-chromium:22")
+    assert len(calls) == 1
+    assert calls[0][:3] == ["podman", "image", "exists"]
+
+
+def test_local_android_image_never_falls_back_to_pull(monkeypatch):
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=1, stdout="", stderr="missing")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    assert not PodmanRunner("podman").image_available(
+        "localhost/private-ci-gradle-android:9.7-jdk21-api36-jdk25-v3"
+    )
     assert len(calls) == 1
     assert calls[0][:3] == ["podman", "image", "exists"]
 
@@ -281,8 +355,8 @@ def test_proxy_is_explicitly_rewritten_and_redacted_from_logs(monkeypatch, tmp_p
     assert len(captured) == 2
     validation, command = captured
     assert "--http-proxy=false" in validation
-    assert any("curl -4 --proxy \"$proxy\" --connect-timeout 5 --max-time 15 -fsS -o /dev/null https://api.github.com" in item for item in validation)
-    assert any("https://api.github.com" in item for item in validation)
+    assert any("curl -4 --proxy \"$proxy\" --connect-timeout 5 --max-time 15 -fsS -o /dev/null https://github.com/robots.txt" in item for item in validation)
+    assert any("https://github.com/robots.txt" in item for item in validation)
     assert validation[validation.index("--network") + 1] == ROOTLESS_OUTBOUND_NETWORK
     assert "--http-proxy=false" in command
     assert command[command.index("--network") + 1] == ROOTLESS_OUTBOUND_NETWORK

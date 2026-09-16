@@ -194,6 +194,21 @@ PRIVATE_CI_WORKER_IDS_OUTPUT="$(
 [ -n "${PRIVATE_CI_WORKER_IDS_OUTPUT}" ] || die "private CI Worker allowlist is empty"
 mapfile -t PRIVATE_CI_WORKER_IDS <<< "${PRIVATE_CI_WORKER_IDS_OUTPUT}"
 
+# Android Gradle is intentionally backed by a worker-owned image: the stock
+# Gradle image has no Android SDK.  Verify the immutable local runtime for
+# every allowed Worker before switching the Controller.
+ANDROID_GRADLE_IMAGE="localhost/private-ci-gradle-android:9.7-jdk21-api36-jdk25-v3"
+for worker_id in "${PRIVATE_CI_WORKER_IDS[@]}"; do
+    run_ciworker_preheat --worker-id "${worker_id}" \
+        /usr/bin/podman image exists "${ANDROID_GRADLE_IMAGE}" \
+        || die "Android Gradle image is not prewarmed for worker ${worker_id}"
+    run_ciworker_preheat --worker-id "${worker_id}" \
+        /usr/bin/podman run --rm --pull=never --network none --entrypoint /bin/sh \
+        "${ANDROID_GRADLE_IMAGE}" -c \
+        'test -d /opt/android-sdk/platforms/android-36 && test -x /opt/android-sdk/cmdline-tools/latest/bin/sdkmanager' \
+        || die "Android SDK/API 36 runtime is incomplete for worker ${worker_id}"
+done
+
 # DX2-CI-B：legacy wsl-ci-01 保留原 unit，仅补充新状态目录写权限；
 # wsl-ci-02 使用受审的实例模板。两个 Worker 的所有可写运行目录互相隔离。
 install -D -o root -g root -m 644 \
@@ -207,6 +222,16 @@ for worker_id in "${PRIVATE_CI_WORKER_IDS[@]}"; do
     install -d -o ciworker -g ciworker -m 0700 \
         "${worker_root}" "${worker_root}/workspaces" "${worker_root}/cache" \
         "${worker_root}/logs" "${worker_root}/run" "${worker_root}/run/tmp"
+
+    # Older Gradle preheats ran as the rootless container's mapped root and
+    # left native-platform lock/library files owned by an unmapped UID.  The
+    # runtime now deliberately executes approved containers as ciworker, so
+    # repair only this persistent, writable cache before starting jobs.
+    # Without this migration Gradle reports a misleading native-library load
+    # failure when it cannot open libnative-platform.so.lock.
+    gradle_cache="${worker_root}/cache/gradle"
+    install -d -o ciworker -g ciworker -m 0770 "${gradle_cache}"
+    chown -R ciworker:ciworker "${gradle_cache}"
 done
 systemctl daemon-reload
 

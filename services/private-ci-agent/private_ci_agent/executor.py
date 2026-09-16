@@ -71,6 +71,10 @@ class JobExecutor:
         )
         self.log_manager = LogManager(controller_client, config.get("max_log_bytes", 10485760))
         self.services = MultiDataPlaneServiceManager(config.get("podman_binary", "/usr/bin/podman"), config)
+        # Gradle's persistent User Home has process-wide journal locks. Keep
+        # separate canonical Gradle roots from contending on that shared
+        # Worker cache while leaving other stacks parallelizable.
+        self._gradle_lock = threading.Lock()
         self.environment_cache = DependencyEnvironmentCache(
             config.get("environment_cache_root", "/srv/private-ci/cache/environments")
         )
@@ -78,6 +82,26 @@ class JobExecutor:
     def _cancelled(self) -> bool:
         cancel_event = getattr(self, "cancel_event", None)
         return cancel_event is not None and cancel_event.is_set()
+
+    def _start_step(self, job_id: str, step_name: str):
+        """Commit preceding buffered logs before the controller snapshots start."""
+        flush = getattr(self.log_manager, "flush", None)
+        if callable(flush):
+            try:
+                flush(job_id)
+            except Exception:  # pragma: no cover - transport failures are fail-closed by the client
+                logger.warning("failed to flush logs before starting step %s", step_name, exc_info=True)
+        return self.client.start_step(job_id, step_name)
+
+    def _finish_step(self, job_id: str, step_id, status: str, exit_code: int):
+        """Persist the step end only after its buffered output is uploaded."""
+        flush = getattr(self.log_manager, "flush", None)
+        if callable(flush):
+            try:
+                flush(job_id)
+            except Exception:  # pragma: no cover - transport failures are fail-closed by the client
+                logger.warning("failed to flush logs before finishing step %s", step_id, exc_info=True)
+        self.client.finish_step(job_id, step_id, status, exit_code, self.log_manager.get_total(job_id))
 
     def _cancel_summary(self, job_id: str, metadata: dict | None = None) -> dict:
         summary = {"status": "cancelled", "exit_code": -1, "steps": [], "cancelled": True}
@@ -621,6 +645,18 @@ class JobExecutor:
         return {**cache_state, **published}
 
     def _execute_workspace(self, job: Job, workspace: dict) -> dict:
+        if workspace.get("stack") == "gradle":
+            # Some embedders/tests construct the executor without __init__;
+            # keep the serialization contract valid for those instances too.
+            gradle_lock = getattr(self, "_gradle_lock", None)
+            if gradle_lock is None:
+                gradle_lock = threading.Lock()
+                self._gradle_lock = gradle_lock
+            with gradle_lock:
+                return self._execute_workspace_inner(job, workspace)
+        return self._execute_workspace_inner(job, workspace)
+
+    def _execute_workspace_inner(self, job: Job, workspace: dict) -> dict:
         path = workspace["path"]
         source_dir = job.source_dir if path == "." else f"{job.source_dir}/{path}"
         commands = self._workspace_commands(workspace, source_dir, job=job)
@@ -856,18 +892,20 @@ class JobExecutor:
 
     def _run_setup(self, job, label, image, source_dir, caches, step_name, command, service_env=None, pass_proxy=False):
         name = f"{label}:{step_name}"
+        step_id = self._start_step(job.job_id, name)
         self.log_manager.upload(job.job_id, f"[{name}] Starting: {command}\n")
-        step_id = self.client.start_step(job.job_id, name)
         start = time.time()
         result = self.podman.run_command(image, job.job_id, source_dir, caches, command, self._setup_timeout(job), network=True,
                                          env=self._service_env(service_env), network_name=service_env.network if service_env else None,
-                                         pass_proxy=pass_proxy, cancel_event=getattr(self, "cancel_event", None))
+                                         pass_proxy=pass_proxy, cancel_event=getattr(self, "cancel_event", None),
+                                         container_discriminator=name,
+                                         allow_exec_tmpfs=label.startswith("gradle:"))
         self._upload_output(job.job_id, result)
         status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else ("cancelled" if result.get("cancelled") else "failed"))
         duration = time.time() - start
         self.log_manager.upload(job.job_id, f"[{name}] {status.upper()} (exit={result['exit_code']}, {duration:.1f}s)\n")
         if step_id:
-            self.client.finish_step(job.job_id, step_id, status, result["exit_code"], self.log_manager.get_total(job.job_id))
+            self._finish_step(job.job_id, step_id, status, result["exit_code"])
         return {"step_name": name, "command": command, "status": status, "exit_code": result["exit_code"], "duration_seconds": duration, "step_id": step_id}
 
     def _setup_timeout(self, job: Job) -> int:
@@ -877,8 +915,8 @@ class JobExecutor:
 
     def _run_check(self, job, label, image, source_dir, caches, name, command, service_env=None, extra_env=None, pass_proxy=False):
         step_name = f"{label}:{name}"
+        step_id = self._start_step(job.job_id, step_name)
         self.log_manager.upload(job.job_id, f"[{step_name}] Starting: {command}\n")
-        step_id = self.client.start_step(job.job_id, step_name)
         start = time.time()
         env = self._service_env(service_env) or {}
         if extra_env:
@@ -888,13 +926,15 @@ class JobExecutor:
         result = self.podman.run_command(image, job.job_id, source_dir, caches, command, job.timeout_seconds,
                                          network=True if service_env else False, env=env if env else None,
                                          network_name=service_env.network if service_env else None,
-                                         pass_proxy=pass_proxy, cancel_event=getattr(self, "cancel_event", None))
+                                         pass_proxy=pass_proxy, cancel_event=getattr(self, "cancel_event", None),
+                                         container_discriminator=step_name,
+                                         allow_exec_tmpfs=step_name.startswith("gradle:"))
         self._upload_output(job.job_id, result)
         status = "passed" if result["exit_code"] == 0 else ("timed_out" if result["timed_out"] else ("cancelled" if result.get("cancelled") else "failed"))
         duration = time.time() - start
         self.log_manager.upload(job.job_id, f"[{step_name}] {status.upper()} (exit={result['exit_code']}, {duration:.1f}s)\n")
         if step_id:
-            self.client.finish_step(job.job_id, step_id, status, result["exit_code"], self.log_manager.get_total(job.job_id))
+            self._finish_step(job.job_id, step_id, status, result["exit_code"])
         return {"step_name": step_name, "command": command, "status": status, "exit_code": result["exit_code"], "duration_seconds": duration, "step_id": step_id}
 
     @staticmethod
@@ -1086,7 +1126,7 @@ class JobExecutor:
         )
 
         step_name = "repo-fast-check:ai-integrity"
-        step_id = self.client.start_step(job_id, step_name)
+        step_id = self._start_step(job_id, step_name)
         step_started = time.time()
         result = self.podman.run_command(
             image,
@@ -1111,9 +1151,7 @@ class JobExecutor:
         status = ("timed_out" if timed_out else ("cancelled" if cancelled else ("passed" if exit_code == 0 else "failed")))
         duration = time.time() - step_started
         if step_id:
-            self.client.finish_step(
-                job_id, step_id, status, exit_code, self.log_manager.get_total(job_id)
-            )
+            self._finish_step(job_id, step_id, status, exit_code)
 
         steps = [{
             "step_name": step_name,

@@ -1,11 +1,14 @@
 import json
 import os
 import shlex
+import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
 from private_ci_agent.profiles import (
+    ANDROID_GRADLE_IMAGE,
     DOTNET_IMAGE,
     GRADLE_IMAGE,
     MAVEN_IMAGE,
@@ -19,6 +22,7 @@ from private_ci_agent.profiles import (
     go_commands_for_workspace,
     go_image_for_version,
     go_version_requirements,
+    get_commands_for_profile,
     node_browser_image,
     node_commands_for_workspace,
     python_ci_image,
@@ -142,6 +146,39 @@ def test_operator_workspace_allowlist_is_authoritative(tmp_path):
     assert [(item["path"], item["stack"]) for item in result["workspaces"]] == [
         (".", "go")
     ]
+
+
+def test_xyzl_regression_groups_parent_build_contexts_and_ignores_modes(tmp_path):
+    fixture = Path(__file__).parent / "fixtures" / "xyzl-regression"
+    source = tmp_path / "xyzl"
+    shutil.copytree(fixture, source)
+
+    before = discover_workspaces(str(source))
+    assert [(item["path"], item["stack"]) for item in before["workspaces"]] == [
+        ("app", "dotnet"),
+        ("app", "gradle"),
+        ("app/AiService", "gradle"),
+        ("bed-admin-backend", "maven"),
+        ("bed-admin-frontend", "node"),
+        ("isup-server", "maven"),
+    ]
+    assert not any(
+        item["path"] in {
+            "app/AiServiceNet", "app/AiServiceNet.Tests", "app/ServerBuild",
+            "app/ServerBuild.Tests", "app/app", "app/opencv",
+        }
+        for item in before["workspaces"]
+    )
+
+    for path in (
+        source / "app" / "XYZL.DotNet.sln",
+        source / "app" / "app" / "build.gradle.kts",
+        source / "app" / "opencv" / "build.gradle",
+    ):
+        path.chmod(path.stat().st_mode ^ 0o111)
+
+    after = discover_workspaces(str(source))
+    assert after == before
 
 
 @pytest.mark.parametrize(
@@ -518,7 +555,29 @@ def test_common_language_profile_commands_keep_setup_online_and_checks_offline_c
     assert "CARGO_NET_OFFLINE=true" in PROFILE_COMMANDS["rust-check"]["check"][1]["command"]
     assert "dependency:go-offline" in PROFILE_COMMANDS["maven-check"]["setup"][0]["command"]
     assert "mvn -o" in PROFILE_COMMANDS["maven-check"]["check"][0]["command"]
-    assert "testClasses" in PROFILE_COMMANDS["gradle-check"]["setup"][0]["command"]
+    assert "gradle --no-daemon test" in PROFILE_COMMANDS["gradle-check"]["setup"][0]["command"]
     assert "--offline" in PROFILE_COMMANDS["gradle-check"]["check"][0]["command"]
     assert "dotnet restore" in PROFILE_COMMANDS["dotnet-check"]["setup"][0]["command"]
     assert all("--no-restore" in item["command"] for item in PROFILE_COMMANDS["dotnet-check"]["check"])
+
+
+def test_xyzl_android_gradle_root_uses_variant_qualified_tasks():
+    fixture = Path(__file__).parent / "fixtures" / "xyzl-regression" / "app"
+    commands = get_commands_for_profile("gradle-check", str(fixture))
+    assert commands["setup"] == [{
+        "name": "dependencies",
+        "command": "gradle --no-daemon assembleDebug testDebugUnitTest 2>&1",
+    }]
+    assert commands["check"] == [{
+        "name": "test",
+        "command": "gradle --offline --no-daemon testDebugUnitTest 2>&1",
+    }]
+    assert commands["image"] == ANDROID_GRADLE_IMAGE
+
+
+def test_jvm_gradle_root_keeps_standard_test_lifecycle(tmp_path):
+    (tmp_path / "settings.gradle").write_text("rootProject.name='service'\n", encoding="utf-8")
+    (tmp_path / "build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
+    commands = get_commands_for_profile("gradle-check", str(tmp_path))
+    assert commands["setup"][0]["command"] == "gradle --no-daemon test 2>&1"
+    assert commands["check"][0]["command"] == "gradle --offline --no-daemon test 2>&1"

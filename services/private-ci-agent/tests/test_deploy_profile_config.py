@@ -49,6 +49,14 @@ def test_deploy_profiles_include_pinned_common_language_images():
         assert data[profile]["cache"] == cache
 
 
+def test_deploy_profiles_pin_android_gradle_runtime_image():
+    data = yaml.safe_load((DEPLOY_DIR / "profiles.yml").read_text(encoding="utf-8"))["profiles"]
+
+    assert data["gradle-check"]["android_base_image"] == (
+        "localhost/private-ci-gradle-android:9.7-jdk21-api36-jdk25-v3"
+    )
+
+
 def test_python_profile_uses_worker_owned_git_runtime():
     data = yaml.safe_load((DEPLOY_DIR / "profiles.yml").read_text(encoding="utf-8"))["profiles"]
     profile = data["python-check"]
@@ -150,6 +158,15 @@ def test_apply_fixes_syncs_entire_runtime_package():
     assert 'deploy/repositories.yml"' in script
     assert "/etc/private-ci/repositories.yml" in script
     assert "install -o root -g root -m 644" in script
+
+
+def test_apply_fixes_verifies_worker_owned_android_runtime_before_switch():
+    script = (DEPLOY_DIR / "apply-fixes.sh").read_text(encoding="utf-8")
+
+    assert "localhost/private-ci-gradle-android:9.7-jdk21-api36-jdk25-v3" in script
+    assert "platforms/android-36" in script
+    assert "sdkmanager" in script
+    assert 'image exists "${ANDROID_GRADLE_IMAGE}"' in script
 
 
 def test_apply_fixes_candidate_handoff_avoids_sgid_write_under_hardened_executor():
@@ -498,7 +515,7 @@ def test_apply_fixes_success_path_continues_in_fail_stop_mode(tmp_path):
     assert "DONE. Workers restarted with shared images and worker-local caches preheated." in _output(result)
     broker_calls = [call for call in calls if call.startswith("systemd-run ")]
     preheat_calls = [call for call in broker_calls if "prepare-" in call]
-    assert len(broker_calls) == 8
+    assert len(broker_calls) == 12
     assert len(preheat_calls) == 7
     assert all("--property=User=ciworker" in call for call in broker_calls)
     assert all("--property=Group=ciworker" in call for call in broker_calls)

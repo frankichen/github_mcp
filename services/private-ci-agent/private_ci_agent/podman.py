@@ -23,7 +23,10 @@ LOOPBACK_PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 CONTAINER_PROXY_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
 PIP_TRUSTED_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]{1,5})?$")
 ROOTLESS_OUTBOUND_NETWORK = "slirp4netns:allow_host_loopback=true"
-LOCAL_ONLY_IMAGE_PREFIXES = ("localhost/node-chromium:",)
+LOCAL_ONLY_IMAGE_PREFIXES = (
+    "localhost/node-chromium:",
+    "localhost/private-ci-gradle-android:",
+)
 GO_CACHE_SUBDIRECTORIES = (
     "home", "gopath", "gomod", "gobuild", "config/go",
     "xdg-cache", "xdg-config", "tmp", ".tool-bin",
@@ -174,7 +177,7 @@ class PodmanRunner:
                 command.extend(["--env", f"{key}={value}"])
         command.extend([
             "--entrypoint", "/bin/sh", image, "-c",
-            'proxy=${HTTPS_PROXY:-${HTTP_PROXY:-${ALL_PROXY:-}}}; test -n "$proxy" && if command -v curl >/dev/null; then curl -4 --proxy "$proxy" --connect-timeout 5 --max-time 15 -fsS -o /dev/null https://api.github.com; elif command -v python >/dev/null; then python -c \'import urllib.request; urllib.request.urlopen("https://api.github.com", timeout=15).close()\'; else exit 127; fi',
+            'proxy=${HTTPS_PROXY:-${HTTP_PROXY:-${ALL_PROXY:-}}}; test -n "$proxy" && if command -v curl >/dev/null; then curl -4 --proxy "$proxy" --connect-timeout 5 --max-time 15 -fsS -o /dev/null https://github.com/robots.txt; elif command -v python >/dev/null; then python -c \'import urllib.request; urllib.request.urlopen("https://github.com/robots.txt", timeout=15).close()\'; else exit 127; fi',
         ])
         try:
             result = subprocess.run(command, capture_output=True, text=True, timeout=20)
@@ -546,15 +549,31 @@ class PodmanRunner:
         cancel_event: threading.Event | None = None,
         source_read_only: bool = False,
         playwright_cache_writable: bool = False,
+        container_discriminator: str = "",
+        allow_exec_tmpfs: bool = False,
     ) -> dict:
         """Run one command with explicit network and proxy boundaries."""
-        container_name = self._container_name(job_id, source_dir)
+        # A repo-auto plan may intentionally run multiple stacks from the same
+        # source directory (for example app/.NET and app/Gradle) concurrently.
+        # The source path alone is therefore not a unique container identity.
+        # Include the stable step label so proxy probes and the real containers
+        # cannot race on one Podman name.
+        container_name = self._container_name(job_id, source_dir, container_discriminator)
         cache_mounts, go_cache = self._cache_mounts(
             cache_dirs, playwright_cache_writable=playwright_cache_writable
         )
         project_root = os.path.abspath(os.path.join(source_dir, os.pardir, os.pardir))
         net_arg = self._network_args(network, network_name)
-        userns_arg = [] if network_name else ["--userns=keep-id"]
+        # Some approved images (notably Gradle) declare a non-root image user.
+        # Bind-mounted checkouts are owned by ciworker, so that image default
+        # UID cannot create project-local state such as /workspace/.gradle.
+        # Keep the rootless namespace and run as the actual Worker identity;
+        # this preserves host ownership without granting host root privileges.
+        userns_arg = [] if network_name else [
+            "--userns=keep-id",
+            "--user", f"{os.getuid()}:{os.getgid()}",
+        ]
+        tmpfs_tmp = "--tmpfs=/tmp:rw,exec,nosuid,size=256m" if allow_exec_tmpfs else "--tmpfs=/tmp:rw,noexec,nosuid,size=256m"
 
         cmd = [
             self.podman, "run",
@@ -570,7 +589,7 @@ class PodmanRunner:
             "--memory-swap=3g",
             "--cpus=2",
             "--read-only",
-            "--tmpfs=/tmp:rw,noexec,nosuid,size=256m",
+            tmpfs_tmp,
             "--tmpfs=/run:rw,noexec,nosuid,size=64m",
             "--tmpfs=/data:rw,noexec,nosuid,size=64m",
             "-v", f"{source_dir}:/workspace:{'ro,' if source_read_only else ''}Z",
@@ -630,8 +649,11 @@ class PodmanRunner:
 
         return self._run_process(cmd, container_name, timeout_seconds, cancel_event)
 
-    def _container_name(self, job_id: str, source_dir: str = "") -> str:
-        suffix = hashlib.sha1(str(source_dir).encode()).hexdigest()[:6] if source_dir else "main"
+    def _container_name(self, job_id: str, source_dir: str = "", discriminator: str = "") -> str:
+        material = str(source_dir)
+        if discriminator:
+            material = f"{material}\0{discriminator}"
+        suffix = hashlib.sha1(material.encode()).hexdigest()[:6] if source_dir else "main"
         return f"{self.container_namespace}-{job_id[:12]}-{suffix}"
 
     def _job_container_prefix(self, job_id: str) -> str:
