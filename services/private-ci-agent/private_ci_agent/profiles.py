@@ -218,7 +218,10 @@ MAVEN_COMMANDS = {
 
 GRADLE_COMMANDS = {
     "setup": [
-        {"name": "dependencies", "command": "gradle --no-daemon testClasses 2>&1"},
+        # JVM Gradle roots expose the standard `test` lifecycle. Android
+        # multi-project roots use the variant-qualified tasks below instead;
+        # the root project itself intentionally has no `testClasses` task.
+        {"name": "dependencies", "command": "gradle --no-daemon test 2>&1"},
     ],
     "check": [
         {"name": "test", "command": "gradle --offline --no-daemon test 2>&1"},
@@ -226,6 +229,53 @@ GRADLE_COMMANDS = {
     "image": GRADLE_IMAGE,
     "cache_dirs": {"gradle": "/ci-cache/gradle"},
 }
+
+GRADLE_ANDROID_COMMANDS = {
+    "setup": [
+        {"name": "dependencies", "command": "gradle --no-daemon assembleDebug testDebugUnitTest 2>&1"},
+    ],
+    "check": [
+        {"name": "test", "command": "gradle --offline --no-daemon testDebugUnitTest 2>&1"},
+    ],
+    "image": GRADLE_IMAGE,
+    "cache_dirs": {"gradle": "/ci-cache/gradle"},
+}
+
+
+def _is_android_gradle_workspace(source_dir: str) -> bool:
+    """Recognize an Android Gradle root without executing repository code."""
+    root = Path(source_dir)
+    if not any((root / name).is_file() for name in ("settings.gradle", "settings.gradle.kts")):
+        return False
+
+    candidates = []
+    for name in ("build.gradle", "build.gradle.kts"):
+        candidates.append(root / name)
+    try:
+        children = sorted(root.iterdir(), key=lambda path: path.name)[:64]
+    except OSError:
+        return False
+    for child in children:
+        if not child.is_dir() or child.name in EXCLUDED_DIRS:
+            continue
+        for name in ("build.gradle", "build.gradle.kts"):
+            candidates.append(child / name)
+
+    # Bounded source inspection is only for stack/task selection. The command
+    # remains fixed and cannot be supplied by repository content.
+    for candidate in candidates:
+        try:
+            text = candidate.read_text(encoding="utf-8")[:256 * 1024]
+        except (OSError, UnicodeDecodeError):
+            continue
+        if re.search(r"com\.android\.|\bandroid\s*\{", text):
+            return True
+    return False
+
+
+def gradle_commands_for_workspace(source_dir: str) -> dict:
+    """Select the fixed Gradle lifecycle for JVM versus Android roots."""
+    return GRADLE_ANDROID_COMMANDS if _is_android_gradle_workspace(source_dir) else GRADLE_COMMANDS
 
 DOTNET_COMMANDS = {
     "setup": [
@@ -939,6 +989,8 @@ def get_commands_for_profile(profile: str, source_dir: str = "") -> dict:
         return go_commands_for_workspace(source_dir)
     if profile == "python-check" and source_dir:
         return python_commands_for_workspace(source_dir)
+    if profile == "gradle-check" and source_dir:
+        return gradle_commands_for_workspace(source_dir)
     if profile in {"rust-check", "maven-check", "gradle-check", "dotnet-check"}:
         return PROFILE_COMMANDS[profile]
     return PROFILE_COMMANDS[profile]
