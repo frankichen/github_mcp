@@ -560,7 +560,15 @@ class PodmanRunner:
         )
         project_root = os.path.abspath(os.path.join(source_dir, os.pardir, os.pardir))
         net_arg = self._network_args(network, network_name)
-        userns_arg = [] if network_name else ["--userns=keep-id"]
+        # Some approved images (notably Gradle) declare a non-root image user.
+        # Bind-mounted checkouts are owned by ciworker, so that image default
+        # UID cannot create project-local state such as /workspace/.gradle.
+        # Keep the rootless namespace and run as the actual Worker identity;
+        # this preserves host ownership without granting host root privileges.
+        userns_arg = [] if network_name else [
+            "--userns=keep-id",
+            "--user", f"{os.getuid()}:{os.getgid()}",
+        ]
 
         cmd = [
             self.podman, "run",

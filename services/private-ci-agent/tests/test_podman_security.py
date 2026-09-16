@@ -1,4 +1,5 @@
 import logging
+import os
 import subprocess
 import threading
 
@@ -28,6 +29,25 @@ def test_same_source_steps_get_distinct_container_names(monkeypatch, tmp_path):
 
     names = [command[command.index("--name") + 1] for command in captured]
     assert names[0] != names[1]
+
+
+def test_writable_checkout_uses_worker_identity(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_run(command, **_kwargs):
+        captured.append(command)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    PodmanRunner("podman").run_command(
+        "docker.io/library/gradle:9.7.0-jdk21-jammy", "job-123", str(tmp_path), {},
+        "mkdir -p .gradle", 30,
+    )
+
+    command = captured[0]
+    assert "--userns=keep-id" in command
+    assert "--user" in command
+    assert f"{os.getuid()}:{os.getgid()}" in command
 
 
 def test_rootless_command_does_not_use_env_host_or_forward_tokens(monkeypatch, tmp_path):
