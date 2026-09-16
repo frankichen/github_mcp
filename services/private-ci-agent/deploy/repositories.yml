@@ -63,6 +63,13 @@ repositories:
       - repo-fast-check
       - python-check
     max_timeout_seconds: 900
+    workspaces:
+      - path: services/github-action-service
+        type: python
+      - path: services/private-ci-agent
+        type: python
+      - path: services/private-deploy-agent
+        type: python
 
   # XYZL owns these parent build contexts.  Nested projects are deliberately
   # not workspace roots: app owns the .NET solution and the Android
@@ -105,6 +112,6 @@ repositories:
       environment: auto-gupiao-test
       scope: reports
       private_ci: false
-      script: scripts/deploy_auto_gupiao.sh
+      script: scripts/deploy_auto_gupiao_test.sh
       workspace_env: AUTO_GUPIAO_DEPLOY_WORKSPACE
       status_file_env: AUTO_GUPIAO_DEPLOY_STATUS_FILE
