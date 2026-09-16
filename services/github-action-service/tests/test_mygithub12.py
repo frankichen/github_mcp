@@ -1089,6 +1089,45 @@ def test_private_ci_plan_auto_selects_only_detected_manifest_stacks(monkeypatch)
     ]
 
 
+def test_private_ci_plan_xyzl_regression_keeps_parent_build_boundaries(monkeypatch):
+    paths = [
+        "app/XYZL.DotNet.sln",
+        "app/AiService/build.gradle",
+        "app/AiService/settings.gradle",
+        "app/AiServiceNet.Tests/AiService.Tests.csproj",
+        "app/AiServiceNet/AiService.csproj",
+        "app/ServerBuild.Tests/ServerManage.Tests.csproj",
+        "app/ServerBuild/ServerManage.csproj",
+        "app/app/build.gradle.kts",
+        "app/build.gradle.kts",
+        "app/opencv/build.gradle",
+        "app/settings.gradle.kts",
+        "bed-admin-backend/pom.xml",
+        "bed-admin-frontend/package-lock.json",
+        "bed-admin-frontend/package.json",
+        "isup-server/pom.xml",
+    ]
+    allowed = [
+        "repo-auto-check", "dotnet-check", "gradle-check", "maven-check", "node-check",
+    ]
+    _configure_ci_plan(monkeypatch, paths, allowed)
+
+    first = mygithub12.plan_private_ci_job(_CIPlanService(), "o/r", "a" * 40, "repo-auto-check")
+    second = mygithub12.plan_private_ci_job(_CIPlanService(), "o/r", "a" * 40, "repo-auto-check")
+
+    assert first == second
+    assert first["applicable"] is True
+    assert first["selected_profiles"] == ["dotnet-check", "gradle-check", "maven-check", "node-check"]
+    assert first["workspaces"] == [
+        {"path": "app", "stack": "dotnet"},
+        {"path": "app", "stack": "gradle"},
+        {"path": "app/AiService", "stack": "gradle"},
+        {"path": "bed-admin-backend", "stack": "maven"},
+        {"path": "bed-admin-frontend", "stack": "node", "package_manager": "npm"},
+        {"path": "isup-server", "stack": "maven"},
+    ]
+
+
 def test_private_ci_plan_explicit_python_matches_worker_root_only_semantics(monkeypatch):
     _configure_ci_plan(monkeypatch, ["services/github-action-service/requirements.txt"], ["python-check"])
     result = mygithub12.plan_private_ci_job(_CIPlanService(), "o/r", "a" * 40, "python-check")

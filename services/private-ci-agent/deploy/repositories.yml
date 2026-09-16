@@ -64,6 +64,34 @@ repositories:
       - python-check
     max_timeout_seconds: 900
 
+  # XYZL owns these parent build contexts.  Nested projects are deliberately
+  # not workspace roots: app owns the .NET solution and the Android
+  # multi-project Gradle build; AiService is its own Gradle root.
+  frankichen/xyzl:
+    enabled: true
+    private_ci: true
+    auto_detect: true
+    allowed_profiles:
+      - repo-auto-check
+      - repo-fast-check
+      - dotnet-check
+      - gradle-check
+      - maven-check
+      - node-check
+    max_timeout_seconds: 900
+    workspaces:
+      - path: app
+        type: auto
+      - path: app/AiService
+        type: gradle
+      - path: bed-admin-backend
+        type: maven
+      - path: bed-admin-frontend
+        type: node
+        package_manager: npm
+      - path: isup-server
+        type: maven
+
   frankichen/auto_gupiao:
     enabled: true
     private_ci: true

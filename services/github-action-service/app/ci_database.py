@@ -171,6 +171,32 @@ def init_db():
         db.execute("ALTER TABLE ci_jobs ADD COLUMN performance_json TEXT NOT NULL DEFAULT '{}'")
     db.commit()
 
+    # Repair ranges written by older Workers that reported their in-memory
+    # log total before flushing.  The exact per-step boundary is unavailable
+    # for those rows, so use the persisted job end as the safest readable
+    # compatibility boundary; all future rows use the flush-before-finish
+    # protocol below and do not take this path.
+    invalid_steps = db.execute(
+        """SELECT id, job_id, log_start_offset, log_end_offset
+           FROM ci_job_steps
+           WHERE log_start_offset < 0
+              OR log_end_offset < 0
+              OR log_end_offset < log_start_offset"""
+    ).fetchall()
+    for step in invalid_steps:
+        start_offset = max(int(step["log_start_offset"] or 0), 0)
+        persisted_end = db.execute(
+            "SELECT COALESCE(MAX(offset_to), 0) FROM ci_job_log_chunks WHERE job_id = ?",
+            (step["job_id"],),
+        ).fetchone()[0]
+        end_offset = max(start_offset, int(persisted_end or 0))
+        db.execute(
+            "UPDATE ci_job_steps SET log_start_offset = ?, log_end_offset = ? WHERE id = ?",
+            (start_offset, end_offset, step["id"]),
+        )
+    if invalid_steps:
+        db.commit()
+
     # DEV-002 adds a separate durable request lifecycle without changing the
     # legacy Worker execution schema or its public start/get/wait behavior.
     from app.ci_request_store import init_ci_request_schema
@@ -1545,24 +1571,39 @@ def finish_step(
                 raise StaleJobLeaseError(str(step_id))
             _begin_job_write(db, job_id, worker_id, lease_token)
             row = db.execute(
-                "SELECT job_id, step_name, started_at FROM ci_job_steps WHERE id = ? AND job_id = ?",
+                "SELECT job_id, step_name, started_at, log_start_offset FROM ci_job_steps WHERE id = ? AND job_id = ?",
                 (step_id, job_id),
             ).fetchone()
         else:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT job_id, step_name, started_at FROM ci_job_steps WHERE id = ?",
+                "SELECT job_id, step_name, started_at, log_start_offset FROM ci_job_steps WHERE id = ?",
                 (step_id,),
             ).fetchone()
         if not row:
             db.rollback()
             return False
         duration = ts - row["started_at"] if row["started_at"] else 0
+        log_start_offset = max(int(row["log_start_offset"] or 0), 0)
+        persisted_end_offset = db.execute(
+            "SELECT COALESCE(MAX(offset_to), 0) FROM ci_job_log_chunks WHERE job_id = ?",
+            (row["job_id"],),
+        ).fetchone()[0]
+        persisted_end_offset = max(int(persisted_end_offset or 0), log_start_offset)
         if log_end_offset is None:
-            log_end_offset = db.execute(
-                "SELECT COALESCE(MAX(offset_to), 0) FROM ci_job_log_chunks WHERE job_id = ?",
-                (row["job_id"],),
-            ).fetchone()[0]
+            requested_end_offset = persisted_end_offset
+        else:
+            try:
+                requested_end_offset = int(log_end_offset)
+            except (TypeError, ValueError):
+                requested_end_offset = persisted_end_offset
+        # The Worker normally supplies the persisted total after flushing its
+        # buffer.  Clamp defensively at the controller boundary as well so a
+        # stale/invalid Worker value can never create an inverted half-open
+        # range that makes the failed-step log unreadable.
+        log_end_offset = min(
+            max(requested_end_offset, log_start_offset), persisted_end_offset
+        )
         db.execute(
             """UPDATE ci_job_steps SET status = ?, exit_code = ?, finished_at = ?,
                duration_seconds = ?, log_end_offset = COALESCE(?, log_end_offset)

@@ -1076,6 +1076,99 @@ def _recursive_tree(service: Any, repository: str, commit_sha: str):
     return identity,list(repo.get_git_tree(_tree_sha(commit),recursive=True).tree)
 
 
+def _ci_path_ancestors(rel: str):
+    normalized = str(rel or ".").strip("/") or "."
+    if normalized == ".":
+        yield "."
+        return
+    parts = normalized.split("/")
+    for end in range(len(parts), 0, -1):
+        yield "/".join(parts[:end])
+    yield "."
+
+
+def _ci_nearest_workspace_ancestor(rel: str, candidates: set[str]) -> str | None:
+    for ancestor in list(_ci_path_ancestors(rel))[1:]:
+        if ancestor in candidates:
+            return ancestor
+    return None
+
+
+def _ci_dotnet_test_parent(rel: str) -> str | None:
+    parts = str(rel or ".").split("/")
+    if not parts or parts[-1] == ".":
+        return None
+    name = parts[-1]
+    lowered = name.lower()
+    for suffix in (".tests", ".test", "tests", "test"):
+        if lowered.endswith(suffix) and len(name) > len(suffix):
+            base = name[:-len(suffix)].rstrip(".")
+            return "/".join([*parts[:-1], base]) or "."
+    return None
+
+
+def _canonical_ci_workspace_roots(directories: dict[str, set[str]]) -> dict[str, set[str]]:
+    """Return manifest ownership roots, not every nested build manifest.
+
+    This mirrors the Worker-side grouping contract.  Solutions/settings files
+    own their child projects, and conventional ``*.Tests`` projects inherit
+    their product directory.  The result depends only on exact tree paths and
+    filenames, never on executable mode bits or filesystem traversal order.
+    """
+    roots: dict[str, set[str]] = {
+        "go": set(), "python": set(), "node": set(), "rust": set(),
+        "maven": set(), "gradle": set(), "dotnet": set(),
+    }
+
+    def dirs_with(predicate) -> set[str]:
+        return {rel for rel, files in directories.items() if predicate(files)}
+
+    dotnet_candidates = dirs_with(
+        lambda files: any(name.endswith((".sln", ".csproj", ".fsproj")) for name in files)
+    )
+    dotnet_solution_roots = dirs_with(lambda files: any(name.endswith(".sln") for name in files))
+    roots["dotnet"].update(dotnet_solution_roots)
+    for rel in sorted(dotnet_candidates, key=lambda value: (len(PurePosixPath(value).parts), value)):
+        if rel in dotnet_solution_roots or _ci_nearest_workspace_ancestor(rel, dotnet_solution_roots):
+            continue
+        test_parent = _ci_dotnet_test_parent(rel)
+        if test_parent in dotnet_candidates:
+            roots["dotnet"].add(test_parent)
+            continue
+        roots["dotnet"].add(_ci_nearest_workspace_ancestor(rel, dotnet_candidates) or rel)
+
+    gradle_candidates = dirs_with(
+        lambda files: bool({"build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"} & files)
+    )
+    gradle_settings_roots = dirs_with(
+        lambda files: "settings.gradle" in files or "settings.gradle.kts" in files
+    )
+    roots["gradle"].update(gradle_settings_roots)
+    for rel in sorted(gradle_candidates):
+        if rel in gradle_settings_roots:
+            continue
+        roots["gradle"].add(_ci_nearest_workspace_ancestor(rel, gradle_settings_roots) or rel)
+
+    maven_candidates = dirs_with(lambda files: "pom.xml" in files)
+    maven_roots: set[str] = set()
+    for rel in sorted(maven_candidates, key=lambda value: (len(PurePosixPath(value).parts), value)):
+        maven_roots.add(_ci_nearest_workspace_ancestor(rel, maven_roots) or rel)
+    roots["maven"] = maven_roots
+
+    go_work_roots = dirs_with(lambda files: "go.work" in files or "go.work.sum" in files)
+    go_candidates = dirs_with(lambda files: "go.mod" in files)
+    roots["go"].update(go_work_roots)
+    for rel in sorted(go_candidates):
+        roots["go"].add(_ci_nearest_workspace_ancestor(rel, go_work_roots) or rel)
+
+    roots["node"] = dirs_with(lambda files: "package.json" in files)
+    roots["python"] = dirs_with(
+        lambda files: bool(files & {"pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg", "Pipfile"})
+    )
+    roots["rust"] = dirs_with(lambda files: "Cargo.toml" in files)
+    return roots
+
+
 def plan_private_ci_job(service: Any, repository: str, commit_sha: str, profile: str="repo-auto-check") -> dict[str,Any]:
     """Plan private CI applicability from exact Git identity, policy and project manifests only."""
     from app.ci_repository_config import (
@@ -1164,8 +1257,12 @@ def plan_private_ci_job(service: Any, repository: str, commit_sha: str, profile:
                 continue
             rel = "/".join(parts[:-1]) or "."
             directories.setdefault(rel, set()).add(parts[-1])
-        for rel, files in directories.items():
-            detect_directory(rel, files)
+        for stack, roots in _canonical_ci_workspace_roots(directories).items():
+            for rel in sorted(roots):
+                files = directories.get(rel, set())
+                if stack == "node" and rel == "." and "go.mod" in files and not any(lock in files for lock in lock_files):
+                    continue
+                detect_directory(rel, files, stack)
 
     workspaces.sort(key=lambda item: (str(item.get("path")), str(item.get("stack"))))
     detected_stacks: list[str] = []

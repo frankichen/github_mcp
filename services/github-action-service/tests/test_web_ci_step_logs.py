@@ -130,6 +130,45 @@ async def test_failed_step_selector_returns_only_exact_persisted_range(get_mcp):
 
 
 @pytest.mark.asyncio
+async def test_finish_step_clamps_stale_log_end_to_a_valid_half_open_range(get_mcp):
+    job = _new_job()
+    start = db.append_log_chunk(job["job_id"], "before\n")
+    step_id = db.add_step(job["job_id"], "failed-step", status="running")
+    body_end = db.append_log_chunk(job["job_id"], "failure\n")
+
+    assert db.finish_step(step_id, "failed", exit_code=1, log_end_offset=-10)
+    step = db.get_job_step(job["job_id"], step_id)
+    assert step["log_start_offset"] == start
+    assert step["log_end_offset"] == start
+    result = await _get_logs(get_mcp, job_id=job["job_id"], step_id=step_id)
+    assert result["ok"] is True
+    assert result["step_log_range"]["end_offset"] >= result["step_log_range"]["start_offset"]
+
+    next_step = db.add_step(job["job_id"], "next-step", status="running")
+    tail_end = db.append_log_chunk(job["job_id"], "next\n")
+    assert db.finish_step(next_step, "passed", exit_code=0, log_end_offset=body_end + 999999)
+    assert db.get_job_step(job["job_id"], next_step)["log_end_offset"] == tail_end
+
+
+def test_init_db_repairs_legacy_inverted_step_ranges(isolated_db):
+    job = _new_job()
+    step_id = db.add_step(job["job_id"], "legacy-failure", status="failed")
+    persisted_end = db.append_log_chunk(job["job_id"], "legacy output\n")
+    connection = db._get_db()
+    connection.execute(
+        "UPDATE ci_job_steps SET log_start_offset=117, log_end_offset=0 WHERE id=?",
+        (step_id,),
+    )
+    connection.commit()
+
+    db.init_db()
+
+    repaired = db.get_job_step(job["job_id"], step_id)
+    assert repaired["log_start_offset"] == 117
+    assert repaired["log_end_offset"] == max(117, persisted_end)
+
+
+@pytest.mark.asyncio
 async def test_step_range_clips_one_stored_chunk_at_both_boundaries(get_mcp):
     job = _new_job()
     step_id = db.add_step(job["job_id"], "clipped", status="failed")

@@ -1,7 +1,9 @@
 import json
 import os
 import shlex
+import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -142,6 +144,39 @@ def test_operator_workspace_allowlist_is_authoritative(tmp_path):
     assert [(item["path"], item["stack"]) for item in result["workspaces"]] == [
         (".", "go")
     ]
+
+
+def test_xyzl_regression_groups_parent_build_contexts_and_ignores_modes(tmp_path):
+    fixture = Path(__file__).parent / "fixtures" / "xyzl-regression"
+    source = tmp_path / "xyzl"
+    shutil.copytree(fixture, source)
+
+    before = discover_workspaces(str(source))
+    assert [(item["path"], item["stack"]) for item in before["workspaces"]] == [
+        ("app", "dotnet"),
+        ("app", "gradle"),
+        ("app/AiService", "gradle"),
+        ("bed-admin-backend", "maven"),
+        ("bed-admin-frontend", "node"),
+        ("isup-server", "maven"),
+    ]
+    assert not any(
+        item["path"] in {
+            "app/AiServiceNet", "app/AiServiceNet.Tests", "app/ServerBuild",
+            "app/ServerBuild.Tests", "app/app", "app/opencv",
+        }
+        for item in before["workspaces"]
+    )
+
+    for path in (
+        source / "app" / "XYZL.DotNet.sln",
+        source / "app" / "app" / "build.gradle.kts",
+        source / "app" / "opencv" / "build.gradle",
+    ):
+        path.chmod(path.stat().st_mode ^ 0o111)
+
+    after = discover_workspaces(str(source))
+    assert after == before
 
 
 @pytest.mark.parametrize(
