@@ -8,6 +8,28 @@ from types import SimpleNamespace
 from private_ci_agent.podman import PodmanRunner, ROOTLESS_OUTBOUND_NETWORK
 
 
+def test_same_source_steps_get_distinct_container_names(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_run(command, **_kwargs):
+        captured.append(command)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", fake_run)
+    runner = PodmanRunner("podman")
+    runner.run_command(
+        "docker.io/library/gradle:9.7.0-jdk21-jammy", "job-123", str(tmp_path), {},
+        "true", 30, container_discriminator="dotnet:app:restore",
+    )
+    runner.run_command(
+        "docker.io/library/gradle:9.7.0-jdk21-jammy", "job-123", str(tmp_path), {},
+        "true", 30, container_discriminator="gradle:app:dependencies",
+    )
+
+    names = [command[command.index("--name") + 1] for command in captured]
+    assert names[0] != names[1]
+
+
 def test_rootless_command_does_not_use_env_host_or_forward_tokens(monkeypatch, tmp_path):
     captured = []
 

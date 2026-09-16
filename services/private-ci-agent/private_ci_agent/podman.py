@@ -546,9 +546,15 @@ class PodmanRunner:
         cancel_event: threading.Event | None = None,
         source_read_only: bool = False,
         playwright_cache_writable: bool = False,
+        container_discriminator: str = "",
     ) -> dict:
         """Run one command with explicit network and proxy boundaries."""
-        container_name = self._container_name(job_id, source_dir)
+        # A repo-auto plan may intentionally run multiple stacks from the same
+        # source directory (for example app/.NET and app/Gradle) concurrently.
+        # The source path alone is therefore not a unique container identity.
+        # Include the stable step label so proxy probes and the real containers
+        # cannot race on one Podman name.
+        container_name = self._container_name(job_id, source_dir, container_discriminator)
         cache_mounts, go_cache = self._cache_mounts(
             cache_dirs, playwright_cache_writable=playwright_cache_writable
         )
@@ -630,8 +636,11 @@ class PodmanRunner:
 
         return self._run_process(cmd, container_name, timeout_seconds, cancel_event)
 
-    def _container_name(self, job_id: str, source_dir: str = "") -> str:
-        suffix = hashlib.sha1(str(source_dir).encode()).hexdigest()[:6] if source_dir else "main"
+    def _container_name(self, job_id: str, source_dir: str = "", discriminator: str = "") -> str:
+        material = str(source_dir)
+        if discriminator:
+            material = f"{material}\0{discriminator}"
+        suffix = hashlib.sha1(material.encode()).hexdigest()[:6] if source_dir else "main"
         return f"{self.container_namespace}-{job_id[:12]}-{suffix}"
 
     def _job_container_prefix(self, job_id: str) -> str:
