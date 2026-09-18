@@ -12,6 +12,7 @@
 **/*.sqlite
 **/*.sqlite-*
 **/*.log
+.reasonix/
 
 # Local environments and build outputs
 **/.venv/
