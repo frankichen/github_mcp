@@ -92,8 +92,9 @@ def register_dx_tools(
         description=(
             "Explicitly adopt a freshly verified forward-only externally advanced branch into drifted "
             "Workspace/Development Session control-plane state. reviewed_scope_expansion_paths_json must "
-            "exactly equal server-computed changed paths outside the declared scope; accepted paths are "
-            "appended atomically. Never moves Git refs or writes repository files."
+            "exactly equal server-computed changed paths outside the declared scope (no missing, extra, "
+            "duplicate, or unsafe paths); accepted paths are appended atomically. Never moves Git refs "
+            "or writes repository files."
         ),
         annotations=_ORCHESTRATION,
     )

@@ -1,6 +1,6 @@
 # MyGithut12 Drifted Workspace / Development Session Recovery
 
-版本：12.7.1  
+版本：12.9.18
 状态：正式 MCP contract  
 工具：`recover_drifted_development_task`
 
@@ -30,6 +30,16 @@ Recovery 的唯一语义是：**把已经存在并重新验真的当前 GitHub b
 
 可选：`lease_seconds`，默认 7200，仍受现有最大 Lease 限制。
 
+可选：`reviewed_scope_expansion_paths_json`，类型为 `string`，默认值为 `"[]"`。
+
+当 old Session HEAD 到 current branch HEAD 的 rename-aware changed paths 中存在 Workspace 声明 scope 之外的路径时，调用方必须先 review 服务端返回的 `required_scope_expansion_paths`，再原样提交该 JSON 数组。服务端会在 recovery transaction 前重新根据 exact Git state 计算 required 集合，并要求：
+
+```text
+sorted(reviewed_paths) == sorted(required_scope_expansion_paths)
+```
+
+不能只提交 subset，也不能提交 superset、unrelated path 或 duplicate path。全部 changed paths 已在 scope 内时，`"[]"` 保持向后兼容。
+
 调用方不能只提供 Workspace ID 无条件恢复；所有关键身份必须由 fresh GitHub 事实和 CAS 共同证明。
 
 ## 3. Fail-stop 门禁
@@ -42,7 +52,7 @@ Recovery 的唯一语义是：**把已经存在并重新验真的当前 GitHub b
 4. 再次 fresh-read GitHub：actual branch HEAD、Tree、base branch HEAD 分别等于 expected identity。
 5. 旧 Session HEAD 必须是 current branch HEAD 的 ancestor，且 compare 必须是纯 forward-only（ahead > 0、behind = 0、merge-base = old Session HEAD）。
 6. old Session HEAD 对应 Tree 必须仍等于 Session 保存的旧 Tree；无法证明 ancestry、force-push、rollback、rewrite、unrelated history 全部返回 `RECOVERY_ANCESTRY_MISMATCH`。
-7. old Session HEAD → current HEAD 的全部 changed paths 必须属于 Workspace 声明 scope；否则 `RECOVERY_SCOPE_VIOLATION`。
+7. old Session HEAD → current HEAD 的 rename-aware changed paths 必须通过 Workspace scope gate。scope 外路径必须由 `reviewed_scope_expansion_paths_json` 精确覆盖；缺失、多余、重复、malformed JSON、非法 path 或 rename identity 不一致均返回 `RECOVERY_SCOPE_VIOLATION` 或稳定输入错误，不得放宽 scope gate。
    - scope path 不含 glob magic 时保持既有兼容语义：`path == declaration` 或位于该 declaration 目录前缀下；
    - scope path 含 `*`、`**`、`?`、`[]` 时按大小写敏感的 repository-relative glob 匹配；
    - `filename` 与 rename 的 `previous_filename` 必须使用同一个 matcher；
@@ -57,6 +67,7 @@ Recovery 的唯一语义是：**把已经存在并重新验真的当前 GitHub b
 
 Workspace：
 
+- 将 exact reviewed scope expansion paths 原子追加到原 scope，不能由 caller 任意决定 scope；
 - `head_sha = current HEAD`
 - `tree_sha = current Tree`
 - `status = active`
@@ -128,7 +139,7 @@ Development Session：
 7. force-push / rewrite / rollback → FAIL
 8. branch deleted → FAIL
 9. base HEAD changed → FAIL
-10. changed path 超 Workspace scope → FAIL
+10. changed path 超 Workspace scope 且未 exact review → `RECOVERY_SCOPE_VIOLATION`
 11. wrong repository → FAIL
 12. wrong branch → FAIL
 13. closed Workspace → FAIL
@@ -149,5 +160,11 @@ Development Session：
 28. 多个 glob declaration 可覆盖同一 recovery 的不同合法模块
 29. rename 的 previous path 越界仍返回 `RECOVERY_SCOPE_VIOLATION`
 30. empty scope 或 matcher 异常均 fail closed
+31. scope 外路径 exact review 后原子追加并成功恢复
+32. missing reviewed path → `RECOVERY_SCOPE_VIOLATION`
+33. extra/unrelated reviewed path → `RECOVERY_SCOPE_VIOLATION`
+34. duplicate reviewed path、malformed JSON、非数组或非法 path → fail closed
+35. rename 的 previous/current path 必须按既有 rename-aware 规则共同核对
+36. scope append、Workspace update 或 Session update 任一注入失败 → 全部事务回滚
 
 此外必须回归现有 expired/resume/renew/write fail-stop、DX2 stale-safe recovery、refresh drift detection、HEAD/Workspace/Session CAS 和 scope isolation。
