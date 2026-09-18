@@ -95,6 +95,7 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert recovery_schema["properties"]["reviewed_scope_expansion_paths_json"]["default"] == "[]"
     assert recovery_schema["properties"]["reviewed_scope_expansion_paths_json"]["type"] == "string"
     assert "exactly equal" in tools["recover_drifted_development_task"].description
+    assert "no missing, extra, duplicate, or unsafe paths" in tools["recover_drifted_development_task"].description
     base_sync_schema = tools["recover_base_synced_development_task"].inputSchema
     assert {
         "repository", "branch", "workspace_id", "development_session_id",
@@ -207,7 +208,7 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.9.17"
+    assert manifest["service_version"] == "12.9.18"
     assert manifest["executable_mode_write"] == {
         **mygithub10.capabilities("a" * 40)["executable_mode_write_semantics"],
         "supported": True,
