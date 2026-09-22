@@ -9,7 +9,6 @@ import subprocess
 import time
 import json
 import logging
-import secrets
 import fcntl
 
 from app.deployment_service import init_deployment_db, _get_deploy_db
@@ -20,6 +19,11 @@ SCRIPT = "scripts/deploy_gongshi_test.sh"
 SECRET_RE = re.compile(r"(?i)(token|authorization|password|secret|database_url|cookie|private_key)=\S+")
 STATUS_PATH = os.environ.get("DEPLOY_STATUS_FILE", "/var/lib/private-ci/gongshi-test-status.json")
 logger = logging.getLogger("private-deploy-agent")
+HANDOFF_OWNER = "private-deploy-agent"
+
+
+def _lease_seconds():
+    return max(10, int(os.environ.get("DEPLOYMENT_CLAIM_LEASE_SECONDS", "45")))
 
 
 def redact(value: str) -> str:
@@ -88,11 +92,15 @@ def process_once() -> bool:
     row = db.execute("SELECT * FROM deployments WHERE deployment_id=? AND status='queued'", (rows[0]["deployment_id"],)).fetchone()
     if not row: return False
     dep_id = row["deployment_id"]
-    lease_token = secrets.token_urlsafe(24)
+    now = time.time()
+    prior_log = row["log_text"] or ""
+    log_text = (prior_log + ("\n" if prior_log else "") + f"agent claimed deployment {dep_id}; execution delegated to WSL")[-200000:]
     claimed = db.execute(
-        "UPDATE deployments SET status='claimed',current_step='claimed',started_at=?,updated_at=?,lease_token=? "
+        """UPDATE deployments SET status='claimed',current_step='claimed',started_at=?,updated_at=?,
+           claim_owner=?,claim_started_at=?,heartbeat_at=?,lease_expires_at=?,claim_generation=claim_generation+1,
+           claim_token_hash=NULL,lease_token=NULL,log_revision=log_revision+1,log_text=?,state_revision=state_revision+1 """
         "WHERE deployment_id=? AND status='queued'",
-        (time.time(), time.time(), lease_token, dep_id),
+        (now, now, HANDOFF_OWNER, now, now, now + _lease_seconds(), log_text, dep_id),
     )
     db.commit()
     if claimed.rowcount != 1:
@@ -104,24 +112,29 @@ def process_once() -> bool:
     # successful symlink switch and health check.
     write_status("busy", "claimed", retained_release, retained_previous, f"claimed deployment {dep_id}")
     if row["artifact_id"] and os.environ.get("MYGITHUB10_ARTIFACT_DEPLOY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}:
+        now = time.time()
+        db.execute(
+            """UPDATE deployments SET status='running',current_step='artifact_deploying',claim_token_hash='local-execution',
+               heartbeat_at=?,lease_expires_at=?,updated_at=?,state_revision=state_revision+1 WHERE deployment_id=?""",
+            (now, now + max(_lease_seconds(), 3600), now, dep_id),
+        )
         return _process_artifact(db, row, retained_release, retained_previous)
     if row["artifact_id"]:
         db.execute("UPDATE deployments SET status='failed',current_step='artifact_feature_disabled',error_code='FEATURE_DISABLED',error_message='artifact deployment is disabled',exit_code=1,finished_at=?,updated_at=? WHERE deployment_id=?", (time.time(), time.time(), dep_id)); db.commit()
         write_status("online", "idle", retained_release, retained_previous, f"artifact deployment disabled for {dep_id}")
         return True
     if os.environ.get("DEPLOY_EXECUTION_MODE") == "claim_only":
-        prior_log = row["log_text"] or ""
-        log_text = (prior_log + ("\n" if prior_log else "") + f"agent claimed deployment {dep_id}; execution delegated to WSL")[-200000:]
-        db.execute(
-            "UPDATE deployments SET status='running',current_step='claimed',updated_at=?,log_revision=log_revision+1,log_text=? WHERE deployment_id=?",
-            (time.time(), log_text, dep_id),
-        )
-        db.commit()
         logger.info("claim-only mode: deployment_id=%s delegated to WSL", dep_id)
         write_status("online", "polling", retained_release, retained_previous, f"deployment {dep_id} delegated to WSL")
         return True
     argv = ["bash", os.path.join(WORKSPACE, SCRIPT), "--yes", "--with-frontend", "--expected-sha", row["commit_sha"]]
     try:
+        now = time.time()
+        db.execute(
+            """UPDATE deployments SET status='running',heartbeat_at=?,lease_expires_at=?,updated_at=?,
+               state_revision=state_revision+1 WHERE deployment_id=? AND claim_owner=?""",
+            (now, now + _lease_seconds(), now, dep_id, HANDOFF_OWNER),
+        )
         deploy_env = os.environ.copy()
         date_shim_dir = deploy_env.get("DEPLOY_DATE_SHIM_DIR")
         if date_shim_dir:
@@ -133,7 +146,12 @@ def process_once() -> bool:
             output.append(safe_line)
             lowered = safe_line.lower()
             step = "verifying" if "health" in lowered or "verification" in lowered else "uploading" if "upload" in lowered or "incoming" in lowered else "building" if "build" in lowered or "npm" in lowered or "go test" in lowered else "preparing"
-            db.execute("UPDATE deployments SET current_step=?,log_text=? WHERE deployment_id=?", (step, "".join(output)[-200000:], dep_id))
+            now = time.time()
+            db.execute(
+                """UPDATE deployments SET current_step=?,log_text=?,heartbeat_at=?,lease_expires_at=?,updated_at=?,
+                   state_revision=state_revision+1 WHERE deployment_id=? AND claim_owner=?""",
+                (step, "".join(output)[-200000:], now, now + _lease_seconds(), now, dep_id, HANDOFF_OWNER),
+            )
             db.commit()
             write_status("busy", step, retained_release, retained_previous, f"deployment {dep_id} {step}")
         proc.wait()

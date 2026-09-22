@@ -1,4 +1,5 @@
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -128,8 +129,8 @@ def test_delegated_deployments_default_lists_all_deployable_repositories(monkeyp
     deployment_service.init_deployment_db()
     db = deployment_service._get_deploy_db()
     db.execute(
-        "INSERT INTO deployments(deployment_id,repository,environment,commit_sha,private_ci_job_id,requested_scope,target_release,status,current_step,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        ("dep_auto", "frankichen/auto_gupiao", "auto-gupiao-test", "d" * 40, "not_required", "reports", "rel", "running", "claimed", 1, 1),
+        "INSERT INTO deployments(deployment_id,repository,environment,commit_sha,private_ci_job_id,requested_scope,target_release,status,current_step,created_at,updated_at,claim_owner,claim_token_hash,heartbeat_at,lease_expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("dep_auto", "frankichen/auto_gupiao", "auto-gupiao-test", "d" * 40, "not_required", "reports", "rel", "running", "claimed", 1, 1, "executor-a", "hash", time.time(), time.time() + 60),
     )
     db.commit()
 

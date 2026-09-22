@@ -994,6 +994,20 @@ async def cancel_test_deployment(deployment_id: str) -> str:
     except Exception as e: return _deployment_tool_error(e)
 
 
+async def reconcile_stale_test_deployment(deployment_id: str) -> str:
+    try:
+        from app import deployment_service
+        return json.dumps(await _github_call(deployment_service.reconcile_stale_test_deployment, deployment_id), ensure_ascii=False)
+    except Exception as e: return _deployment_tool_error(e)
+
+
+async def get_test_deployment_audit(deployment_id: str, limit: int = 100) -> str:
+    try:
+        from app import deployment_service
+        return json.dumps(await _github_call(deployment_service.get_test_deployment_audit, deployment_id, limit), ensure_ascii=False)
+    except Exception as e: return _deployment_tool_error(e)
+
+
 @mcp.tool(name="get_test_environment_status", description="Get redacted fixed-contract test environment and health summary; never returns env values or credentials.")
 async def get_test_environment_status(repository: str, environment: str) -> str:
     try:
@@ -1975,6 +1989,14 @@ mcp.tool(
     name="read_mcp_response_resource",
     description="Read one bounded UTF-8 chunk from an oversized MCP response resource with SHA and continuation metadata.",
 )(read_mcp_response_resource)
+mcp.tool(
+    name="reconcile_stale_test_deployment",
+    description="Reconcile one stale test deployment from server-side lease and verified release evidence. The caller cannot choose the terminal status or supply release facts.",
+)(reconcile_stale_test_deployment)
+mcp.tool(
+    name="get_test_deployment_audit",
+    description="Read bounded stale-claim, claim ownership, cancellation, and reconciliation audit events for one deployment.",
+)(get_test_deployment_audit)
 
 # MyGithut12 high-level Web AI write surface. Register these after the frozen
 # MyGithub10 compatibility manifest so old tool ordering/schema remains stable.

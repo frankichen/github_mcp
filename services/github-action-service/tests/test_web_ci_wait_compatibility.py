@@ -120,9 +120,9 @@ async def test_capabilities_report_wait_deprecation_and_schema_visibility(monkey
     production = json.loads(await get_mygithub_capabilities())
     deprecated = {item["name"]: item for item in production["deprecated_tools"]}
 
-    assert production["tool_count"] == 165
-    assert production["tool_manifest_count"] == 165
-    assert production["compatibility_tool_count"] == 176
+    assert production["tool_count"] == 167
+    assert production["tool_manifest_count"] == 167
+    assert production["compatibility_tool_count"] == 178
     assert production["hidden_deprecated_tool_count"] == 11
     assert "wait_private_ci_job" in production["hidden_deprecated_tools"]
     assert deprecated["wait_private_ci_job"] == {
@@ -142,9 +142,9 @@ async def test_capabilities_report_wait_deprecation_and_schema_visibility(monkey
     monkeypatch.setenv("MYGITHUB12_EXPOSE_DEPRECATED_TOOLS", "true")
     compatibility = json.loads(await get_mygithub_capabilities())
 
-    assert compatibility["tool_count"] == 176
-    assert compatibility["tool_manifest_count"] == 176
-    assert compatibility["compatibility_tool_count"] == 176
+    assert compatibility["tool_count"] == 178
+    assert compatibility["tool_manifest_count"] == 178
+    assert compatibility["compatibility_tool_count"] == 178
     assert compatibility["hidden_deprecated_tool_count"] == 0
     assert "wait_private_ci_job" not in compatibility["hidden_deprecated_tools"]
     assert compatibility["tool_schema_sha256"] != production_schema_sha
@@ -162,8 +162,8 @@ async def test_static_manifests_keep_wait_as_hidden_compatibility_tool(monkeypat
 
     assert legacy_wait["description"] == registered["wait_private_ci_job"].description
     assert "compatibility-only" in legacy_wait["description"]
-    assert canonical["tool_count"] == 165
-    assert canonical["compatibility_tool_count"] == 176
+    assert canonical["tool_count"] == 167
+    assert canonical["compatibility_tool_count"] == 178
     assert "wait_private_ci_job" in canonical["hidden_deprecated_tools"]
 
 

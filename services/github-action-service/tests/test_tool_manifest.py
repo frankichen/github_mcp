@@ -9,8 +9,8 @@ from app.mcp_server import get_mygithub_capabilities, mcp
 from app.version import SERVICE_VERSION
 
 
-EXPECTED_REGISTERED_TOOL_COUNT = 176
-EXPECTED_CANONICAL_TOOL_COUNT = 165
+EXPECTED_REGISTERED_TOOL_COUNT = 178
+EXPECTED_CANONICAL_TOOL_COUNT = 167
 DX1_TOOLS = [
     "prepare_development_task",
     "resume_development_task",
@@ -56,6 +56,7 @@ MYGITHUB12_BASE_TOOLS = {
     "analyze_repository_patch_from_ref",
     "get_affected_tests", "detect_repository_contract_changes",
     "read_mcp_response_resource",
+    "reconcile_stale_test_deployment", "get_test_deployment_audit",
 }
 HIDDEN_DEPRECATED_TOOLS = {
     "get_github_file", "commit_github_files", "get_test_deployment_logs",
@@ -77,7 +78,7 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert all(name and name.strip() == name for name in actual_names)
     tools = {tool.name: tool for tool in actual}
     assert MYGITHUB12_BASE_TOOLS <= set(actual_names)
-    assert len(MYGITHUB12_BASE_TOOLS) == 40
+    assert len(MYGITHUB12_BASE_TOOLS) == 42
     assert actual_names[-16:-12] == HIGH_LEVEL_PUT_TOOLS
     assert actual_names[-12:-3] == DX1_TOOLS
     assert actual_names[-3:] == INFRASTRUCTURE_DEPLOY_TOOLS
@@ -208,7 +209,7 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.9.18"
+    assert manifest["service_version"] == "12.9.19"
     assert manifest["executable_mode_write"] == {
         **mygithub10.capabilities("a" * 40)["executable_mode_write_semantics"],
         "supported": True,
@@ -216,7 +217,7 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     }
     assert manifest["manifest_format"] == "composed-v2"
     assert manifest["legacy_tool_count"] == 120
-    assert manifest["new_tool_count"] == 56
+    assert manifest["new_tool_count"] == 58
     assert manifest["tool_count"] == EXPECTED_CANONICAL_TOOL_COUNT
     assert manifest["compatibility_tool_count"] == EXPECTED_REGISTERED_TOOL_COUNT
     assert set(manifest["hidden_deprecated_tools"]) == HIDDEN_DEPRECATED_TOOLS

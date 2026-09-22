@@ -7,7 +7,15 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 
 from app.config import settings
-from app.deployment_service import append_deployment_log_batch, complete_test_deployment, fail_test_deployment, list_delegated_deployments, update_test_deployment_progress
+from app.deployment_service import (
+    append_deployment_log_batch,
+    claim_delegated_test_deployment,
+    complete_test_deployment,
+    fail_test_deployment,
+    heartbeat_test_deployment,
+    list_delegated_deployments,
+    update_test_deployment_progress,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/internal/deployments", tags=["Deployments"])
@@ -23,9 +31,37 @@ async def _authorize(request: Request) -> None:
 
 
 @router.get("/assigned")
-async def deployment_assigned(request: Request):
+async def deployment_assigned(request: Request, executor_id: str = ""):
     await _authorize(request)
-    return {"ok": True, "items": list_delegated_deployments()}
+    return {"ok": True, "items": list_delegated_deployments(executor_id=executor_id)}
+
+
+@router.post("/claim")
+async def deployment_claim(request: Request):
+    await _authorize(request)
+    body = await request.json()
+    result = claim_delegated_test_deployment(str(body.get("executor_id") or ""))
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error"))
+    return result
+
+
+def _claim_fields(body: dict) -> tuple[str, str, int]:
+    return (
+        str(body.get("claim_owner") or ""),
+        str(body.get("claim_token") or ""),
+        int(body.get("claim_generation") or 0),
+    )
+
+
+@router.post("/{deployment_id}/heartbeat")
+async def deployment_heartbeat(deployment_id: str, request: Request):
+    await _authorize(request)
+    body = await request.json()
+    result = heartbeat_test_deployment(deployment_id, *_claim_fields(body))
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error"))
+    return result
 
 
 @router.post("/{deployment_id}/progress")
@@ -38,6 +74,7 @@ async def deployment_progress(deployment_id: str, request: Request):
         str(body.get("message") or ""),
         body.get("status"),
         body.get("release") if isinstance(body.get("release"), dict) else None,
+        *_claim_fields(body),
     )
     if not result.get("ok"):
         raise HTTPException(status_code=404, detail=result.get("error"))
@@ -64,6 +101,7 @@ async def deployment_complete(deployment_id: str, request: Request):
         int(body.get("exit_code", 0)),
         str(body.get("message") or "deployment completed"),
         body.get("release") if isinstance(body.get("release"), dict) else None,
+        *_claim_fields(body),
     )
     if not result.get("ok"):
         raise HTTPException(status_code=409, detail=result.get("error"))
@@ -80,6 +118,7 @@ async def deployment_fail(deployment_id: str, request: Request):
         int(body.get("exit_code", 1)),
         str(body.get("error_code") or "DEPLOYMENT_FAILED"),
         str(body.get("error_message") or "deployment failed"),
+        *_claim_fields(body),
     )
     if not result.get("ok"):
         raise HTTPException(status_code=409, detail=result.get("error"))

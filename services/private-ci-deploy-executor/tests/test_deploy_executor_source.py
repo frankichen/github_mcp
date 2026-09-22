@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import requests
 import scripts.deploy_executor as executor
 
 
@@ -72,3 +73,34 @@ def test_prepare_workspace_fetch_failure_has_stable_code(monkeypatch, tmp_path):
         assert exc.code == "DEPLOY_SOURCE_FETCH_FAILED"
     else:
         raise AssertionError("fetch failure must stop deployment")
+
+
+def test_controller_timeout_does_not_exit_executor(monkeypatch):
+    monkeypatch.setattr(executor, "_key", lambda: "test-key")
+    monkeypatch.setattr(
+        executor.requests,
+        "post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(requests.ReadTimeout("timeout")),
+    )
+
+    assert executor.poll_once() is False
+
+
+def test_claim_poll_executes_only_returned_fenced_assignment(monkeypatch):
+    row = {
+        "deployment_id": "dep_test",
+        "claim_owner": "executor-a",
+        "claim_token": "opaque",
+        "claim_generation": 3,
+    }
+    response = SimpleNamespace(
+        raise_for_status=lambda: None,
+        json=lambda: {"ok": True, "deployment": row},
+    )
+    monkeypatch.setattr(executor, "_key", lambda: "test-key")
+    monkeypatch.setattr(executor.requests, "post", lambda *args, **kwargs: response)
+    executed = []
+    monkeypatch.setattr(executor, "execute", executed.append)
+
+    assert executor.poll_once() is True
+    assert executed == [row]

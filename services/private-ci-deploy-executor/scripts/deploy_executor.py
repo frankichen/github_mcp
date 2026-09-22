@@ -7,16 +7,18 @@ idempotent callbacks. It never accepts host, shell, or repository parameters
 from the queue.
 """
 
-import json
+import logging
 import os
 import re
-import signal
+import socket
 import subprocess
 import threading
 import time
 from pathlib import Path
 
 import requests
+
+logger = logging.getLogger("private-ci-deploy-executor")
 
 
 CONTROLLER_URL = os.environ.get("DEPLOY_CONTROLLER_URL", "http://127.0.0.1:8788").rstrip("/")
@@ -29,6 +31,9 @@ DEPLOY_WORKSPACES = os.path.join(DEPLOY_CACHE, "workspaces")
 EXPECTED_REPOSITORY = "frankichen/sxt"
 EXPECTED_ENVIRONMENT = "gongshi-test"
 TIMEOUT_SECONDS = int(os.environ.get("DEPLOY_TIMEOUT_SECONDS", "3600"))
+REQUEST_TIMEOUT_SECONDS = float(os.environ.get("DEPLOY_REQUEST_TIMEOUT_SECONDS", "8"))
+HEARTBEAT_SECONDS = max(5, int(os.environ.get("DEPLOY_HEARTBEAT_SECONDS", "15")))
+EXECUTOR_ID = os.environ.get("DEPLOY_EXECUTOR_ID", f"{socket.gethostname()}:private-ci-deploy-executor")
 SECRET_RE = re.compile(r"(?i)(token|authorization|password|secret|database_url|cookie|private_key)=\S+")
 
 
@@ -54,10 +59,7 @@ def prepare_workspace(row: dict) -> tuple[str, list[str]]:
     remote = _git("remote", "get-url", "origin", cwd=DEPLOY_MIRROR)
     if remote != AUTHORITATIVE_REPOSITORY_URL:
         raise DeploymentSourceError("DEPLOY_SOURCE_FETCH_FAILED", "deploy mirror origin is not authoritative")
-    try:
-        _git("remote", "update", "--prune", cwd=DEPLOY_MIRROR)
-    except DeploymentSourceError as exc:
-        raise DeploymentSourceError("DEPLOY_SOURCE_FETCH_FAILED", str(exc)) from exc
+    _git("remote", "update", "--prune", cwd=DEPLOY_MIRROR)
     mirror_sha = _git("rev-parse", "refs/heads/main", cwd=DEPLOY_MIRROR)
     if mirror_sha != expected:
         raise DeploymentSourceError("DEPLOY_MAIN_SHA_MISMATCH", f"mirror main={mirror_sha} expected={expected}")
@@ -69,12 +71,9 @@ def prepare_workspace(row: dict) -> tuple[str, list[str]]:
     if os.path.exists(workspace):
         raise DeploymentSourceError("DEPLOY_WORKSPACE_EXISTS", "deployment workspace already exists")
     os.makedirs(DEPLOY_WORKSPACES, exist_ok=True)
-    try:
-        _git("clone", "--no-local", "--branch", "main", DEPLOY_MIRROR, workspace)
-        _git("remote", "set-url", "origin", AUTHORITATIVE_REPOSITORY_URL, cwd=workspace)
-        _git("fetch", "--no-tags", "origin", "main", cwd=workspace)
-    except DeploymentSourceError:
-        raise
+    _git("clone", "--no-local", "--branch", "main", DEPLOY_MIRROR, workspace)
+    _git("remote", "set-url", "origin", AUTHORITATIVE_REPOSITORY_URL, cwd=workspace)
+    _git("fetch", "--no-tags", "origin", "main", cwd=workspace)
     origin_sha = _git("rev-parse", "refs/remotes/origin/main", cwd=workspace)
     if origin_sha != expected:
         raise DeploymentSourceError("DEPLOY_MAIN_SHA_MISMATCH", f"origin/main={origin_sha} expected={expected}")
@@ -101,21 +100,40 @@ def _redact(text: str) -> str:
     return SECRET_RE.sub(lambda match: match.group(1) + "=***", text)
 
 
-def _callback(path: str, payload: dict) -> None:
+def _claim_payload(row: dict) -> dict:
+    return {
+        "claim_owner": row["claim_owner"],
+        "claim_token": row["claim_token"],
+        "claim_generation": row["claim_generation"],
+    }
+
+
+def _callback(path: str, payload: dict, row: dict | None = None) -> dict:
+    if row is not None:
+        payload = {**payload, **_claim_payload(row)}
     headers = {"X-Deployment-Callback-Key": _key(), "Content-Type": "application/json"}
     last = None
     for delay in (0, 0.5, 1, 2, 4):
         if delay:
             time.sleep(delay)
         try:
-            response = requests.post(CONTROLLER_URL + path, headers=headers, json=payload, timeout=15)
+            response = requests.post(CONTROLLER_URL + path, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
             if response.status_code < 500:
                 response.raise_for_status()
-                return
+                return response.json()
             last = RuntimeError(f"callback HTTP {response.status_code}")
-        except Exception as exc:  # retry boundedly; never expose request headers
+        except (requests.RequestException, ValueError) as exc:  # retry boundedly; never expose request headers
             last = exc
     raise RuntimeError(f"deployment callback failed after retries: {type(last).__name__}")
+
+
+def _heartbeat_loop(row: dict, stop_event: threading.Event) -> None:
+    deployment_id = row["deployment_id"]
+    while not stop_event.wait(HEARTBEAT_SECONDS):
+        try:
+            _callback(f"/internal/deployments/{deployment_id}/heartbeat", {}, row)
+        except RuntimeError as exc:
+            logger.warning("deployment heartbeat failed deployment_id=%s error=%s", deployment_id, type(exc).__name__)
 
 
 def _step(line: str) -> str:
@@ -139,15 +157,21 @@ def execute(row: dict) -> None:
     deployment_id = row["deployment_id"]
     if row.get("repository") != EXPECTED_REPOSITORY or row.get("environment") != EXPECTED_ENVIRONMENT:
         return
-    _callback(f"/internal/deployments/{deployment_id}/progress", {"current_step": "preparing_workspace", "status": "running", "message": "WSL workspace preparation started"})
+    _callback(f"/internal/deployments/{deployment_id}/progress", {"current_step": "preparing_workspace", "status": "running", "message": "WSL workspace preparation started"}, row)
     output = []
     process = None
     workspace = None
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop, args=(row, heartbeat_stop),
+        name=f"deployment-heartbeat-{deployment_id}", daemon=True,
+    )
+    heartbeat_thread.start()
     try:
         workspace, source_lines = prepare_workspace(row)
         for line in source_lines:
             output.append(line)
-            _callback(f"/internal/deployments/{deployment_id}/progress", {"current_step": "validating_main", "status": "running", "message": line})
+            _callback(f"/internal/deployments/{deployment_id}/progress", {"current_step": "validating_main", "status": "running", "message": line}, row)
         script = os.path.join(workspace, "scripts", "deploy_gongshi_test.sh")
         if not os.path.isfile(script):
             raise DeploymentSourceError("DEPLOY_COMMIT_NOT_FOUND", "deployment script is missing from exact checkout")
@@ -173,22 +197,22 @@ def execute(row: dict) -> None:
         for raw in process.stdout:
             line = _redact(raw.rstrip())
             output.append(line)
-            _callback(f"/internal/deployments/{deployment_id}/progress", {"current_step": _step(line), "status": "running", "message": line})
+            _callback(f"/internal/deployments/{deployment_id}/progress", {"current_step": _step(line), "status": "running", "message": line}, row)
         process.wait()
         timer.cancel()
         if timed_out:
-            _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": 124, "error_code": "TIMEOUT", "error_message": "WSL deployment timed out"})
+            _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": 124, "error_code": "TIMEOUT", "error_message": "WSL deployment timed out"}, row)
             return
         text = "\n".join(output)
         if process.returncode != 0:
-            _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": process.returncode, "error_code": "DEPLOYMENT_FAILED", "error_message": "WSL deployment script failed"})
+            _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": process.returncode, "error_code": "DEPLOYMENT_FAILED", "error_message": "WSL deployment script failed"}, row)
             return
         release_match = re.search(r"^release_id=(\S+)$", text, re.MULTILINE)
         current_match = re.search(r"^current=(\S+)$", text, re.MULTILINE)
         release_id = release_match.group(1) if release_match else None
         release_path = current_match.group(1) if current_match else f"/home/dly/releases/{release_id}"
         if not release_id or not release_path or os.path.basename(release_path.rstrip("/")) != release_id:
-            _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": 1, "error_code": "RELEASE_EVIDENCE_INVALID", "error_message": "release id and current path do not match"})
+            _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": 1, "error_code": "RELEASE_EVIDENCE_INVALID", "error_message": "release id and current path do not match"}, row)
             return
         proof = {
             "release_id": release_id,
@@ -204,23 +228,43 @@ def execute(row: dict) -> None:
             "deployment_id": deployment_id,
             "status": "passed",
         }
-        _callback(f"/internal/deployments/{deployment_id}/complete", {"exit_code": 0, "message": "WSL deployment completed with verified manifest, checksum, services and health", "release": proof})
+        _callback(f"/internal/deployments/{deployment_id}/complete", {"exit_code": 0, "message": "WSL deployment completed with verified manifest, checksum, services and health", "release": proof}, row)
     except DeploymentSourceError as exc:
-        _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": 1, "error_code": exc.code, "error_message": str(exc)})
+        _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": 1, "error_code": exc.code, "error_message": str(exc)}, row)
     except subprocess.TimeoutExpired:
         if process:
             process.kill()
-        _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": 124, "error_code": "TIMEOUT", "error_message": "WSL deployment timed out"})
-    except Exception as exc:
-        _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": 1, "error_code": "WSL_EXECUTOR_ERROR", "error_message": type(exc).__name__})
+        _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": 124, "error_code": "TIMEOUT", "error_message": "WSL deployment timed out"}, row)
+    except Exception as exc:  # noqa: BLE001 - convert any local executor defect into a fenced failure callback
+        _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": 1, "error_code": "WSL_EXECUTOR_ERROR", "error_message": type(exc).__name__}, row)
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=HEARTBEAT_SECONDS + 1)
+
+
+def poll_once() -> bool:
+    try:
+        response = requests.post(
+            CONTROLLER_URL + "/internal/deployments/claim",
+            headers={"X-Deployment-Callback-Key": _key(), "Content-Type": "application/json"},
+            json={"executor_id": EXECUTOR_ID},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        row = response.json().get("deployment")
+    except requests.RequestException as exc:
+        logger.warning("deployment claim poll failed error=%s; retrying", type(exc).__name__)
+        return False
+    if not row:
+        return False
+    execute(row)
+    return True
 
 
 def main() -> None:
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
     while True:
-        response = requests.get(CONTROLLER_URL + "/internal/deployments/assigned", headers={"X-Deployment-Callback-Key": _key()}, timeout=15)
-        response.raise_for_status()
-        for row in response.json().get("items", []):
-            execute(row)
+        poll_once()
         time.sleep(2)
 
 

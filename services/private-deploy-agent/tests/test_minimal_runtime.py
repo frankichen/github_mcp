@@ -91,10 +91,13 @@ def test_process_once_claims_queued_sxt_and_delegates_to_wsl(tmp_path, monkeypat
     row = db.execute(
         "SELECT * FROM deployments WHERE deployment_id='dep-regression'"
     ).fetchone()
-    assert row["status"] == "running"
+    assert row["status"] == "claimed"
     assert row["current_step"] == "claimed"
     assert row["started_at"] is not None
-    assert row["lease_token"]
+    assert row["claim_owner"] == "private-deploy-agent"
+    assert row["heartbeat_at"] is not None
+    assert row["lease_expires_at"] > row["heartbeat_at"]
+    assert row["lease_token"] is None
     assert row["log_revision"] == 1
     assert "execution delegated to WSL" in row["log_text"]
     assert "token=" not in row["log_text"].lower()

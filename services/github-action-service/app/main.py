@@ -27,6 +27,7 @@ async def lifespan(app: FastAPI):
     validate_runtime_metadata()
     os.makedirs(os.path.dirname(settings.IDEMPOTENCY_DB_PATH), exist_ok=True)
     leader_lease_task = None
+    deployment_reaper_task = None
     try:
         from app.ci_database import init_db
         from app.deployment_service import init_deployment_db
@@ -98,6 +99,20 @@ async def lifespan(app: FastAPI):
                 maintain_leader_lease(),
                 name="runtime-leader-lease",
             )
+            async def maintain_deployment_claims() -> None:
+                from app.deployment_service import reconcile_stale_deployments
+                interval = max(10, int(os.environ.get("DEPLOYMENT_REAPER_INTERVAL_SECONDS", "60")))
+                while True:
+                    await asyncio.sleep(interval)
+                    try:
+                        result = await asyncio.to_thread(reconcile_stale_deployments)
+                        if result.get("reconciled"):
+                            logger.warning("Reconciled stale deployment claims: %s", result)
+                    except Exception:
+                        logger.exception("Deployment stale-claim reaper failed")
+            deployment_reaper_task = asyncio.create_task(
+                maintain_deployment_claims(), name="deployment-stale-claim-reaper"
+            )
     except Exception:
         logger.exception("Controller database initialization failed")
         raise
@@ -132,6 +147,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if deployment_reaper_task is not None:
+            deployment_reaper_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await deployment_reaper_task
         if leader_lease_task is not None:
             leader_lease_task.cancel()
             with suppress(asyncio.CancelledError):
