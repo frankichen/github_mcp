@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from typing import Any
 
@@ -215,6 +216,117 @@ def _fresh_base_sync_github_identity(
     )
 
 
+def _blob_identity_at_path(
+    repo: Any,
+    commit_sha: str,
+    path: str,
+    tree_cache: dict[str, dict[str, Any]],
+) -> dict[str, str] | None:
+    """Read one exact path identity by walking immutable non-recursive Git trees.
+
+    A missing entry is a proven absence. A failed or incomplete tree read is not
+    absence and must stop recovery because it cannot support a convergence proof.
+    """
+    try:
+        safe_path = mygithub12._safe_path(path)
+        commit = repo.get_commit(commit_sha)
+        if str(getattr(commit, "sha", "")) != commit_sha:
+            raise ValueError("commit identity mismatch")
+        tree_sha = mygithub12._tree_sha(commit)
+    except Exception as exc:
+        raise MyGithub12Error(
+            "RECOVERY_BLOB_IDENTITY_UNAVAILABLE",
+            "an exact commit/path identity could not be resolved for base convergence",
+            {"commit_sha": commit_sha, "path": path, "cause_type": type(exc).__name__},
+        ) from exc
+
+    parts = safe_path.split("/")
+    for index, part in enumerate(parts):
+        entries = tree_cache.get(tree_sha)
+        if entries is None:
+            try:
+                tree = repo.get_git_tree(tree_sha, recursive=False)
+                if tree is None or bool(getattr(tree, "truncated", False)):
+                    raise ValueError("tree missing or incomplete")
+                entries = {
+                    str(getattr(entry, "path", "")): entry
+                    for entry in (getattr(tree, "tree", []) or [])
+                    if getattr(entry, "path", None)
+                }
+                tree_cache[tree_sha] = entries
+            except Exception as exc:
+                raise MyGithub12Error(
+                    "RECOVERY_BLOB_IDENTITY_UNAVAILABLE",
+                    "an exact Git tree could not be read for base convergence",
+                    {
+                        "commit_sha": commit_sha,
+                        "path": path,
+                        "tree_sha": tree_sha,
+                        "cause_type": type(exc).__name__,
+                    },
+                ) from exc
+        entry = entries.get(part)
+        if entry is None:
+            return None
+        entry_type = str(getattr(entry, "type", ""))
+        entry_sha = str(getattr(entry, "sha", ""))
+        if index < len(parts) - 1:
+            if entry_type != "tree" or not re.fullmatch(r"[0-9a-f]{40}", entry_sha):
+                return None
+            tree_sha = entry_sha
+            continue
+        mode = str(getattr(entry, "mode", ""))
+        if (
+            entry_type != "blob"
+            or not re.fullmatch(r"[0-9a-f]{40}", entry_sha)
+            or mode not in {"100644", "100755", "120000"}
+        ):
+            return None
+        return {"blob_sha": entry_sha, "mode": mode}
+    return None
+
+
+def _base_absorbed_task_paths(
+    repo: Any,
+    new_base_sha: str,
+    old_session_head_sha: str,
+    current_head_sha: str,
+    removed_from_task_delta: list[str],
+    base_delta_paths: set[str],
+) -> list[dict[str, Any]]:
+    """Classify only old task paths whose exact nonempty result is in the new base."""
+    tree_cache: dict[str, dict[str, Any]] = {}
+    absorbed: list[dict[str, Any]] = []
+    for path in removed_from_task_delta:
+        # The old-base -> new-base compare must independently identify this path.
+        # A caller cannot claim convergence by supplying a path name alone.
+        if path not in base_delta_paths:
+            continue
+        old_task = _blob_identity_at_path(repo, old_session_head_sha, path, tree_cache)
+        new_base = _blob_identity_at_path(repo, new_base_sha, path, tree_cache)
+        current = _blob_identity_at_path(repo, current_head_sha, path, tree_cache)
+        # Absence is deliberately not a blob identity. Task deletions and
+        # rename/delete cases remain subject to the existing path/forward proof.
+        if not all((old_task, new_base, current)):
+            continue
+        same_task_result = (
+            old_task["blob_sha"] == new_base["blob_sha"] == current["blob_sha"]
+            and old_task["mode"] == new_base["mode"] == current["mode"]
+        )
+        if same_task_result:
+            absorbed.append({
+                "path": path,
+                "classification": "BASE_ABSORBED",
+                "old_task_blob": old_task["blob_sha"],
+                "new_base_blob": new_base["blob_sha"],
+                "current_blob": current["blob_sha"],
+                "old_task_mode": old_task["mode"],
+                "new_base_mode": new_base["mode"],
+                "current_mode": current["mode"],
+            })
+    return absorbed
+
+
 def _verify_base_sync_deltas(
     repo: Any,
     session: dict[str, Any],
@@ -294,6 +406,18 @@ def _verify_base_sync_deltas(
         )
     forward_paths = set(forward_task_delta_paths)
     base_paths = set(base_delta_paths)
+    removed_from_task_delta = sorted(set(old_task_delta_paths) - set(new_task_delta_paths))
+    absorbed_by_new_base: list[dict[str, Any]] = []
+    if old_task_ancestry["verified"]:
+        absorbed_by_new_base = _base_absorbed_task_paths(
+            repo,
+            new_base_sha,
+            old_session_head_sha,
+            current_head_sha,
+            removed_from_task_delta,
+            base_paths,
+        )
+    absorbed_paths = {item["path"] for item in absorbed_by_new_base}
     if ancestry_proof_mode == "same_base_branch_forward_dual":
         # A non-ancestor compare is merge-base-relative and may include paths
         # from the other side of the divergence. Keep it for rename-aware
@@ -313,7 +437,9 @@ def _verify_base_sync_deltas(
         # must still be explained by the verified H0 -> H1 comparison.
         authoritative_task_delta_paths = list(new_task_delta_paths)
         task_path_changes = sorted(set(old_task_delta_paths) ^ set(new_task_delta_paths))
-        unexplained_task_path_changes = sorted(set(task_path_changes) - set(forward_task_delta_paths))
+        unexplained_task_path_changes = sorted(
+            set(task_path_changes) - set(forward_task_delta_paths) - absorbed_paths
+        )
         if unexplained_task_path_changes:
             raise MyGithub12Error(
                 "RECOVERY_TASK_DIFF_MISMATCH",
@@ -322,6 +448,7 @@ def _verify_base_sync_deltas(
                     "old_task_delta_paths": old_task_delta_paths,
                     "new_task_delta_paths": new_task_delta_paths,
                     "forward_task_delta_paths": forward_task_delta_paths,
+                    "base_absorbed_task_paths": sorted(absorbed_paths),
                     "unexplained_task_path_changes": unexplained_task_path_changes,
                 },
             )
@@ -351,6 +478,10 @@ def _verify_base_sync_deltas(
         "excluded_unchanged_historical_cumulative_paths": excluded_unchanged_historical_cumulative_paths,
         "task_path_changes": task_path_changes,
         "unexplained_task_path_changes": unexplained_task_path_changes,
+        "task_path_convergence": {
+            "removed_from_task_delta": removed_from_task_delta,
+            "absorbed_by_new_base": absorbed_by_new_base,
+        },
         "historical_base_overlap_paths": historical_base_overlap,
         "current_base_overlap_paths": current_base_overlap,
         "base_task_overlap_paths": overlap,
@@ -753,6 +884,7 @@ def _atomic_recover_base_sync(
                 "excluded_unchanged_historical_cumulative_paths": verification["deltas"]["excluded_unchanged_historical_cumulative_paths"],
                 "task_path_changes": verification["deltas"]["task_path_changes"],
                 "unexplained_task_path_changes": verification["deltas"]["unexplained_task_path_changes"],
+                "task_path_convergence": verification["deltas"]["task_path_convergence"],
                 "outside_scope_paths": verification["scope"].get("outside_scope_paths", []),
                 "previous_scope": verification["scope"].get("previous_scope", {}),
                 "reviewed_scope_expansion_paths": verification["scope"].get("reviewed_scope_expansion_paths", []),

@@ -1,6 +1,8 @@
 # MCP 与 CI 部署服务
 
-MyGithut12 `12.9.19` 增加 `ACTIVE_WORKSPACE_STALE_SESSION_RECOVERY`：当原 Workspace 已 active/no-drift 且精确对应 GitHub HEAD/Tree、同一 Session 仍绑定旧 HEAD 时，`resume_development_task(recover_stale_session=true)` 可在 exact Workspace/Session CAS、forward-only ancestry、base lineage、scope review、Writer ownership 与 overlap 全部通过后，把当前 Workspace HEAD/Tree adoption 到原 Session。恢复不会创建或移动任何 Git 对象；事务清除旧 HEAD 的 CI、Attestation、failure-pack 和 Session Index 引用，审计记录 before/after 与验证证据，exact current-HEAD Index 可复用，否则会请求新 Index。Scope 外路径必须由 `reviewed_scope_expansion_paths_json` exact review，CAS 缺失、ancestry/base/overlap 不可证明时保持 fail-stop。
+MyGithut12 `12.9.20` 修复 base-sync recovery 对已被新 base 精确吸收的 Task delta path 的误拒绝：仅当 old base → new base、old Session HEAD → current HEAD、new base → current HEAD 的 ancestry 均成立，path 同时属于 old Task delta 与 base delta，且 old Task/new base/current HEAD 的 exact blob 与 mode 一致时，才分类为 `BASE_ABSORBED` 并从 unexplained path mismatch 中排除。成功审计记录每个吸收 path 的三方 blob identity；overlap exact-set review、scope expansion、ownership、Workspace/Session CAS 和旧 CI/Attestation 清理保持原门禁。
+
+此前版本 `12.9.19` 增加 `ACTIVE_WORKSPACE_STALE_SESSION_RECOVERY`：当原 Workspace 已 active/no-drift 且精确对应 GitHub HEAD/Tree、同一 Session 仍绑定旧 HEAD 时，`resume_development_task(recover_stale_session=true)` 可在 exact Workspace/Session CAS、forward-only ancestry、base lineage、scope review、Writer ownership 与 overlap 全部通过后，把当前 Workspace HEAD/Tree adoption 到原 Session。恢复不会创建或移动任何 Git 对象；事务清除旧 HEAD 的 CI、Attestation、failure-pack 和 Session Index 引用，审计记录 before/after 与验证证据，exact current-HEAD Index 可复用，否则会请求新 Index。Scope 外路径必须由 `reviewed_scope_expansion_paths_json` exact review，CAS 缺失、ancestry/base/overlap 不可证明时保持 fail-stop。
 
 此前版本 `12.9.18` 的 `recover_drifted_development_task` 仍要求 `status=drifted + drift_reason=branch_moved_externally`，其 reviewed scope expansion 必须与服务端根据 exact Git state 重算的全部 scope 外 changed paths 精确相等；缺失、多余、重复或不安全路径均 fail closed，合格路径与 Workspace/Session recovery 在同一 CAS 事务中原子提交。`apply_development_change_set` 的 executable-mode 写入继续在 exact HEAD、expected blob、Development Session、Workspace revision 与 Writer lease 全部门禁下提交纯 `100644 ↔ 100755` 变更，mode-only commit 保留原 blob identity，并在成功前 durable read-back branch、commit、tree、path blob 与真实 mode。统一 Git writer 对已有 regular file 的内容写入同时保留现有 mode，不再把 executable 脚本无条件降级为 `100644`；HEAD/BLOB/Workspace drift 或 revision mismatch 继续 fail closed。
 
@@ -44,6 +46,7 @@ private-deploy-agent（服务器端）
 - MyGithut12 开发设计：[`docs/MYGITHUB12开发设计.md`](docs/MYGITHUB12开发设计.md)
 - MyGithut12 开发清单：[`docs/MYGITHUB12开发清单.md`](docs/MYGITHUB12开发清单.md)
 - MyGithut12 验收清单：[`docs/MYGITHUB12验收清单.md`](docs/MYGITHUB12验收清单.md)
+- MyGithut12 Base-Synced Recovery：[`docs/MYGITHUB12_BASE_SYNC_RECOVERY.md`](docs/MYGITHUB12_BASE_SYNC_RECOVERY.md)
 - MyGithut12 DX-2 规划总览：[`docs/MYGITHUB12_DX2规划总览.md`](docs/MYGITHUB12_DX2规划总览.md)
 - MyGithut12 DX-2 需求与验收：[`docs/MYGITHUB12_DX2需求与验收标准.md`](docs/MYGITHUB12_DX2需求与验收标准.md)
 - MyGithut12 DX-2 开发清单：[`docs/MYGITHUB12_DX2开发清单.md`](docs/MYGITHUB12_DX2开发清单.md)
@@ -105,7 +108,7 @@ start_private_ci_job
 - `wait_private_ci_job` 是 compatibility-only legacy/debug 入口，不是 Web 推荐 continuation；canonical Web 客户端 **must not loop** long-poll wait 到 terminal。`converge_development_task` 的 `index_wait_seconds` / `wait_seconds` 也只是 compatibility-only accepted-but-ignored 参数，不建立 blocking wait contract。
 - 这里的 Web-safe 仅表示 bounded、durable、resumable；不声明 OpenAI 或 ChatGPT 产品存在固定 Web timeout SLA。
 
-MyGithut12 源码当前版本为 `12.9.19`；生产运行版本必须以 `get_mygithub_capabilities` 的实时结果为准。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。AI 日常生成 UTF-8 文本文件继续只有一个推荐入口 `put_generated_files`：普通内容使用 `files[{path,content}]`，超过 inline transport budget 时仍调用同一个工具，由 ChatGPT/Codex runtime 通过顶层 `bundle_file` 交付 version=1 的 JSON 文件包；服务端负责临时文件下载、JSON/UTF-8/路径/大小校验、Workspace/Session CAS、旧 blob 推断、hash、chunk staging、原子 Commit 和 durable read-back。bundle 下载只接受 `*.oaiusercontent.com` 或受限 OpenAI Azure Blob fileParam 投递域名的 HTTPS/443 临时 URL，并在首跳与每次 redirect 前重新校验域名 allowlist 和公网 DNS；窗口不管理 upload/chunk/offset/hash/candidate/expected_blob；V2 仍不支持二进制仓库文件和删除。
+MyGithut12 源码当前版本为 `12.9.20`；生产运行版本必须以 `get_mygithub_capabilities` 的实时结果为准。所有 Commit 类写入在返回成功前都必须完成 GitHub fresh read-back：目标 branch HEAD、新 Commit、Commit Tree 和 changed-path Blob 必须与本次写入严格一致；只有 durable verify 通过后才允许推进 Workspace CAS 与 `success_verified` 幂等状态。AI 日常生成 UTF-8 文本文件继续只有一个推荐入口 `put_generated_files`：普通内容使用 `files[{path,content}]`，超过 inline transport budget 时仍调用同一个工具，由 ChatGPT/Codex runtime 通过顶层 `bundle_file` 交付 version=1 的 JSON 文件包；服务端负责临时文件下载、JSON/UTF-8/路径/大小校验、Workspace/Session CAS、旧 blob 推断、hash、chunk staging、原子 Commit 和 durable read-back。bundle 下载只接受 `*.oaiusercontent.com` 或受限 OpenAI Azure Blob fileParam 投递域名的 HTTPS/443 临时 URL，并在首跳与每次 redirect 前重新校验域名 allowlist 和公网 DNS；窗口不管理 upload/chunk/offset/hash/candidate/expected_blob；V2 仍不支持二进制仓库文件和删除。
 
 DX-1 的 `apply_development_change_set` 对小 Candidate 保留 `change_set_json`，对大或 exact-byte-sensitive Candidate 使用 MCP runtime `change_set_file`；当 ChatGPT connector 对该字段未稳定注册 fileParam 时，可使用同工具内的 `bundle_file` 作为传输别名，服务端仍按 ChangeSet artifact 处理并返回 `payload_source=change_set_file`。服务端先校验下载原始 bytes 的长度、SHA-256 与可选 Git Blob SHA，再 strict UTF-8 decode、JSON parse 和 ChangeSet validation；不执行 CRLF、Unicode、BOM 或末尾换行规范化。raw strict dry-run 会持久化一个默认 30 分钟、Session/Workspace/HEAD/blob scope 绑定的 `prepared_change_set_id`，真实 write 使用该 ID 并重新执行全部 CAS，而不要求 AI 再传一次 Candidate。下载安全实现与 `put_generated_files(bundle_file)` 共享。
 
@@ -157,7 +160,7 @@ docker compose up -d --build
 
 ## MyGithut12 运行状态
 
-MyGithut12 `12.9.19` 的 compatibility registration 仍为 176 个工具，canonical production Schema 仍为 165 个可见工具，并隐藏 11 个 deprecated/compatibility-only 工具。新能力 `supports_active_workspace_stale_session_recovery=true` 经 `resume_development_task` 暴露；它只 adoption 原 Session 到 active/no-drift Workspace 的 exact current HEAD/Tree，保留原 Workspace、Session、branch 与 PR。旧 `recover_drifted_development_task` 合同继续要求 `drifted + branch_moved_externally`，scope review 仍按 exact changed-path set 验证。
+MyGithut12 `12.9.20` 的 compatibility registration 仍为 176 个工具，canonical production Schema 仍为 165 个可见工具，并隐藏 11 个 deprecated/compatibility-only 工具。`recover_base_synced_development_task` 现在将具备 exact ancestry、path-set 与 blob/mode 证明的 base-absorbed Task path 记录为 `BASE_ABSORBED`；生产工具数与参数 Schema 不变。`supports_active_workspace_stale_session_recovery=true` 经 `resume_development_task` 暴露；它只 adoption 原 Session 到 active/no-drift Workspace 的 exact current HEAD/Tree，保留原 Workspace、Session、branch 与 PR。旧 `recover_drifted_development_task` 合同继续要求 `drifted + branch_moved_externally`，scope review 仍按 exact changed-path set 验证。
 
 ## Historical MyGithut12 运行状态（12.9.17 及之前）
 
