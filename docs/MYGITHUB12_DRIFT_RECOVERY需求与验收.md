@@ -1,6 +1,6 @@
 # MyGithut12 Drifted Workspace / Development Session Recovery
 
-版本：12.9.18
+版本：12.9.19
 状态：正式 MCP contract  
 工具：`recover_drifted_development_task`
 
@@ -168,3 +168,11 @@ Development Session：
 36. scope append、Workspace update 或 Session update 任一注入失败 → 全部事务回滚
 
 此外必须回归现有 expired/resume/renew/write fail-stop、DX2 stale-safe recovery、refresh drift detection、HEAD/Workspace/Session CAS 和 scope isolation。
+
+## 10. ACTIVE_WORKSPACE_STALE_SESSION_RECOVERY
+
+当 canonical Workspace 已 `active + drift_reason=null`，其 HEAD/Tree 已精确等于 fresh GitHub branch identity，但同一 canonical Development Session 仍指向更旧 HEAD 且 `session.workspace_revision < workspace.revision` 时，`resume_development_task(recover_stale_session=true)` 支持原地 adoption。MCP 输入增加可选 `reviewed_scope_expansion_paths_json`；Scope 外变更必须由调用方显式 review，且集合与服务端 rename-aware 重算结果 exact equality。
+
+本恢复要求 repository、branch、Workspace、Session、owner 与 pinned base 一致；Session 未 closed/finalized；Workspace lease 有效；Workspace 与 Session revision CAS 精确；旧 Session HEAD Tree 与持久记录一致；GitHub compare 证明 `merge_base=old_session_head`、`ahead_by>0`、`behind_by=0`；当前 HEAD/Tree 与 Workspace 一致；没有第二 canonical Session/Workspace/Writer 或 high-overlap Workspace。任何 branch rewrite、divergence、base change、unsafe overlap、未 review scope expansion 或 revision mismatch 均 fail-stop。
+
+成功时只更新原 Session 的 HEAD/Tree、Workspace revision、active 状态与 Session revision，并清空旧 fast/full CI、Attestation、failure-pack 与 Session Index 引用。Workspace 内容不变时不 bump Workspace revision；精确审查 scope expansion 时在同一事务中扩展原 Workspace scope 并 bump Workspace revision。随后复用 exact current-HEAD Index，或请求新 Index。Session event 与 metadata audit 记录 before/after、workspace、GitHub、ancestry、scope、overlap、证据失效状态和 idempotency identity；审计中不保存 Secret/Token。重复请求不重复推进 revision。Git branch、commit、Tree、PR、Workspace ID 和 Session ID 均保持原身份。

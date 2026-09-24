@@ -18,8 +18,16 @@ from app import mygithub12_workspace as workspace_scope
 
 MyGithub12Error = mygithub12.MyGithub12Error
 _ALLOWED_SESSION_STATES = frozenset({"active", "blocked", "drifted", "pr_ready"})
+_ACTIVE_STALE_SESSION_STATES = frozenset(sessions.ACTIVE_STATES | {"validation_failed"})
+_TERMINAL_SESSION_STATES = frozenset(sessions.TERMINAL_STATES)
 _COMPARE_FILE_LIMIT = 300
 _EXACT_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
+
+
+def _recovery_record_key(recovery_kind: str) -> str:
+    if recovery_kind == "active_workspace_stale_session":
+        return "last_active_workspace_stale_session_recovery"
+    return "last_manual_branch_recovery"
 
 
 def _base_identity_mode(
@@ -69,8 +77,9 @@ def _request_identity(
     expected_base_sha: str,
     lease_seconds: int,
     reviewed_scope_expansion_paths: list[str] | None = None,
+    recovery_kind: str = "manual_branch_recovery",
 ) -> dict[str, Any]:
-    return {
+    request = {
         "repository": repository,
         "branch": branch,
         "workspace_id": workspace_id,
@@ -84,6 +93,10 @@ def _request_identity(
         "lease_seconds": int(lease_seconds),
         "reviewed_scope_expansion_paths": sorted(reviewed_scope_expansion_paths or []),
     }
+    # Keep historical drift idempotency payloads compatible across upgrades.
+    if recovery_kind != "manual_branch_recovery":
+        request["recovery_kind"] = recovery_kind
+    return request
 
 
 def _replay_result(
@@ -93,7 +106,8 @@ def _replay_result(
     idempotency_key: str,
 ) -> dict[str, Any] | None:
     metadata = session.get("metadata") if isinstance(session.get("metadata"), dict) else {}
-    record = metadata.get("last_manual_branch_recovery") if isinstance(metadata, dict) else None
+    recovery_kind = str(request.get("recovery_kind") or "manual_branch_recovery")
+    record = metadata.get(_recovery_record_key(recovery_kind)) if isinstance(metadata, dict) else None
     if not isinstance(record, dict) or record.get("idempotency_key") != idempotency_key:
         return None
     if record.get("request") != request:
@@ -309,7 +323,7 @@ def _verify_ownership(service: Any, workspace: dict[str, Any]) -> dict[str, Any]
     if not any(item.get("workspace_id") == workspace_id for item in candidates):
         raise MyGithub12Error(
             "RECOVERY_BRANCH_OWNERSHIP_CONFLICT",
-            "target drifted Workspace is no longer the branch owner",
+            "target Workspace is no longer the branch owner",
             {"workspace_id": workspace_id, "repository": repository, "branch": branch},
         )
     conflicts = [
@@ -324,11 +338,23 @@ def _verify_ownership(service: Any, workspace: dict[str, Any]) -> dict[str, Any]
             {"workspace_id": workspace_id, "conflicting_workspace_ids": [item.get("workspace_id") for item in conflicts]},
         )
     overlap = mygithub12.workspace_overlap(service, workspace_id)
+    if not isinstance(overlap, dict) or overlap.get("ok") is False or not isinstance(overlap.get("items"), list):
+        raise MyGithub12Error(
+            "RECOVERY_WORKSPACE_OVERLAP_UNAVAILABLE",
+            "Workspace overlap could not be verified for control-plane recovery",
+            {"workspace_id": workspace_id},
+        )
+    if overlap.get("comparison_verified") is False:
+        raise MyGithub12Error(
+            "RECOVERY_WORKSPACE_OVERLAP_UNAVAILABLE",
+            "one or more active Workspace change comparisons could not be verified",
+            {"workspace_id": workspace_id, "overlap": overlap},
+        )
     high = [item for item in (overlap.get("items") or []) if item.get("level") == "high"]
     if high:
         raise MyGithub12Error(
             "RECOVERY_WORKSPACE_OVERLAP",
-            "high-overlap active Workspace blocks drift recovery",
+            "high-overlap active Workspace blocks control-plane recovery",
             {"workspace_id": workspace_id, "overlap": high},
         )
     return {"verified": True, "workspace_id": workspace_id, "overlap": overlap}
@@ -352,6 +378,9 @@ def _atomic_recover(
     current_tree = request["expected_current_tree_sha"]
     base_branch = request["expected_base_branch"]
     base_sha = request["expected_base_sha"]
+    recovery_kind = str(request.get("recovery_kind") or "manual_branch_recovery")
+    active_workspace_stale_session = recovery_kind == "active_workspace_stale_session"
+    record_key = _recovery_record_key(recovery_kind)
     now = sessions._now()
     lease_expires_at = now + max(60, min(int(request["lease_seconds"]), mygithub12.MAX_LEASE_SECONDS))
     try:
@@ -369,7 +398,7 @@ def _atomic_recover(
                     {"workspace_base_sha": workspace_row["base_commit_sha"], "session_base_sha": session_row["base_commit_sha"], "expected_base_sha": base_sha},
                 )
             metadata = json.loads(session_row["metadata_json"] or "{}")
-            record = metadata.get("last_manual_branch_recovery") if isinstance(metadata, dict) else None
+            record = metadata.get(record_key) if isinstance(metadata, dict) else None
             if isinstance(record, dict) and record.get("idempotency_key") == idempotency_key:
                 if record.get("request") != request:
                     raise MyGithub12Error("IDEMPOTENCY_CONFLICT", "manual branch recovery idempotency key payload changed")
@@ -416,18 +445,36 @@ def _atomic_recover(
                 raise MyGithub12Error("DEVELOPMENT_SESSION_REVISION_MISMATCH", "development session revision changed before drift recovery")
             if workspace_row["status"] == "closed":
                 raise MyGithub12Error("WORKSPACE_CLOSED", "closed Workspace cannot be recovered")
-            if workspace_row["status"] != "drifted" or workspace_row["drift_reason"] != "branch_moved_externally":
-                raise MyGithub12Error(
-                    "RECOVERY_DRIFT_REASON_UNSUPPORTED",
-                    "only branch_moved_externally drift can be recovered",
-                    {"status": workspace_row["status"], "drift_reason": workspace_row["drift_reason"]},
-                )
-            if session_row["status"] not in _ALLOWED_SESSION_STATES:
-                raise MyGithub12Error(
-                    "DEVELOPMENT_SESSION_STATE_INVALID",
-                    "development session state does not permit manual drift recovery",
-                    {"status": session_row["status"]},
-                )
+            if active_workspace_stale_session:
+                if session_row["status"] in _TERMINAL_SESSION_STATES or session_row["closed_at"] is not None:
+                    raise MyGithub12Error("DEVELOPMENT_SESSION_CLOSED", "closed Development Session cannot be recovered")
+                if workspace_row["status"] != "active" or workspace_row["drift_reason"] is not None:
+                    raise MyGithub12Error(
+                        "ACTIVE_WORKSPACE_RECOVERY_STATE_INVALID",
+                        "active Workspace stale-Session recovery requires active/no-drift Workspace state",
+                        {"status": workspace_row["status"], "drift_reason": workspace_row["drift_reason"]},
+                    )
+                if session_row["status"] not in _ACTIVE_STALE_SESSION_STATES:
+                    raise MyGithub12Error(
+                        "DEVELOPMENT_SESSION_STATE_INVALID",
+                        "Development Session state does not permit active Workspace stale-Session recovery",
+                        {"status": session_row["status"]},
+                    )
+                if float(workspace_row["lease_expires_at"] or 0) <= now:
+                    raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED", "active Workspace lease is expired")
+            else:
+                if workspace_row["status"] != "drifted" or workspace_row["drift_reason"] != "branch_moved_externally":
+                    raise MyGithub12Error(
+                        "RECOVERY_DRIFT_REASON_UNSUPPORTED",
+                        "only branch_moved_externally drift can be recovered",
+                        {"status": workspace_row["status"], "drift_reason": workspace_row["drift_reason"]},
+                    )
+                if session_row["status"] not in _ALLOWED_SESSION_STATES:
+                    raise MyGithub12Error(
+                        "DEVELOPMENT_SESSION_STATE_INVALID",
+                        "development session state does not permit manual drift recovery",
+                        {"status": session_row["status"]},
+                    )
             identity_ok = (
                 workspace_row["repository"] == repository
                 and workspace_row["branch"] == branch
@@ -436,10 +483,34 @@ def _atomic_recover(
                 and session_row["workspace_id"] == workspace_id
                 and session_row["repository"] == repository
                 and session_row["branch"] == branch
+                and workspace_row["owner"] == session_row["owner"]
             )
             if not identity_ok:
                 raise MyGithub12Error("RECOVERY_IDENTITY_MISMATCH", "Workspace/Session identity changed before drift recovery")
             base_identity_mode = _base_identity_mode(dict(workspace_row), dict(session_row), base_branch, base_sha)
+            if active_workspace_stale_session:
+                stale_session_identity = (
+                    int(session_row["workspace_revision"]) < int(workspace_row["revision"])
+                    and session_row["head_commit_sha"] != current_head
+                    and workspace_row["head_sha"] == current_head
+                    and workspace_row["tree_sha"] == current_tree
+                    and session_row["base_branch"] == base_branch
+                    and workspace_row["base_branch"] == base_branch
+                    and session_row["base_commit_sha"] == base_sha
+                    and workspace_row["base_commit_sha"] == base_sha
+                )
+                if not stale_session_identity:
+                    raise MyGithub12Error(
+                        "RECOVERY_IDENTITY_MISMATCH",
+                        "active Workspace and stale Development Session do not form the required forward-adoption identity",
+                        {
+                            "workspace_revision": int(workspace_row["revision"]),
+                            "session_workspace_revision": int(session_row["workspace_revision"]),
+                            "workspace_head": workspace_row["head_sha"],
+                            "session_head": session_row["head_commit_sha"],
+                            "current_head": current_head,
+                        },
+                    )
             other = db.execute(
                 """SELECT workspace_id FROM workspaces WHERE repository=? AND branch=? AND workspace_id<>?
                 AND (status='drifted' OR (status='active' AND lease_expires_at>?)) LIMIT 1""",
@@ -452,6 +523,8 @@ def _atomic_recover(
                     {"conflicting_workspace_id": other["workspace_id"]},
                 )
             _fresh_github_identity(service, repository, branch, current_head, current_tree, base_branch, base_sha)
+            if active_workspace_stale_session:
+                verification["ownership"] = _verify_ownership(service, dict(workspace_row))
             before = {
                 "workspace_revision": int(workspace_row["revision"]),
                 "session_revision": int(session_row["session_revision"]),
@@ -464,9 +537,19 @@ def _atomic_recover(
                 "drift_reason": workspace_row["drift_reason"],
                 "workspace_base_branch": workspace_row["base_branch"],
                 "session_base_branch": session_row["base_branch"],
+                "session_workspace_revision": int(session_row["workspace_revision"]),
+                "workspace_owner": workspace_row["owner"],
+                "session_owner": session_row["owner"],
             }
+            current_scope = json.loads(workspace_row["scope_json"] or "{}")
+            scope_changed = verification["scope"]["resulting_scope"] != current_scope
+            if active_workspace_stale_session:
+                after_workspace_revision = int(workspace_row["revision"]) + int(scope_changed)
+                lease_expires_at = float(workspace_row["lease_expires_at"])
+            else:
+                after_workspace_revision = int(workspace_row["revision"]) + 1
             after = {
-                "workspace_revision": int(workspace_row["revision"]) + 1,
+                "workspace_revision": after_workspace_revision,
                 "session_revision": int(session_row["session_revision"]) + 1,
                 "head_sha": current_head,
                 "tree_sha": current_tree,
@@ -503,35 +586,106 @@ def _atomic_recover(
                 "ownership": verification["ownership"],
                 "idempotency_identity": hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest(),
             }
-            metadata["last_manual_branch_recovery"] = {
+            if active_workspace_stale_session:
+                audit.update({
+                    "recovery_kind": "active_workspace_stale_session",
+                    "before": {
+                        "session_revision": before["session_revision"],
+                        "session_head": before["session_head_sha"],
+                        "session_tree": before["session_tree_sha"],
+                        "session_workspace_revision": before["session_workspace_revision"],
+                        "session_status": before["session_status"],
+                    },
+                    "workspace": {
+                        "workspace_revision": before["workspace_revision"],
+                        "workspace_head": before["workspace_head_sha"],
+                        "workspace_tree": before["workspace_tree_sha"],
+                        "workspace_status": before["workspace_status"],
+                        "drift_reason": before["drift_reason"],
+                    },
+                    "github": {
+                        "repository": repository,
+                        "branch": branch,
+                        "current_head": current_head,
+                        "current_tree": current_tree,
+                        "base_branch": base_branch,
+                        "base_sha": base_sha,
+                    },
+                    "scope": {
+                        "declared_paths": verification["scope"]["declared_paths"],
+                        "changed_paths": verification["scope"]["changed_paths"],
+                        "outside_scope_paths": verification["scope"]["outside_scope_paths"],
+                        "reviewed_scope_expansion_paths": verification["scope"]["reviewed_scope_expansion_paths"],
+                        "reviewed_expansion_paths": verification["scope"]["reviewed_scope_expansion_paths"],
+                        "verified": verification["scope"]["verified"],
+                    },
+                    "overlap": verification["ownership"].get("overlap"),
+                    "after": {
+                        "session_revision": after["session_revision"],
+                        "session_head": current_head,
+                        "session_tree": current_tree,
+                        "session_workspace_revision": after["workspace_revision"],
+                        "session_status": "active",
+                        "workspace_revision": after["workspace_revision"],
+                        "workspace_head": workspace_row["head_sha"],
+                        "workspace_tree": workspace_row["tree_sha"],
+                        "workspace_status": "active",
+                        "drift_reason": None,
+                    },
+                    "stale_evidence_cleared": True,
+                })
+            metadata[record_key] = {
                 "idempotency_key": idempotency_key,
                 "request": request,
                 "before": before,
                 "after": after,
                 "audit": audit,
             }
-            ws_update = db.execute(
-                """UPDATE workspaces SET base_branch=?,head_sha=?,tree_sha=?,scope_json=?,status='active',drift_reason=NULL,lease_expires_at=?,
-                index_commit_sha=NULL,revision=revision+1,updated_at=?
-                WHERE workspace_id=? AND revision=? AND status='drifted' AND drift_reason='branch_moved_externally'""",
-                (
-                    base_branch,
-                    current_head,
-                    current_tree,
-                    json.dumps(after["scope"], ensure_ascii=False, separators=(",", ":")),
-                    lease_expires_at,
-                    now,
-                    workspace_id,
-                    expected_workspace_revision,
-                ),
-            )
+            if active_workspace_stale_session:
+                ws_update = db.execute(
+                    """UPDATE workspaces
+                    SET scope_json=?,revision=revision+?,updated_at=CASE WHEN ?=1 THEN ? ELSE updated_at END
+                    WHERE workspace_id=? AND repository=? AND branch=? AND revision=? AND status='active'
+                      AND drift_reason IS NULL AND head_sha=? AND tree_sha=? AND lease_expires_at>?""",
+                    (
+                        json.dumps(after["scope"], ensure_ascii=False, separators=(",", ":")),
+                        int(scope_changed),
+                        int(scope_changed),
+                        now,
+                        workspace_id,
+                        repository,
+                        branch,
+                        expected_workspace_revision,
+                        current_head,
+                        current_tree,
+                        now,
+                    ),
+                )
+            else:
+                ws_update = db.execute(
+                    """UPDATE workspaces SET base_branch=?,head_sha=?,tree_sha=?,scope_json=?,status='active',drift_reason=NULL,lease_expires_at=?,
+                    index_commit_sha=NULL,revision=revision+1,updated_at=?
+                    WHERE workspace_id=? AND revision=? AND status='drifted' AND drift_reason='branch_moved_externally'""",
+                    (
+                        base_branch,
+                        current_head,
+                        current_tree,
+                        json.dumps(after["scope"], ensure_ascii=False, separators=(",", ":")),
+                        lease_expires_at,
+                        now,
+                        workspace_id,
+                        expected_workspace_revision,
+                    ),
+                )
             if ws_update.rowcount != 1:
                 raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH", "Workspace changed while applying drift recovery")
             session_update = db.execute(
                 """UPDATE development_sessions SET base_branch=?,status='active',head_commit_sha=?,tree_sha=?,workspace_revision=?,
                 lease_expires_at=?,index_commit_sha=NULL,last_fast_ci_job_id=NULL,last_full_ci_job_id=NULL,
                 last_attestation_id=NULL,last_failure_resource_uri=NULL,metadata_json=?,session_revision=session_revision+1,updated_at=?
-                WHERE session_id=? AND session_revision=?""",
+                WHERE session_id=? AND session_revision=?
+                  AND EXISTS (SELECT 1 FROM workspaces WHERE workspace_id=? AND revision=? AND status='active'
+                    AND drift_reason IS NULL AND head_sha=? AND tree_sha=?)""",
                 (
                     base_branch,
                     current_head,
@@ -542,6 +696,10 @@ def _atomic_recover(
                     now,
                     session_id,
                     expected_session_revision,
+                    workspace_id,
+                    after["workspace_revision"],
+                    current_head,
+                    current_tree,
                 ),
             )
             if session_update.rowcount != 1:
@@ -550,7 +708,7 @@ def _atomic_recover(
             sessions._append_event(
                 db,
                 updated_row,
-                "manual_branch_recovery",
+                "active_workspace_stale_session_recovery" if active_workspace_stale_session else "manual_branch_recovery",
                 session_row["status"],
                 "active",
                 after["session_revision"],
@@ -745,4 +903,222 @@ def recover_drifted_task(
         "index": index,
         "index_required": index["index_required"],
         "writer_ready": index["ready"],
+    }
+
+
+def recover_active_workspace_stale_session(
+    service: Any,
+    repository: str,
+    branch: str,
+    workspace_id: str,
+    development_session_id: str,
+    expected_workspace_revision: int,
+    expected_session_revision: int,
+    expected_current_head_sha: str,
+    expected_current_tree_sha: str,
+    expected_base_branch: str,
+    expected_base_sha: str,
+    idempotency_key: str,
+    lease_seconds: int = mygithub12.DEFAULT_LEASE_SECONDS,
+    reviewed_scope_expansion_paths_json: str = "[]",
+) -> dict[str, Any]:
+    """Adopt a verified active Workspace identity into its stale Session."""
+    if not repository or "/" not in repository or not branch:
+        raise MyGithub12Error("SEARCH_QUERY_INVALID", "repository and branch are required")
+    if not workspace_id or not development_session_id or not idempotency_key:
+        raise MyGithub12Error("SEARCH_QUERY_INVALID", "workspace_id, development_session_id and idempotency_key are required")
+    if int(expected_workspace_revision) <= 0 or int(expected_session_revision) <= 0:
+        raise MyGithub12Error("SEARCH_QUERY_INVALID", "positive expected Workspace/Session revisions are required")
+    if not expected_current_head_sha or not expected_current_tree_sha or not expected_base_branch or not expected_base_sha:
+        raise MyGithub12Error("SEARCH_QUERY_INVALID", "exact current HEAD/Tree and base identity are required")
+    reviewed_scope_expansion_paths = _parse_reviewed_scope_expansion_paths(reviewed_scope_expansion_paths_json)
+    workspace = mygithub12.get_workspace(service, workspace_id)
+    session = sessions.get_session(development_session_id)
+    identity = (
+        workspace.get("repository") == repository
+        and workspace.get("branch") == branch
+        and session.get("workspace_id") == workspace_id
+        and session.get("repository") == repository
+        and session.get("branch") == branch
+        and workspace.get("owner") == session.get("owner")
+    )
+    if not identity:
+        raise MyGithub12Error(
+            "RECOVERY_IDENTITY_MISMATCH",
+            "Workspace and Development Session are not the same canonical Writer",
+            {"workspace_id": workspace_id, "development_session_id": development_session_id},
+        )
+    request = _request_identity(
+        repository,
+        branch,
+        workspace_id,
+        development_session_id,
+        expected_workspace_revision,
+        expected_session_revision,
+        expected_current_head_sha,
+        expected_current_tree_sha,
+        expected_base_branch,
+        expected_base_sha,
+        lease_seconds,
+        reviewed_scope_expansion_paths,
+        recovery_kind="active_workspace_stale_session",
+    )
+    replay = _replay_result(session, workspace, request, idempotency_key)
+    if replay:
+        _fresh_github_identity(
+            service,
+            repository,
+            branch,
+            expected_current_head_sha,
+            expected_current_tree_sha,
+            expected_base_branch,
+            expected_base_sha,
+        )
+        _verify_ownership(service, workspace)
+        index = _index_state(
+            service,
+            repository,
+            expected_current_head_sha,
+            expected_current_tree_sha,
+            str((replay.get("before") or {}).get("session_head_sha") or expected_current_head_sha),
+            development_session_id,
+        )
+        return {
+            "ok": True,
+            "control_plane_recovery": "CONTROL_PLANE_RECOVERY_SUCCESS",
+            "recovery_kind": "active_workspace_stale_session",
+            "replayed": True,
+            "workspace": workspace,
+            "development_session": session,
+            "before": replay.get("before"),
+            "after": replay.get("after"),
+            "audit": replay.get("audit"),
+            "index": index,
+            "index_required": index["index_required"],
+            "writer_ready": index["ready"],
+            "git_ref_changed": False,
+        }
+    if workspace.get("status") == "closed":
+        raise MyGithub12Error("WORKSPACE_CLOSED", "closed Workspace cannot be recovered")
+    if workspace.get("status") != "active" or workspace.get("drift_reason") is not None:
+        raise MyGithub12Error(
+            "ACTIVE_WORKSPACE_RECOVERY_STATE_INVALID",
+            "active Workspace stale-Session recovery requires active/no-drift Workspace state",
+            {"status": workspace.get("status"), "drift_reason": workspace.get("drift_reason")},
+        )
+    if session.get("status") in _TERMINAL_SESSION_STATES or session.get("closed_at") is not None:
+        raise MyGithub12Error("DEVELOPMENT_SESSION_CLOSED", "closed Development Session cannot be recovered")
+    if session.get("status") not in _ACTIVE_STALE_SESSION_STATES:
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_STATE_INVALID",
+            "Development Session state does not permit active Workspace stale-Session recovery",
+            {"status": session.get("status")},
+        )
+    if int(workspace.get("revision") or 0) != int(expected_workspace_revision):
+        raise MyGithub12Error(
+            "WORKSPACE_REVISION_MISMATCH",
+            "Workspace revision changed before active Workspace stale-Session recovery",
+            {"expected": int(expected_workspace_revision), "actual": int(workspace.get("revision") or 0)},
+        )
+    if int(session.get("session_revision") or 0) != int(expected_session_revision):
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_REVISION_MISMATCH",
+            "Development Session revision changed before active Workspace stale-Session recovery",
+            {"expected": int(expected_session_revision), "actual": int(session.get("session_revision") or 0)},
+        )
+    if not workspace.get("lease_valid"):
+        raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED", "active Workspace lease is expired")
+    if (
+        workspace.get("head_sha") != expected_current_head_sha
+        or workspace.get("tree_sha") != expected_current_tree_sha
+    ):
+        raise MyGithub12Error(
+            "RECOVERY_IDENTITY_MISMATCH",
+            "active Workspace does not carry the expected current branch HEAD/Tree",
+            {"workspace_head": workspace.get("head_sha"), "workspace_tree": workspace.get("tree_sha")},
+        )
+    if (
+        workspace.get("base_branch") != expected_base_branch
+        or session.get("base_branch") != expected_base_branch
+        or workspace.get("base_commit_sha") != expected_base_sha
+        or session.get("base_commit_sha") != expected_base_sha
+    ):
+        raise MyGithub12Error(
+            "RECOVERY_BASE_CHANGED",
+            "active Workspace stale-Session recovery requires the exact pinned base branch and SHA",
+            {
+                "workspace_base_branch": workspace.get("base_branch"),
+                "session_base_branch": session.get("base_branch"),
+                "workspace_base_sha": workspace.get("base_commit_sha"),
+                "session_base_sha": session.get("base_commit_sha"),
+                "expected_base_branch": expected_base_branch,
+                "expected_base_sha": expected_base_sha,
+            },
+        )
+    if (
+        int(session.get("workspace_revision") or 0) >= int(workspace.get("revision") or 0)
+        or session.get("head_commit_sha") == expected_current_head_sha
+    ):
+        raise MyGithub12Error(
+            "RECOVERY_IDENTITY_MISMATCH",
+            "Development Session is not stale behind the active Workspace identity",
+            {
+                "workspace_revision": workspace.get("revision"),
+                "session_workspace_revision": session.get("workspace_revision"),
+                "workspace_head": workspace.get("head_sha"),
+                "session_head": session.get("head_commit_sha"),
+            },
+        )
+    with sessions._db() as db:
+        nonterminal = db.execute(
+            """SELECT session_id FROM development_sessions WHERE workspace_id=?
+            AND status NOT IN (?,?,?,?) ORDER BY updated_at DESC LIMIT 2""",
+            (workspace_id, *sorted(_TERMINAL_SESSION_STATES)),
+        ).fetchall()
+    if len(nonterminal) != 1 or nonterminal[0]["session_id"] != development_session_id:
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH",
+            "Workspace must have exactly one non-closed canonical Development Session",
+            {"workspace_id": workspace_id, "development_session_ids": [row["session_id"] for row in nonterminal]},
+        )
+
+    repo, github_identity = _fresh_github_identity(
+        service,
+        repository,
+        branch,
+        expected_current_head_sha,
+        expected_current_tree_sha,
+        expected_base_branch,
+        expected_base_sha,
+    )
+    ancestry, changed_paths = _verify_forward_only(repo, session, expected_current_head_sha)
+    scope = _verify_scope(workspace, changed_paths, reviewed_scope_expansion_paths)
+    ownership = _verify_ownership(service, workspace)
+    verification = {"github": github_identity, "ancestry": ancestry, "scope": scope, "ownership": ownership}
+    recovered = _atomic_recover(service, request=request, idempotency_key=idempotency_key, verification=verification)
+    recovered_workspace = mygithub12.get_workspace(service, workspace_id)
+    recovered_session = sessions.get_session(development_session_id)
+    index = _index_state(
+        service,
+        repository,
+        expected_current_head_sha,
+        expected_current_tree_sha,
+        str((recovered.get("before") or {}).get("session_head_sha") or session["head_commit_sha"]),
+        development_session_id,
+    )
+    return {
+        "ok": True,
+        "control_plane_recovery": "CONTROL_PLANE_RECOVERY_SUCCESS",
+        "recovery_kind": "active_workspace_stale_session",
+        "replayed": bool(recovered.get("replayed")),
+        "workspace": recovered_workspace,
+        "development_session": recovered_session,
+        "before": recovered.get("before"),
+        "after": recovered.get("after"),
+        "audit": recovered.get("audit"),
+        "verification": verification,
+        "index": index,
+        "index_required": index["index_required"],
+        "writer_ready": index["ready"],
+        "git_ref_changed": False,
     }

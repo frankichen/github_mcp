@@ -89,6 +89,7 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert resume_schema["recover_stale_session"]["default"] is True
     assert resume_schema["renew_lease"]["default"] is False
     assert resume_schema["lease_seconds"]["default"] == 7200
+    assert resume_schema["reviewed_scope_expansion_paths_json"]["default"] == "[]"
     recovery_schema = tools["recover_drifted_development_task"].inputSchema
     assert {"repository", "branch", "workspace_id", "development_session_id", "expected_workspace_revision", "expected_session_revision", "expected_current_head_sha", "expected_current_tree_sha", "expected_base_branch", "expected_base_sha", "idempotency_key"} <= set(recovery_schema["required"])
     assert recovery_schema["properties"]["lease_seconds"]["default"] == 7200
@@ -208,7 +209,7 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.9.18"
+    assert manifest["service_version"] == "12.9.19"
     assert manifest["executable_mode_write"] == {
         **mygithub10.capabilities("a" * 40)["executable_mode_write_semantics"],
         "supported": True,
@@ -220,6 +221,22 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     assert manifest["tool_count"] == EXPECTED_CANONICAL_TOOL_COUNT
     assert manifest["compatibility_tool_count"] == EXPECTED_REGISTERED_TOOL_COUNT
     assert set(manifest["hidden_deprecated_tools"]) == HIDDEN_DEPRECATED_TOOLS
+    capability_contract = mygithub10.capabilities("a" * 40)
+    assert capability_contract["supports_active_workspace_stale_session_recovery"] is True
+    assert "active_workspace_stale_session" in capability_contract["development_recovery_kinds"]
+    assert manifest["development_recovery"] == {
+        "supports_active_workspace_stale_session_recovery": True,
+        "recovery_kind": "active_workspace_stale_session",
+        "entrypoint": "resume_development_task",
+        "guards": [
+            "active_workspace_no_drift_exact_github_head_tree",
+            "forward_only_ancestry_and_exact_base_lineage",
+            "exact_workspace_session_revision_cas",
+            "exact_scope_expansion_review_and_workspace_overlap",
+            "single_canonical_writer_and_session",
+            "clear_old_head_ci_attestation_failure_index_evidence",
+        ],
+    }
     assert manifest["schema_identity_algorithm"] == "sha256-canonical-mcp-tools-v1"
     assert manifest["new_tools"][-16:-12] == HIGH_LEVEL_PUT_TOOLS
     assert manifest["new_tools"][-12:-3] == DX1_TOOLS

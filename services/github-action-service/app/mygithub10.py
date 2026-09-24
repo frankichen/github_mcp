@@ -1410,6 +1410,13 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_drifted_development_recovery": True,
         "supports_base_synced_development_recovery": True,
         "supports_retargeted_development_recovery": True,
+        "supports_active_workspace_stale_session_recovery": True,
+        "development_recovery_kinds": [
+            "drifted_workspace",
+            "base_synced_workspace",
+            "retargeted_workspace",
+            "active_workspace_stale_session",
+        ],
         "supports_local_git_mirror_reads": True,
         "supports_context_pack_v2": True,
         "supports_fast_feedback_ci": True,

@@ -20,6 +20,7 @@ from app import attestation_registry, ci_request_store, github_utils, mygithub12
 from app import mygithub12_workspace
 from app import development_convergence_store as convergence_store
 from app import development_managed_merge as managed_merge
+from app import development_drift_recovery as drift_recovery
 from app import development_retarget_recovery as retarget_recovery
 from app.github_policy import repository_is_allowed
 from app.ci_repository_config import is_private_ci_enabled, is_test_deploy_enabled, is_self_deploy_enabled
@@ -1868,6 +1869,7 @@ def resume_task(
     expected_session_revision: int = 0,
     lease_seconds: int = mygithub12.DEFAULT_LEASE_SECONDS,
     idempotency_key: str = "",
+    reviewed_scope_expansion_paths_json: str = "[]",
 ) -> dict[str, Any]:
     """Resume branch/PR development context without changing GitHub refs."""
     if not repository or "/" not in repository:
@@ -1974,8 +1976,95 @@ def resume_task(
             session and stale and persisted_branch_drift
             and session.get("status") in TRANSIENT_VALIDATION_STATUSES
         )
+        active_workspace_stale_session = bool(
+            session
+            and stale
+            and not branch_drift
+            and workspace.get("status") == "active"
+            and workspace.get("drift_reason") is None
+            and session.get("head_commit_sha") != workspace.get("head_sha")
+        )
         if session and stale and not branch_drift:
-            if recover_stale_session and drifted_validation_candidate:
+            if active_workspace_stale_session:
+                recovery_classification = "ACTIVE_WORKSPACE_STALE_SESSION"
+                recovery_identity = {
+                    "workspace_id": workspace.get("workspace_id"),
+                    "development_session_id": session.get("session_id"),
+                    "expected_workspace_revision": workspace.get("revision"),
+                    "expected_session_revision": session.get("session_revision"),
+                    "expected_current_head_sha": workspace.get("head_sha"),
+                    "expected_current_tree_sha": workspace.get("tree_sha"),
+                }
+                if not recover_stale_session:
+                    recovery = {
+                        "action": "resume_development_task",
+                        "recovery_required": True,
+                        "recovery_classification": recovery_classification,
+                        "recovery_blocker": "RECOVERY_NOT_REQUESTED",
+                        **recovery_identity,
+                    }
+                    blockers.append("DEVELOPMENT_SESSION_RECOVERY_REQUIRED")
+                elif int(expected_workspace_revision or 0) <= 0 or int(expected_session_revision or 0) <= 0:
+                    recovery = {
+                        "action": "resume_development_task",
+                        "recovery_required": True,
+                        "recovery_classification": recovery_classification,
+                        "recovery_blocker": "RECOVERY_CAS_REQUIRED",
+                        "required_inputs": ["expected_workspace_revision", "expected_session_revision"],
+                        **recovery_identity,
+                    }
+                    blockers.append("DEVELOPMENT_SESSION_RECOVERY_REQUIRED")
+                else:
+                    try:
+                        live_base = _resolve_recovery_base(
+                            service, repository, workspace, session, pr, current_main,
+                        )
+                        recovery_idempotency_key = idempotency_key or (
+                            f"resume-active-workspace-stale-session:{session['session_id']}:"
+                            f"{session['session_revision']}:{workspace['revision']}:{branch_head}"
+                        )
+                        active_recovery = drift_recovery.recover_active_workspace_stale_session(
+                            service=service,
+                            repository=repository,
+                            branch=effective_branch,
+                            workspace_id=str(workspace["workspace_id"]),
+                            development_session_id=str(session["session_id"]),
+                            expected_workspace_revision=int(expected_workspace_revision),
+                            expected_session_revision=int(expected_session_revision),
+                            expected_current_head_sha=branch_head,
+                            expected_current_tree_sha=branch_tree,
+                            expected_base_branch=str(live_base["branch"]),
+                            expected_base_sha=str(live_base["commit_sha"]),
+                            idempotency_key=recovery_idempotency_key,
+                            lease_seconds=lease_seconds,
+                            reviewed_scope_expansion_paths_json=reviewed_scope_expansion_paths_json,
+                        )
+                    except MyGithub12Error as exc:
+                        if exc.code in {"WORKSPACE_REVISION_MISMATCH", "DEVELOPMENT_SESSION_REVISION_MISMATCH"}:
+                            raise
+                        recovery = {
+                            "action": "recovery_required",
+                            "recovery_required": True,
+                            "recovery_classification": recovery_classification,
+                            "recovery_blocker": exc.code,
+                            "error_details": dict(exc.details or {}),
+                            **recovery_identity,
+                        }
+                        blockers.append("DEVELOPMENT_SESSION_RECOVERY_REQUIRED")
+                    else:
+                        workspace = active_recovery["workspace"]
+                        session = active_recovery["development_session"]
+                        workspace_candidates = [workspace]
+                        session_candidates = [session]
+                        recovery = {
+                            **active_recovery,
+                            "recovery_performed": not bool(active_recovery.get("replayed")),
+                            "recovery_kind": "active_workspace_stale_session",
+                            "recovery_classification": recovery_classification,
+                            "recovery_blocker": None,
+                            "recovery_required": False,
+                        }
+            elif recover_stale_session and drifted_validation_candidate:
                 pass
             elif recover_stale_session and workspace.get("status") == "active":
                 transient_state = session.get("status") in TRANSIENT_VALIDATION_STATUSES
@@ -2192,6 +2281,33 @@ def resume_task(
         "pull_request_readiness": readiness,
         "overlap": overlap,
         "recovery": workspace_recovery,
+        "exact_head": bool(
+            workspace
+            and session
+            and workspace.get("head_sha") == branch_head
+            and workspace.get("tree_sha") == branch_tree
+            and session.get("head_commit_sha") == branch_head
+            and session.get("tree_sha") == branch_tree
+            and int(session.get("workspace_revision") or 0) == int(workspace.get("revision") or 0)
+        ),
+        "recovery_required": bool(
+            (workspace_recovery or {}).get("recovery_required")
+            or any(
+                item in blockers
+                for item in (
+                    "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+                    "WORKSPACE_BRANCH_DRIFTED",
+                    "WORKSPACE_EXPIRED",
+                    "WORKSPACE_CLOSED",
+                    "DEVELOPMENT_SESSION_CLOSED",
+                    "DEVELOPMENT_SESSION_BLOCKED",
+                )
+            )
+        ),
+        "recovery_performed": bool((workspace_recovery or {}).get("recovery_performed")),
+        "recovery_kind": (workspace_recovery or {}).get("recovery_kind"),
+        "recovery_classification": (workspace_recovery or {}).get("recovery_classification"),
+        "recovery_blocker": (workspace_recovery or {}).get("recovery_blocker"),
         "blockers": blockers,
         "degraded": degraded,
     }

@@ -226,7 +226,7 @@ def declare_workspace_scope(service: Any, workspace_id: str, expected_workspace_
 
 
 def workspace_overlap(service: Any, workspace_id: str, other_workspace_ids_json: str="[]") -> dict[str,Any]:
-    primary=get_workspace(service,workspace_id); requested=set(_parse(other_workspace_ids_json,list,"other_workspace_ids_json",[])); listing=list_workspaces(service,primary["repository"],"active")["items"]; others=[x for x in listing if x["workspace_id"]!=workspace_id and (not requested or x["workspace_id"] in requested)]; results=[]
+    primary=get_workspace(service,workspace_id); requested=set(_parse(other_workspace_ids_json,list,"other_workspace_ids_json",[])); listing=list_workspaces(service,primary["repository"],"active")["items"]; others=[x for x in listing if x["workspace_id"]!=workspace_id and (not requested or x["workspace_id"] in requested)]; results=[]; comparison_verified=True
     pscope=primary["scope"]
     for other in others:
         evidence=[]
@@ -236,10 +236,14 @@ def workspace_overlap(service: Any, workspace_id: str, other_workspace_ids_json:
         try:
             cmp=_compare(service,primary["repository"],primary["base_commit_sha"],primary["head_sha"]); cmp2=_compare(service,other["repository"],other["base_commit_sha"],other["head_sha"]); actual=sorted({f["path"] for f in cmp["files"]}&{f["path"] for f in cmp2["files"]})
             if actual: evidence.append({"kind":"changed_paths","items":actual})
-        except MyGithub12Error: pass
+        except MyGithub12Error as exc:
+            # Keep the advisory overlap API usable, but let recovery callers
+            # fail closed instead of treating an unreadable comparison as no overlap.
+            comparison_verified=False
+            evidence.append({"kind":"comparison_unavailable","code":exc.code})
         level="high" if any(e["kind"] in {"changed_paths","migrations","tables","apis"} for e in evidence) else "medium" if evidence else "none"
         results.append({"workspace_id":other["workspace_id"],"branch":other["branch"],"level":level,"evidence":evidence})
-    return {"ok":True,"workspace_id":workspace_id,"items":results}
+    return {"ok":True,"workspace_id":workspace_id,"items":results,"comparison_verified":comparison_verified}
 
 
 def workspace_sync_plan(service: Any, workspace_id: str, base_branch: str="") -> dict[str,Any]:
