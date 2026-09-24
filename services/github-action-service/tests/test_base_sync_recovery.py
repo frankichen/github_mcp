@@ -21,6 +21,48 @@ OLD_TREE = "1" * 40
 CURRENT_TREE = "2" * 40
 OTHER_TREE = "3" * 40
 WORKSPACE_ID = "ws_base_sync"
+ABSORBED_PATH = "i18n/app/latest.v"
+MANIFEST_PATH = "i18n/app/manifest.json"
+ABSORBED_BLOB = "a" * 40
+DIFFERENT_BLOB = "b" * 40
+SXT_TASK_140_FIXTURE = {
+    "repository": "frankichen/sxt",
+    "task": 140,
+    "revision": 2,
+    "pull_number": 902,
+    "branch": "ai/account-security-cancel-finalize-worker-a-20260923",
+    "workspace_id": "ws_c952bc0ccd1842a2",
+    "workspace_revision": 30,
+    "development_session_id": "dev_7a148f7d1da347fbabc1",
+    "session_revision": 40,
+    "old_base": "60a5d6acb75959263ce1c1f9769ecf1fb39e2e36",
+    "new_base": "1f1c4f510a38788bfb9d22ec81df0d63a98e2217",
+    "old_session_head": "04a7e312e7acb1e18da1c5b70ec778ff80c9f6b5",
+    "current_head": "fb245beec33348df7eb27328ddd523d27a26ddc0",
+    "current_tree": "18831659ea16f8be217ef357a7205ae86fcede12",
+    "absorbed_blobs": {
+        "i18n/app/latest.v": "9ef16ebadbe286c4ac36a4d1de328b51d2890e11",
+        "i18n/app/manifest.json": "ed7b39e2fa0187882296332f39b193639601a8cd",
+    },
+    "reviewed_overlap_paths": [
+        "api/openapi/app.yaml",
+        "i18n/app/en.json",
+        "i18n/app/latest.v",
+        "i18n/app/manifest.json",
+        "i18n/app/zh-CN.json",
+    ],
+    "reviewed_scope_expansion_paths": [
+        "internal/modules/account/global_index_inventory.go",
+    ],
+}
+
+
+class FakeFileNotFound(Exception):
+    status = 404
+
+
+class FakeBlobReadError(Exception):
+    status = 503
 
 
 class FakeRepo:
@@ -40,6 +82,8 @@ class FakeRepo:
             (NEW_BASE, CURRENT_HEAD): self._cfg(NEW_BASE, 1, 0, ["allowed/feature.py"]),
             (MERGED_HEAD, NEW_BASE): self._cfg(MERGED_HEAD, 1, 0, ["base/region.py"]),
         }
+        self.blobs = {}
+        self.blob_errors = {}
 
     @staticmethod
     def _cfg(merge_base, ahead_by, behind_by, paths, previous=None):
@@ -68,6 +112,15 @@ class FakeRepo:
     def get_commit(self, sha):
         return SimpleNamespace(tree=SimpleNamespace(sha=self.trees[sha]))
 
+    def get_contents(self, path, ref):
+        error = self.blob_errors.get((ref, path))
+        if error:
+            raise error
+        blob_sha = self.blobs.get((ref, path))
+        if blob_sha is None:
+            raise FakeFileNotFound(path)
+        return SimpleNamespace(type="file", path=path, sha=blob_sha)
+
     def compare(self, base, head):
         cfg = self.comparisons[(base, head)]
         return SimpleNamespace(
@@ -82,21 +135,22 @@ class FakeRepo:
 
 
 class FakeGitHub:
-    def __init__(self, repo):
+    def __init__(self, repo, repository=REPO):
         self.repo = repo
+        self.repository = repository
 
     def get_repo(self, repository):
-        assert repository == REPO
+        assert repository == self.repository
         return self.repo
 
 
 class FakeClient:
-    def __init__(self, repo):
-        self._pygithub = FakeGitHub(repo)
-        self.heads = {BRANCH: CURRENT_HEAD, BASE_BRANCH: NEW_BASE, "ai/merged-a": MERGED_HEAD}
+    def __init__(self, repo, repository=REPO, branch=BRANCH, base_branch=BASE_BRANCH):
+        self._pygithub = FakeGitHub(repo, repository)
+        self.heads = {branch: CURRENT_HEAD, base_branch: NEW_BASE, "ai/merged-a": MERGED_HEAD}
 
     def get_branch(self, repository, branch):
-        assert repository == REPO
+        assert repository == self._pygithub.repository
         sha = self.heads.get(branch)
         if not sha:
             return None
@@ -104,19 +158,22 @@ class FakeClient:
 
 
 class FakeService:
-    def __init__(self):
+    def __init__(self, repository=REPO, branch=BRANCH, base_branch=BASE_BRANCH):
+        self.repository = repository
         self.repo = FakeRepo()
-        self.client = FakeClient(self.repo)
+        self.client = FakeClient(self.repo, repository, branch, base_branch)
 
     def _check_repository_allowed(self, repository):
-        if repository != REPO:
+        if repository != self.repository:
             raise AssertionError(f"unexpected repository: {repository}")
 
 
 def _workspace_row(
     *,
     workspace_id=WORKSPACE_ID,
+    repository=REPO,
     branch=BRANCH,
+    base_branch=BASE_BRANCH,
     status="active",
     revision=4,
     base_sha=OLD_BASE,
@@ -129,9 +186,9 @@ def _workspace_row(
     now = sessions._now()
     return (
         workspace_id,
-        REPO,
+        repository,
         branch,
-        BASE_BRANCH,
+        base_branch,
         base_sha,
         head,
         tree,
@@ -148,14 +205,43 @@ def _workspace_row(
     )
 
 
-def _seed(tmp_path, monkeypatch):
+def _seed(
+    tmp_path,
+    monkeypatch,
+    *,
+    repository=REPO,
+    branch=BRANCH,
+    base_branch=BASE_BRANCH,
+    workspace_id=WORKSPACE_ID,
+    session_id="",
+):
     monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "base-sync.db"))
-    service = FakeService()
+    service = FakeService(repository, branch, base_branch)
     sessions.init_session_db()
     with sessions._LOCK, sessions._db() as db:
-        db.execute("INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", _workspace_row())
-    initial = mygithub12.get_workspace(service, WORKSPACE_ID)
+        db.execute(
+            "INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            _workspace_row(
+                workspace_id=workspace_id,
+                repository=repository,
+                branch=branch,
+                base_branch=base_branch,
+            ),
+        )
+    initial = mygithub12.get_workspace(service, workspace_id)
     session = sessions.create_session(initial, idempotency_key="seed-base-sync")
+    if session_id:
+        generated_session_id = session["session_id"]
+        with sessions._LOCK, sessions._db() as db:
+            db.execute(
+                "UPDATE development_session_events SET session_id=? WHERE session_id=?",
+                (session_id, generated_session_id),
+            )
+            db.execute(
+                "UPDATE development_sessions SET session_id=? WHERE session_id=?",
+                (session_id, generated_session_id),
+            )
+        session = sessions.get_session(session_id)
     with sessions._LOCK, sessions._db() as db:
         db.execute(
             """UPDATE development_sessions SET status='pr_ready',last_fast_ci_job_id='old-fast',
@@ -166,7 +252,7 @@ def _seed(tmp_path, monkeypatch):
         db.execute(
             """UPDATE workspaces SET head_sha=?,tree_sha=?,status='drifted',revision=5,
             drift_reason='branch_moved_externally',index_commit_sha=NULL,lease_expires_at=0 WHERE workspace_id=?""",
-            (CURRENT_HEAD, CURRENT_TREE, WORKSPACE_ID),
+            (CURRENT_HEAD, CURRENT_TREE, workspace_id),
         )
     index_requests = []
 
@@ -217,6 +303,17 @@ def _args(session, **overrides):
 
 def _call(service, session, **overrides):
     return recovery.recover_base_synced_task(service, **_args(session, **overrides))
+
+
+def _configure_absorbed_paths(service, paths, blob_by_path=None):
+    absorbed_paths = sorted(paths)
+    service.repo.set_compare(OLD_BASE, NEW_BASE, paths=["base/region.py", *absorbed_paths])
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=["allowed/feature.py", *absorbed_paths])
+    service.repo.set_compare(OLD_HEAD, CURRENT_HEAD, paths=["base/region.py", "allowed/feature.py"])
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=["allowed/feature.py"])
+    for path, blob_sha in (blob_by_path or {path: ABSORBED_BLOB for path in absorbed_paths}).items():
+        for commit_sha in (OLD_HEAD, NEW_BASE, CURRENT_HEAD):
+            service.repo.blobs[(commit_sha, path)] = blob_sha
 
 
 def _db_state(session_id):
@@ -839,6 +936,247 @@ def test_t8_unexplained_task_path_change_fails_closed(tmp_path, monkeypatch):
     with pytest.raises(recovery.MyGithub12Error) as exc:
         _call(service, session)
     assert exc.value.code == "RECOVERY_TASK_DIFF_MISMATCH"
+
+
+def test_base_absorbed_task_path_is_allowed_only_with_exact_three_commit_blob_identity(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _configure_absorbed_paths(service, [ABSORBED_PATH])
+
+    result = _call(
+        service,
+        session,
+        reviewed_overlap_paths_json=json.dumps([ABSORBED_PATH]),
+    )
+
+    assert result["control_plane_recovery"] == "CONTROL_PLANE_BASE_SYNC_RECOVERY_SUCCESS"
+    convergence = result["audit"]["task_path_convergence"]
+    assert convergence["removed_from_task_delta"] == [ABSORBED_PATH]
+    assert convergence["absorbed_by_new_base"] == [{
+        "path": ABSORBED_PATH,
+        "old_task_blob": ABSORBED_BLOB,
+        "new_base_blob": ABSORBED_BLOB,
+        "current_blob": ABSORBED_BLOB,
+        "classification": "BASE_ABSORBED",
+    }]
+    assert result["audit"]["unexplained_task_path_changes"] == []
+
+
+def test_multiple_base_absorbed_task_paths_are_audited_individually(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    paths = [ABSORBED_PATH, MANIFEST_PATH]
+    blobs = {ABSORBED_PATH: ABSORBED_BLOB, MANIFEST_PATH: DIFFERENT_BLOB}
+    _configure_absorbed_paths(service, paths, blobs)
+
+    result = _call(
+        service,
+        session,
+        reviewed_overlap_paths_json=json.dumps(paths),
+    )
+
+    convergence = result["audit"]["task_path_convergence"]
+    assert convergence["removed_from_task_delta"] == sorted(paths)
+    assert [item["path"] for item in convergence["absorbed_by_new_base"]] == sorted(paths)
+    for item in convergence["absorbed_by_new_base"]:
+        assert item["old_task_blob"] == item["new_base_blob"] == item["current_blob"] == blobs[item["path"]]
+
+
+def test_base_content_overwrite_is_not_misclassified_as_task_absorption(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _configure_absorbed_paths(service, [ABSORBED_PATH])
+    service.repo.blobs[(NEW_BASE, ABSORBED_PATH)] = DIFFERENT_BLOB
+    service.repo.blobs[(CURRENT_HEAD, ABSORBED_PATH)] = DIFFERENT_BLOB
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session, reviewed_overlap_paths_json=json.dumps([ABSORBED_PATH]))
+
+    assert exc.value.code == "RECOVERY_TASK_DIFF_MISMATCH"
+    evidence = exc.value.details["base_absorption_candidates"]
+    assert evidence == [{
+        "path": ABSORBED_PATH,
+        "old_task_blob": ABSORBED_BLOB,
+        "new_base_blob": DIFFERENT_BLOB,
+        "current_blob": DIFFERENT_BLOB,
+        "classification": "unproven",
+    }]
+
+
+def test_current_head_edit_keeps_path_in_new_task_delta(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _configure_absorbed_paths(service, [ABSORBED_PATH])
+    service.repo.blobs[(CURRENT_HEAD, ABSORBED_PATH)] = DIFFERENT_BLOB
+    service.repo.set_compare(OLD_HEAD, CURRENT_HEAD, paths=["base/region.py", "allowed/feature.py", ABSORBED_PATH])
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=["allowed/feature.py", ABSORBED_PATH])
+
+    result = _call(
+        service,
+        session,
+        reviewed_overlap_paths_json=json.dumps([ABSORBED_PATH]),
+    )
+
+    assert ABSORBED_PATH in result["audit"]["new_task_delta_paths"]
+    assert result["audit"]["task_path_convergence"]["absorbed_by_new_base"] == []
+
+
+def test_missing_current_or_base_blob_does_not_explain_removed_task_path(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _configure_absorbed_paths(service, [ABSORBED_PATH])
+    del service.repo.blobs[(NEW_BASE, ABSORBED_PATH)]
+    del service.repo.blobs[(CURRENT_HEAD, ABSORBED_PATH)]
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session, reviewed_overlap_paths_json=json.dumps([ABSORBED_PATH]))
+
+    assert exc.value.code == "RECOVERY_TASK_DIFF_MISMATCH"
+    evidence = exc.value.details["base_absorption_candidates"]
+    assert evidence[0]["old_task_blob"] == ABSORBED_BLOB
+    assert evidence[0]["new_base_blob"] is None
+    assert evidence[0]["current_blob"] is None
+
+
+def test_transient_blob_read_failure_stays_fail_closed_before_workspace_mutation(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _configure_absorbed_paths(service, [ABSORBED_PATH])
+    service.repo.blob_errors[(NEW_BASE, ABSORBED_PATH)] = FakeBlobReadError("GitHub unavailable")
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session, reviewed_overlap_paths_json=json.dumps([ABSORBED_PATH]))
+
+    assert exc.value.code == "RECOVERY_TASK_DIFF_MISMATCH"
+    assert exc.value.details == {
+        "path": ABSORBED_PATH,
+        "commit_sha": NEW_BASE,
+        "cause_type": "FakeBlobReadError",
+    }
+    workspace, stored_session, _ = _db_state(session["session_id"])
+    assert workspace["status"] == "drifted"
+    assert workspace["revision"] == 5
+    assert stored_session["status"] == "pr_ready"
+    assert stored_session["last_full_ci_job_id"] == "old-full"
+
+
+def test_base_absorption_does_not_skip_exact_historical_overlap_review(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _configure_absorbed_paths(service, [ABSORBED_PATH])
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+
+    assert exc.value.code == "RECOVERY_BASE_SYNC_OVERLAP"
+    assert exc.value.details["actual_overlap_paths"] == [ABSORBED_PATH]
+    assert exc.value.details["reviewed_overlap_paths"] == []
+
+
+def test_base_absorption_does_not_skip_reviewed_scope_expansion(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _configure_absorbed_paths(service, [ABSORBED_PATH])
+    scope_path = "internal/modules/account/global_index_inventory.go"
+    service.repo.set_compare(OLD_HEAD, CURRENT_HEAD, paths=["base/region.py", "allowed/feature.py", scope_path])
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=["allowed/feature.py", scope_path])
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=["allowed/feature.py", ABSORBED_PATH, scope_path])
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(
+            service,
+            session,
+            reviewed_overlap_paths_json=json.dumps([ABSORBED_PATH]),
+        )
+
+    assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
+    assert exc.value.details["outside_scope_paths"] == [scope_path]
+
+
+def test_verified_forward_task_delete_remains_explained_without_blob_absorption(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    service.repo.set_compare(OLD_BASE, OLD_HEAD, paths=["allowed/feature.py"])
+    service.repo.set_compare(OLD_HEAD, CURRENT_HEAD, paths=["allowed/feature.py"])
+    service.repo.set_compare(NEW_BASE, CURRENT_HEAD, paths=[])
+
+    result = _call(service, session)
+
+    assert result["control_plane_recovery"] == "CONTROL_PLANE_BASE_SYNC_RECOVERY_SUCCESS"
+    assert result["audit"]["task_path_convergence"]["removed_from_task_delta"] == ["allowed/feature.py"]
+    assert result["audit"]["task_path_convergence"]["absorbed_by_new_base"] == []
+    assert result["audit"]["unexplained_task_path_changes"] == []
+
+
+def test_sxt_task_140_exact_identity_fixture_recovers_two_reviewed_absorptions(tmp_path, monkeypatch):
+    f = SXT_TASK_140_FIXTURE
+    service, session, _ = _seed(
+        tmp_path,
+        monkeypatch,
+        repository=f["repository"],
+        branch=f["branch"],
+        workspace_id=f["workspace_id"],
+        session_id=f["development_session_id"],
+    )
+    paths = f["reviewed_overlap_paths"]
+    task_scope_path = f["reviewed_scope_expansion_paths"][0]
+    sxt_paths = sorted([*paths, task_scope_path])
+    base = f["old_base"]
+    new_base = f["new_base"]
+    old_head = f["old_session_head"]
+    current_head = f["current_head"]
+    old_tree = "7" * 40
+    service.repo.trees.update({base: "8" * 40, new_base: "9" * 40, old_head: old_tree, current_head: f["current_tree"]})
+    service.repo.comparisons.update({
+        (base, new_base): service.repo._cfg(base, 10, 0, paths),
+        (base, old_head): service.repo._cfg(base, 8, 0, sxt_paths),
+        (old_head, current_head): service.repo._cfg(old_head, 2, 0, [task_scope_path]),
+        (new_base, current_head): service.repo._cfg(new_base, 10, 0, [
+            "api/openapi/app.yaml",
+            "i18n/app/en.json",
+            "i18n/app/zh-CN.json",
+            task_scope_path,
+        ]),
+    })
+    for path, blob_sha in f["absorbed_blobs"].items():
+        for commit_sha in (old_head, new_base, current_head):
+            service.repo.blobs[(commit_sha, path)] = blob_sha
+    service.client.heads[f["branch"]] = current_head
+    service.client.heads[BASE_BRANCH] = new_base
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            "UPDATE workspaces SET base_commit_sha=?,head_sha=?,tree_sha=?,revision=? WHERE workspace_id=?",
+            (base, current_head, f["current_tree"], f["workspace_revision"], f["workspace_id"]),
+        )
+        db.execute(
+            "UPDATE development_sessions SET base_commit_sha=?,head_commit_sha=?,tree_sha=?,session_revision=?,workspace_revision=? WHERE session_id=?",
+            (base, old_head, old_tree, f["session_revision"], f["workspace_revision"], session["session_id"]),
+        )
+    session = sessions.get_session(f["development_session_id"])
+
+    result = recovery.recover_base_synced_task(
+        service,
+        **_args(
+            session,
+            repository=f["repository"],
+            branch=f["branch"],
+            workspace_id=f["workspace_id"],
+            development_session_id=f["development_session_id"],
+            expected_workspace_revision=f["workspace_revision"],
+            expected_session_revision=f["session_revision"],
+            expected_old_base_sha=base,
+            expected_new_base_sha=new_base,
+            expected_old_session_head_sha=old_head,
+            expected_current_head_sha=current_head,
+            expected_current_tree_sha=f["current_tree"],
+            reviewed_overlap_paths_json=json.dumps(paths),
+            reviewed_scope_expansion_paths_json=json.dumps(f["reviewed_scope_expansion_paths"]),
+            idempotency_key="sxt-task-140-base-absorbed-fixture",
+        ),
+    )
+
+    assert result["control_plane_recovery"] == "CONTROL_PLANE_BASE_SYNC_RECOVERY_SUCCESS"
+    assert result["workspace"]["head_sha"] == f["current_head"]
+    assert result["workspace"]["tree_sha"] == f["current_tree"]
+    assert result["audit"]["actual_overlap_paths"] == paths
+    absorbed = result["audit"]["task_path_convergence"]["absorbed_by_new_base"]
+    assert {item["path"] for item in absorbed} == set(f["absorbed_blobs"])
+    assert all(
+        item["old_task_blob"] == item["new_base_blob"] == item["current_blob"] == f["absorbed_blobs"][item["path"]]
+        and item["classification"] == "BASE_ABSORBED"
+        for item in absorbed
+    )
 
 
 def test_combined_base_sync_and_forward_task_advance_allows_expanded_paths(tmp_path, monkeypatch):
