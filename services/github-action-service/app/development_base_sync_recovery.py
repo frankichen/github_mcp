@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from typing import Any
 
@@ -194,6 +195,54 @@ def _compare_delta(
     return evidence, changed_paths
 
 
+def _exact_path_blob_sha(repo: Any, path: str, commit_sha: str) -> str | None:
+    """Read one path's exact blob identity at a pinned commit; missing paths are not proof."""
+    try:
+        entry = repo.get_contents(path, ref=commit_sha)
+    except Exception as exc:
+        if getattr(exc, "status", None) == 404:
+            return None
+        raise MyGithub12Error(
+            "RECOVERY_TASK_DIFF_MISMATCH",
+            "exact path blob identity could not be verified",
+            {"path": path, "commit_sha": commit_sha, "cause_type": type(exc).__name__},
+        ) from exc
+    if isinstance(entry, list) or getattr(entry, "type", None) != "file":
+        return None
+    if str(getattr(entry, "path", "")) != path:
+        return None
+    blob_sha = str(getattr(entry, "sha", ""))
+    if not re.fullmatch(r"[0-9a-f]{40}", blob_sha):
+        raise MyGithub12Error(
+            "RECOVERY_TASK_DIFF_MISMATCH",
+            "exact path blob identity is malformed",
+            {"path": path, "commit_sha": commit_sha},
+        )
+    return blob_sha
+
+
+def _base_absorbed_path_evidence(
+    repo: Any,
+    path: str,
+    old_session_head_sha: str,
+    new_base_sha: str,
+    current_head_sha: str,
+) -> dict[str, Any]:
+    """Classify a removed task-delta path only when all three exact blobs agree."""
+    old_task_blob = _exact_path_blob_sha(repo, path, old_session_head_sha)
+    new_base_blob = _exact_path_blob_sha(repo, path, new_base_sha)
+    current_blob = _exact_path_blob_sha(repo, path, current_head_sha)
+    evidence = {
+        "path": path,
+        "old_task_blob": old_task_blob,
+        "new_base_blob": new_base_blob,
+        "current_blob": current_blob,
+    }
+    if old_task_blob and old_task_blob == new_base_blob == current_blob:
+        return {**evidence, "classification": "BASE_ABSORBED"}
+    return {**evidence, "classification": "unproven"}
+
+
 def _fresh_base_sync_github_identity(
     service: Any,
     repository: str,
@@ -294,6 +343,11 @@ def _verify_base_sync_deltas(
         )
     forward_paths = set(forward_task_delta_paths)
     base_paths = set(base_delta_paths)
+    # The exact overlap review gate above remains mandatory. Only unadvanced
+    # removals also present in the verified base delta can be blob-checked.
+    removed_from_task_delta = sorted(set(old_task_delta_paths) - set(new_task_delta_paths))
+    absorbed_by_new_base: list[dict[str, Any]] = []
+    absorption_candidates: list[dict[str, Any]] = []
     if ancestry_proof_mode == "same_base_branch_forward_dual":
         # A non-ancestor compare is merge-base-relative and may include paths
         # from the other side of the divergence. Keep it for rename-aware
@@ -313,7 +367,25 @@ def _verify_base_sync_deltas(
         # must still be explained by the verified H0 -> H1 comparison.
         authoritative_task_delta_paths = list(new_task_delta_paths)
         task_path_changes = sorted(set(old_task_delta_paths) ^ set(new_task_delta_paths))
-        unexplained_task_path_changes = sorted(set(task_path_changes) - set(forward_task_delta_paths))
+        unadvanced_removed_paths = sorted(set(removed_from_task_delta) - forward_paths)
+        absorption_candidates = [
+            _base_absorbed_path_evidence(
+                repo, path, old_session_head_sha, new_base_sha, current_head_sha,
+            )
+            for path in unadvanced_removed_paths
+            if path in base_paths
+        ]
+        absorbed_by_new_base = [
+            item for item in absorption_candidates if item["classification"] == "BASE_ABSORBED"
+        ]
+        absorbed_paths = {item["path"] for item in absorbed_by_new_base}
+        unexplained_task_path_changes = sorted(
+            set(task_path_changes) - forward_paths - absorbed_paths
+        )
+        task_path_convergence = {
+            "removed_from_task_delta": removed_from_task_delta,
+            "absorbed_by_new_base": absorbed_by_new_base,
+        }
         if unexplained_task_path_changes:
             raise MyGithub12Error(
                 "RECOVERY_TASK_DIFF_MISMATCH",
@@ -323,6 +395,8 @@ def _verify_base_sync_deltas(
                     "new_task_delta_paths": new_task_delta_paths,
                     "forward_task_delta_paths": forward_task_delta_paths,
                     "unexplained_task_path_changes": unexplained_task_path_changes,
+                    "task_path_convergence": task_path_convergence,
+                    "base_absorption_candidates": absorption_candidates,
                 },
             )
         task_diff_enforcement = "ancestry_backed_path_set_explanation"
@@ -351,6 +425,11 @@ def _verify_base_sync_deltas(
         "excluded_unchanged_historical_cumulative_paths": excluded_unchanged_historical_cumulative_paths,
         "task_path_changes": task_path_changes,
         "unexplained_task_path_changes": unexplained_task_path_changes,
+        "task_path_convergence": {
+            "removed_from_task_delta": removed_from_task_delta,
+            "absorbed_by_new_base": absorbed_by_new_base,
+        },
+        "base_absorption_candidates": absorption_candidates,
         "historical_base_overlap_paths": historical_base_overlap,
         "current_base_overlap_paths": current_base_overlap,
         "base_task_overlap_paths": overlap,
@@ -753,6 +832,7 @@ def _atomic_recover_base_sync(
                 "excluded_unchanged_historical_cumulative_paths": verification["deltas"]["excluded_unchanged_historical_cumulative_paths"],
                 "task_path_changes": verification["deltas"]["task_path_changes"],
                 "unexplained_task_path_changes": verification["deltas"]["unexplained_task_path_changes"],
+                "task_path_convergence": verification["deltas"]["task_path_convergence"],
                 "outside_scope_paths": verification["scope"].get("outside_scope_paths", []),
                 "previous_scope": verification["scope"].get("previous_scope", {}),
                 "reviewed_scope_expansion_paths": verification["scope"].get("reviewed_scope_expansion_paths", []),
