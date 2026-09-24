@@ -1068,16 +1068,23 @@ def test_resume_task_safely_recovers_stale_session(monkeypatch):
     _stub_resume_context(monkeypatch, ws=ws, session=stale, branch_head=SHA_B, branch_tree="2" * 40)
     captured = {}
 
-    def fake_recover(service, session_id, session_revision, workspace_revision, expected_head_sha, idempotency_key):
-        captured.update(session_id=session_id, session_revision=session_revision, workspace_revision=workspace_revision, expected_head_sha=expected_head_sha, idempotency_key=idempotency_key)
-        return {"session": recovered, "workspace": ws, "recovered": True}
+    def fake_recover(**kwargs):
+        captured.update(kwargs)
+        return {"development_session": recovered, "workspace": ws, "replayed": False}
 
-    monkeypatch.setattr(resume.dx, "recover_stale_session", fake_recover)
-    result = resume.resume_task(FakeService(), "owner/repo", branch="ai/resume", idempotency_key="resume-idem")
+    monkeypatch.setattr(resume.drift_recovery, "recover_active_workspace_stale_session", fake_recover)
+    result = resume.resume_task(
+        FakeService(), "owner/repo", branch="ai/resume", idempotency_key="resume-idem",
+        expected_workspace_revision=3, expected_session_revision=4,
+    )
 
-    assert captured == {"session_id": "dev_resume", "session_revision": 4, "workspace_revision": 3, "expected_head_sha": SHA_B, "idempotency_key": "resume-idem"}
+    assert captured["development_session_id"] == "dev_resume"
+    assert captured["expected_session_revision"] == 4
+    assert captured["expected_workspace_revision"] == 3
+    assert captured["expected_current_head_sha"] == SHA_B
+    assert captured["idempotency_key"] == "resume-idem"
     assert result["development_session"]["head_commit_sha"] == SHA_B
-    assert result["recovery"]["session"]["recovered"] is True
+    assert result["recovery"]["recovery_performed"] is True
     assert "continue_write" in result["next_allowed_actions"]
 
 

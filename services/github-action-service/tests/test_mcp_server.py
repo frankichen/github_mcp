@@ -96,7 +96,7 @@ class TestMCPTools:
         from app.mcp_server import get_mygithub_capabilities
         capabilities = json.loads(await get_mygithub_capabilities())
         assert capabilities["name"] == "MyGithut12"
-        assert capabilities["version"] == "12.9.18"
+        assert capabilities["version"] == "12.9.19"
         assert capabilities["max_upload_chunk_bytes"] == 24576
         assert capabilities["recommended_upload_chunk_bytes"] == 16384
         assert capabilities["preferred_upload_encoding"] == "text_for_utf8_base64_for_binary"
@@ -118,6 +118,8 @@ class TestMCPTools:
         assert capabilities["supports_drifted_development_recovery"] is True
         assert capabilities["supports_base_synced_development_recovery"] is True
         assert capabilities["supports_retargeted_development_recovery"] is True
+        assert capabilities["supports_active_workspace_stale_session_recovery"] is True
+        assert "active_workspace_stale_session" in capabilities["development_recovery_kinds"]
         assert capabilities["generated_files_put_semantics"]["bundle_format_version"] == 1
         assert capabilities["generated_files_put_semantics"]["unsupported"] == ["binary", "delete"]
         assert capabilities["generated_files_put_semantics"]["max_file_bytes"] == 1024 * 1024
