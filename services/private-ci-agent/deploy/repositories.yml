@@ -54,6 +54,13 @@ repositories:
           - test:run
           - typecheck
           - build
+      - path: h5/lenshub-storage-mall
+        type: node
+        package_manager: npm
+        required_scripts:
+          - test
+          - typecheck
+          - build
 
   frankichen/github_mcp:
     enabled: true
