@@ -1,0 +1,39 @@
+{
+  "repository": "frankichen/sxt",
+  "task": 140,
+  "revision": 2,
+  "worker": "WORKER-A",
+  "pull_request": 902,
+  "branch": "ai/account-security-cancel-finalize-worker-a-20260923",
+  "old_base_sha": "60a5d6acb75959263ce1c1f9769ecf1fb39e2e36",
+  "new_base_sha": "1f1c4f510a38788bfb9d22ec81df0d63a98e2217",
+  "old_session_head_sha": "04a7e312e7acb1e18da1c5b70ec778ff80c9f6b5",
+  "current_head_sha": "fb245beec33348df7eb27328ddd523d27a26ddc0",
+  "current_tree_sha": "18831659ea16f8be217ef357a7205ae86fcede12",
+  "reviewed_overlap_paths": [
+    "api/openapi/app.yaml",
+    "i18n/app/en.json",
+    "i18n/app/latest.v",
+    "i18n/app/manifest.json",
+    "i18n/app/zh-CN.json"
+  ],
+  "scope_expansion_path": "internal/modules/account/global_index_inventory.go",
+  "absorbed_path_blobs": {
+    "i18n/app/latest.v": {
+      "old_task_blob": "9ef16ebadbe286c4ac36a4d1de328b51d2890e11",
+      "new_base_blob": "9ef16ebadbe286c4ac36a4d1de328b51d2890e11",
+      "current_blob": "9ef16ebadbe286c4ac36a4d1de328b51d2890e11"
+    },
+    "i18n/app/manifest.json": {
+      "old_task_blob": "ed7b39e2fa0187882296332f39b193639601a8cd",
+      "new_base_blob": "ed7b39e2fa0187882296332f39b193639601a8cd",
+      "current_blob": "ed7b39e2fa0187882296332f39b193639601a8cd"
+    }
+  },
+  "scope_expansion_blob_facts": {
+    "path": "internal/modules/account/global_index_inventory.go",
+    "old_task_blob": "cf56ac24c71ff2f6a19c5d7a79495d820cbb0c69",
+    "current_blob": "cf56ac24c71ff2f6a19c5d7a79495d820cbb0c69",
+    "note": "The blob is an unchanged task result in the supplied identity; scope remains governed by the separate reviewed expansion gate."
+  }
+}
