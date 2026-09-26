@@ -957,6 +957,8 @@ def _atomic_recover_base_sync(
                 "historical_cumulative_task_delta_paths": verification["deltas"]["historical_cumulative_task_delta_paths"],
                 "external_forward_delta_paths": verification["deltas"]["external_forward_delta_paths"],
                 "recovery_scope_delta_paths": verification["deltas"]["recovery_scope_delta_paths"],
+                "forward_recovery_scope_delta_paths": verification["deltas"].get("forward_recovery_scope_delta_paths", verification["deltas"]["recovery_scope_delta_paths"]),
+                "scope_authority_mode": verification["deltas"].get("scope_authority_mode", "forward_task_delta"),
                 "excluded_imported_base_paths": verification["deltas"]["excluded_imported_base_paths"],
                 "excluded_unchanged_historical_cumulative_paths": verification["deltas"]["excluded_unchanged_historical_cumulative_paths"],
                 "task_path_changes": verification["deltas"]["task_path_changes"],
@@ -1227,12 +1229,31 @@ def recover_base_synced_task(
         expected_current_head_sha,
         reviewed_overlap_paths,
     )
-    # Scope/ownership apply only to task-owned changes after the old Session HEAD.
+    # Normally scope/ownership follow only the forward task-owned delta after
+    # the old Session HEAD. When live base advanced again after an already
+    # synchronized immutable base, however, resume selected that exact
+    # task/live merge-base as the Task-delta authority. In that shape the
+    # authoritative current Task delta must also be the recovery scope
+    # authority; otherwise a preserved historical Task path can be requested
+    # for review by resume and then rejected as "unexpected" by recovery.
+    forward_recovery_scope_delta_paths = list(deltas["recovery_scope_delta_paths"])
+    if github_identity.get("live_base_advanced_after_sync"):
+        recovery_scope_delta_paths = sorted(set(deltas["authoritative_task_delta_paths"]))
+        scope_authority_mode = "authoritative_current_task_delta"
+    else:
+        recovery_scope_delta_paths = forward_recovery_scope_delta_paths
+        scope_authority_mode = "forward_task_delta"
+    deltas = {
+        **deltas,
+        "forward_recovery_scope_delta_paths": forward_recovery_scope_delta_paths,
+        "recovery_scope_delta_paths": recovery_scope_delta_paths,
+        "scope_authority_mode": scope_authority_mode,
+    }
     scope = _verify_base_sync_scope(
-        workspace, deltas["recovery_scope_delta_paths"], reviewed_scope_expansion_paths,
+        workspace, recovery_scope_delta_paths, reviewed_scope_expansion_paths,
     )
     ownership = _verify_base_sync_ownership(
-        service, repo, workspace, expected_new_base_sha, deltas["recovery_scope_delta_paths"],
+        service, repo, workspace, expected_new_base_sha, recovery_scope_delta_paths,
     )
     verification = {
         "github": github_identity,
