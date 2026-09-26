@@ -940,6 +940,12 @@ def _workspace_recovery_plan(
             recovery_old_base = str(historical_evidence.get("historical_old_base_sha") or "")
             base_sync = bool(recovery_old_base and recovery_old_base != new_base)
         if base_sync:
+            live_base_head = new_base
+            base_selection = {
+                "mode": "live_base_head",
+                "live_base_head_sha": live_base_head,
+                "selected_new_base_sha": new_base,
+            }
             preflight = {
                 "base_ancestry": _resume_ancestry_evidence(service, repository, recovery_old_base, new_base),
                 "old_task_base_ancestry": _resume_ancestry_evidence(service, repository, recovery_old_base, old_head),
@@ -951,8 +957,60 @@ def _workspace_recovery_plan(
                 "required": False,
                 "purpose": "rename_aware_overlap_and_diagnostic_classification",
             }
+
+            # If live base advanced again after the task already synchronized to
+            # an earlier immutable base, only the exact live/task merge base may
+            # become task-delta authority, and only with forward ancestry proofs
+            # on both sides.
+            if not preflight["new_base_ancestry"].get("verified"):
+                merge_base = _resume_merge_base_evidence(
+                    service, repository, live_base_head, current_head,
+                )
+                candidate = _resume_exact_commit_sha(merge_base.get("merge_base_sha"))
+                candidate_base_ancestry = (
+                    _resume_ancestry_evidence(service, repository, recovery_old_base, candidate)
+                    if candidate else {"verified": False}
+                )
+                candidate_task_ancestry = (
+                    _resume_ancestry_evidence(service, repository, candidate, current_head)
+                    if candidate else {"verified": False}
+                )
+                candidate_live_ancestry = (
+                    _resume_ancestry_evidence(service, repository, candidate, live_base_head)
+                    if candidate else {"verified": False}
+                )
+                fallback_verified = bool(
+                    merge_base.get("verified")
+                    and candidate
+                    and candidate != recovery_old_base
+                    and candidate != live_base_head
+                    and candidate_base_ancestry.get("verified")
+                    and candidate_task_ancestry.get("verified")
+                    and candidate_live_ancestry.get("verified")
+                    and int(candidate_live_ancestry.get("ahead_by") or 0) > 0
+                )
+                preflight["live_base_advance_reconciliation"] = {
+                    "verified": fallback_verified,
+                    "live_base_head_sha": live_base_head,
+                    "candidate_synced_base_sha": candidate,
+                    "task_live_merge_base": merge_base,
+                    "candidate_base_ancestry": candidate_base_ancestry,
+                    "candidate_task_ancestry": candidate_task_ancestry,
+                    "candidate_live_ancestry": candidate_live_ancestry,
+                }
+                if fallback_verified:
+                    new_base = candidate
+                    preflight["base_ancestry"] = candidate_base_ancestry
+                    preflight["new_base_ancestry"] = candidate_task_ancestry
+                    base_selection = {
+                        "mode": "verified_task_live_merge_base",
+                        "live_base_head_sha": live_base_head,
+                        "selected_new_base_sha": new_base,
+                    }
+
             preflight["ancestry_proof_mode"] = "same_base_branch_forward_dual"
             preflight["task_delta_authority"] = "new_base_to_current_head"
+            preflight["base_selection"] = base_selection
             preflight["verified"] = all(
                 preflight[name].get("verified")
                 for name in ("base_ancestry", "task_ancestry", "new_base_ancestry")
@@ -973,6 +1031,7 @@ def _workspace_recovery_plan(
                     "expected_old_session_head_sha": old_head,
                     "expected_current_head_sha": current_head,
                     "expected_current_tree_sha": (branch_state or {}).get("tree_sha"),
+                    "live_base_head_sha": live_base_head,
                     "historical_old_base_evidence": historical_evidence,
                     "preflight": preflight,
                 }

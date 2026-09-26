@@ -251,17 +251,144 @@ def _fresh_base_sync_github_identity(
     expected_tree_sha: str,
     base_branch: str,
     expected_new_base_sha: str,
-) -> tuple[Any, dict[str, str]]:
-    """Verify only live identities for base-sync; the old base is pinned control-plane state."""
-    return same_base._fresh_github_identity(
+) -> tuple[Any, dict[str, Any]]:
+    """Verify exact task identity while allowing a proven later live-base advance."""
+    try:
+        return same_base._fresh_github_identity(
+            service,
+            repository,
+            branch,
+            expected_head_sha,
+            expected_tree_sha,
+            base_branch,
+            expected_new_base_sha,
+        )
+    except MyGithub12Error as exc:
+        # A task may remain based on an immutable synchronized base after the
+        # live base branch advances again. Never accept an arbitrary historical
+        # ancestor: the selected base must be the exact current task/live merge
+        # base and a forward ancestor of both sides.
+        if exc.code != "RECOVERY_BASE_CHANGED":
+            raise
+        live_base_sha = str((getattr(exc, "details", None) or {}).get("actual") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}", live_base_sha):
+            raise
+
+    # Re-read HEAD/Tree/base using the observed live base as an exact CAS
+    # identity. A concurrent base movement therefore fails closed here.
+    repo, live_identity = same_base._fresh_github_identity(
         service,
         repository,
         branch,
         expected_head_sha,
         expected_tree_sha,
         base_branch,
-        expected_new_base_sha,
+        live_base_sha,
     )
+
+    def ancestry(ancestor: str, descendant: str, label: str) -> dict[str, Any]:
+        try:
+            comparison = repo.compare(ancestor, descendant)
+            merge_base = (
+                str(comparison.merge_base_commit.sha)
+                if getattr(comparison, "merge_base_commit", None)
+                else ""
+            )
+            ahead_by = int(getattr(comparison, "ahead_by", 0) or 0)
+            behind_by = int(getattr(comparison, "behind_by", 0) or 0)
+        except Exception as compare_exc:
+            raise MyGithub12Error(
+                "RECOVERY_ANCESTRY_MISMATCH",
+                f"{label} ancestry could not be verified",
+                {
+                    "ancestor": ancestor,
+                    "descendant": descendant,
+                    "cause_type": type(compare_exc).__name__,
+                },
+            ) from compare_exc
+        return {
+            "verified": merge_base == ancestor and behind_by == 0,
+            "label": label,
+            "ancestor": ancestor,
+            "descendant": descendant,
+            "merge_base": merge_base,
+            "ahead_by": ahead_by,
+            "behind_by": behind_by,
+        }
+
+    selected_to_live = ancestry(
+        expected_new_base_sha, live_base_sha, "selected_synced_base_to_live_base"
+    )
+    if not selected_to_live["verified"] or selected_to_live["ahead_by"] <= 0:
+        raise MyGithub12Error(
+            "RECOVERY_BASE_CHANGED",
+            "live base advanced without preserving the selected synchronized base as a forward ancestor",
+            {
+                "selected_synced_base_sha": expected_new_base_sha,
+                "live_base_sha": live_base_sha,
+                "ancestry": selected_to_live,
+            },
+        )
+
+    selected_to_current = ancestry(
+        expected_new_base_sha, expected_head_sha, "selected_synced_base_to_current_head"
+    )
+    if not selected_to_current["verified"]:
+        raise MyGithub12Error(
+            "RECOVERY_ANCESTRY_MISMATCH",
+            "current task HEAD is not a forward descendant of the selected synchronized base",
+            {
+                "selected_synced_base_sha": expected_new_base_sha,
+                "current_head_sha": expected_head_sha,
+                "ancestry": selected_to_current,
+            },
+        )
+
+    try:
+        live_to_current = repo.compare(live_base_sha, expected_head_sha)
+        task_live_merge_base = (
+            str(live_to_current.merge_base_commit.sha)
+            if getattr(live_to_current, "merge_base_commit", None)
+            else ""
+        )
+        live_to_current_ahead = int(getattr(live_to_current, "ahead_by", 0) or 0)
+        live_to_current_behind = int(getattr(live_to_current, "behind_by", 0) or 0)
+    except Exception as compare_exc:
+        raise MyGithub12Error(
+            "RECOVERY_ANCESTRY_MISMATCH",
+            "task/live-base merge base could not be verified",
+            {
+                "live_base_sha": live_base_sha,
+                "current_head_sha": expected_head_sha,
+                "cause_type": type(compare_exc).__name__,
+            },
+        ) from compare_exc
+    if task_live_merge_base != expected_new_base_sha:
+        raise MyGithub12Error(
+            "RECOVERY_ANCESTRY_MISMATCH",
+            "selected synchronized base is not the exact task/live-base merge base",
+            {
+                "selected_synced_base_sha": expected_new_base_sha,
+                "live_base_sha": live_base_sha,
+                "current_head_sha": expected_head_sha,
+                "actual_merge_base_sha": task_live_merge_base,
+            },
+        )
+
+    return repo, {
+        **live_identity,
+        "base_sha": expected_new_base_sha,
+        "live_base_sha": live_base_sha,
+        "live_base_advanced_after_sync": True,
+        "selected_synced_base_to_live_base": selected_to_live,
+        "selected_synced_base_to_current_head": selected_to_current,
+        "task_live_merge_base": {
+            "verified": True,
+            "merge_base_sha": task_live_merge_base,
+            "ahead_by": live_to_current_ahead,
+            "behind_by": live_to_current_behind,
+        },
+    }
 
 
 def _verify_base_sync_deltas(
