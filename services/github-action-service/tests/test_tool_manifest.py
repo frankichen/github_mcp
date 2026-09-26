@@ -209,7 +209,7 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.9.20"
+    assert manifest["service_version"] == "12.9.21"
     assert manifest["executable_mode_write"] == {
         **mygithub10.capabilities("a" * 40)["executable_mode_write_semantics"],
         "supported": True,
