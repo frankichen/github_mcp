@@ -31,6 +31,7 @@ python-multipart==0.0.18
 referencing==0.37.0
 requests==2.34.2
 rpds-py==2026.6.3
+socksio==1.0.0
 sse-starlette==3.0.3
 starlette==0.41.3
 typing-inspection==0.4.2
