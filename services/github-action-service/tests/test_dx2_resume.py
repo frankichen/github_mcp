@@ -1404,6 +1404,44 @@ def test_base_sync_resume_selects_exact_task_live_merge_base_after_live_base_adv
     assert plan["preflight"]["live_base_advance_reconciliation"]["verified"] is True
 
 
+def test_active_workspace_pinned_to_verified_task_live_merge_base_does_not_reenter_base_sync_recovery():
+    synced_base = "2" * 40
+    live_base = "3" * 40
+    current_head = "5" * 40
+    current_tree = "6" * 40
+    ws = _workspace(status="active", revision=4)
+    ws.update({
+        "base_branch": "main",
+        "base_commit_sha": synced_base,
+        "head_sha": current_head,
+        "tree_sha": current_tree,
+        "drift_reason": None,
+    })
+    session = {
+        **_ready_session(
+            head=current_head,
+            tree=current_tree,
+            workspace_revision=4,
+            lease=ws["lease_expires_at"],
+        ),
+        "base_branch": "main",
+        "base_commit_sha": synced_base,
+    }
+    live = {"branch": "main", "commit_sha": live_base, "tree_sha": "8" * 40}
+    branch_state = {"commit_sha": current_head, "tree_sha": current_tree}
+
+    plan = resume._workspace_recovery_plan(
+        ws,
+        service=FakeService(),
+        session=session,
+        current_main=live,
+        current_base=live,
+        branch_state=branch_state,
+    )
+
+    assert plan is None
+
+
 def test_already_pinned_new_base_stacked_resume_fails_stop_when_current_head_is_not_old_session_forward_descendant(monkeypatch):
     old_head = "23aab1b9f80296d0e88c552ddbdac54c56939bc9"
     current_head = "249f4dc68200e83b4fd73a8bbe43608beaac5d42"
