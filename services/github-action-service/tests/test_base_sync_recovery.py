@@ -37,6 +37,7 @@ SXT_TASK_140_FIXTURE = {
     "session_revision": 40,
     "old_base": "60a5d6acb75959263ce1c1f9769ecf1fb39e2e36",
     "new_base": "1f1c4f510a38788bfb9d22ec81df0d63a98e2217",
+    "live_base_after_sync": "7eaa7cbeff5b33de2d57422064515135b2d62fb0",
     "old_session_head": "04a7e312e7acb1e18da1c5b70ec778ff80c9f6b5",
     "current_head": "fb245beec33348df7eb27328ddd523d27a26ddc0",
     "current_tree": "18831659ea16f8be217ef357a7205ae86fcede12",
@@ -1114,10 +1115,17 @@ def test_sxt_task_140_exact_identity_fixture_recovers_two_reviewed_absorptions(t
     sxt_paths = sorted([*paths, task_scope_path])
     base = f["old_base"]
     new_base = f["new_base"]
+    live_base = f["live_base_after_sync"]
     old_head = f["old_session_head"]
     current_head = f["current_head"]
     old_tree = "7" * 40
-    service.repo.trees.update({base: "8" * 40, new_base: "9" * 40, old_head: old_tree, current_head: f["current_tree"]})
+    service.repo.trees.update({
+        base: "8" * 40,
+        new_base: "9" * 40,
+        live_base: "6" * 40,
+        old_head: old_tree,
+        current_head: f["current_tree"],
+    })
     service.repo.comparisons.update({
         (base, new_base): service.repo._cfg(base, 10, 0, paths),
         (base, old_head): service.repo._cfg(base, 8, 0, sxt_paths),
@@ -1128,12 +1136,16 @@ def test_sxt_task_140_exact_identity_fixture_recovers_two_reviewed_absorptions(t
             "i18n/app/zh-CN.json",
             task_scope_path,
         ]),
+        (new_base, live_base): service.repo._cfg(new_base, 1, 0, ["unrelated/main-only.py"]),
+        (live_base, current_head): service.repo._cfg(
+            new_base, 10, 1, ["api/openapi/app.yaml", task_scope_path]
+        ),
     })
     for path, blob_sha in f["absorbed_blobs"].items():
         for commit_sha in (old_head, new_base, current_head):
             service.repo.blobs[(commit_sha, path)] = blob_sha
     service.client.heads[f["branch"]] = current_head
-    service.client.heads[BASE_BRANCH] = new_base
+    service.client.heads[BASE_BRANCH] = live_base
     with sessions._LOCK, sessions._db() as db:
         db.execute(
             "UPDATE workspaces SET base_commit_sha=?,head_sha=?,tree_sha=?,revision=? WHERE workspace_id=?",
@@ -1169,6 +1181,10 @@ def test_sxt_task_140_exact_identity_fixture_recovers_two_reviewed_absorptions(t
     assert result["control_plane_recovery"] == "CONTROL_PLANE_BASE_SYNC_RECOVERY_SUCCESS"
     assert result["workspace"]["head_sha"] == f["current_head"]
     assert result["workspace"]["tree_sha"] == f["current_tree"]
+    assert result["audit"]["github"]["base_sha"] == f["new_base"]
+    assert result["audit"]["github"]["live_base_sha"] == f["live_base_after_sync"]
+    assert result["audit"]["github"]["live_base_advanced_after_sync"] is True
+    assert result["audit"]["github"]["task_live_merge_base"]["merge_base_sha"] == f["new_base"]
     assert result["audit"]["actual_overlap_paths"] == paths
     absorbed = result["audit"]["task_path_convergence"]["absorbed_by_new_base"]
     assert {item["path"] for item in absorbed} == set(f["absorbed_blobs"])
@@ -1177,6 +1193,26 @@ def test_sxt_task_140_exact_identity_fixture_recovers_two_reviewed_absorptions(t
         and item["classification"] == "BASE_ABSORBED"
         for item in absorbed
     )
+
+
+def test_live_base_advance_with_different_task_merge_base_fails_closed(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    live_base = "7" * 40
+    service.repo.trees[live_base] = "8" * 40
+    service.repo.comparisons[(NEW_BASE, live_base)] = service.repo._cfg(
+        NEW_BASE, 1, 0, ["unrelated/main-only.py"]
+    )
+    service.repo.comparisons[(live_base, CURRENT_HEAD)] = service.repo._cfg(
+        OLD_BASE, 1, 1, ["unrelated/main-only.py"]
+    )
+    service.client.heads[BASE_BRANCH] = live_base
+
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+
+    assert exc.value.code == "RECOVERY_ANCESTRY_MISMATCH"
+    assert exc.value.details["selected_synced_base_sha"] == NEW_BASE
+    assert exc.value.details["actual_merge_base_sha"] == OLD_BASE
 
 
 def test_combined_base_sync_and_forward_task_advance_allows_expanded_paths(tmp_path, monkeypatch):

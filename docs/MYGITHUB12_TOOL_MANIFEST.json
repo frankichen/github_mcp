@@ -1,6 +1,6 @@
 {
   "service_name": "MyGithut12",
-  "service_version": "12.9.20",
+  "service_version": "12.9.21",
   "development_recovery": {
     "supports_active_workspace_stale_session_recovery": true,
     "recovery_kind": "active_workspace_stale_session",
