@@ -297,15 +297,16 @@ def _fresh_base_sync_github_identity(
             ahead_by = int(getattr(comparison, "ahead_by", 0) or 0)
             behind_by = int(getattr(comparison, "behind_by", 0) or 0)
         except Exception as compare_exc:
-            raise MyGithub12Error(
-                "RECOVERY_ANCESTRY_MISMATCH",
-                f"{label} ancestry could not be verified",
-                {
-                    "ancestor": ancestor,
-                    "descendant": descendant,
-                    "cause_type": type(compare_exc).__name__,
-                },
-            ) from compare_exc
+            return {
+                "verified": False,
+                "label": label,
+                "ancestor": ancestor,
+                "descendant": descendant,
+                "merge_base": "",
+                "ahead_by": 0,
+                "behind_by": 0,
+                "cause_type": type(compare_exc).__name__,
+            }
         return {
             "verified": merge_base == ancestor and behind_by == 0,
             "label": label,
@@ -932,6 +933,7 @@ def _atomic_recover_base_sync(
                 "development_session_id": session_id,
                 "old_base_sha": old_base_sha,
                 "new_base_sha": new_base_sha,
+                "github": verification["github"],
                 "pinned_base_state": pinned_base_state,
                 "old_session_head": old_session_head,
                 "adopted_head": current_head,
