@@ -1129,7 +1129,11 @@ def test_sxt_task_140_exact_identity_fixture_recovers_two_reviewed_absorptions(t
     service.repo.comparisons.update({
         (base, new_base): service.repo._cfg(base, 10, 0, paths),
         (base, old_head): service.repo._cfg(base, 8, 0, sxt_paths),
-        (old_head, current_head): service.repo._cfg(old_head, 2, 0, [task_scope_path]),
+        # Real #140 keeps the reviewed scope-expansion blob unchanged from the
+        # old Session HEAD to current HEAD; it is still part of new-base ->
+        # current Task delta and must therefore remain reviewable during the
+        # post-sync live-base-advance recovery.
+        (old_head, current_head): service.repo._cfg(old_head, 2, 0, ["api/openapi/app.yaml"]),
         (new_base, current_head): service.repo._cfg(new_base, 10, 0, [
             "api/openapi/app.yaml",
             "i18n/app/en.json",
@@ -1148,8 +1152,15 @@ def test_sxt_task_140_exact_identity_fixture_recovers_two_reviewed_absorptions(t
     service.client.heads[BASE_BRANCH] = live_base
     with sessions._LOCK, sessions._db() as db:
         db.execute(
-            "UPDATE workspaces SET base_commit_sha=?,head_sha=?,tree_sha=?,revision=? WHERE workspace_id=?",
-            (base, current_head, f["current_tree"], f["workspace_revision"], f["workspace_id"]),
+            "UPDATE workspaces SET base_commit_sha=?,head_sha=?,tree_sha=?,revision=?,scope_json=? WHERE workspace_id=?",
+            (
+                base,
+                current_head,
+                f["current_tree"],
+                f["workspace_revision"],
+                json.dumps({"paths": ["api/openapi/app.yaml", "i18n/app/en.json", "i18n/app/zh-CN.json"]}),
+                f["workspace_id"],
+            ),
         )
         db.execute(
             "UPDATE development_sessions SET base_commit_sha=?,head_commit_sha=?,tree_sha=?,session_revision=?,workspace_revision=? WHERE session_id=?",
@@ -1186,6 +1197,11 @@ def test_sxt_task_140_exact_identity_fixture_recovers_two_reviewed_absorptions(t
     assert result["audit"]["github"]["live_base_advanced_after_sync"] is True
     assert result["audit"]["github"]["task_live_merge_base"]["merge_base_sha"] == f["new_base"]
     assert result["audit"]["actual_overlap_paths"] == paths
+    assert result["audit"]["scope_authority_mode"] == "authoritative_current_task_delta"
+    assert result["audit"]["forward_recovery_scope_delta_paths"] == []
+    assert task_scope_path in result["audit"]["recovery_scope_delta_paths"]
+    assert result["audit"]["reviewed_scope_expansion_paths"] == [task_scope_path]
+    assert task_scope_path in result["workspace"]["scope"]["paths"]
     absorbed = result["audit"]["task_path_convergence"]["absorbed_by_new_base"]
     assert {item["path"] for item in absorbed} == set(f["absorbed_blobs"])
     assert all(
