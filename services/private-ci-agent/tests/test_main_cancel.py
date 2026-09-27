@@ -1,5 +1,8 @@
+import logging
 import threading
 from types import SimpleNamespace
+
+import pytest
 
 import private_ci_agent.main as main_module
 
@@ -111,3 +114,93 @@ def test_controller_client_sends_attempt_lease_on_job_callbacks(monkeypatch):
 
     client.finish_job("job-lease", 0, "passed")
     assert "job-lease" not in client._job_leases
+
+
+def test_sigterm_marks_active_job_for_cancellation(monkeypatch):
+    cancel_event = threading.Event()
+    monkeypatch.setattr(main_module, "_running", True)
+    monkeypatch.setattr(main_module, "_current_job_id", "job-active")
+    monkeypatch.setattr(main_module, "_cancel_event", cancel_event)
+
+    main_module.signal_handler(15, None)
+
+    assert main_module._running is False
+    assert cancel_event.is_set()
+
+
+def test_cleanup_job_runs_service_container_source_workspace_order(monkeypatch, tmp_path, caplog):
+    events = []
+    workspace = tmp_path / "job-ordered"
+    workspace.mkdir()
+    manager = SimpleNamespace(
+        workspace_root=str(tmp_path),
+        cleanup=lambda _job_id: (events.append("workspace"), workspace.rmdir(), True)[-1],
+    )
+    monkeypatch.setattr(main_module, "cleanup_job_services", lambda *_args: events.append("services"))
+
+    class FakeRunner:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def kill_job(self, _job_id):
+            events.append("containers")
+
+    monkeypatch.setattr(main_module, "PodmanRunner", FakeRunner)
+    monkeypatch.setattr(main_module, "remove_source_worktree", lambda *_args: events.append("source_worktree"))
+
+    with caplog.at_level(logging.INFO, logger="ci-agent"):
+        main_module._cleanup_job("job-ordered", manager)
+
+    assert events == ["services", "containers", "source_worktree", "workspace"]
+    assert not workspace.exists()
+    assert "Job cleanup verified: job=job-ordered workspace_absent=true" in caplog.text
+
+
+def test_cleanup_job_attempts_all_phases_and_fails_without_success_log(monkeypatch, tmp_path, caplog):
+    events = []
+    workspace = tmp_path / "job-failed"
+    workspace.mkdir()
+
+    def fail_workspace(_job_id):
+        events.append("workspace")
+        raise PermissionError("simulated UID-mapped tree")
+
+    manager = SimpleNamespace(workspace_root=str(tmp_path), cleanup=fail_workspace)
+    monkeypatch.setattr(main_module, "cleanup_job_services", lambda *_args: events.append("services"))
+
+    class FakeRunner:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def kill_job(self, _job_id):
+            events.append("containers")
+
+    monkeypatch.setattr(main_module, "PodmanRunner", FakeRunner)
+    monkeypatch.setattr(main_module, "remove_source_worktree", lambda *_args: events.append("source_worktree"))
+
+    with caplog.at_level(logging.ERROR, logger="ci-agent"):
+        with pytest.raises(RuntimeError, match="workspace"):
+            main_module._cleanup_job("job-failed", manager)
+
+    assert events == ["services", "containers", "source_worktree", "workspace"]
+    assert workspace.exists()
+    assert "phase=workspace" in caplog.text
+    assert "Job cleanup verified" not in caplog.text
+
+
+def test_cleanup_current_job_resets_worker_state_even_when_cleanup_fails(monkeypatch, tmp_path, caplog):
+    manager = SimpleNamespace(workspace_root=str(tmp_path))
+    monkeypatch.setattr(main_module, "_current_job_id", "job-reset")
+    monkeypatch.setattr(main_module, "_current_lease_token", "lease")
+    monkeypatch.setattr(
+        main_module,
+        "_cleanup_job",
+        lambda *_args: (_ for _ in ()).throw(PermissionError("cleanup failed")),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="ci-agent"):
+        main_module._cleanup_current_job("job-reset", manager)
+
+    assert main_module._current_job_id is None
+    assert main_module._current_lease_token is None
+    assert "Job cleanup failed: job-reset (PermissionError)" in caplog.text

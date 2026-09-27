@@ -340,6 +340,7 @@ class PodmanRunner:
             "--http-proxy=false",
             "--name", container_name,
             "--userns=keep-id",
+            "--user", f"{os.getuid()}:{os.getgid()}",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             "--pids-limit=256",
@@ -564,15 +565,13 @@ class PodmanRunner:
         )
         project_root = os.path.abspath(os.path.join(source_dir, os.pardir, os.pardir))
         net_arg = self._network_args(network, network_name)
-        # Some approved images (notably Gradle) declare a non-root image user.
-        # Bind-mounted checkouts are owned by ciworker, so that image default
-        # UID cannot create project-local state such as /workspace/.gradle.
-        # Keep the rootless namespace and run as the actual Worker identity;
-        # this preserves host ownership without granting host root privileges.
-        userns_arg = [] if network_name else [
-            "--userns=keep-id",
-            "--user", f"{os.getuid()}:{os.getgid()}",
-        ]
+        # Writable checkouts are owned by the Worker. Service pods already own
+        # their keep-id user namespace, so member containers must not request a
+        # second namespace; they still must run as the Worker UID/GID. Without
+        # this explicit --user, container root maps to the Worker's subordinate
+        # host UID range and leaves workspace files the Worker cannot remove.
+        worker_user = ["--user", f"{os.getuid()}:{os.getgid()}"]
+        userns_arg = worker_user if network_name else ["--userns=keep-id", *worker_user]
         tmpfs_tmp = "--tmpfs=/tmp:rw,exec,nosuid,size=256m" if allow_exec_tmpfs else "--tmpfs=/tmp:rw,noexec,nosuid,size=256m"
 
         cmd = [

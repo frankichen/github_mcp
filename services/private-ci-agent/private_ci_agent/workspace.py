@@ -1,9 +1,9 @@
 """Workspace management for CI jobs."""
 
-import os
-import shutil
 import logging
-from typing import Optional
+import os
+
+from private_ci_agent.cleanup import cleanup_workspaces, remove_tree_verified
 
 logger = logging.getLogger(__name__)
 
@@ -23,19 +23,19 @@ class WorkspaceManager:
     def get_source_dir(self, job_id: str) -> str:
         return os.path.join(self.workspace_root, job_id, "source")
 
-    def cleanup(self, job_id: str):
+    def cleanup(self, job_id: str) -> bool:
         path = os.path.join(self.workspace_root, job_id)
-        if os.path.exists(path):
-            shutil.rmtree(path, ignore_errors=True)
+        if not os.path.lexists(path):
+            return False
+        try:
+            removed = remove_tree_verified(path)
+        except Exception as exc:
+            logger.error("Failed to clean workspace: %s (%s)", job_id, type(exc).__name__)
+            raise
+        if removed:
             logger.info("Cleaned workspace: %s", job_id)
+        return removed
 
     def cleanup_stale(self, active_job_ids: list):
-        """Remove workspaces for jobs no longer active."""
-        if not os.path.exists(self.workspace_root):
-            return
-        for entry in os.listdir(self.workspace_root):
-            if entry not in active_job_ids:
-                path = os.path.join(self.workspace_root, entry)
-                if os.path.isdir(path):
-                    shutil.rmtree(path, ignore_errors=True)
-                    logger.info("Cleaned stale workspace: %s", entry)
+        """Remove stale workspaces only from this Worker's workspace root."""
+        cleanup_workspaces(self.workspace_root, active_job_ids)
