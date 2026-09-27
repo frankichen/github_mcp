@@ -204,3 +204,46 @@ def test_cleanup_current_job_resets_worker_state_even_when_cleanup_fails(monkeyp
     assert main_module._current_job_id is None
     assert main_module._current_lease_token is None
     assert "Job cleanup failed: job-reset (PermissionError)" in caplog.text
+
+
+def test_run_job_lifecycle_always_cleans_after_normal_return(monkeypatch, tmp_path):
+    events = []
+    job = SimpleNamespace(job_id="job-normal")
+    manager = SimpleNamespace(workspace_root=str(tmp_path))
+    monkeypatch.setattr(main_module, "_execute_job", lambda *_args: events.append("execute"))
+    monkeypatch.setattr(
+        main_module,
+        "_cleanup_current_job",
+        lambda job_id, _manager: events.append(f"cleanup:{job_id}"),
+    )
+
+    main_module._run_job_lifecycle(job, SimpleNamespace(), {}, manager, 1024, SimpleNamespace())
+
+    assert events == ["execute", "cleanup:job-normal"]
+
+
+def test_run_job_lifecycle_internal_exception_finishes_and_cleans(monkeypatch, tmp_path):
+    events = []
+    finished = []
+    job = SimpleNamespace(job_id="job-internal")
+    manager = SimpleNamespace(workspace_root=str(tmp_path))
+    client = SimpleNamespace(
+        finish_job=lambda job_id, exit_code, status, **kwargs: finished.append(
+            (job_id, exit_code, status, kwargs)
+        )
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_execute_job",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_cleanup_current_job",
+        lambda job_id, _manager: events.append(f"cleanup:{job_id}"),
+    )
+
+    main_module._run_job_lifecycle(job, client, {}, manager, 1024, SimpleNamespace())
+
+    assert finished and finished[-1][2] == "internal_error"
+    assert events == ["cleanup:job-internal"]

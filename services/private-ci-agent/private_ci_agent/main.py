@@ -205,18 +205,10 @@ def main():
                         _current_lease_token = job.lease_token
                         _cancel_event.clear()
 
-                        try:
-                            _execute_job(job, client, config, workspace_mgr,
-                                         max_source_bytes, podman_runner)
-                        except Exception as e:
-                            logger.error("Job execution failed: %s", e)
-                            try:
-                                client.finish_job(job.job_id, -1, "internal_error",
-                                                  error_message=str(e)[:500])
-                            except Exception:
-                                pass
-                        finally:
-                            _cleanup_current_job(job.job_id, workspace_mgr)
+                        _run_job_lifecycle(
+                            job, client, config, workspace_mgr,
+                            max_source_bytes, podman_runner,
+                        )
 
                 time.sleep(poll_interval)
             except Exception as e:
@@ -235,6 +227,27 @@ def main():
 
         podman_runner.cleanup_stale([])
         logger.info("CI Agent stopped")
+
+
+def _run_job_lifecycle(job: Job, client, config: dict, workspace_mgr: WorkspaceManager,
+                       max_source_bytes: int, podman_runner: PodmanRunner) -> None:
+    """Execute one leased Job and always run terminal cleanup."""
+    try:
+        _execute_job(
+            job, client, config, workspace_mgr,
+            max_source_bytes, podman_runner,
+        )
+    except Exception as exc:
+        logger.error("Job execution failed: %s", exc)
+        try:
+            client.finish_job(
+                job.job_id, -1, "internal_error",
+                error_message=str(exc)[:500],
+            )
+        except Exception:
+            pass
+    finally:
+        _cleanup_current_job(job.job_id, workspace_mgr)
 
 
 def _execute_job(job: Job, client, config: dict, workspace_mgr: WorkspaceManager,
