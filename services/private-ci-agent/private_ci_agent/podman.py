@@ -1,6 +1,7 @@
 """Rootless Podman container management."""
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -31,6 +32,86 @@ GO_CACHE_SUBDIRECTORIES = (
     "home", "gopath", "gomod", "gobuild", "config/go",
     "xdg-cache", "xdg-config", "tmp", ".tool-bin",
 )
+
+JOB_LABEL = "private-ci.job"
+WORKER_LABEL = "private-ci.worker"
+RESOURCE_LABEL = "private-ci.resource"
+ACTIVE_JOB_STATES = {"leased", "downloading", "preparing", "running"}
+STALE_JOB_STATES = {"queued", "passed", "failed", "timed_out", "cancelled", "internal_error", "superseded", "worker_lost"}
+MANAGED_RESOURCE_TYPES = {
+    "pod", "job-container", "postgres", "redis", "rabbitmq",
+    "postgres-global", "postgres-regional-cn", "postgres-regional-de",
+    "postgres-data", "redis-data", "rabbitmq-data",
+    "postgres-global-data", "postgres-regional-cn-data", "postgres-regional-de-data",
+}
+SHARED_RESOURCE_TYPES = {"shared-cache", "cache"}
+
+
+class PodmanCleanupError(RuntimeError):
+    """Owned Podman resource cleanup failed or could not be verified."""
+
+
+def _resource_exists(podman: str, kind: str, name: str) -> bool:
+    commands = {
+        "container": [podman, "container", "exists", name],
+        "pod": [podman, "pod", "exists", name],
+        "volume": [podman, "volume", "exists", name],
+    }
+    if kind not in commands:
+        raise ValueError(f"unsupported Podman resource kind: {kind}")
+    try:
+        result = subprocess.run(commands[kind], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PodmanCleanupError(f"{kind} existence check failed for {name}: {type(exc).__name__}") from exc
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise PodmanCleanupError(f"{kind} existence check failed for {name}: exit_code={result.returncode}")
+
+
+def inspect_podman_resource_labels(podman: str, kind: str, name: str) -> dict[str, str] | None:
+    if not _resource_exists(podman, kind, name):
+        return None
+    commands = {
+        "container": [podman, "inspect", "--format", "{{json .Config.Labels}}", name],
+        "pod": [podman, "pod", "inspect", "--format", "{{json .Labels}}", name],
+        "volume": [podman, "volume", "inspect", "--format", "{{json .Labels}}", name],
+    }
+    try:
+        result = subprocess.run(commands[kind], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PodmanCleanupError(f"{kind} label inspection failed for {name}: {type(exc).__name__}") from exc
+    if result.returncode != 0:
+        raise PodmanCleanupError(f"{kind} label inspection failed for {name}: exit_code={result.returncode}")
+    try:
+        labels = json.loads((result.stdout or "{}").strip() or "{}")
+    except (TypeError, ValueError) as exc:
+        raise PodmanCleanupError(f"{kind} labels are invalid for {name}") from exc
+    return labels if isinstance(labels, dict) else {}
+
+
+def remove_podman_resource_verified(podman: str, kind: str, name: str) -> bool:
+    if not _resource_exists(podman, kind, name):
+        return False
+    commands = {
+        "container": [podman, "rm", "-f", "-v", name],
+        "pod": [podman, "pod", "rm", "-f", name],
+        "volume": [podman, "volume", "rm", "-f", name],
+    }
+    try:
+        result = subprocess.run(commands[kind], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.error("podman cleanup failed resource_kind=%s resource_name=%s error=%s", kind, name, type(exc).__name__)
+        raise PodmanCleanupError(f"{kind} removal failed for {name}: {type(exc).__name__}") from exc
+    if result.returncode != 0:
+        logger.error("podman cleanup failed resource_kind=%s resource_name=%s exit_code=%s", kind, name, result.returncode)
+        raise PodmanCleanupError(f"{kind} removal failed for {name}: exit_code={result.returncode}")
+    if _resource_exists(podman, kind, name):
+        logger.error("podman cleanup failed resource_kind=%s resource_name=%s postcondition=still_exists", kind, name)
+        raise PodmanCleanupError(f"{kind} still exists after removal: {name}")
+    logger.info("podman cleanup succeeded resource_kind=%s resource_name=%s absent=true", kind, name)
+    return True
 
 
 class PodmanRunner:
@@ -146,6 +227,7 @@ class PodmanRunner:
         self,
         image: str,
         container_name: str,
+        job_id: str,
         network: bool,
         network_name: str | None,
         proxy_env: dict[str, str],
@@ -168,6 +250,9 @@ class PodmanRunner:
         command = [
             self.podman, "run", "--rm", "--pull=never", "--http-proxy=false",
             "--name", f"{container_name}-proxycheck",
+            "--label", f"{WORKER_LABEL}={self.worker_id}",
+            "--label", f"{JOB_LABEL}={job_id}",
+            "--label", f"{RESOURCE_LABEL}=job-container",
         ] + userns_args + [
             "--cap-drop=ALL", "--security-opt=no-new-privileges",
             "--read-only", "--tmpfs=/tmp:rw,noexec,nosuid,size=64m",
@@ -339,6 +424,9 @@ class PodmanRunner:
             "--pull=never",
             "--http-proxy=false",
             "--name", container_name,
+            "--label", f"{WORKER_LABEL}={self.worker_id}",
+            "--label", f"{JOB_LABEL}={job_id}",
+            "--label", f"{RESOURCE_LABEL}=job-container",
             "--userns=keep-id",
             "--user", f"{os.getuid()}:{os.getgid()}",
             "--cap-drop=ALL",
@@ -370,7 +458,7 @@ class PodmanRunner:
         except ValueError:
             logger.error("Container proxy configuration is invalid")
             return self._proxy_failure("PROXY_CONFIGURATION_INVALID")
-        if pass_proxy and not self._validate_container_proxy(image, container_name, False, None, proxy_env):
+        if pass_proxy and not self._validate_container_proxy(image, container_name, job_id, False, None, proxy_env):
             return self._proxy_failure("PROXY_VALIDATION_FAILED")
         safe_env = self._no_proxy_env()
         safe_env.update(proxy_env)
@@ -580,6 +668,9 @@ class PodmanRunner:
             "--pull=never",
             "--http-proxy=false",
             "--name", container_name,
+            "--label", f"{WORKER_LABEL}={self.worker_id}",
+            "--label", f"{JOB_LABEL}={job_id}",
+            "--label", f"{RESOURCE_LABEL}=job-container",
         ] + userns_arg + [
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
@@ -608,7 +699,7 @@ class PodmanRunner:
         except ValueError:
             logger.error("Container proxy configuration is invalid")
             return self._proxy_failure("PROXY_CONFIGURATION_INVALID")
-        if pass_proxy and not self._validate_container_proxy(image, container_name, network, network_name, proxy_env):
+        if pass_proxy and not self._validate_container_proxy(image, container_name, job_id, network, network_name, proxy_env):
             return self._proxy_failure("PROXY_VALIDATION_FAILED")
         safe_env = self._no_proxy_env()
         safe_env.update(proxy_env)
@@ -655,35 +746,58 @@ class PodmanRunner:
         suffix = hashlib.sha1(material.encode()).hexdigest()[:6] if source_dir else "main"
         return f"{self.container_namespace}-{job_id[:12]}-{suffix}"
 
-    def _job_container_prefix(self, job_id: str) -> str:
-        """Prefix shared only by this Worker's containers for one job."""
-        return f"{self.container_namespace}-{job_id[:12]}"
+    @staticmethod
+    def _container_name_from_item(item: dict) -> str:
+        names = item.get("Names") or item.get("Name") or ""
+        if isinstance(names, list):
+            return str(names[0]) if names else ""
+        return str(names)
+
+    def _podman_json(self, args: list[str]) -> list[dict]:
+        try:
+            result = subprocess.run([self.podman, *args], capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise PodmanCleanupError(f"Podman inventory failed: {type(exc).__name__}") from exc
+        if result.returncode != 0:
+            raise PodmanCleanupError(f"Podman inventory failed: exit_code={result.returncode}")
+        try:
+            payload = json.loads(result.stdout or "[]")
+        except (TypeError, ValueError) as exc:
+            raise PodmanCleanupError("Podman inventory returned invalid JSON") from exc
+        return payload if isinstance(payload, list) else []
+
+    def _owned_job_containers(self, job_id: str) -> list[dict]:
+        return self._podman_json(["ps", "-a", "--filter", f"label={WORKER_LABEL}={self.worker_id}", "--filter", f"label={JOB_LABEL}={job_id}", "--format", "json"])
+
+    def _verify_owned_resource(self, kind: str, name: str, job_id: str, resource_type: str) -> bool:
+        labels = inspect_podman_resource_labels(self.podman, kind, name)
+        if labels is None:
+            return False
+        expected = {WORKER_LABEL: self.worker_id, JOB_LABEL: job_id, RESOURCE_LABEL: resource_type}
+        if any(labels.get(key) != value for key, value in expected.items()):
+            raise PodmanCleanupError(f"{kind} ownership changed for {name}; refusing removal")
+        return True
 
     def kill_job(self, job_id: str) -> int:
-        """Force-stop and remove every container owned by the job."""
-        prefix = self._job_container_prefix(job_id)
-        names = self._container_names_matching(prefix)
-        for name in names:
-            self._kill_container(name)
+        removed, failures = 0, []
+        for item in self._owned_job_containers(job_id):
+            if bool(item.get("IsInfra")):
+                continue
+            name = self._container_name_from_item(item)
+            resource_type = str((item.get("Labels") or {}).get(RESOURCE_LABEL) or "")
+            if not name or resource_type not in MANAGED_RESOURCE_TYPES:
+                continue
             try:
-                subprocess.run([self.podman, "rm", "-f", name],
-                               capture_output=True, timeout=10)
-            except Exception:
-                pass
-        if names:
-            logger.warning("Cancelled job %s: reclaimed %d container(s)", job_id[:12], len(names))
-        return len(names)
-
-    def _container_names_matching(self, prefix: str) -> list[str]:
-        try:
-            result = subprocess.run(
-                [self.podman, "ps", "-a", "--format", "{{.Names}}"],
-                capture_output=True, text=True, timeout=10,
-            )
-            return [name for name in result.stdout.strip().split("\n") if name.startswith(prefix)]
-        except Exception as exc:
-            logger.warning("Listing containers failed: %s", exc)
-            return []
+                if self._verify_owned_resource("container", name, job_id, resource_type):
+                    removed += int(remove_podman_resource_verified(self.podman, "container", name))
+            except Exception as exc:
+                logger.error("podman cleanup failed worker=%s job=%s resource_type=%s resource_name=%s error=%s", self.worker_id, job_id, resource_type, name, type(exc).__name__)
+                failures.append(f"{name}:{type(exc).__name__}")
+        if failures:
+            raise PodmanCleanupError("job container cleanup incomplete: " + ", ".join(failures))
+        if removed:
+            logger.warning("Cancelled job %s: reclaimed %d container(s)", job_id[:12], removed)
+        return removed
 
     @staticmethod
     def _go_cache_env(go_cache: str | None) -> dict:
@@ -719,22 +833,129 @@ class PodmanRunner:
             except Exception:
                 pass
 
-    def cleanup_stale(self, job_id_prefixes: list):
-        """Remove only stale containers owned by this Worker namespace."""
+    @staticmethod
+    def _volume_size_bytes(mountpoint: str) -> int | None:
+        if not mountpoint:
+            return None
+        total = 0
         try:
-            result = subprocess.run(
-                [self.podman, "ps", "-a", "--format", "{{.Names}}"],
-                capture_output=True, text=True, timeout=10,
-            )
-            active_prefixes = [self._job_container_prefix(job_id) for job_id in job_id_prefixes]
-            namespace_prefix = self.container_namespace + "-"
-            for name in result.stdout.strip().split("\n"):
-                if name.startswith(namespace_prefix) and not any(name.startswith(prefix) for prefix in active_prefixes):
-                    logger.info("Removing stale container for %s: %s", self.worker_id, name)
+            for root, _dirs, files in os.walk(mountpoint):
+                for filename in files:
                     try:
-                        subprocess.run([self.podman, "rm", "-f", name],
-                                       capture_output=True, timeout=10)
-                    except Exception:
-                        pass
-        except Exception as exc:
-            logger.warning("Cleanup stale containers failed: %s", exc)
+                        total += os.stat(os.path.join(root, filename), follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+            return total
+        except OSError:
+            return None
+
+    def _volume_references(self, containers: list[dict]) -> dict[str, list[str]]:
+        references: dict[str, list[str]] = {}
+        for item in containers:
+            name = self._container_name_from_item(item)
+            if not name:
+                continue
+            try:
+                result = subprocess.run([self.podman, "inspect", "--format", "{{json .Mounts}}", name], capture_output=True, text=True, timeout=10)
+                if result.returncode != 0:
+                    continue
+                mounts = json.loads(result.stdout or "[]")
+            except (OSError, subprocess.TimeoutExpired, TypeError, ValueError):
+                continue
+            for mount in mounts if isinstance(mounts, list) else []:
+                if mount.get("Type") == "volume" and mount.get("Name"):
+                    references.setdefault(str(mount["Name"]), []).append(name)
+        return references
+
+    def _classify_resource(self, kind: str, item: dict, status_resolver, status_cache: dict[str, str | None]) -> tuple[str, str | None, str]:
+        labels = item.get("Labels") or {}
+        resource_type = str(labels.get(RESOURCE_LABEL) or "")
+        worker, job_id = labels.get(WORKER_LABEL), labels.get(JOB_LABEL)
+        if kind == "volume" and bool(item.get("Anonymous")) and not labels:
+            return "LEGACY_UNOWNED", None, "anonymous_without_private_ci_labels"
+        if resource_type in SHARED_RESOURCE_TYPES:
+            return "SHARED", None, "shared_resource_type"
+        if worker != self.worker_id:
+            return "UNKNOWN", None, "other_or_missing_worker"
+        if not job_id:
+            return "UNKNOWN", None, "missing_job_label"
+        if resource_type not in MANAGED_RESOURCE_TYPES:
+            return "UNKNOWN", None, "unrecognized_resource_type"
+        if status_resolver is None:
+            return "UNKNOWN", None, "job_status_not_resolved"
+        if job_id not in status_cache:
+            try:
+                status_cache[job_id] = status_resolver(job_id)
+            except Exception:
+                status_cache[job_id] = None
+        status = status_cache[job_id]
+        if status in ACTIVE_JOB_STATES:
+            return "ACTIVE", status, "controller_active"
+        if status in STALE_JOB_STATES:
+            return "SAFE_STALE", status, "controller_non_active"
+        return "UNKNOWN", status, "unknown_job_status"
+
+    def inventory_resources(self, status_resolver=None, *, include_size: bool = False) -> list[dict]:
+        pods = self._podman_json(["pod", "ps", "--format", "json"])
+        containers = self._podman_json(["ps", "-a", "--format", "json"])
+        volumes = self._podman_json(["volume", "ls", "--format", "json"])
+        volume_refs, status_cache, inventory = self._volume_references(containers), {}, []
+        for kind, items in (("pod", pods), ("container", containers), ("volume", volumes)):
+            for item in items:
+                labels = item.get("Labels") or {}
+                if kind == "pod":
+                    name = str(item.get("Name") or "")
+                    referenced_by = [str(c.get("Names") or c.get("Name") or c.get("Id") or "") for c in (item.get("Containers") or [])]
+                    created_at = item.get("Created")
+                elif kind == "container":
+                    name = self._container_name_from_item(item)
+                    referenced_by = [str(item.get("Pod") or "")] if item.get("Pod") else []
+                    created_at = item.get("CreatedAt") or item.get("Created")
+                else:
+                    name = str(item.get("Name") or "")
+                    referenced_by = volume_refs.get(name, [])
+                    created_at = item.get("CreatedAt")
+                if not name:
+                    continue
+                classification, job_status, reason = self._classify_resource(kind, item, status_resolver, status_cache)
+                size = self._volume_size_bytes(str(item.get("Mountpoint") or "")) if include_size and kind == "volume" else None
+                inventory.append({"kind": kind, "volume_name": name if kind == "volume" else None, "name": name, "labels": labels, "created_at": created_at, "referenced_by": [v for v in referenced_by if v], "worker": labels.get(WORKER_LABEL), "job": labels.get(JOB_LABEL), "resource_type": labels.get(RESOURCE_LABEL), "job_status": job_status, "classification": classification, "classification_reason": reason, "estimated_size": size, "is_infra": bool(item.get("IsInfra")) if kind == "container" else False})
+        return inventory
+
+    def reconcile_stale_resources(self, status_resolver) -> dict:
+        inventory = self.inventory_resources(status_resolver)
+        removed, preserved, failures = [], [], []
+        order = {"pod": 0, "container": 1, "volume": 2}
+        for item in sorted(inventory, key=lambda value: order[value["kind"]]):
+            if item["classification"] != "SAFE_STALE":
+                preserved.append(item)
+                if item["classification"] in {"ACTIVE", "UNKNOWN", "SHARED", "LEGACY_UNOWNED"}:
+                    logger.info("podman resource preserved worker=%s job=%s resource_type=%s resource_name=%s classification=%s", self.worker_id, item.get("job"), item.get("resource_type"), item["name"], item["classification"])
+                continue
+            job_id, resource_type = str(item["job"]), str(item["resource_type"])
+            try:
+                fresh_status = status_resolver(job_id)
+            except Exception:
+                fresh_status = None
+            if fresh_status in ACTIVE_JOB_STATES or fresh_status not in STALE_JOB_STATES:
+                protected = dict(item)
+                protected["classification"] = "ACTIVE" if fresh_status in ACTIVE_JOB_STATES else "UNKNOWN"
+                protected["job_status"] = fresh_status
+                protected["classification_reason"] = "controller_active_recheck" if fresh_status in ACTIVE_JOB_STATES else "job_status_changed_or_unknown"
+                preserved.append(protected)
+                continue
+            try:
+                if self._verify_owned_resource(item["kind"], item["name"], job_id, resource_type):
+                    remove_podman_resource_verified(self.podman, item["kind"], item["name"])
+                    removed.append(item)
+                    logger.info("stale resource removed worker=%s job=%s resource_type=%s resource_name=%s", self.worker_id, job_id, resource_type, item["name"])
+            except Exception as exc:
+                logger.error("stale resource cleanup failed worker=%s job=%s resource_type=%s resource_name=%s error=%s", self.worker_id, job_id, resource_type, item["name"], type(exc).__name__)
+                failures.append(f"{item['kind']}:{item['name']}:{type(exc).__name__}")
+        if failures:
+            raise PodmanCleanupError("startup Podman reconciliation incomplete: " + ", ".join(failures))
+        return {"removed": removed, "preserved": preserved}
+
+    def cleanup_stale(self, _job_id_prefixes: list | None = None) -> int:
+        logger.warning("Podman cleanup_stale without Controller job state is disabled; resources preserved")
+        return 0
