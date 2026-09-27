@@ -43,6 +43,8 @@ def signal_handler(sig, frame):
     global _running
     logger.info("Received signal %s, shutting down...", sig)
     _running = False
+    if _current_job_id:
+        _request_cancel(_current_job_id)
 
 
 def _request_cancel(job_id: str | None = None) -> bool:
@@ -123,7 +125,18 @@ def main():
     podman_runner = PodmanRunner(_podman_binary, worker_id)
     podman_runner.cleanup_stale([])
     workspace_mgr = WorkspaceManager(workspace_root)
-    workspace_mgr.cleanup_stale([])
+    try:
+        workspace_mgr.cleanup_stale([])
+    except Exception as exc:
+        # Legacy UID-mapped workspaces must remain visible as cleanup failures,
+        # but one historical tree must not keep the Worker permanently offline.
+        logger.error(
+            "Startup workspace cleanup incomplete: worker=%s cleanup_status=failed "
+            "error=%s: %s",
+            worker_id,
+            type(exc).__name__,
+            str(exc)[:500],
+        )
 
     executor = JobExecutor(client, config)
 
@@ -157,10 +170,10 @@ def main():
                         if hb.get("cancel_requested"):
                             logger.info("Cancel requested for job %s", _current_job_id)
                             _request_cancel(_current_job_id)
-                            client.finish_job(_current_job_id, -1, "cancelled",
+                            cancelled_job_id = _current_job_id
+                            client.finish_job(cancelled_job_id, -1, "cancelled",
                                               summary={"cancelled": True})
-                            _cleanup_job(_current_job_id, workspace_mgr)
-                            _current_job_id = None
+                            _cleanup_current_job(cancelled_job_id, workspace_mgr)
                             continue
                     except Exception:
                         pass
@@ -194,20 +207,10 @@ def main():
                         _current_lease_token = job.lease_token
                         _cancel_event.clear()
 
-                        try:
-                            _execute_job(job, client, config, workspace_mgr,
-                                         max_source_bytes, podman_runner)
-                        except Exception as e:
-                            logger.error("Job execution failed: %s", e)
-                            try:
-                                client.finish_job(job.job_id, -1, "internal_error",
-                                                  error_message=str(e)[:500])
-                            except Exception:
-                                pass
-                        finally:
-                            _cleanup_job(job.job_id, workspace_mgr)
-                            _current_job_id = None
-                            _current_lease_token = None
+                        _run_job_lifecycle(
+                            job, client, config, workspace_mgr,
+                            max_source_bytes, podman_runner,
+                        )
 
                 time.sleep(poll_interval)
             except Exception as e:
@@ -226,6 +229,27 @@ def main():
 
         podman_runner.cleanup_stale([])
         logger.info("CI Agent stopped")
+
+
+def _run_job_lifecycle(job: Job, client, config: dict, workspace_mgr: WorkspaceManager,
+                       max_source_bytes: int, podman_runner: PodmanRunner) -> None:
+    """Execute one leased Job and always run terminal cleanup."""
+    try:
+        _execute_job(
+            job, client, config, workspace_mgr,
+            max_source_bytes, podman_runner,
+        )
+    except Exception as exc:
+        logger.error("Job execution failed: %s", exc)
+        try:
+            client.finish_job(
+                job.job_id, -1, "internal_error",
+                error_message=str(exc)[:500],
+            )
+        except Exception:
+            pass
+    finally:
+        _cleanup_current_job(job.job_id, workspace_mgr)
 
 
 def _execute_job(job: Job, client, config: dict, workspace_mgr: WorkspaceManager,
@@ -375,28 +399,77 @@ def _kill_current_job(job_id: str | None = None):
         logger.error("Failed to force-stop job containers: %s", exc)
 
 
-def _cleanup_job(job_id: str, workspace_mgr: WorkspaceManager):
-    global _podman_binary
+def _cleanup_current_job(job_id: str, workspace_mgr: WorkspaceManager) -> None:
+    """Run cleanup without letting a failure pin the Worker to a terminal Job."""
+    global _current_job_id, _current_lease_token
     try:
-        # Worktrees belong to the independent mirror.  Remove stale worktree
-        # metadata on every cleanup; this is harmless for archive jobs and
-        # prevents a failed job from poisoning the next exact-SHA checkout.
-        remove_source_worktree(
-            os.path.join(workspace_mgr.workspace_root, job_id, "source"),
-            os.environ.get("CI_SOURCE_MIRROR_ROOT", "/srv/private-ci/cache/git"),
+        _cleanup_job(job_id, workspace_mgr)
+    except Exception as exc:
+        logger.error(
+            "Job cleanup failed: job=%s cleanup_status=failed error=%s: %s",
+            job_id,
+            type(exc).__name__,
+            str(exc)[:500],
         )
-    except Exception:
-        pass
-    try:
-        cleanup_job_services(_podman_binary, job_id, os.path.join(workspace_mgr.workspace_root, job_id))
-    except Exception:
-        pass
-    try:
-        PodmanRunner(_podman_binary).kill_job(job_id)
-    except Exception:
-        pass
+    finally:
+        if _current_job_id == job_id:
+            _current_job_id = None
+            _current_lease_token = None
 
-    workspace_mgr.cleanup(job_id)
+
+def _cleanup_job(job_id: str, workspace_mgr: WorkspaceManager) -> None:
+    """Run all Job cleanup phases and only report success after FS verification."""
+    global _podman_binary
+    workspace = os.path.join(workspace_mgr.workspace_root, job_id)
+    failures: list[tuple[str, str]] = []
+
+    def cleanup_phase(name: str, callback) -> None:
+        try:
+            callback()
+        except Exception as exc:
+            logger.error(
+                "Job cleanup phase failed: job=%s phase=%s cleanup_status=failed "
+                "error=%s: %s",
+                job_id,
+                name,
+                type(exc).__name__,
+                str(exc)[:500],
+            )
+            failures.append((name, type(exc).__name__))
+
+    cleanup_phase(
+        "services",
+        lambda: cleanup_job_services(_podman_binary, job_id, workspace),
+    )
+    cleanup_phase(
+        "containers",
+        lambda: PodmanRunner(_podman_binary).kill_job(job_id),
+    )
+    cleanup_phase(
+        "source_worktree",
+        lambda: remove_source_worktree(
+            os.path.join(workspace, "source"),
+            os.environ.get("CI_SOURCE_MIRROR_ROOT", "/srv/private-ci/cache/git"),
+        ),
+    )
+    cleanup_phase("workspace", lambda: workspace_mgr.cleanup(job_id))
+
+    if os.path.lexists(workspace):
+        logger.error(
+            "Job cleanup phase failed: job=%s phase=workspace_verify "
+            "cleanup_status=failed error=PATH_EXISTS",
+            job_id,
+        )
+        failures.append(("workspace_verify", "PATH_EXISTS"))
+
+    if failures:
+        details = ", ".join(f"{phase}:{error}" for phase, error in failures)
+        raise RuntimeError(f"job cleanup incomplete: {details}")
+
+    logger.info(
+        "Job cleanup verified: job=%s cleanup_status=passed workspace_absent=true",
+        job_id,
+    )
 
 
 if __name__ == "__main__":

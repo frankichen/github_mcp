@@ -432,6 +432,8 @@ def test_legacy_run_also_disables_automatic_proxy_inheritance(monkeypatch, tmp_p
 
     command = captured[0]
     assert "--http-proxy=false" in command
+    assert "--userns=keep-id" in command
+    assert command[command.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
     assert not any(item.startswith("HTTP_PROXY=") for item in command)
     assert "127.0.0.1:10808" not in command
 
@@ -460,6 +462,8 @@ def test_service_environment_is_forwarded_without_host_env(monkeypatch, tmp_path
     )
     command = captured[0]
     assert "--pod" in command and "ci-job_123" in command
+    assert "--userns=keep-id" not in command
+    assert command[command.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
     assert any(item.startswith("DATABASE_URL=") for item in command)
     assert any(item.startswith("CI_GLOBAL_DATABASE_URL=") for item in command)
     assert any(item.startswith("CI_REGIONAL_CN_DATABASE_URL=") for item in command)
