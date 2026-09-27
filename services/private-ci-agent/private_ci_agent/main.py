@@ -123,7 +123,13 @@ def main():
     # Each Worker only reclaims its own namespaced Podman resources and its
     # own writable workspace root. Starting wsl-ci-02 must not touch wsl-ci-01.
     podman_runner = PodmanRunner(_podman_binary, worker_id)
-    podman_runner.cleanup_stale([])
+    try:
+        podman_runner.cleanup_stale(client.get_job_state)
+    except Exception as exc:
+        logger.error(
+            "Startup Podman reconciliation incomplete: worker=%s error=%s: %s",
+            worker_id, type(exc).__name__, str(exc)[:500],
+        )
     workspace_mgr = WorkspaceManager(workspace_root)
     try:
         workspace_mgr.cleanup_stale([])
@@ -227,7 +233,13 @@ def main():
             except Exception:
                 pass
 
-        podman_runner.cleanup_stale([])
+        try:
+            podman_runner.cleanup_stale(client.get_job_state)
+        except Exception as exc:
+            logger.error(
+                "Shutdown Podman reconciliation incomplete: worker=%s error=%s: %s",
+                worker_id, type(exc).__name__, str(exc)[:500],
+            )
         logger.info("CI Agent stopped")
 
 
