@@ -76,6 +76,15 @@ class ControllerClient:
         except Exception:
             return None
 
+    def get_job_state(self, job_id: str) -> Optional[dict]:
+        """Return Controller-authoritative Job state for safe local reconciliation."""
+        try:
+            return self._request("GET", f"/internal/ci/jobs/{job_id}")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            raise
+
     def upload_log(self, job_id: str, content: str) -> bool:
         try:
             self._request("POST", f"/internal/ci/jobs/{job_id}/logs", {"content": content}, job_id=job_id)
