@@ -11,6 +11,10 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 from private_ci_agent.config import resolve_worker_id
+from private_ci_agent.podman import (
+    JOB_LABEL, WORKER_LABEL, RESOURCE_LABEL,
+    PodmanCleanupError, inspect_podman_resource_labels, remove_podman_resource_verified,
+)
 
 logger = logging.getLogger(__name__)
 JOB_ID_RE = re.compile(r"[^a-z0-9]+")
@@ -20,8 +24,11 @@ ASSIGNMENT_RE = re.compile(
     r"(?i)\b([A-Za-z0-9_]*(?:password|passwd|token|secret|authorization|cookie))\b"
     r"\s*([=:])\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
-JOB_LABEL = "private-ci.job"
-RESOURCE_LABEL = "private-ci.resource"
+SERVICE_VOLUME_DESTINATIONS = {
+    "postgres": "/var/lib/postgresql/data", "redis": "/data", "rabbitmq": "/var/lib/rabbitmq",
+    "postgres-global": "/var/lib/postgresql/data", "postgres-regional-cn": "/var/lib/postgresql/data",
+    "postgres-regional-de": "/var/lib/postgresql/data",
+}
 
 
 def safe_job_suffix(job_id: str) -> str:
@@ -102,6 +109,27 @@ class ServiceManager:
         }
         self.timeout = min(int(config.get("ci_services_timeout_seconds", 90)), 90)
 
+    def _volume_name(self, suffix: str, service: str) -> str:
+        return f"ci-{self.worker_id}-{suffix}-{service}-data"
+
+    def _label_args(self, job_id: str, resource_type: str) -> list[str]:
+        return ["--label", f"{WORKER_LABEL}={self.worker_id}", "--label", f"{JOB_LABEL}={job_id}", "--label", f"{RESOURCE_LABEL}={resource_type}"]
+
+    def _create_job_volume(self, job_id: str, suffix: str, service: str, error_code: str) -> str:
+        volume = self._volume_name(suffix, service)
+        self._run(["volume", "create", *self._label_args(job_id, f"{service}-data"), volume], error_code, resource_type=service, operation="create_volume", resource_name=volume)
+        logger.info("podman resource created worker=%s job=%s resource_type=%s resource_name=%s", self.worker_id, job_id, f"{service}-data", volume)
+        return volume
+
+    def _cleanup_owned_resource(self, kind: str, name: str, job_id: str, resource_type: str) -> bool:
+        labels = inspect_podman_resource_labels(self.podman, kind, name)
+        if labels is None:
+            return False
+        expected = {WORKER_LABEL: self.worker_id, JOB_LABEL: job_id, RESOURCE_LABEL: resource_type}
+        if any(labels.get(key) != value for key, value in expected.items()):
+            raise PodmanCleanupError(f"refusing {kind} cleanup with mismatched ownership: {name}")
+        return remove_podman_resource_verified(self.podman, kind, name)
+
     def prepare(
         self,
         job_id: str,
@@ -119,6 +147,7 @@ class ServiceManager:
         suffix = safe_job_suffix(job_id)
         network = f"ci-svc-{self.worker_id}-{suffix}"
         names = {kind: f"ci-{self.worker_id}-{suffix}-{kind}" for kind in requested}
+        volumes = {kind: self._volume_name(suffix, kind) for kind in requested}
         database = f"lenshub_ci_{suffix}"
         db_password = secrets.token_urlsafe(24)
         rabbit_password = secrets.token_urlsafe(24)
@@ -138,10 +167,12 @@ class ServiceManager:
                     image=self.images[kind],
                 )
 
+            for kind in requested:
+                self._create_job_volume(job_id, suffix, kind, f"{kind.upper()}_UNAVAILABLE")
+
             pod_args = [
                 "pod", "create", "--name", network,
-                "--label", f"{JOB_LABEL}={suffix}",
-                "--label", f"{RESOURCE_LABEL}=pod",
+                *self._label_args(job_id, "pod"),
                 "--userns=keep-id",
                 "--network", "slirp4netns:allow_host_loopback=true",
             ]
@@ -159,9 +190,9 @@ class ServiceManager:
                 self._run([
                     "run", "-d", "--http-proxy=false",
                     "--name", names["postgres"],
-                    "--label", f"{JOB_LABEL}={suffix}",
-                    "--label", f"{RESOURCE_LABEL}=postgres",
+                    *self._label_args(job_id, "postgres"),
                     "--pod", network, "--user", "0",
+                    "-v", f"{volumes['postgres']}:{SERVICE_VOLUME_DESTINATIONS['postgres']}:Z",
                     "-e", "POSTGRES_USER=lenshub",
                     "-e", f"POSTGRES_PASSWORD={db_password}",
                     "-e", "POSTGRES_DB=postgres",
@@ -174,9 +205,9 @@ class ServiceManager:
                 self._run([
                     "run", "-d", "--http-proxy=false",
                     "--name", names["redis"],
-                    "--label", f"{JOB_LABEL}={suffix}",
-                    "--label", f"{RESOURCE_LABEL}=redis",
+                    *self._label_args(job_id, "redis"),
                     "--pod", network,
+                    "-v", f"{volumes['redis']}:{SERVICE_VOLUME_DESTINATIONS['redis']}:Z",
                     self.images["redis"], "redis-server", "--save", "", "--appendonly", "no",
                 ], "REDIS_UNAVAILABLE", resource_type="redis",
                     operation="start_container", image=self.images["redis"],
@@ -186,9 +217,9 @@ class ServiceManager:
                 self._run([
                     "run", "-d", "--http-proxy=false",
                     "--name", names["rabbitmq"],
-                    "--label", f"{JOB_LABEL}={suffix}",
-                    "--label", f"{RESOURCE_LABEL}=rabbitmq",
+                    *self._label_args(job_id, "rabbitmq"),
                     "--pod", network,
+                    "-v", f"{volumes['rabbitmq']}:{SERVICE_VOLUME_DESTINATIONS['rabbitmq']}:Z",
                     "-e", f"RABBITMQ_DEFAULT_USER={rabbit_user}",
                     "-e", f"RABBITMQ_DEFAULT_PASS={rabbit_password}",
                     "-e", f"RABBITMQ_DEFAULT_VHOST={rabbit_vhost}",
@@ -299,18 +330,27 @@ class ServiceManager:
         os.chmod(path, 0o600)
 
     def cleanup(self, job_id: str, workspace: str = "") -> None:
-        # 资源名绑定 Worker + Job，只处理当前实例自己的精确名称。
-        suffix = safe_job_suffix(job_id)
-        pod_name = f"ci-svc-{self.worker_id}-{suffix}"
-        self._cleanup_resource(["pod", "rm", "-f", pod_name], "pod", pod_name)
+        suffix, failures = safe_job_suffix(job_id), []
+        def attempt(kind: str, name: str, resource_type: str) -> None:
+            try:
+                self._cleanup_owned_resource(kind, name, job_id, resource_type)
+            except Exception as exc:
+                logger.error("services cleanup failed worker=%s job=%s resource_type=%s resource_name=%s error=%s", self.worker_id, job_id, resource_type, name, type(exc).__name__)
+                failures.append(f"{kind}:{name}:{type(exc).__name__}")
+        attempt("pod", f"ci-svc-{self.worker_id}-{suffix}", "pod")
         for kind in self.images:
-            name = f"ci-{self.worker_id}-{suffix}-{kind}"
-            self._cleanup_resource(["rm", "-f", name], kind, name)
+            attempt("container", f"ci-{self.worker_id}-{suffix}-{kind}", kind)
+        for kind in self.images:
+            attempt("volume", self._volume_name(suffix, kind), f"{kind}-data")
         if workspace:
             try:
                 os.remove(os.path.join(workspace, "runtime", "services.env"))
-            except OSError:
+            except FileNotFoundError:
                 pass
+            except OSError as exc:
+                failures.append(f"env_file:{type(exc).__name__}")
+        if failures:
+            raise PodmanCleanupError("service cleanup incomplete: " + ", ".join(failures))
 
     @staticmethod
     def _diagnostic(code: str, operation: str, resource_type: str, exit_code: int | None,
@@ -506,9 +546,6 @@ class MultiDataPlaneServiceManager(ServiceManager):
         postgres_image = self.images["postgres"]
         self.images.update({name: postgres_image for name in _MULTI_POSTGRES_SERVICES})
 
-    def _volume_name(self, suffix: str, service: str) -> str:
-        return f"ci-{self.worker_id}-{suffix}-{service}-data"
-
     def prepare(
         self,
         job_id: str,
@@ -534,7 +571,7 @@ class MultiDataPlaneServiceManager(ServiceManager):
         suffix = safe_job_suffix(job_id)
         network = f"ci-svc-{self.worker_id}-{suffix}"
         names = {kind: f"ci-{self.worker_id}-{suffix}-{kind}" for kind in requested}
-        volumes = {kind: self._volume_name(suffix, kind) for kind in _MULTI_POSTGRES_SERVICES}
+        volumes = {kind: self._volume_name(suffix, kind) for kind in requested}
         database = f"lenshub_ci_{suffix}"[:63]
         passwords = {kind: secrets.token_urlsafe(24) for kind in _MULTI_POSTGRES_SERVICES}
         rabbit_password = secrets.token_urlsafe(24)
@@ -554,26 +591,13 @@ class MultiDataPlaneServiceManager(ServiceManager):
                     resource_type=kind, operation="inspect", image=image,
                 )
 
-            for kind in _MULTI_POSTGRES_SERVICES:
-                volume = volumes[kind]
-                self._run(
-                    [
-                        "volume", "create",
-                        "--label", f"{JOB_LABEL}={suffix}",
-                        "--label", f"{RESOURCE_LABEL}={kind}-data",
-                        volume,
-                    ],
-                    _MULTI_POSTGRES[kind]["error_code"],
-                    resource_type=kind,
-                    operation="create_volume",
-                    resource_name=volume,
-                )
-                created_volumes.append(volume)
+            for kind in requested:
+                error_code = _MULTI_POSTGRES.get(kind, {}).get("error_code", "REDIS_UNAVAILABLE" if kind == "redis" else "RABBITMQ_UNAVAILABLE")
+                created_volumes.append(self._create_job_volume(job_id, suffix, kind, error_code))
 
             pod_command = [
                 "pod", "create", "--name", network,
-                "--label", f"{JOB_LABEL}={suffix}",
-                "--label", f"{RESOURCE_LABEL}=pod",
+                *self._label_args(job_id, "pod"),
                 "--userns=keep-id",
                 "--network", "slirp4netns:allow_host_loopback=true",
             ]
@@ -594,11 +618,10 @@ class MultiDataPlaneServiceManager(ServiceManager):
                 self._run(
                     [
                         "run", "-d", "--name", names[kind],
-                        "--label", f"{JOB_LABEL}={suffix}",
-                        "--label", f"{RESOURCE_LABEL}={kind}",
+                        *self._label_args(job_id, kind),
                         "--http-proxy=false", "--pod", network, "--user", "0",
                         *_MULTI_POSTGRES_LIMITS,
-                        "-v", f"{volumes[kind]}:/var/lib/postgresql/data:Z",
+                        "-v", f"{volumes[kind]}:{SERVICE_VOLUME_DESTINATIONS[kind]}:Z",
                         "-e", "POSTGRES_USER=lenshub",
                         "-e", f"POSTGRES_PASSWORD={passwords[kind]}",
                         "-e", "POSTGRES_DB=postgres",
@@ -616,10 +639,10 @@ class MultiDataPlaneServiceManager(ServiceManager):
                 self._run(
                     [
                         "run", "-d", "--name", names["redis"],
-                        "--label", f"{JOB_LABEL}={suffix}",
-                        "--label", f"{RESOURCE_LABEL}=redis",
+                        *self._label_args(job_id, "redis"),
                         "--http-proxy=false", "--pod", network,
                         *_MULTI_REDIS_LIMITS,
+                        "-v", f"{volumes['redis']}:{SERVICE_VOLUME_DESTINATIONS['redis']}:Z",
                         self.images["redis"],
                     ],
                     "REDIS_UNAVAILABLE", resource_type="redis", operation="start_container",
@@ -630,10 +653,10 @@ class MultiDataPlaneServiceManager(ServiceManager):
                 self._run(
                     [
                         "run", "-d", "--name", names["rabbitmq"],
-                        "--label", f"{JOB_LABEL}={suffix}",
-                        "--label", f"{RESOURCE_LABEL}=rabbitmq",
+                        *self._label_args(job_id, "rabbitmq"),
                         "--http-proxy=false", "--pod", network,
                         *_MULTI_RABBITMQ_LIMITS,
+                        "-v", f"{volumes['rabbitmq']}:{SERVICE_VOLUME_DESTINATIONS['rabbitmq']}:Z",
                         "-e", "RABBITMQ_DEFAULT_USER=lenshub",
                         "-e", f"RABBITMQ_DEFAULT_PASS={rabbit_password}",
                         "-e", f"RABBITMQ_DEFAULT_VHOST={rabbit_vhost}",
@@ -774,11 +797,8 @@ class MultiDataPlaneServiceManager(ServiceManager):
         os.chmod(path, 0o600)
 
     def cleanup(self, job_id: str, workspace: str = "") -> None:
-        suffix = safe_job_suffix(job_id)
         super().cleanup(job_id, workspace)
-        for kind in _MULTI_POSTGRES_SERVICES:
-            volume = self._volume_name(suffix, kind)
-            self._cleanup_resource(["volume", "rm", "-f", volume], kind, volume)
+
 
 def cleanup_job_services(podman_binary: str, job_id: str, workspace: str = "") -> None:
     MultiDataPlaneServiceManager(podman_binary).cleanup(job_id, workspace)

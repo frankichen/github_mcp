@@ -113,17 +113,18 @@ def main():
 
     logger.info("Worker registered. Supported profiles: %s", profiles_list)
 
-    # Startup state reconciliation
+    # Controller lease reconciliation precedes exact Podman ownership cleanup.
+    reconciler = Reconciler(base_url, worker_id, token)
     try:
-        reconciler = Reconciler(base_url, worker_id, token)
         reconciler.reconcile()
     except Exception as e:
         logger.warning("Startup reconcile failed (non-fatal): %s", e)
 
-    # Each Worker only reclaims its own namespaced Podman resources and its
-    # own writable workspace root. Starting wsl-ci-02 must not touch wsl-ci-01.
     podman_runner = PodmanRunner(_podman_binary, worker_id)
-    podman_runner.cleanup_stale([])
+    try:
+        podman_runner.reconcile_stale_resources(reconciler.get_job_status)
+    except Exception as exc:
+        logger.error("Startup Podman reconciliation incomplete: worker=%s cleanup_status=failed error=%s: %s", worker_id, type(exc).__name__, str(exc)[:500])
     workspace_mgr = WorkspaceManager(workspace_root)
     try:
         workspace_mgr.cleanup_stale([])
@@ -227,7 +228,6 @@ def main():
             except Exception:
                 pass
 
-        podman_runner.cleanup_stale([])
         logger.info("CI Agent stopped")
 
 
@@ -390,8 +390,7 @@ def _kill_current_job(job_id: str | None = None):
         job_id = _current_job_id
     if not job_id:
         return
-    # Containers are named ci-<job_id>[:12]-<source-hash>; stop by job prefix
-    # so every container owned by the job (main + per-workspace) is reclaimed.
+    # Exact worker/job labels are the ownership authority; names are not.
     runner = PodmanRunner(_podman_binary)
     try:
         runner.kill_job(job_id)

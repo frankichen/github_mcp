@@ -8,6 +8,7 @@ import logging
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 import json
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,12 @@ class Reconciler:
             logger.warning("Reconcile request failed %s %s: %s", method, path, e)
             return {"error": str(e)}
 
+    def get_job_status(self, job_id: str) -> str | None:
+        result = self._request("GET", f"/internal/ci/jobs/{urllib.parse.quote(job_id, safe='')}", timeout=10)
+        if result.get("error"):
+            return None
+        return str(result["status"]) if result.get("status") else None
+
     def reconcile(self):
         """Execute safe startup state reconciliation.
 
@@ -61,7 +68,7 @@ class Reconciler:
 
             if result.get("error"):
                 logger.warning("Reconcile returned error: %s", result["error"])
-                return
+                return result
 
             current_job_id = result.get("current_job_id")
             current_job_status = result.get("current_job_status")
@@ -70,7 +77,7 @@ class Reconciler:
 
             if not current_job_id:
                 logger.info("Reconcile: no current_job - worker is idle")
-                return
+                return result
 
             logger.info(
                 "Reconcile: current_job=%s status=%s lease_expired=%s action=%s",
@@ -90,3 +97,4 @@ class Reconciler:
             logger.warning("Reconcile failed (non-fatal): %s", e)
 
         logger.info("Startup reconciliation complete")
+        return result if "result" in locals() else None
