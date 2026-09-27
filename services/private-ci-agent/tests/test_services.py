@@ -26,9 +26,19 @@ def test_prepare_uses_isolated_network_and_aliases(monkeypatch, tmp_path):
     assert any("--pod" in command and any("redis" in item for item in command) for command in commands)
     assert any("--pod" in command and any("rabbitmq" in item for item in command) for command in commands)
     assert all("--http-proxy=false" in command for command in commands if command[1] == "run")
-    assert any("private-ci.job=job_123" in item for command in commands for item in command)
+    assert any("private-ci.job=job-123" in item for command in commands for item in command)
+    assert any("private-ci.worker=wsl-ci-01" in item for command in commands for item in command)
     assert any("private-ci.resource=postgres" in item for command in commands for item in command)
+    volume_creates = [command for command in commands if command[1:3] == ["volume", "create"]]
+    assert len(volume_creates) == 3
+    assert all("private-ci.job=job-123" in command for command in volume_creates)
+    assert all("private-ci.worker=wsl-ci-01" in command for command in volume_creates)
+    flattened = [item for command in commands for item in command]
+    assert any("/var/lib/postgresql/data:Z" in item for item in flattened)
+    assert any("/data:Z" in item for item in flattened)
+    assert any("/var/lib/rabbitmq:Z" in item for item in flattened)
     assert (tmp_path / "runtime" / "services.env").stat().st_mode & 0o777 == 0o600
+    monkeypatch.setattr("private_ci_agent.services.inspect_podman_resource_labels", lambda *_: None)
     manager.cleanup("job-123", str(tmp_path))
     assert not (tmp_path / "runtime" / "services.env").exists()
 
@@ -63,11 +73,20 @@ def test_prepare_starts_only_explicitly_requested_services(monkeypatch, tmp_path
 
 
 def test_cleanup_is_scoped_to_current_job(monkeypatch):
-    commands = []
-    monkeypatch.setattr("private_ci_agent.services.subprocess.run", lambda command, **_: commands.append(command) or SimpleNamespace(returncode=0, stdout="", stderr=""))
-    ServiceManager("podman").cleanup("job-123")
-    assert ["podman", "pod", "rm", "-f", "ci-svc-wsl-ci-01-job_123"] in commands
-    assert all("lenshub-postgres" not in item for command in commands for item in command)
+    manager = ServiceManager("podman")
+    requested = []
+    monkeypatch.setattr(
+        manager,
+        "_cleanup_owned_resource",
+        lambda kind, name, job_id, resource_type: requested.append(
+            (kind, name, job_id, resource_type)
+        ),
+    )
+    manager.cleanup("job-123")
+    assert requested[0] == ("pod", "ci-svc-wsl-ci-01-job_123", "job-123", "pod")
+    assert all(item[2] == "job-123" for item in requested)
+    assert all("job_123" in item[1] for item in requested)
+    assert not any("job_456" in item[1] for item in requested)
 
 
 def test_second_worker_service_names_do_not_overlap_primary(monkeypatch, tmp_path):
@@ -137,8 +156,10 @@ def test_multidataplane_prepare_provisions_three_independent_postgres_instances(
     assert any("port=5433" in command for command in postgres_runs)
     assert any("port=5434" in command for command in postgres_runs)
     volume_creates = [command for command in commands if command[1:3] == ["volume", "create"]]
-    assert len(volume_creates) == 3
-    assert len({command[-1] for command in volume_creates}) == 3
+    assert len(volume_creates) == 5
+    assert len({command[-1] for command in volume_creates}) == 5
+    assert all("private-ci.worker=wsl-ci-01" in command for command in volume_creates)
+    assert all("private-ci.job=job-multi" in command for command in volume_creates)
     env_file = tmp_path / "runtime" / "services.env"
     assert env_file.stat().st_mode & 0o777 == 0o600
     contents = env_file.read_text(encoding="utf-8")
@@ -146,9 +167,8 @@ def test_multidataplane_prepare_provisions_three_independent_postgres_instances(
     assert "CI_REGIONAL_CN_DATABASE_URL=" in contents
     assert "CI_REGIONAL_DE_DATABASE_URL=" in contents
 
+    monkeypatch.setattr("private_ci_agent.services.inspect_podman_resource_labels", lambda *_: None)
     manager.cleanup("job-multi", str(tmp_path))
-    volume_removes = [command for command in commands if command[1:4] == ["volume", "rm", "-f"]]
-    assert len(volume_removes) >= 3
     assert not env_file.exists()
 
 
@@ -174,6 +194,7 @@ def test_multidataplane_health_failure_is_role_specific_and_cleans_current_job(m
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("private_ci_agent.services.subprocess.run", fake_run)
+    monkeypatch.setattr("private_ci_agent.services.inspect_podman_resource_labels", lambda *_: None)
     manager = MultiDataPlaneServiceManager("podman")
     manager.timeout = 0.01
     with pytest.raises(ServiceSetupError) as raised:
@@ -182,19 +203,24 @@ def test_multidataplane_health_failure_is_role_specific_and_cleans_current_job(m
     flattened = [item for command in commands for item in command]
     assert "ci-svc-wsl-ci-01-job_failing" in flattened
     assert not any("job_other" in item for item in flattened)
-    assert any(command[1:4] == ["volume", "rm", "-f"] for command in commands)
+    assert any(command[1:3] == ["volume", "create"] for command in commands)
 
 
 def test_multidataplane_cleanup_identity_does_not_cross_jobs(monkeypatch):
-    commands = []
+    manager = MultiDataPlaneServiceManager("podman")
+    requested = []
     monkeypatch.setattr(
-        "private_ci_agent.services.subprocess.run",
-        lambda command, **_: commands.append(command) or SimpleNamespace(returncode=0, stdout="", stderr=""),
+        manager,
+        "_cleanup_owned_resource",
+        lambda kind, name, job_id, resource_type: requested.append(
+            (kind, name, job_id, resource_type)
+        ),
     )
-    MultiDataPlaneServiceManager("podman").cleanup("job-a")
-    flattened = [item for command in commands for item in command]
-    assert any("job_a" in item for item in flattened)
-    assert not any("job_b" in item for item in flattened)
+    manager.cleanup("job-a")
+    assert requested
+    assert all(item[2] == "job-a" for item in requested)
+    assert all("job_a" in item[1] for item in requested)
+    assert not any("job_b" in item[1] for item in requested)
 
 
 def test_service_run_failure_contains_safe_diagnostic(monkeypatch):
@@ -260,6 +286,7 @@ def test_missing_service_image_reports_inspect_operation(monkeypatch, tmp_path):
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("private_ci_agent.services.subprocess.run", fake_run)
+    monkeypatch.setattr("private_ci_agent.services.inspect_podman_resource_labels", lambda *_: None)
     with pytest.raises(ServiceSetupError) as raised:
         ServiceManager("podman").prepare("job-image-missing", str(tmp_path), ["postgres"])
 
@@ -322,3 +349,78 @@ def test_stderr_sanitizer_bounds_and_removes_url_credentials():
     assert len(sanitized) == 500
     assert "unit-pass" not in sanitized
     assert "token=unit-secret" not in sanitized
+
+
+
+def test_partial_service_startup_cleans_created_job_volumes(monkeypatch, tmp_path):
+    removed = []
+
+    def fake_run(command, **_kwargs):
+        if command[1:3] == ["run", "-d"] and any("rabbitmq" in item for item in command):
+            return SimpleNamespace(returncode=125, stdout="", stderr="simulated start failure")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_labels(_podman, kind, name):
+        if kind != "volume":
+            return None
+        for service in ("postgres", "redis", "rabbitmq"):
+            if f"-{service}-data" in name:
+                return {
+                    "private-ci.worker": "wsl-ci-01",
+                    "private-ci.job": "job-partial-cleanup",
+                    "private-ci.resource": f"{service}-data",
+                }
+        return None
+
+    monkeypatch.setattr("private_ci_agent.services.subprocess.run", fake_run)
+    monkeypatch.setattr("private_ci_agent.services.inspect_podman_resource_labels", fake_labels)
+    monkeypatch.setattr(
+        "private_ci_agent.services.remove_podman_resource_verified",
+        lambda _podman, kind, name: removed.append((kind, name)) or True,
+    )
+    with pytest.raises(ServiceSetupError):
+        ServiceManager("podman").prepare(
+            "job-partial-cleanup",
+            str(tmp_path),
+            ["postgres", "redis", "rabbitmq"],
+        )
+    assert {name for kind, name in removed if kind == "volume"} == {
+        "ci-wsl-ci-01-job_partial_cleanup-postgres-data",
+        "ci-wsl-ci-01-job_partial_cleanup-redis-data",
+        "ci-wsl-ci-01-job_partial_cleanup-rabbitmq-data",
+    }
+
+
+def test_cleanup_failure_is_visible_and_never_logs_success(monkeypatch, caplog):
+    manager = ServiceManager("podman")
+    volume = "ci-wsl-ci-01-job_cleanup-postgres-data"
+
+    def fake_labels(_podman, kind, name):
+        if kind == "volume" and name == volume:
+            return {
+                "private-ci.worker": "wsl-ci-01",
+                "private-ci.job": "job-cleanup",
+                "private-ci.resource": "postgres-data",
+            }
+        return None
+
+    monkeypatch.setattr("private_ci_agent.services.inspect_podman_resource_labels", fake_labels)
+    monkeypatch.setattr(
+        "private_ci_agent.services.remove_podman_resource_verified",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("simulated volume rm failure")),
+    )
+    with caplog.at_level("INFO"):
+        with pytest.raises(Exception, match="service cleanup incomplete"):
+            manager.cleanup("job-cleanup")
+    assert "services cleanup failed" in caplog.text
+    assert "podman cleanup succeeded" not in caplog.text
+
+
+def test_cleanup_is_idempotent_when_resources_are_absent(monkeypatch):
+    monkeypatch.setattr(
+        "private_ci_agent.services.inspect_podman_resource_labels",
+        lambda *_args: None,
+    )
+    manager = ServiceManager("podman")
+    manager.cleanup("job-idempotent")
+    manager.cleanup("job-idempotent")
