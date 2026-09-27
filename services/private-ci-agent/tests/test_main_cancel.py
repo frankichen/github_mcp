@@ -116,16 +116,23 @@ def test_controller_client_sends_attempt_lease_on_job_callbacks(monkeypatch):
     assert "job-lease" not in client._job_leases
 
 
-def test_sigterm_marks_active_job_for_cancellation(monkeypatch):
+def test_sigterm_marks_active_job_for_cancellation_and_reclaims_containers(monkeypatch):
     cancel_event = threading.Event()
+    killed = []
     monkeypatch.setattr(main_module, "_running", True)
     monkeypatch.setattr(main_module, "_current_job_id", "job-active")
     monkeypatch.setattr(main_module, "_cancel_event", cancel_event)
+    monkeypatch.setattr(
+        main_module,
+        "_kill_current_job",
+        lambda job_id=None: killed.append(job_id),
+    )
 
     main_module.signal_handler(15, None)
 
     assert main_module._running is False
     assert cancel_event.is_set()
+    assert killed == ["job-active"]
 
 
 def test_cleanup_job_runs_service_container_source_workspace_order(monkeypatch, tmp_path, caplog):

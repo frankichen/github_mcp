@@ -44,7 +44,7 @@ def signal_handler(sig, frame):
     logger.info("Received signal %s, shutting down...", sig)
     _running = False
     if _current_job_id:
-        _cancel_event.set()
+        _request_cancel(_current_job_id)
 
 
 def _request_cancel(job_id: str | None = None) -> bool:
