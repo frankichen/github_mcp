@@ -157,8 +157,14 @@ def test_multidataplane_prepare_provisions_three_independent_postgres_instances(
     assert len({command[-1] for command in volume_creates}) == 5
     assert all("private-ci.worker=wsl-ci-01" in command for command in volume_creates)
     assert all("private-ci.job=job-multi" in command for command in volume_creates)
-    assert any("redis-data" in command for command in volume_creates)
-    assert any("rabbitmq-data" in command for command in volume_creates)
+    assert any(
+        any("redis-data" in item for item in command)
+        for command in volume_creates
+    )
+    assert any(
+        any("rabbitmq-data" in item for item in command)
+        for command in volume_creates
+    )
     env_file = tmp_path / "runtime" / "services.env"
     assert env_file.stat().st_mode & 0o777 == 0o600
     contents = env_file.read_text(encoding="utf-8")

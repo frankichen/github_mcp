@@ -199,5 +199,43 @@ def test_dry_run_inventory_classifies_legacy_anonymous_volume_without_deleting(m
     assert items[0]["name"] == "legacy-anon"
     assert items[0]["classification"] == "LEGACY_UNOWNED"
     assert items[0]["referenced_by"] == []
+    assert "estimated_size" in items[0]
     assert "estimated_size_bytes" in items[0]
     assert all("rm" not in args for args in command_calls)
+
+
+def test_dry_run_inventory_include_sizes_inspects_volume_mountpoint(monkeypatch):
+    manager = PodmanResourceManager("podman", "wsl-ci-01")
+
+    def fake_list(args):
+        if args[:2] == ["volume", "ls"]:
+            return [{
+                "Name": "owned-volume",
+                "Labels": _labels(),
+                "Anonymous": False,
+                "MountCount": 0,
+                "CreatedAt": "2026-09-27T00:00:00Z",
+            }]
+        return []
+
+    monkeypatch.setattr(manager, "_list_json", fake_list)
+    monkeypatch.setattr(
+        manager,
+        "_volume_mountpoint",
+        lambda name: "/fake/owned-volume" if name == "owned-volume" else "",
+    )
+    monkeypatch.setattr(
+        manager,
+        "_estimate_size_bytes",
+        lambda mountpoint: 12345 if mountpoint == "/fake/owned-volume" else None,
+    )
+
+    items = manager.inventory_resources(
+        lambda _job_id: {"status": "queued", "worker_id": None},
+        include_sizes=True,
+    )
+
+    assert len(items) == 1
+    assert items[0]["classification"] == "SAFE_STALE"
+    assert items[0]["estimated_size"] == 12345
+    assert items[0]["estimated_size_bytes"] == 12345

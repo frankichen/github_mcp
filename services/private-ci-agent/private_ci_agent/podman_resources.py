@@ -247,6 +247,21 @@ class PodmanResourceManager:
             return ["<unavailable>"]
         return [line for line in result.stdout.splitlines() if line]
 
+    def _volume_mountpoint(self, name: str) -> str:
+        result = self._command(
+            ["volume", "inspect", "--format", "{{.Mountpoint}}", name]
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "podman volume size inventory could not inspect mountpoint: "
+                "worker=%s volume=%s exit_code=%s",
+                self.worker_id,
+                name,
+                result.returncode,
+            )
+            return ""
+        return result.stdout.strip()
+
     @staticmethod
     def _estimate_size_bytes(mountpoint: str) -> int | None:
         if not mountpoint or not os.path.isdir(mountpoint):
@@ -332,17 +347,24 @@ class PodmanResourceManager:
                 mount_count = int(raw.get("MountCount") or 0)
             except (TypeError, ValueError):
                 mount_count = 0
-            mountpoint = raw.get("Mountpoint") or ""
+            name = raw.get("Name") or ""
+            mountpoint = raw.get("Mountpoint") or (
+                self._volume_mountpoint(name) if include_sizes else ""
+            )
+            estimated_size = (
+                self._estimate_size_bytes(mountpoint) if include_sizes else None
+            )
             items.append({
                 "kind": "volume",
-                "name": raw.get("Name") or "",
+                "name": name,
                 "labels": labels,
                 "worker": labels.get(WORKER_LABEL),
                 "job": labels.get(JOB_LABEL),
                 "resource_type": labels.get(RESOURCE_LABEL),
                 "created_at": raw.get("CreatedAt"),
-                "referenced_by": self._volume_references(raw.get("Name") or "", mount_count),
-                "estimated_size_bytes": self._estimate_size_bytes(mountpoint) if include_sizes else None,
+                "referenced_by": self._volume_references(name, mount_count),
+                "estimated_size": estimated_size,
+                "estimated_size_bytes": estimated_size,
                 "anonymous": anonymous,
                 "classification": classification,
                 "reason": reason,
