@@ -48,6 +48,9 @@ def test_writable_checkout_uses_worker_identity(monkeypatch, tmp_path):
     assert "--userns=keep-id" in command
     assert "--user" in command
     assert f"{os.getuid()}:{os.getgid()}" in command
+    assert "private-ci.worker=wsl-ci-01" in command
+    assert "private-ci.job=job-123" in command
+    assert "private-ci.resource=build-container" in command
 
 
 def test_gradle_step_can_load_native_library_from_exec_tmpfs(monkeypatch, tmp_path):
@@ -553,17 +556,25 @@ def test_run_command_with_cancel_event_stops_container_and_reports_cancelled(mon
 def test_kill_job_stops_only_current_worker_job_containers(monkeypatch):
     import private_ci_agent.podman as podman_module
 
-    ps_output = (
-        "ci-wsl-ci-01-job-123-abc123\n"
-        "ci-wsl-ci-01-job-123-def456\n"
-        "ci-wsl-ci-01-job-999-other\n"
-        "ci-wsl-ci-02-job-123-other\n"
-    )
+    existing = {
+        "ci-wsl-ci-01-job-123-abc123",
+        "ci-wsl-ci-01-job-123-def456",
+        "ci-wsl-ci-01-job-999-other",
+        "ci-wsl-ci-02-job-123-other",
+    }
     stopped = []
 
     def fake_run(cmd, **_kwargs):
         if cmd[:2] == ["podman", "ps"]:
-            return SimpleNamespace(returncode=0, stdout=ps_output, stderr="")
+            return SimpleNamespace(returncode=0, stdout="\n".join(sorted(existing)) + "\n", stderr="")
+        if cmd[1:3] == ["container", "exists"]:
+            return SimpleNamespace(returncode=0 if cmd[-1] in existing else 1, stdout="", stderr="")
+        if cmd[1:3] == ["inspect", "--format"]:
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+        if cmd[1] == "rm":
+            existing.discard(cmd[-1])
+            stopped.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         stopped.append(cmd)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -576,29 +587,22 @@ def test_kill_job_stops_only_current_worker_job_containers(monkeypatch):
     assert any("ci-wsl-ci-01-job-123-def456" in cmd and cmd[1] == "stop" for cmd in stopped)
     assert not any("ci-wsl-ci-02" in item for cmd in stopped for item in cmd)
     assert not any("ci-wsl-ci-01-job-999" in item for cmd in stopped for item in cmd)
+    assert all("-v" in cmd for cmd in stopped if len(cmd) > 1 and cmd[1] == "rm")
 
 
-def test_cleanup_stale_keeps_active_job_and_other_worker_containers(monkeypatch):
-    import private_ci_agent.podman as podman_module
-
-    ps_output = (
-        "ci-wsl-ci-01-job-123-abc123\n"
-        "ci-wsl-ci-01-job-456-stale\n"
-        "ci-wsl-ci-02-job-456-running\n"
+def test_cleanup_stale_delegates_to_ownership_reconciliation(monkeypatch):
+    runner = PodmanRunner("podman", "wsl-ci-01")
+    resolver = lambda _job_id: {"status": "queued", "worker_id": None}
+    expected = {"removed": 1}
+    seen = []
+    monkeypatch.setattr(
+        runner.resources,
+        "reconcile_stale",
+        lambda callback: seen.append(callback) or expected,
     )
-    removed = []
 
-    def fake_run(cmd, **_kwargs):
-        if cmd[:2] == ["podman", "ps"]:
-            return SimpleNamespace(returncode=0, stdout=ps_output, stderr="")
-        if cmd[1] == "rm":
-            removed.append(cmd)
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(podman_module.subprocess, "run", fake_run)
-    PodmanRunner("podman", "wsl-ci-01").cleanup_stale(["job-123"])
-
-    assert removed == [["podman", "rm", "-f", "ci-wsl-ci-01-job-456-stale"]]
+    assert runner.cleanup_stale(resolver) == expected
+    assert seen == [resolver]
 
 
 def test_image_digest_prefers_registry_repo_digest(monkeypatch):

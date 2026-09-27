@@ -52,15 +52,23 @@ def test_request_cancel_is_noop_without_active_job(monkeypatch):
 def test_kill_current_job_reclaims_all_job_containers_by_prefix(monkeypatch):
     stopped = []
     removed = []
-    ps_output = "ci-wsl-ci-01-job-abc123-aaa111\nci-wsl-ci-01-job-abc123-bbb222\n"
+    existing = {
+        "ci-wsl-ci-01-job-abc123-aaa111",
+        "ci-wsl-ci-01-job-abc123-bbb222",
+    }
 
     def fake_run(cmd, **_kwargs):
         if cmd[:2] == ["podman", "ps"]:
-            return SimpleNamespace(returncode=0, stdout=ps_output, stderr="")
+            return SimpleNamespace(returncode=0, stdout="\n".join(sorted(existing)) + "\n", stderr="")
+        if cmd[1:3] == ["container", "exists"]:
+            return SimpleNamespace(returncode=0 if cmd[-1] in existing else 1, stdout="", stderr="")
+        if cmd[1:3] == ["inspect", "--format"]:
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
         if cmd[1] == "stop":
             stopped.append(cmd)
         elif cmd[1] == "rm":
             removed.append(cmd)
+            existing.discard(cmd[-1])
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     import private_ci_agent.podman as podman_module
@@ -74,6 +82,33 @@ def test_kill_current_job_reclaims_all_job_containers_by_prefix(monkeypatch):
     assert any("ci-wsl-ci-01-job-abc123-bbb222" in cmd and cmd[1] == "stop" for cmd in stopped)
     assert any("ci-wsl-ci-01-job-abc123-aaa111" in cmd and cmd[1] == "rm" for cmd in removed)
     assert any("ci-wsl-ci-01-job-abc123-bbb222" in cmd and cmd[1] == "rm" for cmd in removed)
+    assert all("-v" in cmd for cmd in removed)
+
+
+@pytest.mark.parametrize("terminal_status", ["passed", "failed", "cancelled", "timed_out"])
+def test_run_job_lifecycle_terminal_paths_always_cleanup(monkeypatch, tmp_path, terminal_status):
+    events = []
+    job = SimpleNamespace(job_id=f"job-{terminal_status}")
+    manager = SimpleNamespace(workspace_root=str(tmp_path))
+    monkeypatch.setattr(
+        main_module,
+        "_execute_job",
+        lambda *_args: events.append(f"execute:{terminal_status}"),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_cleanup_current_job",
+        lambda job_id, _manager: events.append(f"cleanup:{job_id}"),
+    )
+
+    main_module._run_job_lifecycle(
+        job, SimpleNamespace(), {}, manager, 1024, SimpleNamespace()
+    )
+
+    assert events == [
+        f"execute:{terminal_status}",
+        f"cleanup:job-{terminal_status}",
+    ]
 
 
 def test_controller_client_sends_attempt_lease_on_job_callbacks(monkeypatch):
