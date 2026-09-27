@@ -38,6 +38,27 @@ def test_cleanup_command_failure_is_visible_and_never_logs_success(monkeypatch, 
     assert "podman cleanup succeeded" not in caplog.text
 
 
+def test_cleanup_removal_allows_podman_stop_grace(monkeypatch):
+    manager = PodmanResourceManager("podman", "wsl-ci-01")
+    exists = iter([True, False])
+    calls = []
+    monkeypatch.setattr(manager, "_exists", lambda *_args: next(exists))
+    monkeypatch.setattr(manager, "_inspect_labels", lambda *_args: _labels())
+
+    def fake_command(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(manager, "_command", fake_command)
+
+    assert manager.remove_verified(
+        "pod", "job-pod", "job-1", "postgres-data"
+    ) is True
+    assert calls == [
+        (["pod", "rm", "-f", "job-pod"], {"timeout": 30}),
+    ]
+
+
 def test_cleanup_requires_verified_physical_absence(monkeypatch):
     manager = PodmanResourceManager("podman", "wsl-ci-01")
     exists = iter([True, True])

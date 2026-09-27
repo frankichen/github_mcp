@@ -19,6 +19,7 @@ STALE_JOB_STATES = {
     "internal_error", "superseded", "worker_lost",
 }
 SHARED_RESOURCE_TYPES = {"cache", "shared-cache"}
+RESOURCE_REMOVE_TIMEOUT_SECONDS = 30
 
 
 class PodmanCleanupError(RuntimeError):
@@ -174,7 +175,7 @@ class PodmanResourceManager:
             "podman cleanup requested worker=%s job=%s resource_type=%s resource_name=%s",
             self.worker_id, job_id, resource_type, name,
         )
-        result = self._command(args)
+        result = self._command(args, timeout=RESOURCE_REMOVE_TIMEOUT_SECONDS)
         if result.returncode != 0:
             logger.error(
                 "podman cleanup failed worker=%s job=%s resource_type=%s resource_name=%s exit_code=%s",
@@ -208,7 +209,10 @@ class PodmanResourceManager:
                 raise PodmanCleanupError(f"current job container ownership mismatch: name={name}")
             resource_type = labels.get(RESOURCE_LABEL) or "build-container"
 
-        result = self._command(["rm", "-f", "-v", name])
+        result = self._command(
+            ["rm", "-f", "-v", name],
+            timeout=RESOURCE_REMOVE_TIMEOUT_SECONDS,
+        )
         if result.returncode != 0:
             raise PodmanCleanupError(
                 f"podman current-job container remove failed: name={name} exit_code={result.returncode}"
