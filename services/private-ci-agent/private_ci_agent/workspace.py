@@ -30,7 +30,12 @@ class WorkspaceManager:
         try:
             removed = remove_tree_verified(path)
         except Exception as exc:
-            logger.error("Failed to clean workspace: %s (%s)", job_id, type(exc).__name__)
+            logger.error(
+                "Failed to clean workspace: %s cleanup_status=failed error=%s: %s",
+                job_id,
+                type(exc).__name__,
+                str(exc)[:500],
+            )
             raise
         if removed:
             logger.info("Cleaned workspace: %s", job_id)

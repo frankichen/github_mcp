@@ -153,7 +153,10 @@ def test_cleanup_job_runs_service_container_source_workspace_order(monkeypatch, 
 
     assert events == ["services", "containers", "source_worktree", "workspace"]
     assert not workspace.exists()
-    assert "Job cleanup verified: job=job-ordered workspace_absent=true" in caplog.text
+    assert (
+        "Job cleanup verified: job=job-ordered cleanup_status=passed "
+        "workspace_absent=true"
+    ) in caplog.text
 
 
 def test_cleanup_job_attempts_all_phases_and_fails_without_success_log(monkeypatch, tmp_path, caplog):
@@ -185,6 +188,8 @@ def test_cleanup_job_attempts_all_phases_and_fails_without_success_log(monkeypat
     assert events == ["services", "containers", "source_worktree", "workspace"]
     assert workspace.exists()
     assert "phase=workspace" in caplog.text
+    assert "cleanup_status=failed" in caplog.text
+    assert "simulated UID-mapped tree" in caplog.text
     assert "Job cleanup verified" not in caplog.text
 
 
@@ -203,7 +208,8 @@ def test_cleanup_current_job_resets_worker_state_even_when_cleanup_fails(monkeyp
 
     assert main_module._current_job_id is None
     assert main_module._current_lease_token is None
-    assert "Job cleanup failed: job-reset (PermissionError)" in caplog.text
+    assert "Job cleanup failed: job=job-reset cleanup_status=failed" in caplog.text
+    assert "cleanup failed" in caplog.text
 
 
 def test_run_job_lifecycle_always_cleans_after_normal_return(monkeypatch, tmp_path):

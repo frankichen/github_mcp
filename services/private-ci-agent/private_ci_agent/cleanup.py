@@ -142,9 +142,10 @@ def cleanup_workspaces(workspace_root: str, active_job_ids: list):
                 removed = remove_tree_verified(entry.path)
             except Exception as exc:
                 logger.error(
-                    "Failed to clean stale workspace: %s (%s)",
+                    "Failed to clean stale workspace: %s cleanup_status=failed error=%s: %s",
                     entry.name,
                     type(exc).__name__,
+                    str(exc)[:500],
                 )
                 failures.append((entry.name, type(exc).__name__))
                 continue

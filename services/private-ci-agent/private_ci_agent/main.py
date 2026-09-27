@@ -131,9 +131,11 @@ def main():
         # Legacy UID-mapped workspaces must remain visible as cleanup failures,
         # but one historical tree must not keep the Worker permanently offline.
         logger.error(
-            "Startup workspace cleanup incomplete for %s (%s)",
+            "Startup workspace cleanup incomplete: worker=%s cleanup_status=failed "
+            "error=%s: %s",
             worker_id,
             type(exc).__name__,
+            str(exc)[:500],
         )
 
     executor = JobExecutor(client, config)
@@ -403,7 +405,12 @@ def _cleanup_current_job(job_id: str, workspace_mgr: WorkspaceManager) -> None:
     try:
         _cleanup_job(job_id, workspace_mgr)
     except Exception as exc:
-        logger.error("Job cleanup failed: %s (%s)", job_id, type(exc).__name__)
+        logger.error(
+            "Job cleanup failed: job=%s cleanup_status=failed error=%s: %s",
+            job_id,
+            type(exc).__name__,
+            str(exc)[:500],
+        )
     finally:
         if _current_job_id == job_id:
             _current_job_id = None
@@ -421,10 +428,12 @@ def _cleanup_job(job_id: str, workspace_mgr: WorkspaceManager) -> None:
             callback()
         except Exception as exc:
             logger.error(
-                "Job cleanup phase failed: job=%s phase=%s error=%s",
+                "Job cleanup phase failed: job=%s phase=%s cleanup_status=failed "
+                "error=%s: %s",
                 job_id,
                 name,
                 type(exc).__name__,
+                str(exc)[:500],
             )
             failures.append((name, type(exc).__name__))
 
@@ -446,14 +455,21 @@ def _cleanup_job(job_id: str, workspace_mgr: WorkspaceManager) -> None:
     cleanup_phase("workspace", lambda: workspace_mgr.cleanup(job_id))
 
     if os.path.lexists(workspace):
-        logger.error("Job cleanup phase failed: job=%s phase=workspace_verify error=PATH_EXISTS", job_id)
+        logger.error(
+            "Job cleanup phase failed: job=%s phase=workspace_verify "
+            "cleanup_status=failed error=PATH_EXISTS",
+            job_id,
+        )
         failures.append(("workspace_verify", "PATH_EXISTS"))
 
     if failures:
         details = ", ".join(f"{phase}:{error}" for phase, error in failures)
         raise RuntimeError(f"job cleanup incomplete: {details}")
 
-    logger.info("Job cleanup verified: job=%s workspace_absent=true", job_id)
+    logger.info(
+        "Job cleanup verified: job=%s cleanup_status=passed workspace_absent=true",
+        job_id,
+    )
 
 
 if __name__ == "__main__":

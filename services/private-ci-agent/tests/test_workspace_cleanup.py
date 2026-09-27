@@ -174,6 +174,8 @@ def test_stale_cleanup_failure_is_error_and_not_false_success(tmp_path, caplog, 
     assert failed.exists()
     assert not removable.exists()
     assert "Failed to clean stale workspace: failed-job" in caplog.text
+    assert "cleanup_status=failed" in caplog.text
+    assert "simulated UID-mapped tree" in caplog.text
     assert "Cleaned stale workspace: failed-job" not in caplog.text
     assert "Cleaned stale workspace: removable-job" in caplog.text
 
@@ -191,6 +193,8 @@ def test_cleanup_failure_is_logged_without_false_success(tmp_path, caplog, monke
             manager.cleanup("failed-job")
     assert workspace.exists()
     assert "Failed to clean workspace: failed-job" in caplog.text
+    assert "cleanup_status=failed" in caplog.text
+    assert "simulated cleanup failure" in caplog.text
     assert "Cleaned workspace: failed-job" not in caplog.text
 
 
