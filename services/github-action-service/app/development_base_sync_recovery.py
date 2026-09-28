@@ -195,6 +195,54 @@ def _compare_delta(
     return evidence, changed_paths
 
 
+def _exact_path_blob_sha(repo: Any, path: str, commit_sha: str) -> str | None:
+    """Read one path's exact blob identity at a pinned commit; missing paths are not proof."""
+    try:
+        entry = repo.get_contents(path, ref=commit_sha)
+    except Exception as exc:
+        if getattr(exc, "status", None) == 404:
+            return None
+        raise MyGithub12Error(
+            "RECOVERY_TASK_DIFF_MISMATCH",
+            "exact path blob identity could not be verified",
+            {"path": path, "commit_sha": commit_sha, "cause_type": type(exc).__name__},
+        ) from exc
+    if isinstance(entry, list) or getattr(entry, "type", None) != "file":
+        return None
+    if str(getattr(entry, "path", "")) != path:
+        return None
+    blob_sha = str(getattr(entry, "sha", ""))
+    if not re.fullmatch(r"[0-9a-f]{40}", blob_sha):
+        raise MyGithub12Error(
+            "RECOVERY_TASK_DIFF_MISMATCH",
+            "exact path blob identity is malformed",
+            {"path": path, "commit_sha": commit_sha},
+        )
+    return blob_sha
+
+
+def _base_absorbed_path_evidence(
+    repo: Any,
+    path: str,
+    old_session_head_sha: str,
+    new_base_sha: str,
+    current_head_sha: str,
+) -> dict[str, Any]:
+    """Classify a removed task-delta path only when all three exact blobs agree."""
+    old_task_blob = _exact_path_blob_sha(repo, path, old_session_head_sha)
+    new_base_blob = _exact_path_blob_sha(repo, path, new_base_sha)
+    current_blob = _exact_path_blob_sha(repo, path, current_head_sha)
+    evidence = {
+        "path": path,
+        "old_task_blob": old_task_blob,
+        "new_base_blob": new_base_blob,
+        "current_blob": current_blob,
+    }
+    if old_task_blob and old_task_blob == new_base_blob == current_blob:
+        return {**evidence, "classification": "BASE_ABSORBED"}
+    return {**evidence, "classification": "unproven"}
+
+
 def _fresh_base_sync_github_identity(
     service: Any,
     repository: str,
@@ -203,128 +251,145 @@ def _fresh_base_sync_github_identity(
     expected_tree_sha: str,
     base_branch: str,
     expected_new_base_sha: str,
-) -> tuple[Any, dict[str, str]]:
-    """Verify only live identities for base-sync; the old base is pinned control-plane state."""
-    return same_base._fresh_github_identity(
+) -> tuple[Any, dict[str, Any]]:
+    """Verify exact task identity while allowing a proven later live-base advance."""
+    try:
+        return same_base._fresh_github_identity(
+            service,
+            repository,
+            branch,
+            expected_head_sha,
+            expected_tree_sha,
+            base_branch,
+            expected_new_base_sha,
+        )
+    except MyGithub12Error as exc:
+        # A task may remain based on an immutable synchronized base after the
+        # live base branch advances again. Never accept an arbitrary historical
+        # ancestor: the selected base must be the exact current task/live merge
+        # base and a forward ancestor of both sides.
+        if exc.code != "RECOVERY_BASE_CHANGED":
+            raise
+        live_base_sha = str((getattr(exc, "details", None) or {}).get("actual") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}", live_base_sha):
+            raise
+
+    # Re-read HEAD/Tree/base using the observed live base as an exact CAS
+    # identity. A concurrent base movement therefore fails closed here.
+    repo, live_identity = same_base._fresh_github_identity(
         service,
         repository,
         branch,
         expected_head_sha,
         expected_tree_sha,
         base_branch,
-        expected_new_base_sha,
+        live_base_sha,
     )
 
+    def ancestry(ancestor: str, descendant: str, label: str) -> dict[str, Any]:
+        try:
+            comparison = repo.compare(ancestor, descendant)
+            merge_base = (
+                str(comparison.merge_base_commit.sha)
+                if getattr(comparison, "merge_base_commit", None)
+                else ""
+            )
+            ahead_by = int(getattr(comparison, "ahead_by", 0) or 0)
+            behind_by = int(getattr(comparison, "behind_by", 0) or 0)
+        except Exception as compare_exc:
+            return {
+                "verified": False,
+                "label": label,
+                "ancestor": ancestor,
+                "descendant": descendant,
+                "merge_base": "",
+                "ahead_by": 0,
+                "behind_by": 0,
+                "cause_type": type(compare_exc).__name__,
+            }
+        return {
+            "verified": merge_base == ancestor and behind_by == 0,
+            "label": label,
+            "ancestor": ancestor,
+            "descendant": descendant,
+            "merge_base": merge_base,
+            "ahead_by": ahead_by,
+            "behind_by": behind_by,
+        }
 
-def _blob_identity_at_path(
-    repo: Any,
-    commit_sha: str,
-    path: str,
-    tree_cache: dict[str, dict[str, Any]],
-) -> dict[str, str] | None:
-    """Read one exact path identity by walking immutable non-recursive Git trees.
-
-    A missing entry is a proven absence. A failed or incomplete tree read is not
-    absence and must stop recovery because it cannot support a convergence proof.
-    """
-    try:
-        safe_path = mygithub12._safe_path(path)
-        commit = repo.get_commit(commit_sha)
-        if str(getattr(commit, "sha", "")) != commit_sha:
-            raise ValueError("commit identity mismatch")
-        tree_sha = mygithub12._tree_sha(commit)
-    except Exception as exc:
+    selected_to_live = ancestry(
+        expected_new_base_sha, live_base_sha, "selected_synced_base_to_live_base"
+    )
+    if not selected_to_live["verified"] or selected_to_live["ahead_by"] <= 0:
         raise MyGithub12Error(
-            "RECOVERY_BLOB_IDENTITY_UNAVAILABLE",
-            "an exact commit/path identity could not be resolved for base convergence",
-            {"commit_sha": commit_sha, "path": path, "cause_type": type(exc).__name__},
-        ) from exc
-
-    parts = safe_path.split("/")
-    for index, part in enumerate(parts):
-        entries = tree_cache.get(tree_sha)
-        if entries is None:
-            try:
-                tree = repo.get_git_tree(tree_sha, recursive=False)
-                if tree is None or bool(getattr(tree, "truncated", False)):
-                    raise ValueError("tree missing or incomplete")
-                entries = {
-                    str(getattr(entry, "path", "")): entry
-                    for entry in (getattr(tree, "tree", []) or [])
-                    if getattr(entry, "path", None)
-                }
-                tree_cache[tree_sha] = entries
-            except Exception as exc:
-                raise MyGithub12Error(
-                    "RECOVERY_BLOB_IDENTITY_UNAVAILABLE",
-                    "an exact Git tree could not be read for base convergence",
-                    {
-                        "commit_sha": commit_sha,
-                        "path": path,
-                        "tree_sha": tree_sha,
-                        "cause_type": type(exc).__name__,
-                    },
-                ) from exc
-        entry = entries.get(part)
-        if entry is None:
-            return None
-        entry_type = str(getattr(entry, "type", ""))
-        entry_sha = str(getattr(entry, "sha", ""))
-        if index < len(parts) - 1:
-            if entry_type != "tree" or not re.fullmatch(r"[0-9a-f]{40}", entry_sha):
-                return None
-            tree_sha = entry_sha
-            continue
-        mode = str(getattr(entry, "mode", ""))
-        if (
-            entry_type != "blob"
-            or not re.fullmatch(r"[0-9a-f]{40}", entry_sha)
-            or mode not in {"100644", "100755", "120000"}
-        ):
-            return None
-        return {"blob_sha": entry_sha, "mode": mode}
-    return None
-
-
-def _base_absorbed_task_paths(
-    repo: Any,
-    new_base_sha: str,
-    old_session_head_sha: str,
-    current_head_sha: str,
-    removed_from_task_delta: list[str],
-    base_delta_paths: set[str],
-) -> list[dict[str, Any]]:
-    """Classify only old task paths whose exact nonempty result is in the new base."""
-    tree_cache: dict[str, dict[str, Any]] = {}
-    absorbed: list[dict[str, Any]] = []
-    for path in removed_from_task_delta:
-        # The old-base -> new-base compare must independently identify this path.
-        # A caller cannot claim convergence by supplying a path name alone.
-        if path not in base_delta_paths:
-            continue
-        old_task = _blob_identity_at_path(repo, old_session_head_sha, path, tree_cache)
-        new_base = _blob_identity_at_path(repo, new_base_sha, path, tree_cache)
-        current = _blob_identity_at_path(repo, current_head_sha, path, tree_cache)
-        # Absence is deliberately not a blob identity. Task deletions and
-        # rename/delete cases remain subject to the existing path/forward proof.
-        if not all((old_task, new_base, current)):
-            continue
-        same_task_result = (
-            old_task["blob_sha"] == new_base["blob_sha"] == current["blob_sha"]
-            and old_task["mode"] == new_base["mode"] == current["mode"]
+            "RECOVERY_BASE_CHANGED",
+            "live base advanced without preserving the selected synchronized base as a forward ancestor",
+            {
+                "selected_synced_base_sha": expected_new_base_sha,
+                "live_base_sha": live_base_sha,
+                "ancestry": selected_to_live,
+            },
         )
-        if same_task_result:
-            absorbed.append({
-                "path": path,
-                "classification": "BASE_ABSORBED",
-                "old_task_blob": old_task["blob_sha"],
-                "new_base_blob": new_base["blob_sha"],
-                "current_blob": current["blob_sha"],
-                "old_task_mode": old_task["mode"],
-                "new_base_mode": new_base["mode"],
-                "current_mode": current["mode"],
-            })
-    return absorbed
+
+    selected_to_current = ancestry(
+        expected_new_base_sha, expected_head_sha, "selected_synced_base_to_current_head"
+    )
+    if not selected_to_current["verified"]:
+        raise MyGithub12Error(
+            "RECOVERY_ANCESTRY_MISMATCH",
+            "current task HEAD is not a forward descendant of the selected synchronized base",
+            {
+                "selected_synced_base_sha": expected_new_base_sha,
+                "current_head_sha": expected_head_sha,
+                "ancestry": selected_to_current,
+            },
+        )
+
+    try:
+        live_to_current = repo.compare(live_base_sha, expected_head_sha)
+        task_live_merge_base = (
+            str(live_to_current.merge_base_commit.sha)
+            if getattr(live_to_current, "merge_base_commit", None)
+            else ""
+        )
+        live_to_current_ahead = int(getattr(live_to_current, "ahead_by", 0) or 0)
+        live_to_current_behind = int(getattr(live_to_current, "behind_by", 0) or 0)
+    except Exception as compare_exc:
+        raise MyGithub12Error(
+            "RECOVERY_ANCESTRY_MISMATCH",
+            "task/live-base merge base could not be verified",
+            {
+                "live_base_sha": live_base_sha,
+                "current_head_sha": expected_head_sha,
+                "cause_type": type(compare_exc).__name__,
+            },
+        ) from compare_exc
+    if task_live_merge_base != expected_new_base_sha:
+        raise MyGithub12Error(
+            "RECOVERY_ANCESTRY_MISMATCH",
+            "selected synchronized base is not the exact task/live-base merge base",
+            {
+                "selected_synced_base_sha": expected_new_base_sha,
+                "live_base_sha": live_base_sha,
+                "current_head_sha": expected_head_sha,
+                "actual_merge_base_sha": task_live_merge_base,
+            },
+        )
+
+    return repo, {
+        **live_identity,
+        "base_sha": expected_new_base_sha,
+        "live_base_sha": live_base_sha,
+        "live_base_advanced_after_sync": True,
+        "selected_synced_base_to_live_base": selected_to_live,
+        "selected_synced_base_to_current_head": selected_to_current,
+        "task_live_merge_base": {
+            "verified": True,
+            "merge_base_sha": task_live_merge_base,
+            "ahead_by": live_to_current_ahead,
+            "behind_by": live_to_current_behind,
+        },
+    }
 
 
 def _verify_base_sync_deltas(
@@ -406,18 +471,11 @@ def _verify_base_sync_deltas(
         )
     forward_paths = set(forward_task_delta_paths)
     base_paths = set(base_delta_paths)
+    # The exact overlap review gate above remains mandatory. Only unadvanced
+    # removals also present in the verified base delta can be blob-checked.
     removed_from_task_delta = sorted(set(old_task_delta_paths) - set(new_task_delta_paths))
     absorbed_by_new_base: list[dict[str, Any]] = []
-    if old_task_ancestry["verified"]:
-        absorbed_by_new_base = _base_absorbed_task_paths(
-            repo,
-            new_base_sha,
-            old_session_head_sha,
-            current_head_sha,
-            removed_from_task_delta,
-            base_paths,
-        )
-    absorbed_paths = {item["path"] for item in absorbed_by_new_base}
+    absorption_candidates: list[dict[str, Any]] = []
     if ancestry_proof_mode == "same_base_branch_forward_dual":
         # A non-ancestor compare is merge-base-relative and may include paths
         # from the other side of the divergence. Keep it for rename-aware
@@ -437,9 +495,25 @@ def _verify_base_sync_deltas(
         # must still be explained by the verified H0 -> H1 comparison.
         authoritative_task_delta_paths = list(new_task_delta_paths)
         task_path_changes = sorted(set(old_task_delta_paths) ^ set(new_task_delta_paths))
+        unadvanced_removed_paths = sorted(set(removed_from_task_delta) - forward_paths)
+        absorption_candidates = [
+            _base_absorbed_path_evidence(
+                repo, path, old_session_head_sha, new_base_sha, current_head_sha,
+            )
+            for path in unadvanced_removed_paths
+            if path in base_paths
+        ]
+        absorbed_by_new_base = [
+            item for item in absorption_candidates if item["classification"] == "BASE_ABSORBED"
+        ]
+        absorbed_paths = {item["path"] for item in absorbed_by_new_base}
         unexplained_task_path_changes = sorted(
-            set(task_path_changes) - set(forward_task_delta_paths) - absorbed_paths
+            set(task_path_changes) - forward_paths - absorbed_paths
         )
+        task_path_convergence = {
+            "removed_from_task_delta": removed_from_task_delta,
+            "absorbed_by_new_base": absorbed_by_new_base,
+        }
         if unexplained_task_path_changes:
             raise MyGithub12Error(
                 "RECOVERY_TASK_DIFF_MISMATCH",
@@ -448,8 +522,9 @@ def _verify_base_sync_deltas(
                     "old_task_delta_paths": old_task_delta_paths,
                     "new_task_delta_paths": new_task_delta_paths,
                     "forward_task_delta_paths": forward_task_delta_paths,
-                    "base_absorbed_task_paths": sorted(absorbed_paths),
                     "unexplained_task_path_changes": unexplained_task_path_changes,
+                    "task_path_convergence": task_path_convergence,
+                    "base_absorption_candidates": absorption_candidates,
                 },
             )
         task_diff_enforcement = "ancestry_backed_path_set_explanation"
@@ -482,6 +557,7 @@ def _verify_base_sync_deltas(
             "removed_from_task_delta": removed_from_task_delta,
             "absorbed_by_new_base": absorbed_by_new_base,
         },
+        "base_absorption_candidates": absorption_candidates,
         "historical_base_overlap_paths": historical_base_overlap,
         "current_base_overlap_paths": current_base_overlap,
         "base_task_overlap_paths": overlap,
@@ -857,6 +933,7 @@ def _atomic_recover_base_sync(
                 "development_session_id": session_id,
                 "old_base_sha": old_base_sha,
                 "new_base_sha": new_base_sha,
+                "github": verification["github"],
                 "pinned_base_state": pinned_base_state,
                 "old_session_head": old_session_head,
                 "adopted_head": current_head,
@@ -880,6 +957,8 @@ def _atomic_recover_base_sync(
                 "historical_cumulative_task_delta_paths": verification["deltas"]["historical_cumulative_task_delta_paths"],
                 "external_forward_delta_paths": verification["deltas"]["external_forward_delta_paths"],
                 "recovery_scope_delta_paths": verification["deltas"]["recovery_scope_delta_paths"],
+                "forward_recovery_scope_delta_paths": verification["deltas"].get("forward_recovery_scope_delta_paths", verification["deltas"]["recovery_scope_delta_paths"]),
+                "scope_authority_mode": verification["deltas"].get("scope_authority_mode", "forward_task_delta"),
                 "excluded_imported_base_paths": verification["deltas"]["excluded_imported_base_paths"],
                 "excluded_unchanged_historical_cumulative_paths": verification["deltas"]["excluded_unchanged_historical_cumulative_paths"],
                 "task_path_changes": verification["deltas"]["task_path_changes"],
@@ -1150,12 +1229,31 @@ def recover_base_synced_task(
         expected_current_head_sha,
         reviewed_overlap_paths,
     )
-    # Scope/ownership apply only to task-owned changes after the old Session HEAD.
+    # Normally scope/ownership follow only the forward task-owned delta after
+    # the old Session HEAD. When live base advanced again after an already
+    # synchronized immutable base, however, resume selected that exact
+    # task/live merge-base as the Task-delta authority. In that shape the
+    # authoritative current Task delta must also be the recovery scope
+    # authority; otherwise a preserved historical Task path can be requested
+    # for review by resume and then rejected as "unexpected" by recovery.
+    forward_recovery_scope_delta_paths = list(deltas["recovery_scope_delta_paths"])
+    if github_identity.get("live_base_advanced_after_sync"):
+        recovery_scope_delta_paths = sorted(set(deltas["authoritative_task_delta_paths"]))
+        scope_authority_mode = "authoritative_current_task_delta"
+    else:
+        recovery_scope_delta_paths = forward_recovery_scope_delta_paths
+        scope_authority_mode = "forward_task_delta"
+    deltas = {
+        **deltas,
+        "forward_recovery_scope_delta_paths": forward_recovery_scope_delta_paths,
+        "recovery_scope_delta_paths": recovery_scope_delta_paths,
+        "scope_authority_mode": scope_authority_mode,
+    }
     scope = _verify_base_sync_scope(
-        workspace, deltas["recovery_scope_delta_paths"], reviewed_scope_expansion_paths,
+        workspace, recovery_scope_delta_paths, reviewed_scope_expansion_paths,
     )
     ownership = _verify_base_sync_ownership(
-        service, repo, workspace, expected_new_base_sha, deltas["recovery_scope_delta_paths"],
+        service, repo, workspace, expected_new_base_sha, recovery_scope_delta_paths,
     )
     verification = {
         "github": github_identity,

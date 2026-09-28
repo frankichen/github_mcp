@@ -1321,6 +1321,127 @@ def test_same_base_branch_forward_resume_does_not_require_old_base_to_old_sessio
     assert plan["preflight"]["new_base_ancestry"]["verified"] is True
 
 
+def test_base_sync_resume_selects_exact_task_live_merge_base_after_live_base_advances(monkeypatch):
+    old_base = "1" * 40
+    synced_base = "2" * 40
+    live_base = "3" * 40
+    old_head = "4" * 40
+    current_head = "5" * 40
+    current_tree = "6" * 40
+    ws = _workspace(status="drifted", revision=3)
+    ws.update({
+        "base_branch": "main",
+        "base_commit_sha": old_base,
+        "head_sha": current_head,
+        "tree_sha": current_tree,
+        "drift_reason": "branch_moved_externally",
+    })
+    session = {
+        **_ready_session(
+            head=old_head,
+            tree="7" * 40,
+            workspace_revision=2,
+            lease=ws["lease_expires_at"],
+        ),
+        "base_branch": "main",
+        "base_commit_sha": old_base,
+    }
+    current_main = {"branch": "main", "commit_sha": live_base, "tree_sha": "8" * 40}
+    branch_state = {"commit_sha": current_head, "tree_sha": current_tree}
+
+    def ancestry(_service, _repository, ancestor, descendant):
+        verified = (ancestor, descendant) != (live_base, current_head)
+        ahead_by = 1 if (ancestor, descendant) == (synced_base, live_base) else 0
+        return {
+            "verified": verified,
+            "ancestor": ancestor,
+            "descendant": descendant,
+            "ahead_by": ahead_by,
+            "behind_by": 0 if verified else 1,
+        }
+
+    monkeypatch.setattr(resume, "_resume_ancestry_evidence", ancestry)
+    monkeypatch.setattr(
+        resume,
+        "_resume_merge_base_evidence",
+        lambda _service, _repository, left, right: {
+            "verified": True,
+            "left": left,
+            "right": right,
+            "merge_base_sha": synced_base,
+            "ahead_by": 1,
+            "behind_by": 1,
+        },
+    )
+    monkeypatch.setattr(
+        resume,
+        "_resume_authoritative_current_delta",
+        lambda _service, _repository, selected_base, head: (
+            {"verified": True, "paths": []}
+            if (selected_base, head) == (synced_base, current_head)
+            else pytest.fail((selected_base, head))
+        ),
+    )
+
+    plan = resume._workspace_recovery_plan(
+        ws,
+        service=FakeService(),
+        session=session,
+        current_main=current_main,
+        current_base=current_main,
+        branch_state=branch_state,
+    )
+
+    assert plan["action"] == "recover_base_synced_development_task"
+    assert plan["expected_old_base_sha"] == old_base
+    assert plan["expected_new_base_sha"] == synced_base
+    assert plan["preflight"]["verified"] is True
+    assert plan["preflight"]["base_selection"] == {
+        "mode": "verified_task_live_merge_base",
+        "live_base_head_sha": live_base,
+        "selected_new_base_sha": synced_base,
+    }
+    assert plan["preflight"]["live_base_advance_reconciliation"]["verified"] is True
+
+
+def test_active_workspace_pinned_to_verified_task_live_merge_base_does_not_reenter_base_sync_recovery():
+    synced_base = "2" * 40
+    live_base = "3" * 40
+    current_head = "5" * 40
+    current_tree = "6" * 40
+    ws = _workspace(status="active", revision=4)
+    ws.update({
+        "base_branch": "main",
+        "base_commit_sha": synced_base,
+        "head_sha": current_head,
+        "tree_sha": current_tree,
+        "drift_reason": None,
+    })
+    session = {
+        **_ready_session(
+            head=current_head,
+            tree=current_tree,
+            workspace_revision=4,
+            lease=ws["lease_expires_at"],
+        ),
+        "base_branch": "main",
+        "base_commit_sha": synced_base,
+    }
+    live = {"branch": "main", "commit_sha": live_base, "tree_sha": "8" * 40}
+    branch_state = {"commit_sha": current_head, "tree_sha": current_tree}
+
+    plan = resume._workspace_recovery_plan(
+        ws,
+        service=FakeService(),
+        session=session,
+        current_main=live,
+        current_base=live,
+        branch_state=branch_state,
+    )
+
+    assert plan is None
+
+
 def test_already_pinned_new_base_stacked_resume_fails_stop_when_current_head_is_not_old_session_forward_descendant(monkeypatch):
     old_head = "23aab1b9f80296d0e88c552ddbdac54c56939bc9"
     current_head = "249f4dc68200e83b4fd73a8bbe43608beaac5d42"

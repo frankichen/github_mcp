@@ -10,6 +10,7 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 
 from private_ci_agent.config import resolve_worker_id
+from private_ci_agent.podman_resources import PodmanResourceManager
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class PodmanRunner:
         self.podman = podman_binary
         self.worker_id = resolve_worker_id(worker_id)
         self.container_namespace = f"ci-{self.worker_id}"
+        self.resources = PodmanResourceManager(self.podman, self.worker_id)
         self._validated_proxy_contexts: set[tuple[str, str, str]] = set()
 
     @staticmethod
@@ -145,6 +147,7 @@ class PodmanRunner:
     def _validate_container_proxy(
         self,
         image: str,
+        job_id: str,
         container_name: str,
         network: bool,
         network_name: str | None,
@@ -168,7 +171,7 @@ class PodmanRunner:
         command = [
             self.podman, "run", "--rm", "--pull=never", "--http-proxy=false",
             "--name", f"{container_name}-proxycheck",
-        ] + userns_args + [
+        ] + self.resources.label_args(job_id, "proxy-check") + userns_args + [
             "--cap-drop=ALL", "--security-opt=no-new-privileges",
             "--read-only", "--tmpfs=/tmp:rw,noexec,nosuid,size=64m",
         ] + network_args
@@ -339,7 +342,9 @@ class PodmanRunner:
             "--pull=never",
             "--http-proxy=false",
             "--name", container_name,
+        ] + self.resources.label_args(job_id, "build-container") + [
             "--userns=keep-id",
+            "--user", f"{os.getuid()}:{os.getgid()}",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             "--pids-limit=256",
@@ -369,7 +374,7 @@ class PodmanRunner:
         except ValueError:
             logger.error("Container proxy configuration is invalid")
             return self._proxy_failure("PROXY_CONFIGURATION_INVALID")
-        if pass_proxy and not self._validate_container_proxy(image, container_name, False, None, proxy_env):
+        if pass_proxy and not self._validate_container_proxy(image, job_id, container_name, False, None, proxy_env):
             return self._proxy_failure("PROXY_VALIDATION_FAILED")
         safe_env = self._no_proxy_env()
         safe_env.update(proxy_env)
@@ -564,15 +569,13 @@ class PodmanRunner:
         )
         project_root = os.path.abspath(os.path.join(source_dir, os.pardir, os.pardir))
         net_arg = self._network_args(network, network_name)
-        # Some approved images (notably Gradle) declare a non-root image user.
-        # Bind-mounted checkouts are owned by ciworker, so that image default
-        # UID cannot create project-local state such as /workspace/.gradle.
-        # Keep the rootless namespace and run as the actual Worker identity;
-        # this preserves host ownership without granting host root privileges.
-        userns_arg = [] if network_name else [
-            "--userns=keep-id",
-            "--user", f"{os.getuid()}:{os.getgid()}",
-        ]
+        # Writable checkouts are owned by the Worker. Service pods already own
+        # their keep-id user namespace, so member containers must not request a
+        # second namespace; they still must run as the Worker UID/GID. Without
+        # this explicit --user, container root maps to the Worker's subordinate
+        # host UID range and leaves workspace files the Worker cannot remove.
+        worker_user = ["--user", f"{os.getuid()}:{os.getgid()}"]
+        userns_arg = worker_user if network_name else ["--userns=keep-id", *worker_user]
         tmpfs_tmp = "--tmpfs=/tmp:rw,exec,nosuid,size=256m" if allow_exec_tmpfs else "--tmpfs=/tmp:rw,noexec,nosuid,size=256m"
 
         cmd = [
@@ -581,7 +584,7 @@ class PodmanRunner:
             "--pull=never",
             "--http-proxy=false",
             "--name", container_name,
-        ] + userns_arg + [
+        ] + self.resources.label_args(job_id, "build-container") + userns_arg + [
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             "--pids-limit=256",
@@ -609,7 +612,7 @@ class PodmanRunner:
         except ValueError:
             logger.error("Container proxy configuration is invalid")
             return self._proxy_failure("PROXY_CONFIGURATION_INVALID")
-        if pass_proxy and not self._validate_container_proxy(image, container_name, network, network_name, proxy_env):
+        if pass_proxy and not self._validate_container_proxy(image, job_id, container_name, network, network_name, proxy_env):
             return self._proxy_failure("PROXY_VALIDATION_FAILED")
         safe_env = self._no_proxy_env()
         safe_env.update(proxy_env)
@@ -661,16 +664,23 @@ class PodmanRunner:
         return f"{self.container_namespace}-{job_id[:12]}"
 
     def kill_job(self, job_id: str) -> int:
-        """Force-stop and remove every container owned by the job."""
+        """Force-stop and verified-remove every current-Job build container."""
         prefix = self._job_container_prefix(job_id)
         names = self._container_names_matching(prefix)
+        failures = []
         for name in names:
             self._kill_container(name)
             try:
-                subprocess.run([self.podman, "rm", "-f", name],
-                               capture_output=True, timeout=10)
-            except Exception:
-                pass
+                self.resources.remove_current_job_container_verified(name, job_id, prefix)
+            except Exception as exc:
+                logger.error(
+                    "Failed to reclaim current job container: job=%s name=%s error=%s",
+                    job_id, name, type(exc).__name__,
+                )
+                failures.append((name, type(exc).__name__))
+        if failures:
+            details = ", ".join(f"{name}:{error}" for name, error in failures)
+            raise RuntimeError(f"job container cleanup incomplete: {details}")
         if names:
             logger.warning("Cancelled job %s: reclaimed %d container(s)", job_id[:12], len(names))
         return len(names)
@@ -681,6 +691,8 @@ class PodmanRunner:
                 [self.podman, "ps", "-a", "--format", "{{.Names}}"],
                 capture_output=True, text=True, timeout=10,
             )
+            if result.returncode != 0:
+                raise RuntimeError(f"podman ps failed with exit={result.returncode}")
             return [name for name in result.stdout.strip().split("\n") if name.startswith(prefix)]
         except Exception as exc:
             logger.warning("Listing containers failed: %s", exc)
@@ -720,22 +732,6 @@ class PodmanRunner:
             except Exception:
                 pass
 
-    def cleanup_stale(self, job_id_prefixes: list):
-        """Remove only stale containers owned by this Worker namespace."""
-        try:
-            result = subprocess.run(
-                [self.podman, "ps", "-a", "--format", "{{.Names}}"],
-                capture_output=True, text=True, timeout=10,
-            )
-            active_prefixes = [self._job_container_prefix(job_id) for job_id in job_id_prefixes]
-            namespace_prefix = self.container_namespace + "-"
-            for name in result.stdout.strip().split("\n"):
-                if name.startswith(namespace_prefix) and not any(name.startswith(prefix) for prefix in active_prefixes):
-                    logger.info("Removing stale container for %s: %s", self.worker_id, name)
-                    try:
-                        subprocess.run([self.podman, "rm", "-f", name],
-                                       capture_output=True, timeout=10)
-                    except Exception:
-                        pass
-        except Exception as exc:
-            logger.warning("Cleanup stale containers failed: %s", exc)
+    def cleanup_stale(self, job_state_resolver):
+        """Reconcile only ownership-labelled stale resources for this Worker."""
+        return self.resources.reconcile_stale(job_state_resolver)
