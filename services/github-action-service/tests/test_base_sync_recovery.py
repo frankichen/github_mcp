@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1084,6 +1085,54 @@ def test_base_absorption_does_not_skip_reviewed_scope_expansion(tmp_path, monkey
 
     assert exc.value.code == "RECOVERY_SCOPE_VIOLATION"
     assert exc.value.details["outside_scope_paths"] == [scope_path]
+
+
+def test_sxt_task_140_exact_graph_fixture_records_absorbed_blob_evidence():
+    fixture_path = Path(__file__).parent / "fixtures" / "base_sync" / "sxt_task_140_base_absorbed.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    repo = FakeRepo()
+    old_base = fixture["old_base_sha"]
+    new_base = fixture["new_base_sha"]
+    old_head = fixture["old_session_head_sha"]
+    current_head = fixture["current_head_sha"]
+    current_tree = fixture["current_tree_sha"]
+    old_tree = "7" * 40
+    repo.trees.update({old_base: "8" * 40, new_base: "9" * 40, old_head: old_tree, current_head: current_tree})
+
+    overlaps = fixture["reviewed_overlap_paths"]
+    absorbed_paths = sorted(fixture["absorbed_path_blobs"])
+    retained_paths = sorted(set(overlaps) - set(absorbed_paths))
+    scope_path = fixture["scope_expansion_path"]
+    repo.comparisons[(old_base, new_base)] = repo._cfg(old_base, 10, 0, overlaps)
+    repo.comparisons[(old_base, old_head)] = repo._cfg(old_base, 8, 0, [*overlaps, scope_path])
+    repo.comparisons[(old_head, current_head)] = repo._cfg(old_head, 1, 0, [*retained_paths, scope_path])
+    repo.comparisons[(new_base, current_head)] = repo._cfg(new_base, 9, 0, [*retained_paths, scope_path])
+    for path, blobs in fixture["absorbed_path_blobs"].items():
+        repo.blobs[(old_head, path)] = blobs["old_task_blob"]
+        repo.blobs[(new_base, path)] = blobs["new_base_blob"]
+        repo.blobs[(current_head, path)] = blobs["current_blob"]
+
+    deltas = recovery._verify_base_sync_deltas(
+        repo,
+        {"tree_sha": old_tree},
+        old_base,
+        new_base,
+        old_head,
+        current_head,
+        overlaps,
+    )
+
+    assert deltas["actual_overlap_paths"] == overlaps
+    assert scope_path in deltas["old_task_delta_paths"]
+    assert scope_path in deltas["new_task_delta_paths"]
+    evidence = deltas["task_path_convergence"]["absorbed_by_new_base"]
+    assert [item["path"] for item in evidence] == absorbed_paths
+    for item in evidence:
+        expected = fixture["absorbed_path_blobs"][item["path"]]
+        assert item["classification"] == "BASE_ABSORBED"
+        assert item["old_task_blob"] == expected["old_task_blob"]
+        assert item["new_base_blob"] == expected["new_base_blob"]
+        assert item["current_blob"] == expected["current_blob"]
 
 
 def test_verified_forward_task_delete_remains_explained_without_blob_absorption(tmp_path, monkeypatch):
