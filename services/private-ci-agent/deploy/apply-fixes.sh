@@ -235,6 +235,21 @@ for worker_id in "${PRIVATE_CI_WORKER_IDS[@]}"; do
 done
 systemctl daemon-reload
 
+# 同步当前生产正在使用的 delegated deployment executor，再切换 Controller。
+# Controller 新 policy 一旦上线就可能接受新仓库部署，因此 Executor 白名单
+# 必须先于 Controller 切换完成并通过 systemd 存活检查，避免短暂能力分裂。
+DELEGATED_DEPLOY_EXECUTOR_SOURCE="${REPO_ROOT}/services/github-action-service/scripts/deploy_executor.py"
+DELEGATED_DEPLOY_EXECUTOR_TARGET="${MYGITHUB12_DELEGATED_DEPLOY_EXECUTOR_TARGET:-/home/xiaowu/work/private-ci-controller-node-workspace/scripts/deploy_executor.py}"
+DELEGATED_DEPLOY_EXECUTOR_OWNER="${MYGITHUB12_DELEGATED_DEPLOY_EXECUTOR_OWNER:-xiaowu}"
+DELEGATED_DEPLOY_EXECUTOR_GROUP="${MYGITHUB12_DELEGATED_DEPLOY_EXECUTOR_GROUP:-xiaowu}"
+[ -f "${DELEGATED_DEPLOY_EXECUTOR_SOURCE}" ] || die "delegated deploy executor source is missing"
+install -D -o "${DELEGATED_DEPLOY_EXECUTOR_OWNER}" -g "${DELEGATED_DEPLOY_EXECUTOR_GROUP}" -m 755     "${DELEGATED_DEPLOY_EXECUTOR_SOURCE}" "${DELEGATED_DEPLOY_EXECUTOR_TARGET}"
+python3 -m py_compile "${DELEGATED_DEPLOY_EXECUTOR_TARGET}"     || die "delegated deploy executor syntax validation failed"
+systemctl restart private-ci-deploy-executor.service     || die "delegated deploy executor restart failed"
+sleep 2
+systemctl is-active --quiet private-ci-deploy-executor.service     || die "delegated deploy executor is not active after update"
+log "Delegated deploy executor synchronized and active"
+
 # Controller/Agent 的 attempt-lease 协议必须先升级现有 Agent，再切换 Controller。
 # 新 Agent 给旧 Controller 多发送受控 header 是向后兼容的；反向顺序会让
 # 旧 Agent 在 Controller 切换到严格 fencing 后无法提交 log/step/finish。
