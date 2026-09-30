@@ -160,6 +160,17 @@ def test_apply_fixes_syncs_entire_runtime_package():
     assert "install -o root -g root -m 644" in script
 
 
+def test_apply_fixes_syncs_delegated_deploy_executor_before_controller_switch():
+    script = (DEPLOY_DIR / "apply-fixes.sh").read_text(encoding="utf-8")
+
+    assert "services/github-action-service/scripts/deploy_executor.py" in script
+    assert "MYGITHUB12_DELEGATED_DEPLOY_EXECUTOR_TARGET" in script
+    assert "/home/xiaowu/work/private-ci-controller-node-workspace/scripts/deploy_executor.py" in script
+    assert 'systemctl restart private-ci-deploy-executor.service' in script
+    assert 'systemctl is-active --quiet private-ci-deploy-executor.service' in script
+    assert script.index("private-ci-deploy-executor.service") < script.index("Rebuilding github-action-service controller")
+
+
 def test_apply_fixes_verifies_worker_owned_android_runtime_before_switch():
     script = (DEPLOY_DIR / "apply-fixes.sh").read_text(encoding="utf-8")
 
@@ -345,9 +356,11 @@ def _stage_apply_fixes_repo(tmp_path):
     deploy_root = agent_root / "deploy"
     source_root = agent_root / "private_ci_agent"
     controller_app = repo_root / "services/github-action-service/app"
+    controller_scripts = repo_root / "services/github-action-service/scripts"
     deploy_root.mkdir(parents=True)
     source_root.mkdir(parents=True)
     controller_app.mkdir(parents=True)
+    controller_scripts.mkdir(parents=True)
 
     staged_script = deploy_root / "apply-fixes.sh"
     staged_script.write_bytes(APPLY_FIXES_SCRIPT.read_bytes())
@@ -362,6 +375,9 @@ def _stage_apply_fixes_repo(tmp_path):
         (source_root / name).write_text("# test fixture\n", encoding="utf-8")
     (controller_app / "version.py").write_text(
         'SERVICE_VERSION = "12.0.5"\n', encoding="utf-8"
+    )
+    (controller_scripts / "deploy_executor.py").write_text(
+        "# test delegated deploy executor\n", encoding="utf-8"
     )
     return repo_root, staged_script
 

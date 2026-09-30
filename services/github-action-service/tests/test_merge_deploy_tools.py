@@ -136,3 +136,33 @@ def test_delegated_deployments_default_lists_all_deployable_repositories(monkeyp
     items = deployment_service.list_delegated_deployments()
 
     assert [item["deployment_id"] for item in items] == ["dep_auto"]
+
+
+def test_devhub_policy_explicitly_allows_fixed_production_self_deploy():
+    ci_repository_config.reload_config()
+    repository = "frankichen/devhub"
+    assert ci_repository_config.get_repository_policy_source(repository) == "explicit"
+    assert ci_repository_config.is_private_ci_enabled(repository) is True
+    assert ci_repository_config.is_test_deploy_enabled(repository) is True
+    assert ci_repository_config.is_self_deploy_enabled(repository) is True
+    contract = ci_repository_config.get_deployment_config(repository)
+    assert contract == {
+        "enabled": True,
+        "self_deploy": True,
+        "environment": "devhub-production",
+        "scope": "control-plane",
+        "private_ci": True,
+        "profile": "repo-auto-check",
+        "script": "scripts/deploy_production.sh",
+        "workspace_env": "DEVHUB_DEPLOY_WORKSPACE",
+        "status_file_env": "DEVHUB_DEPLOY_STATUS_FILE",
+    }
+    assert deployment_service._validate_common(
+        repository, "devhub-production", "control-plane", "a" * 40
+    ) is None
+    assert deployment_service._validate_common(
+        repository, "gongshi-test", "control-plane", "a" * 40
+    ) == "ENVIRONMENT_NOT_ALLOWED"
+    assert deployment_service._validate_common(
+        repository, "devhub-production", "fullstack", "a" * 40
+    ) == "SCOPE_NOT_ALLOWED"

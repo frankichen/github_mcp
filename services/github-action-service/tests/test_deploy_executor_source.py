@@ -87,3 +87,12 @@ def test_prepare_workspace_fetch_failure_has_stable_code(monkeypatch, tmp_path):
         assert exc.code == "DEPLOY_SOURCE_FETCH_FAILED"
     else:
         raise AssertionError("fetch failure must stop deployment")
+
+
+def test_devhub_executor_contract_is_fixed_and_provider_specific():
+    contract = executor.CONTRACTS["frankichen/devhub"]
+    assert contract["environment"] == "devhub-production"
+    assert contract["repository_url"] == "https://github.com/frankichen/devhub.git"
+    assert contract["script"] == "scripts/deploy_production.sh"
+    assert contract["frontend"] is False
+    assert contract["mirror"].endswith("/frankichen-devhub.git")

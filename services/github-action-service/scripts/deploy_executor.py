@@ -40,6 +40,14 @@ CONTRACTS = {
         "script": "scripts/deploy_gongshi_test.sh",
         "frontend": True,
     },
+    "frankichen/devhub": {
+        "environment": "devhub-production",
+        "workspace": os.environ.get("DEVHUB_DEPLOY_WORKSPACE", "/home/xiaowu/AgentDock/devhub"),
+        "mirror": os.environ.get("DEVHUB_DEPLOY_MIRROR", os.path.join(DEPLOY_CACHE, "frankichen-devhub.git")),
+        "repository_url": os.environ.get("DEVHUB_REPOSITORY_URL", "https://github.com/frankichen/devhub.git"),
+        "script": "scripts/deploy_production.sh",
+        "frontend": False,
+    },
     "frankichen/auto_gupiao": {
         "environment": "auto-gupiao-test",
         "workspace": os.environ.get("AUTO_GUPIAO_DEPLOY_WORKSPACE", "/home/xiaowu/work/auto_gupiao"),
