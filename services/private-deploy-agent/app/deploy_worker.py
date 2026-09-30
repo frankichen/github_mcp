@@ -24,6 +24,15 @@ CONTRACTS = {
         "status_file": "DEPLOY_STATUS_FILE",
         "status_default": "/var/lib/private-ci/gongshi-test-status.json",
     },
+    "frankichen/devhub": {
+        "workspace": "DEVHUB_DEPLOY_WORKSPACE",
+        "workspace_default": "/srv/private-ci/deploy-workspace/devhub",
+        "script": "scripts/deploy_production.sh",
+        "environment": "devhub-production",
+        "scope": "control-plane",
+        "status_file": "DEVHUB_DEPLOY_STATUS_FILE",
+        "status_default": "/var/lib/private-ci/devhub-production-status.json",
+    },
     "frankichen/auto_gupiao": {
         "workspace": "AUTO_GUPIAO_DEPLOY_WORKSPACE",
         "workspace_default": "/srv/private-ci/deploy-workspace/auto_gupiao",
@@ -49,10 +58,10 @@ def _status_path(contract):
 
 
 def _should_delegate_to_wsl(repository):
-    """Delegate only sxt claim-only jobs; auto_gupiao executes its fixed local contract."""
+    """Delegate WSL-owned fixed contracts; auto_gupiao executes locally."""
     return (
         os.environ.get("DEPLOY_EXECUTION_MODE") == "claim_only"
-        and repository == "frankichen/sxt"
+        and repository in {"frankichen/sxt", "frankichen/devhub"}
     )
 
 
@@ -115,9 +124,9 @@ def process_once() -> bool:
     init_deployment_db(); db = get_deploy_db()
     rows = db.execute(
         "SELECT deployment_id, repository FROM deployments "
-        "WHERE status='queued' AND repository IN (?, ?) "
+        "WHERE status='queued' AND repository IN (?, ?, ?) "
         "ORDER BY created_at LIMIT 20",
-        ("frankichen/sxt", "frankichen/auto_gupiao"),
+        ("frankichen/sxt", "frankichen/devhub", "frankichen/auto_gupiao"),
     ).fetchall()
     if rows:
         _status_repository = rows[0]["repository"]
