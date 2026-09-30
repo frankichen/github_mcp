@@ -5,7 +5,7 @@ services:
       args:
         SOURCE_REPOSITORY: ${SOURCE_REPOSITORY:-https://github.com/frankichen/github_mcp}
         VCS_REF: ${VCS_REF:?VCS_REF is required for a production Controller build}
-        SERVICE_VERSION: ${SERVICE_VERSION:-12.9.23}
+        SERVICE_VERSION: ${SERVICE_VERSION:-12.9.24}
         BUILD_DATE: ${BUILD_DATE:?BUILD_DATE is required for a production Controller build}
     container_name: github-action-service
     restart: unless-stopped
