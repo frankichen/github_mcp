@@ -356,9 +356,11 @@ def _stage_apply_fixes_repo(tmp_path):
     deploy_root = agent_root / "deploy"
     source_root = agent_root / "private_ci_agent"
     controller_app = repo_root / "services/github-action-service/app"
+    controller_scripts = repo_root / "services/github-action-service/scripts"
     deploy_root.mkdir(parents=True)
     source_root.mkdir(parents=True)
     controller_app.mkdir(parents=True)
+    controller_scripts.mkdir(parents=True)
 
     staged_script = deploy_root / "apply-fixes.sh"
     staged_script.write_bytes(APPLY_FIXES_SCRIPT.read_bytes())
