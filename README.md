@@ -167,7 +167,7 @@ docker compose up -d --build
 
 ## MyGithut12 运行状态
 
-MyGithut12 `12.9.23` 的 compatibility registration 仍为 176 个工具，canonical production Schema 仍为 165 个可见工具，并隐藏 11 个 deprecated/compatibility-only 工具。新能力 `supports_active_workspace_stale_session_recovery=true` 经 `resume_development_task` 暴露；它只 adoption 原 Session 到 active/no-drift Workspace 的 exact current HEAD/Tree，保留原 Workspace、Session、branch 与 PR。旧 `recover_drifted_development_task` 合同继续要求 `drifted + branch_moved_externally`，scope review 仍按 exact changed-path set 验证。
+MyGithut12 `12.9.24` 的 compatibility registration 仍为 176 个工具，canonical production Schema 仍为 165 个可见工具，并隐藏 11 个 deprecated/compatibility-only 工具。新能力 `supports_active_workspace_stale_session_recovery=true` 经 `resume_development_task` 暴露；它只 adoption 原 Session 到 active/no-drift Workspace 的 exact current HEAD/Tree，保留原 Workspace、Session、branch 与 PR。旧 `recover_drifted_development_task` 合同继续要求 `drifted + branch_moved_externally`，scope review 仍按 exact changed-path set 验证。
 
 ## Historical MyGithut12 运行状态（12.9.17 及之前）
 
