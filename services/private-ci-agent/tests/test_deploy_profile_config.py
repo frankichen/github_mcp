@@ -376,6 +376,9 @@ def _stage_apply_fixes_repo(tmp_path):
     (controller_app / "version.py").write_text(
         'SERVICE_VERSION = "12.0.5"\n', encoding="utf-8"
     )
+    (controller_scripts / "deploy_executor.py").write_text(
+        "# test delegated deploy executor\n", encoding="utf-8"
+    )
     return repo_root, staged_script
 
 
