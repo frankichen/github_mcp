@@ -1,5 +1,7 @@
 # MCP 与 CI 部署服务
 
+MyGithut12 `12.9.24` 为 `frankichen/devhub` 增加显式、固定的生产部署契约：Controller policy 只允许 `devhub-production / control-plane`，WSL Executor 只接受权威 `frankichen/devhub.git` main 的 exact SHA，并固定执行仓库内 `scripts/deploy_production.sh`；调用方不能提供 host、shell、Compose 路径、Docker volume、Secret 或 rollback 行为。DevHub 的正式 CI 仍使用本地 Private CI，不引入 GitHub Actions 额度依赖。
+
 MyGithut12 `12.9.23` 修复 GitHub Actions HTTPX 客户端在生产 SOCKS 代理环境下缺少可选运行时依赖的问题：Controller 现在通过 `httpx[socks]==0.28.1` 安装并以 constraints 固定 `socksio==1.0.0`，保持现有代理路由语义不变；新增回归测试验证 SOCKS 代理环境下 `httpx.AsyncClient` 可正常构造。
 
 MyGithut12 `12.9.22` 修复 post-sync live-base advance 下 resume/recovery 的 scope authority 一致性：当 exact task/live merge-base 已被证明为 Task delta authority 时，scope/ownership 同样使用 new-base→current-HEAD authoritative Task delta；legacy forward-delta recovery 保持原语义。这样已人工 review 的历史 Task path 不会被 resume 要求后又被 recovery 误判为 unexpected scope expansion，所有 exact review、CAS、Lease、HEAD/Tree/blob 与 ownership 门禁继续 fail closed。
