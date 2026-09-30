@@ -160,6 +160,17 @@ def test_apply_fixes_syncs_entire_runtime_package():
     assert "install -o root -g root -m 644" in script
 
 
+def test_apply_fixes_syncs_delegated_deploy_executor_before_controller_switch():
+    script = (DEPLOY_DIR / "apply-fixes.sh").read_text(encoding="utf-8")
+
+    assert "services/github-action-service/scripts/deploy_executor.py" in script
+    assert "MYGITHUB12_DELEGATED_DEPLOY_EXECUTOR_TARGET" in script
+    assert "/home/xiaowu/work/private-ci-controller-node-workspace/scripts/deploy_executor.py" in script
+    assert 'systemctl restart private-ci-deploy-executor.service' in script
+    assert 'systemctl is-active --quiet private-ci-deploy-executor.service' in script
+    assert script.index("private-ci-deploy-executor.service") < script.index("Rebuilding github-action-service controller")
+
+
 def test_apply_fixes_verifies_worker_owned_android_runtime_before_switch():
     script = (DEPLOY_DIR / "apply-fixes.sh").read_text(encoding="utf-8")
 
