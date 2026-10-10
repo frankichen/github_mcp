@@ -8,10 +8,12 @@
 
 ## 运维预热与启用（必须另行授权）
 
-该 PR 仅变更基础设施源码，不安装镜像、不重启 Worker、不发布生产控制面。运维在核验准确代码 SHA、基镜像 Digest 且取得授权后，在每台 Worker 的 rootless Podman 存储里预加载 `node:22` 和 `golang:1.26.4` 并执行：
+该 PR 仅变更基础设施源码，不安装镜像、不重启 Worker、不发布生产控制面。运维在核验准确代码 SHA、基镜像 Digest 且取得授权后，在每台 Worker 使用的 rootless Podman 存储里预加载 `node:22` 和 `golang:1.26.4` 并使用已在 CI Worker `ciworker` 身份下实机验证通过的 `buildah bud` 路径执行（原 `podman build` 在多阶段 `COPY --from` 时可能因临时目录只读失败）：
 
 ```sh
-podman build --pull=never -t localhost/private-ci-go-node:1.26.4-node22 -f services/private-ci-agent/deploy/Dockerfile.go-node services/private-ci-agent/deploy
+TMPDIR=/tmp BUILDAH_TMPDIR=/tmp buildah bud --pull=never --network=none \
+  -t localhost/private-ci-go-node:1.26.4-node22 \
+  -f services/private-ci-agent/deploy/Dockerfile.go-node services/private-ci-agent/deploy
 podman run --rm --pull=never --network=none localhost/private-ci-go-node:1.26.4-node22 sh -ec 'node --version && go version'
 ```
 
