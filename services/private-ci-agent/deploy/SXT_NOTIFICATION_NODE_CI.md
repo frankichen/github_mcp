@@ -34,3 +34,15 @@ run only the dedicated `go-node:notification:real-simulator` phase. The
 private CI Python tests deliberately inject a mixed image and verify this
 configuration fails closed. Do not relax this guard to make Go-only CI green;
 fix profile propagation in the Worker instead.
+
+## End-to-end environment forwarding gate
+`JobExecutor._run_check` supplies `CI_COMMIT_SHA`, `CI_PROFILE` and (only for
+`frankichen/sxt` full `repo-auto-check`) `SXT_NOTIFICATION_NODE_CI_ENABLED=1`.
+`PodmanRunner.run_command` must forward the latter two fields through its
+explicit allowed environment keys; setting them in the Executor alone is not
+enough. The ordinary Go-only checks stay on the official Go image, while the
+tagged real simulator executes separately in the prewarmed Go+Node image.
+The regression in `tests/test_notification_profile_env.py` checks the actual
+Podman `--env` arguments, not only the pre-filter Executor dictionary, and
+verifies that unrelated/token keys remain blocked. Unknown CI profiles and
+missing dedicated phase continue to fail closed; do not relax the Go guard.
