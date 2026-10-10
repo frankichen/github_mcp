@@ -14,6 +14,7 @@ from private_ci_agent.models import Job
 from private_ci_agent.notification_node_integration import (
     GO_ONLY_TEST_COMMAND, NODE_INTEGRATION_COMMAND,
     NODE_INTEGRATION_IMAGE, notification_node_integration_required,
+    sxt_go_only_image_allowed,
 )
 from private_ci_agent.affected_selection import select_affected
 from private_ci_agent.contract_integrity import verify_product_contract_integrity
@@ -608,6 +609,11 @@ class JobExecutor:
         if commands.get("error"):
             return commands
         commands = apply_workspace_hooks(commands, workspace)
+        if job is not None and not sxt_go_only_image_allowed(
+            job.repository, stack, commands.get("image", "")
+        ):
+            return {"error": "configuration_error",
+                    "message": "CI_GO_ONLY_IMAGE_CONTRACT_VIOLATION"}
         if (job is not None and workspace.get("stack") == "go"
                 and notification_node_integration_required(job.repository, job.profile)
                 and not commands.get("error")):

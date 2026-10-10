@@ -3,7 +3,8 @@ from types import SimpleNamespace
 from private_ci_agent.executor import JobExecutor
 from private_ci_agent.notification_node_integration import (
     GO_ONLY_TEST_COMMAND, NODE_INTEGRATION_COMMAND, NODE_INTEGRATION_IMAGE,
-    SIMULATOR_TEST, notification_node_integration_required)
+    SIMULATOR_TEST, notification_node_integration_required,
+    sxt_go_only_image_allowed)
 
 def test_exact_sxt_full_ci_only():
     assert notification_node_integration_required("frankichen/sxt", "repo-auto-check")
@@ -71,3 +72,26 @@ def test_profile_is_explicit_and_only_full_ci_enables_node_gate(tmp_path):
         env = worker.runs[-1][2]["env"]
         assert env["CI_PROFILE"] == profile
         assert (env.get("SXT_NOTIFICATION_NODE_CI_ENABLED") == "1") == (profile == "repo-auto-check")
+
+def test_sxt_go_only_image_contract_blocks_mixed_worker_configuration(tmp_path, monkeypatch):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n")
+    executor = object.__new__(JobExecutor)
+    job = SimpleNamespace(repository="frankichen/sxt", profile="repo-auto-check")
+    workspace = {"path": ".", "stack": "go"}
+    original = executor._workspace_commands(workspace, str(tmp_path), job=job)
+    assert not original.get("error")
+    assert sxt_go_only_image_allowed(job.repository, "go", original["image"])
+    assert original["image"] != NODE_INTEGRATION_IMAGE
+    assert "node" not in GO_ONLY_TEST_COMMAND.lower()
+    for invalid in (NODE_INTEGRATION_IMAGE, "docker.io/library/golang:1.26.4-node",
+                    "localhost/custom-go-node:latest", "node:22"):
+        assert not sxt_go_only_image_allowed(job.repository, "go", invalid)
+    assert sxt_go_only_image_allowed("another/repo", "go", NODE_INTEGRATION_IMAGE)
+    assert sxt_go_only_image_allowed(job.repository, "node", NODE_INTEGRATION_IMAGE)
+    monkeypatch.setattr(
+        "private_ci_agent.executor.go_commands_for_workspace",
+        lambda _source: {**original, "image": NODE_INTEGRATION_IMAGE},
+    )
+    rejected = executor._workspace_commands(workspace, str(tmp_path), job=job)
+    assert rejected["error"] == "configuration_error"
+    assert rejected["message"] == "CI_GO_ONLY_IMAGE_CONTRACT_VIOLATION"

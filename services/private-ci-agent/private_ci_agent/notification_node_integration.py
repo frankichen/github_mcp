@@ -1,4 +1,7 @@
 """Mandatory notification simulator integration in a separate Go+Node CI image."""
+
+import re
+
 SXT_REPOSITORY = "frankichen/sxt"
 NODE_INTEGRATION_IMAGE = "localhost/sxt-notification-go-node:1.26.4-22"
 SIMULATOR_TEST = "TestPreferenceDNDSimulatorFullMigrationIntegration"
@@ -24,3 +27,13 @@ NODE_INTEGRATION_COMMAND = (
 
 def notification_node_integration_required(repository: str, profile: str) -> bool:
     return repository == SXT_REPOSITORY and profile == "repo-auto-check"
+
+def sxt_go_only_image_allowed(repository: str, stack: str, image: str) -> bool:
+    """SXT Go checks must never inherit the dedicated Go+Node test image."""
+    if repository != SXT_REPOSITORY or stack != "go":
+        return True
+    return re.fullmatch(
+        r"(?:docker\.io/library/)?golang:\d+\.\d+(?:\.\d+)?"
+        r"(?:-(?:alpine(?:[0-9.]+)?|bookworm|bullseye))?",
+        image,
+    ) is not None

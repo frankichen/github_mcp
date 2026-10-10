@@ -25,3 +25,12 @@ fail-closed until the managed Worker is active.
 The offline prewarm script intentionally uses `buildah bud --network=none`
 with explicit temporary directories: rootless Podman `podman build` had a
 verified read-only temporary directory failure with multi-stage COPY.
+
+## Enforced regression boundary
+The Executor rejects any `frankichen/sxt` Go workspace whose image is not an
+official `golang:<version>` image (error
+`CI_GO_ONLY_IMAGE_CONTRACT_VIOLATION`). The special combined Go+Node image may
+run only the dedicated `go-node:notification:real-simulator` phase. The
+private CI Python tests deliberately inject a mixed image and verify this
+configuration fails closed. Do not relax this guard to make Go-only CI green;
+fix profile propagation in the Worker instead.
