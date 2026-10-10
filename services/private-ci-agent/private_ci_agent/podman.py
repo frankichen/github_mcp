@@ -27,6 +27,7 @@ ROOTLESS_OUTBOUND_NETWORK = "slirp4netns:allow_host_loopback=true"
 LOCAL_ONLY_IMAGE_PREFIXES = (
     "localhost/node-chromium:",
     "localhost/private-ci-gradle-android:",
+    "localhost/sxt-notification-go-node:",
 )
 GO_CACHE_SUBDIRECTORIES = (
     "home", "gopath", "gomod", "gobuild", "config/go",
