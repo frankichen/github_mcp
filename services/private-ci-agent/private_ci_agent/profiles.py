@@ -80,6 +80,9 @@ def _python_test_extra(root: Path) -> str | None:
         return None
     return next((name for name in _PYTHON_TEST_EXTRAS if isinstance(optional.get(name), list)), None)
 
+# Fixed worker-preheated Go+Node image. Only an operator-controlled hook may select it.
+GO_NODE_IMAGE = "localhost/private-ci-go-node:1.26.4-node22"
+
 GO_COMMANDS = {
     "setup": [
         {
@@ -600,7 +603,7 @@ def _load_json(path: Path) -> dict:
 
 
 SUPPORTED_WORKSPACE_SERVICES = ("postgres", "postgres-global", "postgres-regional-cn", "postgres-regional-de", "redis", "rabbitmq")
-SUPPORTED_WORKSPACE_HOOKS = ("go-migrate", "ai-integrity")
+SUPPORTED_WORKSPACE_HOOKS = ("go-migrate", "ai-integrity", "go-node-runtime")
 
 
 def _node_workspace(source_dir: str, rel: str, files: set[str], explicit: dict | None = None) -> dict:
@@ -966,6 +969,18 @@ def apply_workspace_hooks(commands: dict, workspace: dict) -> dict:
         "check": list(commands.get("check") or []),
     }
     for name in workspace.get("hooks") or []:
+        if name == "go-node-runtime":
+            if workspace.get("stack") != "go":
+                return {"error": "configuration_error", "message": "Hook go-node-runtime is only valid for go"}
+            if result.get("selected_go_version") != "1.26.4":
+                return {"error": "configuration_error", "message": "controlled Go+Node runtime unavailable for requested Go version"}
+            result["image"] = GO_NODE_IMAGE
+            result["selected_image"] = GO_NODE_IMAGE
+            result["setup"].append({
+                "name": "node_runtime",
+                "command": "command -v node >/dev/null 2>&1 || { echo 'CI_INFRA_NODE_RUNTIME_UNAVAILABLE' >&2; exit 86; }; node --version",
+            })
+            continue
         hook = WORKSPACE_HOOKS.get(name)
         if not hook:
             return {"error": "configuration_error", "message": f"Unknown workspace hook: {name}"}

@@ -1,0 +1,6 @@
+# syntax=docker/dockerfile:1.7
+# Worker-preheated fixed image for real Go tests invoking Node.js.
+FROM docker.io/library/node:22 AS node-runtime
+FROM docker.io/library/golang:1.26.4
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+RUN node --version && go version

@@ -39,7 +39,7 @@ def test_checked_in_sxt_config_keeps_runtime_services_and_hooks_explicit():
     )
 
     assert root["services"] == ["postgres", "redis", "rabbitmq"]
-    assert root["hooks"] == ["go-migrate", "ai-integrity"]
+    assert root["hooks"] == ["go-migrate", "ai-integrity", "go-node-runtime"]
 
 
 def test_checked_in_sxt_config_includes_react_console_node_workspace():

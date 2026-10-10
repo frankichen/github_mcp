@@ -38,6 +38,7 @@ repositories:
         hooks:
           - go-migrate
           - ai-integrity
+          - go-node-runtime
       - path: h5/lenshub-console
         type: node
         package_manager: npm

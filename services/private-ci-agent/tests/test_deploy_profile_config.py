@@ -85,7 +85,7 @@ def test_sxt_runtime_overrides_request_only_lenshub_services_and_hooks():
     root = next(item for item in data["repositories"]["frankichen/sxt"]["workspaces"] if item["path"] == ".")
 
     assert root["services"] == ["postgres-global", "postgres-regional-cn", "postgres-regional-de", "redis", "rabbitmq"]
-    assert root["hooks"] == ["go-migrate", "ai-integrity"]
+    assert root["hooks"] == ["go-migrate", "ai-integrity", "go-node-runtime"]
 
 
 def test_sxt_runtime_overrides_include_react_console_node_workspace():
