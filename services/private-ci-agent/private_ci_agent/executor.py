@@ -980,6 +980,7 @@ class JobExecutor:
         if extra_env:
             env.update(extra_env)
         env["CI_COMMIT_SHA"] = job.commit_sha
+        env["CI_PROFILE"] = job.profile
         if notification_node_integration_required(job.repository, job.profile):
             env["SXT_NOTIFICATION_NODE_CI_ENABLED"] = "1"
         env["CI_REPOSITORY_ROOT"] = "/repo"

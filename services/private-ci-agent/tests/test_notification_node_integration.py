@@ -53,3 +53,21 @@ def test_stage_fails_closed_and_uses_same_real_service(tmp_path):
     assert worker.runs[-1][0] == NODE_INTEGRATION_IMAGE
     assert worker.runs[-1][2]["network_name"] == "net"
     assert worker.runs[-1][2]["env"]["DATABASE_URL"] == service.database_url
+    assert worker.runs[-1][2]["env"]["CI_PROFILE"] == "repo-auto-check"
+    assert worker.runs[-1][2]["env"]["SXT_NOTIFICATION_NODE_CI_ENABLED"] == "1"
+
+def test_profile_is_explicit_and_only_full_ci_enables_node_gate(tmp_path):
+    worker = Podman()
+    e = object.__new__(JobExecutor)
+    e.podman, e.cache_map, e.cancel_event = worker, {"go": str(tmp_path)}, None
+    e.client = SimpleNamespace(start_step=lambda *args: None)
+    e.log_manager = SimpleNamespace(upload=lambda *args: None)
+    for profile in ("go-check", "repo-fast-check", "repo-auto-check"):
+        job = SimpleNamespace(job_id="unit", repository="frankichen/sxt",
+                              profile=profile, commit_sha="a"*40, timeout_seconds=30)
+        result = e._run_check(job, "go:.", "golang:1.26.4", str(tmp_path),
+                              {"go":str(tmp_path)}, "gotest", "true")
+        assert result["status"] == "passed"
+        env = worker.runs[-1][2]["env"]
+        assert env["CI_PROFILE"] == profile
+        assert (env.get("SXT_NOTIFICATION_NODE_CI_ENABLED") == "1") == (profile == "repo-auto-check")

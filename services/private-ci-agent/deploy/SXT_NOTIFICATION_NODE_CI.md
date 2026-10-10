@@ -15,3 +15,13 @@ review/merge the github_mcp PR; build the image on both authorized workers
 using prewarm-sxt-notification-go-node.sh; deploy Worker; validate exact
 SXT payment PR HEAD with full repo-auto-check, Worker idle and attestation.
 No API/OpenAPI, database Migration, APP, payment or business rules change.
+
+CI Worker sets `CI_PROFILE` on every check. The LensHub test wiring guard
+only requires a dedicated Node phase for `repo-auto-check`; `go-check` and
+`repo-fast-check` are ordinary feedback profiles and do not certify the real
+simulator integration. An absent/unknown profile with `CI_COMMIT_SHA` remains
+fail-closed until the managed Worker is active.
+
+The offline prewarm script intentionally uses `buildah bud --network=none`
+with explicit temporary directories: rootless Podman `podman build` had a
+verified read-only temporary directory failure with multi-stage COPY.
