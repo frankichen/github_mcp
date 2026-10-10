@@ -11,6 +11,11 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from private_ci_agent.models import Job
+from private_ci_agent.notification_node_integration import (
+    GO_ONLY_TEST_COMMAND, NODE_INTEGRATION_COMMAND,
+    NODE_INTEGRATION_IMAGE, notification_node_integration_required,
+    sxt_go_only_image_allowed,
+)
 from private_ci_agent.affected_selection import select_affected
 from private_ci_agent.contract_integrity import verify_product_contract_integrity
 from private_ci_agent.environment_cache import (
@@ -282,6 +287,22 @@ class JobExecutor:
                     for result in results
                     if result.get("environment_cache")
                 ]
+                if notification_node_integration_required(job.repository, job.profile):
+                    go_result = next((r for r in results if r.get("is_go_workspace")), None)
+                    if not go_result or not go_result["passed"]:
+                        integration_step = {
+                            "step_name": "go-node:notification:real-simulator",
+                            "status": "blocked_by_go", "exit_code": 2,
+                            "error_code": "CI_NODE_INTEGRATION_GO_PREREQUISITE_FAILED",
+                        }
+                    else:
+                        # Same migrated database while the service pod is alive.
+                        integration_step = self._run_notification_node_integration(
+                            job, go_result.get("service_env"))
+                    all_steps.append(integration_step)
+                    if integration_step["exit_code"] != 0:
+                        all_passed = False
+                        final_exit_code = final_exit_code or integration_step["exit_code"]
         finally:
             self.log_manager.flush(job_id)
             self.services.cleanup(job_id, job.workspace)
@@ -293,6 +314,13 @@ class JobExecutor:
             return summary
 
         images = self._workspace_images(plan.get("workspaces", []), job.source_dir, job=job)
+        if notification_node_integration_required(job.repository, job.profile):
+            images.append({
+                "workspace": ".", "stack": "go-node-integration",
+                "image": NODE_INTEGRATION_IMAGE,
+                "digest": self.podman.image_digest(NODE_INTEGRATION_IMAGE) or "",
+            })
+            images.sort(key=lambda r: (r["workspace"], r["stack"], r["image"]))
         metadata["images"] = images
         image_identity_ok = self._images_have_immutable_identity(images)
         metadata["image_digest"] = self._hash_json(images) if images and image_identity_ok else ""
@@ -580,7 +608,21 @@ class JobExecutor:
             return {"error": "unsupported", "message": f"Unsupported stack: {stack}"}
         if commands.get("error"):
             return commands
-        return apply_workspace_hooks(commands, workspace)
+        commands = apply_workspace_hooks(commands, workspace)
+        if job is not None and not sxt_go_only_image_allowed(
+            job.repository, stack, commands.get("image", "")
+        ):
+            return {"error": "configuration_error",
+                    "message": "CI_GO_ONLY_IMAGE_CONTRACT_VIOLATION"}
+        if (job is not None and workspace.get("stack") == "go"
+                and notification_node_integration_required(job.repository, job.profile)
+                and not commands.get("error")):
+            checks = [dict(c) for c in commands.get("check", [])]
+            for check in checks:
+                if check.get("name") == "gotest":
+                    check["command"] = GO_ONLY_TEST_COMMAND
+            return {**commands, "check": checks}
+        return commands
 
     def _restore_python_environment(
         self,
@@ -888,7 +930,29 @@ class JobExecutor:
             "exit_code": exit_code,
             "steps": steps,
             "environment_cache": environment_cache,
+            "service_env": service_env,  # Ephemeral; never part of public metadata.
+            "is_go_workspace": workspace["stack"] == "go",
         }
+
+    def _run_notification_node_integration(self, job: Job, service_env) -> dict:
+        name = "go-node:notification:real-simulator"
+        if service_env is None:
+            self.log_manager.upload(job.job_id, "CI_NODE_INTEGRATION_SERVICE_REQUIRED\n")
+            return {"step_name": name, "status": "failed", "exit_code": 2,
+                    "error_code": "CI_NODE_INTEGRATION_SERVICE_REQUIRED"}
+        if not self.podman.image_available(NODE_INTEGRATION_IMAGE, allow_pull=False):
+            self.log_manager.upload(job.job_id, "CI_NODE_INTEGRATION_IMAGE_UNAVAILABLE\n")
+            return {"step_name": name, "status": "failed", "exit_code": 2,
+                    "error_code": "CI_NODE_INTEGRATION_IMAGE_UNAVAILABLE"}
+        if not self.podman.image_digest(NODE_INTEGRATION_IMAGE):
+            self.log_manager.upload(job.job_id, "CI_NODE_INTEGRATION_IMAGE_DIGEST_UNAVAILABLE\n")
+            return {"step_name": name, "status": "failed", "exit_code": 2,
+                    "error_code": "CI_NODE_INTEGRATION_IMAGE_DIGEST_UNAVAILABLE"}
+        return self._run_check(
+            job, "go-node:notification", NODE_INTEGRATION_IMAGE,
+            job.source_dir, {"go": self.cache_map["go"]},
+            "real-simulator", NODE_INTEGRATION_COMMAND,
+            service_env=service_env, pass_proxy=False)
 
     def _run_setup(self, job, label, image, source_dir, caches, step_name, command, service_env=None, pass_proxy=False):
         name = f"{label}:{step_name}"
@@ -922,6 +986,9 @@ class JobExecutor:
         if extra_env:
             env.update(extra_env)
         env["CI_COMMIT_SHA"] = job.commit_sha
+        env["CI_PROFILE"] = job.profile
+        if notification_node_integration_required(job.repository, job.profile):
+            env["SXT_NOTIFICATION_NODE_CI_ENABLED"] = "1"
         env["CI_REPOSITORY_ROOT"] = "/repo"
         result = self.podman.run_command(image, job.job_id, source_dir, caches, command, job.timeout_seconds,
                                          network=True if service_env else False, env=env if env else None,
