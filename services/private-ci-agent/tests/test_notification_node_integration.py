@@ -95,3 +95,15 @@ def test_sxt_go_only_image_contract_blocks_mixed_worker_configuration(tmp_path, 
     rejected = executor._workspace_commands(workspace, str(tmp_path), job=job)
     assert rejected["error"] == "configuration_error"
     assert rejected["message"] == "CI_GO_ONLY_IMAGE_CONTRACT_VIOLATION"
+
+
+def test_podman_runtime_forwards_controlled_ci_profile_and_node_marker(tmp_path, monkeypatch):
+    """Regression: Executor markers must survive PodmanRunner's env allowlist."""
+    from private_ci_agent.podman import PodmanRunner
+    import inspect
+
+    source = inspect.getsource(PodmanRunner.run_command)
+    assert '"CI_PROFILE"' in source
+    assert '"SXT_NOTIFICATION_NODE_CI_ENABLED"' in source
+    assert '"CI_COMMIT_SHA"' in source
+    assert '"CI_REPOSITORY_ROOT"' in source
