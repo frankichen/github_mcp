@@ -24,6 +24,8 @@ SCOPE = "fullstack"
 PROFILE = "repo-auto-check"
 STATUSES = ("queued", "claimed", "running", "preparing", "validating_main", "testing", "building", "packaging", "checksum_verification", "uploading", "migrating", "switching", "restarting_services", "health_checking", "completed", "passed", "failed", "cancel_requested", "cancelled", "rolling_back", "rollback_failed", "rolled_back")
 INFRA_FILES = ("scripts/deploy_gongshi_test.sh", "deploy/", "scripts/sync_test_env.sh")
+CANCEL_ACK_GRACE_SECONDS = 60
+DELEGATED_CLAIM_MARKER = "execution delegated to WSL"
 _lock = threading.Lock()
 _local = threading.local()
 
@@ -108,6 +110,9 @@ def init_deployment_db():
         "lease_token": "TEXT",
         "performance_json": "TEXT NOT NULL DEFAULT '{}'",
         "artifact_id": "TEXT",
+        "cancel_requested_at": "REAL",
+        "reconciled_at": "REAL",
+        "reconciliation_reason": "TEXT",
     }
     for name, definition in additions.items():
         if name not in columns:
@@ -160,16 +165,25 @@ def _deployment_callback_update(deployment_id: str, current_step: str, message: 
                                 exit_code: int | None = None, error_code: str | None = None,
                                 error_message: str | None = None, release: dict | None = None) -> dict:
     init_deployment_db(); db = _get_deploy_db()
+    db.execute("BEGIN IMMEDIATE")
     row = db.execute("SELECT * FROM deployments WHERE deployment_id=?", (deployment_id,)).fetchone()
     if not row:
+        db.rollback()
         return _error_response("DEPLOYMENT_NOT_FOUND", "deployment not found")
     terminal = row["status"] in ("passed", "failed", "cancelled", "rollback_failed", "rolled_back")
     if terminal:
+        db.rollback()
         return {"ok": True, "idempotent": True, "deployment": _row(row)}
+    if row["status"] == "cancel_requested" and row["current_step"] == "claimed":
+        db.rollback()
+        return _error_response("DEPLOYMENT_CANCEL_PENDING", "unstarted cancellation requires WSL acknowledgement")
     now = _now()
     next_status = status or ("running" if row["status"] in ("queued", "claimed", "preparing") else row["status"])
     if next_status not in STATUSES:
+        db.rollback()
         return _error_response("DEPLOYMENT_STATUS_INVALID", "invalid deployment status")
+    if row["status"] == "cancel_requested" and next_status in ("running", "claimed", "preparing"):
+        next_status = "cancel_requested"
     log_text, revision = _append_deployment_log(db, row, message)
     values = [next_status, current_step, now, revision, log_text]
     assignments = "status=?,current_step=?,updated_at=?,log_revision=?,log_text=?"
@@ -187,8 +201,13 @@ def _deployment_callback_update(deployment_id: str, current_step: str, message: 
         if release.get("release_id"):
             assignments += ",target_release=?"
             values.append(release.get("release_id"))
-    values.append(deployment_id)
-    db.execute(f"UPDATE deployments SET {assignments} WHERE deployment_id=?", values)
+    values.extend([deployment_id, row["status"], row["log_revision"]])
+    updated = db.execute(
+        f"UPDATE deployments SET {assignments} WHERE deployment_id=? AND status=? AND log_revision=?", values
+    )
+    if updated.rowcount != 1:
+        db.rollback()
+        return _error_response("DEPLOYMENT_CALLBACK_CONFLICT", "deployment changed during callback")
     db.commit()
     return {"ok": True, "idempotent": False, "deployment": _row(db.execute("SELECT * FROM deployments WHERE deployment_id=?", (deployment_id,)).fetchone())}
 
@@ -452,8 +471,10 @@ def get_test_deployment_log_tail(deployment_id: str, lines: int = 100) -> dict:
 
 def list_delegated_deployments(repository="", environment=""):
     init_deployment_db()
-    clauses = ["status IN ('running','claimed')", "current_step='claimed'"]
-    params = []
+    clauses = ["""((status IN ('running','claimed') AND current_step='claimed')
+        OR (repository=? AND environment=? AND requested_scope=? AND status='cancel_requested'
+            AND cancel_requested=1 AND current_step='claimed' AND log_revision=1))"""]
+    params = [REPOSITORY, ENVIRONMENT, SCOPE]
     if repository:
         clauses.append("repository=?")
         params.append(repository)
@@ -483,12 +504,116 @@ def list_test_deployments(repository="", environment="", commit_sha="", status="
 
 
 def cancel_test_deployment(deployment_id):
-    init_deployment_db(); db=_get_deploy_db(); row=db.execute("SELECT * FROM deployments WHERE deployment_id=?",(deployment_id,)).fetchone()
-    if not row: return _error_response("DEPLOYMENT_NOT_FOUND", "deployment not found")
-    if row["status"] in ("passed","failed","rolled_back","cancelled"): return _error_response("DEPLOYMENT_NOT_CANCELLABLE", "deployment already finished")
-    if row["status"] == "queued": db.execute("UPDATE deployments SET status='cancelled',finished_at=? WHERE deployment_id=?",(_now(),deployment_id))
-    else: db.execute("UPDATE deployments SET status='cancel_requested',cancel_requested=1 WHERE deployment_id=?",(deployment_id,))
-    db.commit(); return get_test_deployment(deployment_id)
+    init_deployment_db()
+    db = _get_deploy_db()
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute("SELECT * FROM deployments WHERE deployment_id=?", (deployment_id,)).fetchone()
+    if not row:
+        db.rollback()
+        return _error_response("DEPLOYMENT_NOT_FOUND", "deployment not found")
+    if row["status"] in ("passed", "failed", "rolled_back", "cancelled", "rollback_failed"):
+        db.rollback()
+        return _error_response("DEPLOYMENT_NOT_CANCELLABLE", "deployment already finished")
+    if row["status"] == "cancel_requested":
+        db.rollback()
+        return get_test_deployment(deployment_id)
+    now = _now()
+    if row["status"] == "queued":
+        db.execute(
+            "UPDATE deployments SET status='cancelled',current_step='cancelled',"
+            "cancel_requested=1,cancel_requested_at=?,finished_at=?,updated_at=? WHERE deployment_id=?",
+            (now, now, now, deployment_id),
+        )
+    else:
+        db.execute(
+            "UPDATE deployments SET status='cancel_requested',cancel_requested=1,"
+            "cancel_requested_at=COALESCE(cancel_requested_at,?),updated_at=? WHERE deployment_id=?",
+            (now, now, deployment_id),
+        )
+    db.commit()
+    return get_test_deployment(deployment_id)
+
+
+def acknowledge_cancelled_deployment(
+    deployment_id: str, expected_log_revision: int, expected_current_release_id: str,
+    expected_commit_sha: str, workspace_absent: bool = False,
+    expected_claim_generation: int | None = None,
+) -> dict:
+    """Finalize only the authenticated executor's provably unstarted cancellation.
+
+    The executor checks that its immutable deployment checkout path does not exist.
+    The controller independently guards claim/progress CAS and retained release.
+    Expiration alone never releases a deployment lock.
+    """
+    if workspace_absent is not True:
+        return _error_response("DEPLOYMENT_WORKSPACE_EVIDENCE_REQUIRED", "WSL checkout absence not confirmed")
+    init_deployment_db()
+    db = _get_deploy_db()
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute("SELECT * FROM deployments WHERE deployment_id=?", (deployment_id,)).fetchone()
+    if not row:
+        db.rollback()
+        return _error_response("DEPLOYMENT_NOT_FOUND", "deployment not found")
+    if row["status"] == "cancelled":
+        db.rollback()
+        return {"ok": True, "idempotent": True, "deployment": _row(row)}
+    if (row["repository"] != REPOSITORY or row["environment"] != ENVIRONMENT
+            or row["requested_scope"] != SCOPE or row["status"] != "cancel_requested"
+            or not row["cancel_requested"] or row["current_step"] != "claimed"
+            or int(row["log_revision"] or 0) != 1
+            or DELEGATED_CLAIM_MARKER not in (row["log_text"] or "")):
+        db.rollback()
+        return _error_response("DEPLOYMENT_CANCEL_ACK_UNSAFE", "execution progress or delegated proof invalid")
+    if (int(expected_log_revision) != int(row["log_revision"])
+            or expected_current_release_id != row["current_release_before"]
+            or expected_commit_sha != row["commit_sha"]):
+        db.rollback()
+        return _error_response("DEPLOYMENT_CANCEL_ACK_IDENTITY_MISMATCH", "deployment identity changed")
+    keys = row.keys()
+    if "claim_owner" in keys and row["claim_owner"] not in (None, "private-deploy-agent"):
+        db.rollback()
+        return _error_response("DEPLOYMENT_CANCEL_ACK_OWNER_MISMATCH", "claim owner changed")
+    if "claim_generation" in keys and row["claim_generation"] is not None:
+        if expected_claim_generation is None or int(expected_claim_generation) != int(row["claim_generation"]):
+            db.rollback()
+            return _error_response("DEPLOYMENT_CANCEL_ACK_GENERATION_MISMATCH", "claim generation changed")
+    now = _now()
+    if "lease_expires_at" in keys and row["lease_expires_at"] is not None and row["lease_expires_at"] > now:
+        db.rollback()
+        return _error_response("DEPLOYMENT_LEASE_ACTIVE", "claim lease has not expired")
+    cancelled_at = row["cancel_requested_at"] or row["updated_at"]
+    if cancelled_at is None or now - cancelled_at < CANCEL_ACK_GRACE_SECONDS:
+        db.rollback()
+        return _error_response("DEPLOYMENT_CANCEL_ACK_GRACE", "cancellation grace not elapsed")
+    current, _ = _release_snapshot(_status_snapshot(row["repository"]) or {})
+    if (not current or not row["current_release_before"]
+            or current.get("release_id") != row["current_release_before"]
+            or current.get("git_sha") == row["commit_sha"]
+            or not all(current.get(k) is True for k in (
+                "manifest_verified", "checksum_verified", "health_verified", "services_healthy"
+            ))):
+        db.rollback()
+        return _error_response("DEPLOYMENT_RELEASE_DRIFT", "original verified release changed or unavailable")
+    log_text, revision = _append_deployment_log(
+        db, row, "WSL confirmed no deployment checkout; verified previous release unchanged; cancelled"
+    )
+    changed = db.execute(
+        """UPDATE deployments
+           SET status='cancelled',current_step='cancelled',finished_at=?,updated_at=?,
+               reconciled_at=?,reconciliation_reason='wslexecutor_unstarted_cancel_ack',
+               error_code='CANCELLED_BEFORE_EXECUTION',error_message='confirmed no WSL checkout',
+               log_revision=?,log_text=?
+           WHERE deployment_id=? AND status='cancel_requested'
+             AND current_step='claimed' AND cancel_requested=1 AND log_revision=? AND commit_sha=?""",
+        (now, now, now, revision, log_text, deployment_id, row["log_revision"], row["commit_sha"]),
+    )
+    if changed.rowcount != 1:
+        db.rollback()
+        return _error_response("DEPLOYMENT_CANCEL_ACK_CONFLICT", "concurrent deployment callback")
+    db.commit()
+    result = get_test_deployment(deployment_id)
+    result["idempotent"] = False
+    return result
 
 
 def _status_snapshot(repository=""):

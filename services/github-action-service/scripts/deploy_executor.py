@@ -8,6 +8,7 @@ from the queue.
 """
 
 import json
+import logging
 import os
 import re
 import signal
@@ -172,7 +173,13 @@ def execute(row: dict) -> None:
     contract = CONTRACTS.get(row.get("repository"))
     if not contract or row.get("environment") != contract["environment"]:
         return
-    _callback(f"/internal/deployments/{deployment_id}/progress", {"current_step": "preparing_workspace", "status": "running", "message": "WSL workspace preparation started"})
+    try:
+        _callback(f"/internal/deployments/{deployment_id}/progress", {"current_step": "preparing_workspace", "status": "running", "message": "WSL workspace preparation started"})
+    except Exception as exc:
+        # Never start checkout or deployment when the initial state callback
+        # was rejected, cancelled or could not be persisted.
+        logging.warning("Deployment begin refused id=%s error=%s", deployment_id, type(exc).__name__)
+        return
     output = []
     process = None
     workspace = None
@@ -251,11 +258,56 @@ def execute(row: dict) -> None:
         _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": 1, "error_code": "WSL_EXECUTOR_ERROR", "error_message": type(exc).__name__})
 
 
+def acknowledge_unstarted_cancellation(row: dict) -> bool:
+    """The fixed checkout cannot be removed by execute(); absence proves no script start."""
+    if (row.get("repository") != EXPECTED_REPOSITORY
+            or row.get("environment") != EXPECTED_ENVIRONMENT
+            or row.get("requested_scope") != "fullstack"
+            or row.get("status") != "cancel_requested"
+            or row.get("current_step") != "claimed"
+            or row.get("cancel_requested") is not True
+            or row.get("log_revision") != 1):
+        return False
+    deployment_id = row.get("deployment_id")
+    if not isinstance(deployment_id, str) or not re.fullmatch(r"dep_[0-9a-f]{32}", deployment_id):
+        return False
+    if not os.path.isdir(DEPLOY_WORKSPACES):
+        return False
+    if os.path.lexists(os.path.join(DEPLOY_WORKSPACES, deployment_id)):
+        return False
+    if not row.get("current_release_before") or not row.get("commit_sha"):
+        return False
+    _callback(f"/internal/deployments/{deployment_id}/cancel-ack", {
+        "expected_log_revision": row["log_revision"],
+        "expected_current_release_id": row["current_release_before"],
+        "expected_commit_sha": row["commit_sha"],
+        "expected_claim_generation": row.get("claim_generation"),
+        "workspace_absent": True,
+    })
+    return True
+
+
 def main() -> None:
     while True:
-        response = requests.get(CONTROLLER_URL + "/internal/deployments/assigned", headers={"X-Deployment-Callback-Key": _key()}, timeout=15)
-        response.raise_for_status()
+        try:
+            response = requests.get(
+                CONTROLLER_URL + "/internal/deployments/assigned",
+                headers={"X-Deployment-Callback-Key": _key()}, timeout=15,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            logging.warning("Deployment controller unavailable error=%s", type(exc).__name__)
+            time.sleep(2)
+            continue
         for row in response.json().get("items", []):
+            if row.get("status") == "cancel_requested":
+                try:
+                    if not acknowledge_unstarted_cancellation(row):
+                        logging.warning("Unsafe cancellation left pending id=%s", row.get("deployment_id"))
+                except Exception as exc:
+                    logging.warning("Cancellation ack failed id=%s error=%s",
+                                    row.get("deployment_id"), type(exc).__name__)
+                continue
             execute(row)
         time.sleep(2)
 

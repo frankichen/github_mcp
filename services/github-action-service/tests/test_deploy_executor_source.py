@@ -96,3 +96,65 @@ def test_devhub_executor_contract_is_fixed_and_provider_specific():
     assert contract["script"] == "scripts/deploy_production.sh"
     assert contract["frontend"] is False
     assert contract["mirror"].endswith("/frankichen-devhub.git")
+
+
+def _unstarted_cancelled_row():
+    return {
+        "deployment_id": "dep_" + "a" * 32, "repository": "frankichen/sxt",
+        "environment": "gongshi-test", "requested_scope": "fullstack",
+        "commit_sha": "b" * 40, "current_release_before": "rel_old",
+        "current_step": "claimed", "status": "cancel_requested",
+        "cancel_requested": True, "log_revision": 1, "claim_generation": 4,
+    }
+
+
+def test_cancel_ack_only_when_deployment_checkout_is_absent(monkeypatch, tmp_path):
+    root = tmp_path / "workspaces"
+    root.mkdir()
+    monkeypatch.setattr(executor, "DEPLOY_WORKSPACES", str(root))
+    calls = []
+    monkeypatch.setattr(executor, "_callback", lambda path, body: calls.append((path, body)))
+    row = _unstarted_cancelled_row()
+    assert executor.acknowledge_unstarted_cancellation(row) is True
+    assert calls[0][0].endswith("/cancel-ack") and calls[0][1]["expected_claim_generation"] == 4
+    (root / row["deployment_id"]).mkdir()
+    assert executor.acknowledge_unstarted_cancellation(row) is False
+    assert executor.acknowledge_unstarted_cancellation({**row, "current_step": "building"}) is False
+    assert len(calls) == 1
+
+
+def test_cancel_ack_fails_closed_on_unknown_cache_or_id(monkeypatch, tmp_path):
+    monkeypatch.setattr(executor, "DEPLOY_WORKSPACES", str(tmp_path / "missing"))
+    monkeypatch.setattr(executor, "_callback", lambda path, body: (_ for _ in ()).throw(AssertionError("must not call")))
+    assert executor.acknowledge_unstarted_cancellation(_unstarted_cancelled_row()) is False
+    (tmp_path / "missing").mkdir()
+    assert executor.acknowledge_unstarted_cancellation(
+        {**_unstarted_cancelled_row(), "deployment_id": "../bad"}
+    ) is False
+
+
+def test_assigned_cancellation_never_runs_deployment_command(monkeypatch):
+    import pytest
+    from unittest.mock import Mock
+    monkeypatch.setattr(executor, "_key", lambda: "fake")
+    monkeypatch.setattr(executor.requests, "get", lambda *args, **kwargs: Mock(
+        raise_for_status=lambda: None, json=lambda: {"items": [_unstarted_cancelled_row()]}
+    ))
+    seen = []
+    monkeypatch.setattr(executor, "acknowledge_unstarted_cancellation",
+                        lambda row: seen.append(row["deployment_id"]) or True)
+    monkeypatch.setattr(executor, "execute", lambda row: pytest.fail("cancelled deployment must not execute"))
+    monkeypatch.setattr(executor.time, "sleep", lambda _: (_ for _ in ()).throw(StopIteration()))
+    with pytest.raises(StopIteration):
+        executor.main()
+    assert seen == ["dep_" + "a" * 32]
+
+
+def test_controller_read_timeout_does_not_crash_executor(monkeypatch):
+    import pytest
+    monkeypatch.setattr(executor, "_key", lambda: "fake")
+    monkeypatch.setattr(executor.requests, "get",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(executor.requests.ReadTimeout("offline")))
+    monkeypatch.setattr(executor.time, "sleep", lambda _: (_ for _ in ()).throw(StopIteration()))
+    with pytest.raises(StopIteration):
+        executor.main()
