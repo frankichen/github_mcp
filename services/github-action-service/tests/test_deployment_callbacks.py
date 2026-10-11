@@ -109,3 +109,103 @@ def test_fail_callback_does_not_write_release_registry(monkeypatch, tmp_path):
     deployment_service.update_test_deployment_progress("dep_test", "building", "started", status="running")
     deployment_service.fail_test_deployment("dep_test", 1, "DEPLOY_SOURCE_FETCH_FAILED", "fetch failed")
     assert not (tmp_path / "status.json").exists()
+
+
+def _prepare_claimed_cancel(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    (tmp_path / "status.json").write_text(json.dumps({
+        "environment": "gongshi-test", "current_release_id": "rel_old",
+        "current_git_sha": "b" * 40, "manifest_verified": True,
+        "checksum_verified": True, "health_verified": True, "services_healthy": True,
+        "releases": [{
+            "release_id": "rel_old", "repository": "frankichen/sxt",
+            "environment": "gongshi-test", "git_sha": "b" * 40,
+            "current_release_path": "/home/dly/releases/rel_old",
+            "manifest_verified": True, "checksum_verified": True,
+            "health_verified": True, "services_healthy": True
+        }],
+    }), encoding="utf-8")
+    db = deployment_service._get_deploy_db()
+    db.execute("""UPDATE deployments SET status='running',current_step='claimed',
+        current_release_before='rel_old',started_at=1,updated_at=1,log_revision=1,
+        log_text='agent claimed deployment dep_test; execution delegated to WSL'
+        WHERE deployment_id='dep_test'""")
+    db.commit()
+    monkeypatch.setattr(deployment_service, "_now", lambda: 1000)
+    assert deployment_service.cancel_test_deployment("dep_test")["deployment"]["status"] == "cancel_requested"
+    return db
+
+
+def _cancel_ack(**extra):
+    data = {"deployment_id": "dep_test", "expected_log_revision": 1,
+            "expected_current_release_id": "rel_old", "expected_commit_sha": "a" * 40,
+            "workspace_absent": True}
+    data.update(extra)
+    return deployment_service.acknowledge_cancelled_deployment(**data)
+
+
+def test_cancel_ack_frees_original_lock_and_preserves_verified_release(monkeypatch, tmp_path):
+    db = _prepare_claimed_cancel(monkeypatch, tmp_path)
+    assert [x["deployment_id"] for x in deployment_service.list_delegated_deployments()] == ["dep_test"]
+    assert _cancel_ack()["error"]["code"] == "DEPLOYMENT_CANCEL_ACK_GRACE"
+    monkeypatch.setattr(deployment_service, "_now", lambda: 1100)
+    result = _cancel_ack()
+    assert result["ok"] and result["deployment"]["status"] == "cancelled"
+    assert result["deployment"]["reconciliation_reason"] == "wslexecutor_unstarted_cancel_ack"
+    assert _cancel_ack()["idempotent"] is True
+    assert deployment_service.list_delegated_deployments() == []
+    assert db.execute("SELECT log_revision FROM deployments WHERE deployment_id='dep_test'").fetchone()[0] == 2
+    current = deployment_service.get_test_environment_status("frankichen/sxt", "gongshi-test")["status"]
+    assert current["current_release_id"] == "rel_old" and current["current_git_sha"] == "b" * 40
+
+
+def test_cancel_ack_fails_closed_on_workspace_progress_and_drift(monkeypatch, tmp_path):
+    db = _prepare_claimed_cancel(monkeypatch, tmp_path)
+    monkeypatch.setattr(deployment_service, "_now", lambda: 1100)
+    assert _cancel_ack(workspace_absent=False)["error"]["code"] == "DEPLOYMENT_WORKSPACE_EVIDENCE_REQUIRED"
+    assert _cancel_ack(expected_log_revision=2)["error"]["code"] == "DEPLOYMENT_CANCEL_ACK_IDENTITY_MISMATCH"
+    assert _cancel_ack(expected_commit_sha="c" * 40)["error"]["code"] == "DEPLOYMENT_CANCEL_ACK_IDENTITY_MISMATCH"
+    assert deployment_service.update_test_deployment_progress(
+        "dep_test", "preparing_workspace", "started", status="running"
+    )["error"]["code"] == "DEPLOYMENT_CANCEL_PENDING"
+    status = json.loads((tmp_path / "status.json").read_text())
+    status["current_release_id"] = "rel_other"
+    (tmp_path / "status.json").write_text(json.dumps(status))
+    assert _cancel_ack()["error"]["code"] == "DEPLOYMENT_RELEASE_DRIFT"
+    assert db.execute("SELECT status FROM deployments WHERE deployment_id='dep_test'").fetchone()[0] == "cancel_requested"
+
+
+def test_cancel_ack_rejects_progress_active_lease_and_wrong_generation(monkeypatch, tmp_path):
+    db = _prepare_claimed_cancel(monkeypatch, tmp_path)
+    monkeypatch.setattr(deployment_service, "_now", lambda: 1100)
+    db.execute("UPDATE deployments SET current_step='testing',log_revision=2 WHERE deployment_id='dep_test'")
+    db.commit()
+    assert _cancel_ack(expected_log_revision=2)["error"]["code"] == "DEPLOYMENT_CANCEL_ACK_UNSAFE"
+    db.execute("UPDATE deployments SET current_step='claimed',log_revision=1 WHERE deployment_id='dep_test'")
+    db.execute("ALTER TABLE deployments ADD COLUMN lease_expires_at REAL")
+    db.execute("UPDATE deployments SET lease_expires_at=1200 WHERE deployment_id='dep_test'")
+    db.commit()
+    assert _cancel_ack()["error"]["code"] == "DEPLOYMENT_LEASE_ACTIVE"
+    db.execute("UPDATE deployments SET lease_expires_at=900 WHERE deployment_id='dep_test'")
+    db.execute("ALTER TABLE deployments ADD COLUMN claim_generation INTEGER")
+    db.execute("UPDATE deployments SET claim_generation=7 WHERE deployment_id='dep_test'")
+    db.commit()
+    assert _cancel_ack()["error"]["code"] == "DEPLOYMENT_CANCEL_ACK_GENERATION_MISMATCH"
+    assert _cancel_ack(expected_claim_generation=7)["ok"] is True
+
+
+def test_running_cancel_stays_sticky_until_actual_finish(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    deployment_service.update_test_deployment_progress("dep_test", "testing", "started", status="running")
+    deployment_service.cancel_test_deployment("dep_test")
+    progress = deployment_service.update_test_deployment_progress("dep_test", "building", "build", status="running")
+    assert progress["ok"] and progress["deployment"]["status"] == "cancel_requested"
+    assert deployment_service.complete_test_deployment("dep_test", 0, "success", _proof())["deployment"]["status"] == "passed"
+
+
+def test_queued_cancel_is_terminal_and_late_callback_cannot_restart(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    assert deployment_service.cancel_test_deployment("dep_test")["deployment"]["status"] == "cancelled"
+    assert deployment_service.update_test_deployment_progress(
+        "dep_test", "building", "late", status="running"
+    )["deployment"]["status"] == "cancelled"

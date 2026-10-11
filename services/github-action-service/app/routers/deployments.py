@@ -7,7 +7,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 
 from app.config import settings
-from app.deployment_service import append_deployment_log_batch, complete_test_deployment, fail_test_deployment, list_delegated_deployments, update_test_deployment_progress
+from app.deployment_service import acknowledge_cancelled_deployment, append_deployment_log_batch, complete_test_deployment, fail_test_deployment, list_delegated_deployments, update_test_deployment_progress
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/internal/deployments", tags=["Deployments"])
@@ -40,8 +40,38 @@ async def deployment_progress(deployment_id: str, request: Request):
         body.get("release") if isinstance(body.get("release"), dict) else None,
     )
     if not result.get("ok"):
-        raise HTTPException(status_code=404, detail=result.get("error"))
+        code = (result.get("error") or {}).get("code")
+        raise HTTPException(status_code=404 if code == "DEPLOYMENT_NOT_FOUND" else 409, detail=result.get("error"))
     logger.info("Deployment progress callback deployment_id=%s step=%s idempotent=%s", deployment_id, body.get("current_step"), result.get("idempotent"))
+    return result
+
+
+@router.post("/{deployment_id}/cancel-ack")
+async def deployment_cancel_ack(deployment_id: str, request: Request):
+    await _authorize(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail={"error": "invalid_cancel_ack_payload"})
+    try:
+        revision = int(body.get("expected_log_revision", -1))
+        generation = body.get("expected_claim_generation")
+        if generation is not None:
+            generation = int(generation)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail={"error": "invalid_cancel_ack_identity"})
+    result = acknowledge_cancelled_deployment(
+        deployment_id=deployment_id,
+        expected_log_revision=revision,
+        expected_current_release_id=str(body.get("expected_current_release_id") or ""),
+        expected_commit_sha=str(body.get("expected_commit_sha") or ""),
+        workspace_absent=body.get("workspace_absent") is True,
+        expected_claim_generation=generation,
+    )
+    if not result.get("ok"):
+        code = (result.get("error") or {}).get("code")
+        raise HTTPException(status_code=404 if code == "DEPLOYMENT_NOT_FOUND" else 409, detail=result.get("error"))
+    logger.info("Pre-execution cancellation acknowledged id=%s idempotent=%s",
+                deployment_id, result.get("idempotent"))
     return result
 
 
