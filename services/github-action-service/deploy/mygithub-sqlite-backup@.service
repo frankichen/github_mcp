@@ -24,4 +24,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/backups/mygithub12 /run/mygithub-maintenance
+# mode=ro still needs to create WAL/SHM when those sidecars do not exist.
+# Allow sidecar maintenance but enforce read-only on the source main DB inode.
+ReadWritePaths=/var/backups/mygithub12 /run/mygithub-maintenance /var/lib/docker/volumes/github_action_data/_data
+ReadOnlyPaths=/var/lib/docker/volumes/github_action_data/_data/mygithub12.db

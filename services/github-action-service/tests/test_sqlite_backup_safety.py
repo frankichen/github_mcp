@@ -194,3 +194,12 @@ def test_destination_created_during_copy_is_not_overwritten(source, tmp_path, mo
         safe.backup(source, target, seconds=5, lock_dir=tmp_path / "locks")
     assert target.read_bytes() == b"another completed backup"
     assert not list(tmp_path.glob(".backup-*"))
+
+
+def test_wal_database_without_sidecars(source, tmp_path):
+    # Last connection closed: WAL mode persists in the DB, sidecars disappear.
+    assert not Path(str(source) + "-wal").exists()
+    target = tmp_path / "wal-no-sidecars.sqlite"
+    assert safe.backup(source, target, seconds=5, lock_dir=tmp_path / "locks")["status"] == "passed"
+    with closing(sqlite3.connect(target)) as copied:
+        assert copied.execute("SELECT count(*) FROM data").fetchone()[0] == 512

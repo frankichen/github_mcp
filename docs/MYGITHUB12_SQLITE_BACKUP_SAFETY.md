@@ -53,6 +53,8 @@ sudo journalctl -u mygithub-sqlite-backup@repair-20261017T090000Z.service
 
 1. 源库以 `mode=ro` 打开，`BEGIN` 后真实读取固定 WAL 快照。
    不使用 `immutable=1`，不跳过 WAL，不锁住业务 Writer。
+   unit 对主数据库文件强制只读，源目录允许 SQLite 管理 WAL/SHM 侧文件；
+   WAL 模式在侧文件暂时不存在时也需要此目录权限。不会修改源库逻辑数据。
 2. 剩余页数回退、快照页数改变、临时目标删除/替换立即失败。
 3. 默认逻辑复制上限 16 MiB/s，CLI 最大 32 MiB/s；默认/最大总时限 300 秒。
    独立 supervisor 硬超时，worker 自己有 alarm，父进程被杀后由 Linux
