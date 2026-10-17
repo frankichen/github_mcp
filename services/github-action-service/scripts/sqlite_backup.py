@@ -109,9 +109,9 @@ def stop_child(child: subprocess.Popen | None) -> None:
         child.wait()
 
 
-def backup(source: Path, destination: Path, *, seconds: float = 300,
+def backup(source: Path, destination: Path, *, seconds: float = 600,
            rate: float = 16 * 1024**2, lock_dir: Path | None = None) -> dict:
-    if not math.isfinite(seconds) or not 0 < seconds <= 300:
+    if not math.isfinite(seconds) or not 0 < seconds <= 600:
         raise BackupError("BACKUP_INVALID_DEADLINE")
     if not math.isfinite(rate) or not 0 < rate <= 32 * 1024**2:
         raise BackupError("BACKUP_INVALID_RATE")
@@ -173,7 +173,7 @@ def main() -> int:
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--destination", required=True, type=Path)
     parser.add_argument("--lock-dir", type=Path)
-    parser.add_argument("--seconds", type=float, default=300)
+    parser.add_argument("--seconds", type=float, default=600)
     parser.add_argument("--bytes-per-second", type=float, default=16 * 1024**2)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--parent-pid", type=int, help=argparse.SUPPRESS)

@@ -154,7 +154,7 @@ def test_deleted_target_aborts(source, tmp_path, monkeypatch):
         safe.copy_snapshot(source, partial, seconds=5, rate=32 * 1024**2)
 
 
-@pytest.mark.parametrize("seconds,rate", [(0, 1024), (301, 1024), (float("nan"), 1024), (1, float("inf"))])
+@pytest.mark.parametrize("seconds,rate", [(0, 1024), (601, 1024), (float("nan"), 1024), (1, float("inf"))])
 def test_unbounded_options_rejected(source, tmp_path, seconds, rate):
     with pytest.raises(safe.BackupError, match="INVALID"):
         safe.backup(source, tmp_path / "bad.sqlite", seconds=seconds, rate=rate)
