@@ -9,6 +9,7 @@ than drifted.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import re
 from typing import Any
@@ -1887,6 +1888,8 @@ def _next_actions(
         return ["resume_development_task"]
     if "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS" in blockers:
         return ["get_private_ci_job", "resume_development_task"]
+    if (recovery_plan or {}).get("recovery_required") and (recovery_plan or {}).get("next_allowed_actions"):
+        return list(recovery_plan["next_allowed_actions"])
     if workspace.get("status") == "expired":
         return ["resume_development_workspace", "recovery_required"]
     if workspace.get("status") == "drifted":
@@ -1897,6 +1900,8 @@ def _next_actions(
     if session.get("status") in BLOCKED_SESSION_STATUSES:
         return ["recovery_required"]
     if index and index.get("status") != "ready":
+        actions.append("request_index")
+    if "INDEX_IDENTITY_MISMATCH" in blockers:
         actions.append("request_index")
     if not blockers and workspace.get("lease_valid") and session.get("status") in ACTIVE_SESSION_STATUSES and index and index.get("status") == "ready":
         actions.append("continue_write")
@@ -1978,12 +1983,59 @@ def resume_task(
             limit=20,
         )
         session = session_candidates[0] if session_candidates else None
-        if session and expected_session_revision and int(session["session_revision"]) != int(expected_session_revision):
-            raise MyGithub12Error(
-                "DEVELOPMENT_SESSION_REVISION_MISMATCH",
-                "development session revision changed",
-                {"expected": int(expected_session_revision), "actual": int(session["session_revision"]), "development_session_id": session["session_id"]},
+        if session and recover_stale_session and expected_workspace_revision and expected_session_revision:
+            record = (session.get("metadata") or {}).get("last_active_workspace_stale_session_recovery") or {}
+            recorded_request = record.get("request") or {}
+            original_cas = (
+                recorded_request.get("expected_workspace_revision") == int(expected_workspace_revision)
+                and recorded_request.get("expected_session_revision") == int(expected_session_revision)
             )
+            if original_cas:
+                # Original-CAS retry after a concurrent winner or process restart.
+                # Rebuild from fresh GitHub identity; never replay stale evidence.
+                live_base = _resolve_recovery_base(service, repository, workspace, session, pr, current_main)
+                replayed = drift_recovery.recover_active_workspace_stale_session(
+                    service, repository, effective_branch, str(workspace["workspace_id"]), str(session["session_id"]),
+                    int(expected_workspace_revision), int(expected_session_revision), branch_head, branch_tree,
+                    str(live_base["branch"]), str(live_base["commit_sha"]),
+                    idempotency_key or str(record["idempotency_key"]), lease_seconds,
+                    reviewed_scope_expansion_paths_json,
+                )
+                workspace = replayed["workspace"]
+                session = replayed["development_session"]
+                workspace_candidates = [workspace]
+                session_candidates = [session]
+                recovery = {**replayed, "recovery_performed": False, "recovery_required": False,
+                            "recovery_classification": "ACTIVE_WORKSPACE_STALE_SESSION", "recovery_blocker": None}
+        if session and recover_stale_session and idempotency_key and not recovery:
+            last = (session.get("metadata") or {}).get("last_session_recovery") or {}
+            before, after = last.get("before") or {}, last.get("after") or {}
+            if (
+                last.get("idempotency_key") == idempotency_key
+                and int(expected_session_revision or 0) == before.get("session_revision")
+                and int(expected_workspace_revision or 0) == after.get("workspace_revision") == workspace.get("revision")
+                and session.get("session_revision") == after.get("session_revision")
+                and session.get("owner") == workspace.get("owner")
+                and workspace.get("lease_valid") and session.get("lease_valid")
+                and workspace.get("head_sha") == session.get("head_commit_sha") == after.get("head_commit_sha") == branch_head
+                and workspace.get("tree_sha") == session.get("tree_sha") == after.get("tree_sha") == branch_tree
+                and float(workspace.get("lease_expires_at") or 0) == float(session.get("lease_expires_at") or 0) == after.get("lease_expires_at")
+            ):
+                replayed = dx.recover_stale_session(service, session["session_id"], int(expected_session_revision),
+                                                   int(expected_workspace_revision), branch_head, idempotency_key)
+                session, workspace = replayed["session"], replayed["workspace"]
+                recovery = {"session": replayed, "replayed": True, "recovery_performed": False}
+        if (expected_workspace_revision and int(workspace["revision"]) != int(expected_workspace_revision)
+                and not (recovery and (recovery.get("replayed") or recovery.get("workspace_resumed")))):
+            raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH", "workspace revision changed",
+                                 {"expected": int(expected_workspace_revision), "actual": int(workspace["revision"])})
+        if session and expected_session_revision and int(session["session_revision"]) != int(expected_session_revision):
+            if not (recovery and recovery.get("replayed")):
+                raise MyGithub12Error(
+                    "DEVELOPMENT_SESSION_REVISION_MISMATCH",
+                    "development session revision changed",
+                    {"expected": int(expected_session_revision), "actual": int(session["session_revision"]), "development_session_id": session["session_id"]},
+                )
         if pr and pr.get("merged") is True and workspace and session:
             if recover_stale_session:
                 merge_reconciliation = managed_merge.finalize_managed_pr_merge(
@@ -2109,6 +2161,37 @@ def resume_task(
                             "error_details": dict(exc.details or {}),
                             **recovery_identity,
                         }
+                        if exc.code == "RECOVERY_SCOPE_VIOLATION":
+                            recovery["next_allowed_actions"] = ["review_scope_expansion", "resume_development_task"]
+                            recovery["retry_arguments"] = {
+                                "repository": repository, "branch": effective_branch,
+                                "recover_stale_session": True, "renew_lease": False,
+                                "expected_workspace_revision": workspace["revision"],
+                                "expected_session_revision": session["session_revision"],
+                                "idempotency_key": recovery_idempotency_key,
+                                "lease_seconds": lease_seconds,
+                                "reviewed_scope_expansion_paths_json": json.dumps((exc.details or {}).get("required_scope_expansion_paths") or []),
+                            }
+                        elif exc.code == "RECOVERY_BASE_OVERLAP":
+                            recovery["next_allowed_actions"] = ["plan_development_workspace_sync", "manual_review"]
+                            recovery["sync_plan_arguments"] = {"workspace_id": workspace["workspace_id"], "base_branch": workspace["base_branch"]}
+                            recovery["baseline_convergence_steps"] = [
+                                {"tool": "plan_development_workspace_sync", "arguments": recovery["sync_plan_arguments"]},
+                                {"action": "review_exact_base_overlap", "paths": (exc.details or {}).get("overlapping_paths"),
+                                 "expected_old_base_sha": workspace["base_commit_sha"], "expected_new_base_sha": live_base["commit_sha"]},
+                            ]
+                            if pr and pr.get("state") == "open":
+                                recovery["baseline_convergence_steps"].append({
+                                    "tool": "update_github_pull_request_branch", "requires_separate_authorization": True,
+                                    "arguments": {"repository": repository, "pull_number": pr["pull_number"], "expected_head_sha": branch_head},
+                                })
+                            recovery["baseline_convergence_steps"].extend([
+                                {"tool": "refresh_development_workspace", "after": "authorized_branch_sync",
+                                 "arguments": {"workspace_id": workspace["workspace_id"], "expected_workspace_revision": workspace["revision"]}},
+                                {"tool": "resume_development_task", "arguments": {"repository": repository, "branch": effective_branch,
+                                  "recover_stale_session": False, "renew_lease": False},
+                                 "use_result": "copy recovery identity/CAS fields into recover_base_synced_development_task; review exact overlap and scope before execution"},
+                            ])
                         blockers.append("DEVELOPMENT_SESSION_RECOVERY_REQUIRED")
                     else:
                         workspace = active_recovery["workspace"]
@@ -2202,6 +2285,8 @@ def resume_task(
     index = mygithub12.get_index_status(service, repository, commit_sha=branch_head)
     if index.get("status") != "ready":
         blockers.append("INDEX_NOT_READY")
+    elif index.get("commit_sha") != branch_head or index.get("tree_sha") != branch_tree:
+        blockers.append("INDEX_IDENTITY_MISMATCH")
     overlap = None
     if workspace:
         try:
@@ -2392,4 +2477,23 @@ def resume_task(
         response["historical_evidence"]["convergences"] = convergence_evidence["historical"]
     response["candidate_next_actions"] = next_actions
     response["next_allowed_actions"] = next_actions
+    # Kept inline by MCP resource fallback, even when historical audit/context
+    # needs a resource. Callers must not infer readiness from an old audit row.
+    response["status_summary"] = {
+        "workspace_id": (workspace or {}).get("workspace_id"),
+        "development_session_id": (session or {}).get("session_id"),
+        "workspace_revision": (workspace or {}).get("revision"),
+        "session_revision": (session or {}).get("session_revision"),
+        "head_sha": branch_head, "tree_sha": branch_tree,
+        "workspace_lease_valid": bool((workspace or {}).get("lease_valid")),
+        "session_lease_valid": bool((session or {}).get("lease_valid")),
+        "lease_expires_at": (workspace or {}).get("lease_expires_at"),
+        "exact_head": response["exact_head"],
+        "recovery_performed": response["recovery_performed"],
+        "recovery_required": response["recovery_required"],
+        "recovery_classification": response["recovery_classification"],
+        "recovery_blocker": response["recovery_blocker"],
+        "blockers": blockers, "next_allowed_actions": next_actions,
+        "writer_ready": bool(response["exact_head"] and not blockers and (workspace or {}).get("lease_valid") and (session or {}).get("lease_valid")),
+    }
     return response

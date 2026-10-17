@@ -133,6 +133,9 @@ def _replay_result(
         and workspace.get("base_commit_sha") == after.get("base_commit_sha")
         and session.get("base_commit_sha") == after.get("base_commit_sha")
         and workspace.get("scope") == after.get("scope")
+        and workspace.get("owner") == session.get("owner") == record.get("before", {}).get("workspace_owner")
+        and float(workspace.get("lease_expires_at") or 0) > sessions._now()
+        and float(session.get("lease_expires_at") or 0) == float(workspace.get("lease_expires_at") or 0)
     )
     if not matches:
         raise MyGithub12Error(
@@ -141,6 +144,34 @@ def _replay_result(
             {"workspace_id": workspace.get("workspace_id"), "development_session_id": session.get("session_id")},
         )
     return record
+
+
+def _verify_pinned_base_advance(
+    repo: Any, workspace: dict[str, Any], session: dict[str, Any], live_base_sha: str,
+) -> dict[str, Any]:
+    """Prove a historical base remains valid without adopting or moving live main."""
+    pinned = str(workspace.get("base_commit_sha") or "")
+    if pinned != session.get("base_commit_sha"):
+        raise MyGithub12Error("RECOVERY_BASE_CHANGED", "Workspace and Session pinned bases differ")
+    evidence = {"pinned_base_sha": pinned, "live_base_sha": live_base_sha, "base_advanced": pinned != live_base_sha}
+    if pinned == live_base_sha:
+        return evidence
+    # Exact immutable comparisons, including rename sources, bounded by GitHub's
+    # compare API limit. A rewritten base or an unreadable delta cannot qualify.
+    from app.development_base_sync_recovery import _compare_delta
+    base_ancestry, base_paths = _compare_delta(repo, pinned, live_base_sha, label="resume_base_advance", require_advance=True)
+    task_ancestry, task_paths = _compare_delta(repo, pinned, str(workspace["head_sha"]), label="resume_pinned_task")
+    if session["head_commit_sha"] != pinned:
+        _compare_delta(repo, pinned, str(session["head_commit_sha"]), label="resume_pinned_session")
+    overlap = sorted(set(base_paths) & set(task_paths))
+    evidence.update({"base_ancestry": base_ancestry, "task_ancestry": task_ancestry,
+                     "base_changed_paths": base_paths, "task_changed_paths": task_paths, "overlapping_paths": overlap})
+    if overlap:
+        raise MyGithub12Error(
+            "RECOVERY_BASE_OVERLAP", "base advancement overlaps task files; explicit base synchronization review is required",
+            {**evidence, "next_allowed_actions": ["plan_development_workspace_sync", "manual_review"]},
+        )
+    return evidence
 
 
 def _fresh_github_identity(
@@ -314,10 +345,25 @@ def _verify_scope(
     }
 
 
+def _ownership_snapshot(db: sqlite3.Connection, repository: str) -> list[dict[str, Any]]:
+    return [dict(row) for row in db.execute(
+        "SELECT workspace_id,repository,branch,base_branch,base_commit_sha,head_sha,tree_sha,"
+        "status,revision,owner,lease_expires_at,scope_json,drift_reason FROM workspaces "
+        "WHERE repository=? AND status IN ('active','drifted') ORDER BY workspace_id", (repository,),
+    ).fetchall()]
+
+
+def _verify_ownership_snapshot(db: sqlite3.Connection, evidence: dict[str, Any]) -> None:
+    if _ownership_snapshot(db, evidence["repository"]) != evidence.get("workspace_snapshot"):
+        raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH", "Workspace ownership/overlap inputs changed after verification")
+
+
 def _verify_ownership(service: Any, workspace: dict[str, Any]) -> dict[str, Any]:
     repository = str(workspace["repository"])
     branch = str(workspace["branch"])
     workspace_id = str(workspace["workspace_id"])
+    with sessions._db() as db:
+        snapshot = _ownership_snapshot(db, repository)
     listing = mygithub12.list_workspaces(service, repository=repository, branch=branch, limit=100)
     candidates = [item for item in (listing.get("items") or []) if item.get("branch") == branch]
     if not any(item.get("workspace_id") == workspace_id for item in candidates):
@@ -357,7 +403,11 @@ def _verify_ownership(service: Any, workspace: dict[str, Any]) -> dict[str, Any]
             "high-overlap active Workspace blocks control-plane recovery",
             {"workspace_id": workspace_id, "overlap": high},
         )
-    return {"verified": True, "workspace_id": workspace_id, "overlap": overlap}
+    evidence = {"verified": True, "repository": repository, "workspace_id": workspace_id,
+                "overlap": overlap, "workspace_snapshot": snapshot}
+    with sessions._db() as db:
+        _verify_ownership_snapshot(db, evidence)
+    return evidence
 
 
 def _atomic_recover(
@@ -377,7 +427,8 @@ def _atomic_recover(
     current_head = request["expected_current_head_sha"]
     current_tree = request["expected_current_tree_sha"]
     base_branch = request["expected_base_branch"]
-    base_sha = request["expected_base_sha"]
+    live_base_sha = request["expected_base_sha"]
+    base_sha = request.get("pinned_base_sha", live_base_sha)
     recovery_kind = str(request.get("recovery_kind") or "manual_branch_recovery")
     active_workspace_stale_session = recovery_kind == "active_workspace_stale_session"
     record_key = _recovery_record_key(recovery_kind)
@@ -385,6 +436,7 @@ def _atomic_recover(
     lease_expires_at = now + max(60, min(int(request["lease_seconds"]), mygithub12.MAX_LEASE_SECONDS))
     try:
         with sessions._LOCK, sessions._db() as db:
+            db.execute("BEGIN IMMEDIATE")
             workspace_row = db.execute("SELECT * FROM workspaces WHERE workspace_id=?", (workspace_id,)).fetchone()
             session_row = db.execute("SELECT * FROM development_sessions WHERE session_id=?", (session_id,)).fetchone()
             if not workspace_row:
@@ -419,6 +471,9 @@ def _atomic_recover(
                     and workspace_row["base_commit_sha"] == after.get("base_commit_sha")
                     and session_row["base_commit_sha"] == after.get("base_commit_sha")
                     and json.loads(workspace_row["scope_json"] or "{}") == after.get("scope")
+                    and workspace_row["owner"] == session_row["owner"] == record.get("before", {}).get("workspace_owner")
+                    and float(workspace_row["lease_expires_at"] or 0) > sessions._now()
+                    and float(session_row["lease_expires_at"] or 0) == float(workspace_row["lease_expires_at"] or 0)
                 )
                 if not replay_state_matches:
                     raise MyGithub12Error(
@@ -437,7 +492,9 @@ def _atomic_recover(
                         {"conflicting_workspace_id": other["workspace_id"]},
                     )
                 _base_identity_mode(dict(workspace_row), dict(session_row), base_branch, base_sha)
-                _fresh_github_identity(service, repository, branch, current_head, current_tree, base_branch, base_sha)
+                _fresh_github_identity(service, repository, branch, current_head, current_tree, base_branch, live_base_sha)
+                if active_workspace_stale_session:
+                    _verify_ownership_snapshot(db, verification["ownership"])
                 return {"replayed": True, "before": record["before"], "after": record["after"], "audit": record["audit"]}
             if int(workspace_row["revision"]) != int(expected_workspace_revision):
                 raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH", "workspace revision changed before drift recovery")
@@ -522,9 +579,23 @@ def _atomic_recover(
                     "another active or drifted Workspace claims the recovery branch",
                     {"conflicting_workspace_id": other["workspace_id"]},
                 )
-            _fresh_github_identity(service, repository, branch, current_head, current_tree, base_branch, base_sha)
+            _fresh_github_identity(service, repository, branch, current_head, current_tree, base_branch, live_base_sha)
             if active_workspace_stale_session:
-                verification["ownership"] = _verify_ownership(service, dict(workspace_row))
+                fresh_workspace = {**dict(workspace_row), "scope": json.loads(workspace_row["scope_json"] or "{}")}
+                # Remote overlap was proved before taking the SQLite writer
+                # lock. Every input row must still be identical under CAS.
+                _verify_ownership_snapshot(db, verification["ownership"])
+                verification["scope"] = _verify_scope(
+                    fresh_workspace, verification["scope"]["changed_paths"],
+                    request.get("reviewed_scope_expansion_paths"),
+                )
+                canonical = db.execute(
+                    "SELECT session_id FROM development_sessions WHERE workspace_id=? AND closed_at IS NULL "
+                    "AND status NOT IN (?,?,?,?) LIMIT 2",
+                    (workspace_id, *sorted(_TERMINAL_SESSION_STATES)),
+                ).fetchall()
+                if len(canonical) != 1 or canonical[0]["session_id"] != session_id:
+                    raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "canonical Session changed during recovery")
             before = {
                 "workspace_revision": int(workspace_row["revision"]),
                 "session_revision": int(session_row["session_revision"]),
@@ -589,6 +660,7 @@ def _atomic_recover(
             if active_workspace_stale_session:
                 audit.update({
                     "recovery_kind": "active_workspace_stale_session",
+                    "base_advance": verification.get("base_advance"),
                     "before": {
                         "session_revision": before["session_revision"],
                         "session_head": before["session_head_sha"],
@@ -651,7 +723,7 @@ def _atomic_recover(
                         json.dumps(after["scope"], ensure_ascii=False, separators=(",", ":")),
                         int(scope_changed),
                         int(scope_changed),
-                        now,
+                        sessions._now(),
                         workspace_id,
                         repository,
                         branch,
@@ -714,7 +786,9 @@ def _atomic_recover(
                 after["session_revision"],
                 audit,
             )
-            _fresh_github_identity(service, repository, branch, current_head, current_tree, base_branch, base_sha)
+            _fresh_github_identity(service, repository, branch, current_head, current_tree, base_branch, live_base_sha)
+            if active_workspace_stale_session and lease_expires_at <= sessions._now():
+                raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED", "Workspace lease expired while verifying recovery")
         return {"replayed": False, "before": before, "after": after, "audit": audit}
     except sqlite3.IntegrityError as exc:
         raise MyGithub12Error(
@@ -963,6 +1037,9 @@ def recover_active_workspace_stale_session(
         reviewed_scope_expansion_paths,
         recovery_kind="active_workspace_stale_session",
     )
+    pinned_base_sha = str(workspace.get("base_commit_sha") or "")
+    if pinned_base_sha != expected_base_sha:
+        request["pinned_base_sha"] = pinned_base_sha
     replay = _replay_result(session, workspace, request, idempotency_key)
     if replay:
         _fresh_github_identity(
@@ -998,6 +1075,13 @@ def recover_active_workspace_stale_session(
             "writer_ready": index["ready"],
             "git_ref_changed": False,
         }
+    # Another caller may have completed this exact CAS operation before our
+    # initial read. Reconcile the winner's durable result without renewing it.
+    recorded = (session.get("metadata") or {}).get("last_active_workspace_stale_session_recovery") or {}
+    if recorded.get("request") == request:
+        reconciled = reconcile_active_recovery(service, request, idempotency_key)
+        if reconciled is not None:
+            return reconciled
     if workspace.get("status") == "closed":
         raise MyGithub12Error("WORKSPACE_CLOSED", "closed Workspace cannot be recovered")
     if workspace.get("status") != "active" or workspace.get("drift_reason") is not None:
@@ -1040,8 +1124,8 @@ def recover_active_workspace_stale_session(
     if (
         workspace.get("base_branch") != expected_base_branch
         or session.get("base_branch") != expected_base_branch
-        or workspace.get("base_commit_sha") != expected_base_sha
-        or session.get("base_commit_sha") != expected_base_sha
+        or not pinned_base_sha
+        or session.get("base_commit_sha") != pinned_base_sha
     ):
         raise MyGithub12Error(
             "RECOVERY_BASE_CHANGED",
@@ -1092,10 +1176,19 @@ def recover_active_workspace_stale_session(
         expected_base_sha,
     )
     ancestry, changed_paths = _verify_forward_only(repo, session, expected_current_head_sha)
+    base_advance = _verify_pinned_base_advance(repo, workspace, session, expected_base_sha)
     scope = _verify_scope(workspace, changed_paths, reviewed_scope_expansion_paths)
     ownership = _verify_ownership(service, workspace)
-    verification = {"github": github_identity, "ancestry": ancestry, "scope": scope, "ownership": ownership}
-    recovered = _atomic_recover(service, request=request, idempotency_key=idempotency_key, verification=verification)
+    verification = {"github": github_identity, "ancestry": ancestry, "scope": scope, "ownership": ownership, "base_advance": base_advance}
+    try:
+        recovered = _atomic_recover(service, request=request, idempotency_key=idempotency_key, verification=verification)
+    except MyGithub12Error as exc:
+        if exc.code not in {"WORKSPACE_REVISION_MISMATCH", "DEVELOPMENT_SESSION_REVISION_MISMATCH"}:
+            raise
+        reconciled = reconcile_active_recovery(service, request, idempotency_key)
+        if reconciled is None:
+            raise
+        return reconciled
     recovered_workspace = mygithub12.get_workspace(service, workspace_id)
     recovered_session = sessions.get_session(development_session_id)
     index = _index_state(
@@ -1122,3 +1215,23 @@ def recover_active_workspace_stale_session(
         "writer_ready": index["ready"],
         "git_ref_changed": False,
     }
+
+
+def reconcile_active_recovery(service: Any, request: dict[str, Any], idempotency_key: str) -> dict[str, Any] | None:
+    """Fresh-read after CAS: accept only the exact completed operation, never retry a write."""
+    fresh_session = sessions.get_session(request["development_session_id"])
+    record = (fresh_session.get("metadata") or {}).get("last_active_workspace_stale_session_recovery") or {}
+    if record.get("request") != request:
+        return None
+    workspace = mygithub12.get_workspace(service, request["workspace_id"])
+    winner_key = record["idempotency_key"]
+    _replay_result(fresh_session, workspace, request, winner_key)
+    result = recover_active_workspace_stale_session(
+        service, **{key: value for key, value in request.items()
+                    if key not in {"pinned_base_sha", "recovery_kind", "reviewed_scope_expansion_paths"}},
+        idempotency_key=winner_key,
+        reviewed_scope_expansion_paths_json=json.dumps(request.get("reviewed_scope_expansion_paths") or []),
+    )
+    result["reconciled"] = True
+    result["recovery_performed"] = False
+    return result
