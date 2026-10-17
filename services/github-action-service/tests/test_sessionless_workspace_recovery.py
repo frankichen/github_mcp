@@ -1,0 +1,301 @@
+"""No-session legacy workspace recovery must preserve Writer identity and fail closed."""
+
+import json
+import sys
+from pathlib import Path
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from app import development_sessionless_recovery as legacy
+from app import development_session_store as sessions
+from app import mygithub12
+from test_drift_recovery import (
+    FakeService,
+    REPO,
+    BRANCH,
+    BASE,
+    BASE_SHA,
+    WORKSPACE_ID,
+    OLD_HEAD,
+    NEW_HEAD,
+    OLD_TREE,
+    NEW_TREE,
+    _workspace_row,
+)
+
+
+def seed(tmp_path, monkeypatch, *, drifted=True):
+    monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "legacy-recovery.db"))
+    service = FakeService()
+    sessions.init_session_db()
+    original = _workspace_row(
+        status="drifted" if drifted else "active",
+        revision=7,
+        head=NEW_HEAD,
+        tree=NEW_TREE,
+        drift_reason="branch_moved_externally" if drifted else None,
+    )
+    values = list(original)
+    values[11] = OLD_HEAD if drifted else NEW_HEAD
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            "INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values
+        )
+    monkeypatch.setattr(
+        legacy.mygithub12,
+        "workspace_overlap",
+        lambda service, workspace_id: {
+            "ok": True,
+            "workspace_id": workspace_id,
+            "items": [],
+            "comparison_verified": True,
+        },
+    )
+    monkeypatch.setattr(
+        legacy.mygithub12,
+        "get_index_status",
+        lambda service, repository, commit_sha="", ref="": {
+            "status": "ready",
+            "commit_sha": commit_sha,
+            "tree_sha": NEW_TREE,
+        },
+    )
+    monkeypatch.setattr(
+        legacy.mygithub12,
+        "request_index_build",
+        lambda *a, **k: pytest.fail("existing exact-head index expected"),
+    )
+    return service
+
+
+def args(*, drifted=True, **overrides):
+    options = dict(
+        repository=REPO,
+        branch=BRANCH,
+        workspace_id=WORKSPACE_ID,
+        expected_owner="chatgpt",
+        expected_workspace_revision=7,
+        expected_previous_head_sha=OLD_HEAD if drifted else NEW_HEAD,
+        expected_current_head_sha=NEW_HEAD,
+        expected_current_tree_sha=NEW_TREE,
+        expected_base_branch=BASE,
+        expected_base_sha=BASE_SHA,
+        idempotency_key="legacy-recovery-only-once",
+        confirm=False,
+    )
+    options.update(overrides)
+    return options
+
+
+def state():
+    with sessions._db() as db:
+        w = db.execute(
+            "SELECT * FROM workspaces WHERE workspace_id=?", (WORKSPACE_ID,)
+        ).fetchone()
+        s = db.execute(
+            "SELECT * FROM development_sessions WHERE workspace_id=?", (WORKSPACE_ID,)
+        ).fetchall()
+        return dict(w), [dict(x) for x in s]
+
+
+def expect_error(service, code, **kwargs):
+    with pytest.raises(mygithub12.MyGithub12Error) as exc:
+        legacy.recover_sessionless_workspace(service, **args(**kwargs))
+    assert exc.value.code == code
+
+
+def test_preview_is_read_only_and_identifies_original_writer(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    before, s0 = state()
+    result = legacy.recover_sessionless_workspace(service, **args())
+    assert result["ok"] and not result["confirmed"]
+    assert result["no_existing_session"]
+    assert result["owner"] == "chatgpt"
+    assert result["ancestry"]["verified"]
+    assert result["required_scope_expansion_paths"] == []
+    after, s1 = state()
+    assert before == after and s0 == s1 == []
+
+
+def test_confirm_creates_first_session_on_same_original_workspace(
+    tmp_path, monkeypatch
+):
+    service = seed(tmp_path, monkeypatch)
+    result = legacy.recover_sessionless_workspace(service, **args(confirm=True))
+    w, session_rows = state()
+    assert result["confirmed"] and result["created_first_session"]
+    assert result["no_replacement_workspace"] and not result["git_ref_changed"]
+    assert w["status"] == "active" and w["drift_reason"] is None
+    assert w["revision"] == 8 and w["head_sha"] == NEW_HEAD
+    assert len(session_rows) == 1
+    assert session_rows[0]["owner"] == "chatgpt"
+    assert session_rows[0]["workspace_revision"] == 8
+    assert session_rows[0]["head_commit_sha"] == NEW_HEAD
+    assert result["writer_ready"] is True
+    with sessions._db() as db:
+        assert db.execute("SELECT count(*) FROM workspaces").fetchone()[0] == 1
+        events = db.execute(
+            "SELECT event_type FROM development_session_events"
+        ).fetchall()
+        assert [x[0] for x in events] == ["legacy_workspace_session_reconciled"]
+
+
+def test_replay_is_idempotent_no_second_session(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    kwargs = args(confirm=True)
+    first = legacy.recover_sessionless_workspace(service, **kwargs)
+    second = legacy.recover_sessionless_workspace(service, **kwargs)
+    assert second["replayed"] and not second["git_ref_changed"]
+    assert (
+        first["development_session"]["session_id"]
+        == second["development_session"]["session_id"]
+    )
+    assert len(state()[1]) == 1
+
+
+def test_active_same_head_first_session(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch, drifted=False)
+    out = legacy.recover_sessionless_workspace(
+        service, **args(drifted=False, confirm=True)
+    )
+    assert out["confirmed"] and out["writer_ready"]
+    w, s = state()
+    assert w["head_sha"] == NEW_HEAD and w["revision"] == 8
+    assert len(s) == 1 and s[0]["owner"] == "chatgpt"
+
+
+def test_wrong_owner_fails(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    expect_error(service, "RECOVERY_OWNER_MISMATCH", expected_owner="other")
+    assert not state()[1]
+
+
+def test_stale_cas_fails(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    expect_error(service, "WORKSPACE_REVISION_MISMATCH", expected_workspace_revision=6)
+    assert state()[0]["revision"] == 7
+
+
+def test_previous_head_must_match_durable_pin(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    expect_error(
+        service, "RECOVERY_ANCESTRY_MISMATCH", expected_previous_head_sha="f" * 40
+    )
+
+
+def test_forward_only_required(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    service.repo.merge_base = BASE_SHA
+    expect_error(service, "RECOVERY_ANCESTRY_MISMATCH")
+    assert not state()[1]
+
+
+def test_scope_exact_review_before_commit(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    service.repo.changed_paths = ["outside/control.py"]
+    preview = legacy.recover_sessionless_workspace(service, **args())
+    assert preview["required_scope_expansion_paths"] == ["outside/control.py"]
+    expect_error(service, "RECOVERY_SCOPE_VIOLATION", confirm=True)
+    actual = legacy.recover_sessionless_workspace(
+        service,
+        **args(
+            confirm=True, reviewed_scope_expansion_paths_json='["outside/control.py"]'
+        ),
+    )
+    assert actual["confirmed"]
+    assert "outside/control.py" in json.loads(state()[0]["scope_json"])["paths"]
+
+
+def test_session_already_exists_fails_closed(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    ws = mygithub12.get_workspace(service, WORKSPACE_ID)
+    sessions.create_session(ws, owner="chatgpt", idempotency_key="existing")
+    expect_error(service, "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH")
+    assert len(state()[1]) == 1
+    assert state()[0]["status"] == "drifted"
+
+
+def test_transaction_rolls_back_if_audit_fails(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+
+    def refuse_audit(*args, **kwargs):
+        raise RuntimeError("synthetic audit failure")
+
+    monkeypatch.setattr(sessions, "_append_event", refuse_audit)
+    with pytest.raises(RuntimeError, match="synthetic"):
+        legacy.recover_sessionless_workspace(service, **args(confirm=True))
+    w, ss = state()
+    assert w["status"] == "drifted" and w["revision"] == 7
+    assert ss == []
+
+
+def test_active_workspace_must_have_live_lease(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch, drifted=False)
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            "UPDATE workspaces SET lease_expires_at=0 WHERE workspace_id=?",
+            (WORKSPACE_ID,),
+        )
+    expect_error(service, "RECOVERY_DRIFT_REASON_UNSUPPORTED", drifted=False)
+
+
+def test_replayed_key_different_request_fails(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    legacy.recover_sessionless_workspace(service, **args(confirm=True))
+    expect_error(
+        service,
+        "IDEMPOTENCY_CONFLICT",
+        reviewed_scope_expansion_paths_json='["other/file.py"]',
+    )
+
+
+def test_high_overlap_blocks_first_session(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        legacy.mygithub12,
+        "workspace_overlap",
+        lambda *a: {
+            "ok": True,
+            "comparison_verified": True,
+            "items": [{"workspace_id": "other", "level": "high", "evidence": []}],
+        },
+    )
+    expect_error(service, "RECOVERY_WORKSPACE_OVERLAP")
+    assert state()[0]["status"] == "drifted" and not state()[1]
+
+
+def test_changed_git_identity_within_transaction_rolls_back(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    original = legacy.drift._fresh_github_identity
+    calls = {"count": 0}
+
+    def identity_changes(*a, **kw):
+        calls["count"] += 1
+        if calls["count"] > 1:
+            raise mygithub12.MyGithub12Error(
+                "RECOVERY_HEAD_MISMATCH", "changed after preflight"
+            )
+        return original(*a, **kw)
+
+    monkeypatch.setattr(legacy.drift, "_fresh_github_identity", identity_changes)
+    with pytest.raises(mygithub12.MyGithub12Error, match="changed after preflight"):
+        legacy.recover_sessionless_workspace(service, **args(confirm=True))
+    assert state()[0]["revision"] == 7 and not state()[1]
+
+
+def test_base_move_fails_closed(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    service.client.heads[BASE] = "f" * 40
+    expect_error(service, "RECOVERY_BASE_CHANGED")
+    assert state()[0]["status"] == "drifted" and not state()[1]
+
+
+def test_replay_fails_if_owner_changes(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    legacy.recover_sessionless_workspace(service, **args(confirm=True))
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            "UPDATE workspaces SET owner='other' WHERE workspace_id=?", (WORKSPACE_ID,)
+        )
+    expect_error(service, "IDEMPOTENCY_CONFLICT", confirm=True)

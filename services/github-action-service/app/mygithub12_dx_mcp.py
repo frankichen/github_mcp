@@ -12,6 +12,7 @@ from mcp.types import ToolAnnotations
 
 from app import artifact_store
 from app import development_drift_recovery as drift_recovery
+from app import development_sessionless_recovery as sessionless_recovery
 from app import development_base_sync_recovery as base_sync_recovery
 from app import development_retarget_recovery as retarget_recovery
 from app import development_managed_merge as managed_merge
@@ -123,6 +124,36 @@ def register_dx_tools(
             )
             return json.dumps(result,ensure_ascii=False)
         except Exception as exc: return _error(exc)
+
+    @mcp.tool(
+        name="recover_sessionless_development_workspace",
+        description=(
+            "Preview or explicitly reconcile the FIRST canonical Development Session onto an EXISTING "
+            "legacy Workspace that never had a Session. For drifted Workspace requires exact durable old "
+            "index HEAD, forward-only ancestry, reviewed exact changed paths, owner, base, Tree, "
+            "Workspace CAS and overlap checks; no Git/Workspace/branch/PR creation. confirm=false by default."
+        ),
+        annotations=_ORCHESTRATION,
+    )
+    async def recover_sessionless_development_workspace(
+        repository: str, branch: str, workspace_id: str, expected_owner: str,
+        expected_workspace_revision: int, expected_previous_head_sha: str,
+        expected_current_head_sha: str, expected_current_tree_sha: str,
+        expected_base_branch: str, expected_base_sha: str, idempotency_key: str,
+        confirm: bool=False, lease_seconds: int=mygithub12.DEFAULT_LEASE_SECONDS,
+        reviewed_scope_expansion_paths_json: str="[]",
+    ) -> str:
+        try:
+            result=await github_call(
+                sessionless_recovery.recover_sessionless_workspace,service,repository,branch,
+                workspace_id,expected_owner,expected_workspace_revision,expected_previous_head_sha,
+                expected_current_head_sha,expected_current_tree_sha,expected_base_branch,
+                expected_base_sha,idempotency_key,confirm,lease_seconds,
+                reviewed_scope_expansion_paths_json,
+            )
+            return json.dumps(result,ensure_ascii=False)
+        except Exception as exc:
+            return _error(exc)
 
     @mcp.tool(
         name="recover_base_synced_development_task",
