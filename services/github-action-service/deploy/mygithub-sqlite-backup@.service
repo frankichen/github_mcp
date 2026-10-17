@@ -1,0 +1,30 @@
+[Unit]
+Description=Bounded MyGithut12 SQLite backup (%i)
+After=docker.service
+
+[Service]
+Type=exec
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/mygithub-maintenance/sqlite_backup.py --source /var/lib/docker/volumes/github_action_data/_data/mygithub12.db --destination /var/backups/mygithub12/mygithub12-%i.sqlite --lock-dir /run/mygithub-maintenance
+RuntimeDirectory=mygithub-maintenance
+RuntimeDirectoryPreserve=yes
+RuntimeMaxSec=630
+TimeoutStopSec=5
+KillMode=control-group
+Restart=no
+Nice=15
+IOSchedulingClass=idle
+IOWeight=10
+# The installer must confirm this is the data filesystem's physical device.
+IOReadBandwidthMax=/dev/nvme0n1 32M
+IOWriteBandwidthMax=/dev/nvme0n1 16M
+MemoryMax=256M
+CPUQuota=50%
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# mode=ro still needs to create WAL/SHM when those sidecars do not exist.
+# Allow sidecar maintenance but enforce read-only on the source main DB inode.
+ReadWritePaths=/var/backups/mygithub12 /run/mygithub-maintenance /var/lib/docker/volumes/github_action_data/_data
+ReadOnlyPaths=/var/lib/docker/volumes/github_action_data/_data/mygithub12.db
