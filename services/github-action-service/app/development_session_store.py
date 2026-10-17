@@ -289,6 +289,7 @@ def recover_stale_session_from_workspace(
     """CAS-sync a provably stale Session from already-verified Workspace evidence."""
     init_session_db()
     with _LOCK, _db() as db:
+        db.execute("BEGIN IMMEDIATE")
         row = db.execute("SELECT * FROM development_sessions WHERE session_id=?", (session_id,)).fetchone()
         if not row:
             raise MyGithub12Error(
@@ -296,11 +297,28 @@ def recover_stale_session_from_workspace(
                 "development session was not found",
                 {"development_session_id": session_id},
             )
+        persisted_workspace = db.execute("SELECT * FROM workspaces WHERE workspace_id=?", (workspace["workspace_id"],)).fetchone()
+        if not persisted_workspace:
+            raise MyGithub12Error("WORKSPACE_NOT_FOUND", "Workspace disappeared before Session recovery")
+        snapshot_fields = ("revision", "head_sha", "tree_sha", "base_branch", "base_commit_sha", "owner", "lease_expires_at")
+        if any(persisted_workspace[field] != workspace.get(field) for field in snapshot_fields):
+            raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH", "Workspace changed after Session recovery verification")
+        if persisted_workspace["status"] != "active" or persisted_workspace["drift_reason"]:
+            raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED", "Workspace is no longer active/no-drift")
+        if float(persisted_workspace["lease_expires_at"] or 0) <= _now():
+            raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED", "Workspace lease expired before Session recovery")
+        identity_fields = ("workspace_id", "repository", "branch", "base_branch", "base_commit_sha", "owner")
+        if any(row[field] != workspace.get(field) for field in identity_fields):
+            raise MyGithub12Error("DEVELOPMENT_SESSION_WORKSPACE_MISMATCH", "Session and canonical Workspace identities differ")
         metadata = json.loads(row["metadata_json"] or "{}")
         last = metadata.get("last_session_recovery") if isinstance(metadata, dict) else None
         if idempotency_key and isinstance(last, dict) and last.get("idempotency_key") == idempotency_key:
             after = last.get("after") if isinstance(last.get("after"), dict) else {}
-            if int(row["session_revision"]) == int(after.get("session_revision", -1)):
+            if (int(row["session_revision"]) == int(after.get("session_revision", -1))
+                    and row["head_commit_sha"] == workspace["head_sha"] == after.get("head_commit_sha")
+                    and row["tree_sha"] == workspace["tree_sha"] == after.get("tree_sha")
+                    and int(row["workspace_revision"]) == int(workspace["revision"]) == after.get("workspace_revision")
+                    and float(row["lease_expires_at"]) == float(workspace["lease_expires_at"]) == after.get("lease_expires_at")):
                 return {
                     "session": _public(row), "recovered": bool(last.get("recovered")),
                     "replayed": True, "before": last.get("before"), "after": after,

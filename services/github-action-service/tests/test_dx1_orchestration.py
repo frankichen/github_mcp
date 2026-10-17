@@ -51,6 +51,17 @@ def _workspace(**overrides):
     return value
 
 
+def _persist_recovery_workspace(workspace):
+    """Recovery tests exercise the real persistent Workspace CAS boundary."""
+    mygithub12.init_db()
+    values = {**workspace, "scope_json": "{}", "drift_reason": workspace.get("drift_reason"),
+              "created_at": 1000.0, "updated_at": 1000.0}
+    with mygithub12._db() as db:
+        columns = [r[1] for r in db.execute("PRAGMA table_info(workspaces)")]
+        db.execute(f"INSERT INTO workspaces ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                   [values.get(key) for key in columns])
+
+
 def _no_renewal(session, workspace_revision=3):
     return {
         "renewed": False,
@@ -415,10 +426,11 @@ def test_auto_renew_orchestrator_replays_only_owned_renewal_revision(monkeypatch
 def test_session_recovery_cas_clears_stale_evidence_and_replays_idempotently(tmp_path, monkeypatch):
     monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "session-recovery.db"))
     monkeypatch.setattr(sessions, "_now", lambda: 1000.0)
-    created=sessions.create_session(_workspace(head_sha=SHA_A,tree_sha=SHA_B,revision=2,index_commit_sha=SHA_A))
+    created=sessions.create_session(_workspace(head_sha=SHA_A,tree_sha=SHA_B,revision=2,index_commit_sha=SHA_A), owner="test")
     with mygithub12._db() as db:
         db.execute("UPDATE development_sessions SET last_fast_ci_job_id='fast-old',last_full_ci_job_id='full-old',last_attestation_id='att-old',last_failure_resource_uri='resource-old' WHERE session_id=?",(created["session_id"],))
     workspace=_workspace(head_sha=SHA_B,tree_sha=SHA_C,revision=3,index_commit_sha=SHA_B)
+    _persist_recovery_workspace(workspace)
     recovered=sessions.recover_stale_session_from_workspace(
         created["session_id"],1,workspace,idempotency_key="recover-1",index_commit_sha=SHA_B,
         recovery_evidence={"github_head_sha":SHA_B,"github_tree_sha":SHA_C},
@@ -443,10 +455,11 @@ def test_session_recovery_cas_clears_stale_evidence_and_replays_idempotently(tmp
 def test_session_recovery_preserves_exact_head_ci_when_only_workspace_revision_is_stale(tmp_path, monkeypatch):
     monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "session-revision-recovery.db"))
     monkeypatch.setattr(sessions, "_now", lambda: 1000.0)
-    created=sessions.create_session(_workspace(revision=2,index_commit_sha=SHA_B))
+    created=sessions.create_session(_workspace(revision=2,index_commit_sha=SHA_B), owner="test")
     with mygithub12._db() as db:
         db.execute("UPDATE development_sessions SET last_full_ci_job_id='full-exact',last_attestation_id='att-exact' WHERE session_id=?",(created["session_id"],))
     workspace=_workspace(revision=3,index_commit_sha=SHA_B)
+    _persist_recovery_workspace(workspace)
     recovered=sessions.recover_stale_session_from_workspace(created["session_id"],1,workspace,index_commit_sha=SHA_B)
     assert recovered["session"]["workspace_revision"] == 3
     assert recovered["session"]["last_full_ci_job_id"] == "full-exact"
@@ -474,8 +487,9 @@ def _recovery_service(actual_head=SHA_B, actual_tree=SHA_C, *, merge_base=SHA_A,
 def test_orchestrator_recovers_proven_session_stale_and_requests_exact_index(tmp_path, monkeypatch):
     monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "orchestrator-recovery.db"))
     monkeypatch.setattr(sessions, "_now", lambda: 1000.0)
-    created=sessions.create_session(_workspace(head_sha=SHA_A,tree_sha=SHA_B,revision=2,index_commit_sha=SHA_A))
+    created=sessions.create_session(_workspace(head_sha=SHA_A,tree_sha=SHA_B,revision=2,index_commit_sha=SHA_A), owner="test")
     workspace={**_workspace(head_sha=SHA_B,tree_sha=SHA_C,revision=3,index_commit_sha=SHA_B),"lease_valid":True,"drift_reason":None}
+    _persist_recovery_workspace(workspace)
     service=_recovery_service()
     monkeypatch.setattr(mygithub12, "get_workspace", lambda *args, **kwargs: workspace)
     monkeypatch.setattr(mygithub12, "_service_repo", lambda *args, **kwargs: service.repo)
