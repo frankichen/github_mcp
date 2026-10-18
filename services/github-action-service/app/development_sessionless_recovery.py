@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from typing import Any
@@ -32,8 +33,9 @@ def _identity_payload(
     base_sha: str,
     lease_seconds: int,
     paths: list[str],
+    expected_live_base_sha: str,
 ) -> dict[str, Any]:
-    return {
+    request = {
         "repository": repository,
         "branch": branch,
         "workspace_id": workspace_id,
@@ -47,6 +49,59 @@ def _identity_payload(
         "lease_seconds": int(lease_seconds),
         "reviewed_scope_expansion_paths": sorted(paths),
     }
+    if expected_live_base_sha:
+        request["expected_live_base_sha"] = expected_live_base_sha
+    return request
+
+
+def _fresh_pinned_base_proof(
+    service: Any, repository: str, branch: str, current_head_sha: str,
+    current_tree_sha: str, base_branch: str, pinned_base_sha: str,
+    expected_live_base_sha: str, confirm: bool,
+) -> tuple[Any, dict[str, Any]]:
+    """Keep the historical pinned base, but prove disjoint forward main progress.
+
+    This does not sync/merge the task branch and never silently treats a newer
+    main as the original pinned base. A caller must explicitly pin the live
+    base SHA to confirm an advanced-base first-session recovery.
+    """
+    base_state = service.client.get_branch(repository, base_branch)
+    if not base_state:
+        raise Error("RECOVERY_BASE_CHANGED", "recovery base branch not found")
+    live_base_sha = str(base_state.commit.sha)
+    if expected_live_base_sha and live_base_sha != expected_live_base_sha:
+        raise Error("RECOVERY_BASE_CHANGED", "reviewed live base SHA changed",
+                    {"reviewed": expected_live_base_sha, "actual": live_base_sha})
+    if live_base_sha != pinned_base_sha and confirm and expected_live_base_sha != live_base_sha:
+        raise Error("RECOVERY_BASE_ADVANCE_REVIEW_REQUIRED",
+                    "caller must explicitly review and pin the advanced base SHA",
+                    {"pinned_base_sha": pinned_base_sha, "live_base_sha": live_base_sha})
+    repo, _ = drift._fresh_github_identity(
+        service, repository, branch, current_head_sha, current_tree_sha,
+        base_branch, live_base_sha,
+    )
+    if live_base_sha == pinned_base_sha:
+        return repo, {"advanced": False, "pinned_base_sha": pinned_base_sha,
+                      "live_base_sha": live_base_sha, "overlapping_paths": []}
+    from app.development_base_sync_recovery import _compare_delta
+    base_ancestry, base_paths = _compare_delta(
+        repo, pinned_base_sha, live_base_sha,
+        label="sessionless_live_base_advance", require_advance=True,
+    )
+    task_ancestry, task_paths = _compare_delta(
+        repo, pinned_base_sha, current_head_sha, label="sessionless_pinned_task",
+    )
+    overlapping = sorted(set(base_paths) & set(task_paths))
+    evidence = {"advanced": True, "pinned_base_sha": pinned_base_sha,
+                "live_base_sha": live_base_sha,
+                "base_ancestry": base_ancestry, "task_ancestry": task_ancestry,
+                "base_changed_paths": base_paths, "task_changed_paths": task_paths,
+                "overlapping_paths": overlapping}
+    if overlapping:
+        raise Error("RECOVERY_BASE_OVERLAP",
+                    "advanced main overlaps the pinned task delta; manual review required",
+                    evidence)
+    return repo, evidence
 
 
 def recover_sessionless_workspace(
@@ -65,6 +120,7 @@ def recover_sessionless_workspace(
     confirm: bool = False,
     lease_seconds: int = mygithub12.DEFAULT_LEASE_SECONDS,
     reviewed_scope_expansion_paths_json: str = "[]",
+    expected_live_base_sha: str = "",
 ) -> dict[str, Any]:
     """Preview or CAS-reconcile a unique original Workspace without any Session.
 
@@ -104,6 +160,8 @@ def recover_sessionless_workspace(
         )
     if not expected_previous_head_sha or len(expected_previous_head_sha) != 40:
         raise Error("SEARCH_QUERY_INVALID", "exact previously indexed HEAD is required")
+    if expected_live_base_sha and not re.fullmatch(r"[0-9a-f]{40}", expected_live_base_sha):
+        raise Error("SEARCH_QUERY_INVALID", "expected_live_base_sha must be a full lowercase Git SHA")
     if int(lease_seconds) < 60 or int(lease_seconds) > mygithub12.MAX_LEASE_SECONDS:
         raise Error("SEARCH_QUERY_INVALID", "lease_seconds outside supported bounds")
     reviewed = drift._parse_reviewed_scope_expansion_paths(
@@ -122,6 +180,7 @@ def recover_sessionless_workspace(
         expected_base_sha,
         lease_seconds,
         reviewed,
+        expected_live_base_sha,
     )
     digest = hashlib.sha256(
         json.dumps(request, sort_keys=True, ensure_ascii=False).encode()
@@ -165,14 +224,10 @@ def recover_sessionless_workspace(
             raise Error(
                 "IDEMPOTENCY_CONFLICT", "replayed recovery state has since changed"
             )
-        drift._fresh_github_identity(
-            service,
-            repository,
-            branch,
-            expected_current_head_sha,
-            expected_current_tree_sha,
-            expected_base_branch,
-            expected_base_sha,
+        _fresh_pinned_base_proof(
+            service, repository, branch, expected_current_head_sha,
+            expected_current_tree_sha, expected_base_branch,
+            expected_base_sha, expected_live_base_sha, True,
         )
         drift._verify_ownership(service, workspace)
         return {
@@ -235,14 +290,10 @@ def recover_sessionless_workspace(
             "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH",
             "Workspace/branch already has a Development Session",
         )
-    repo, github = drift._fresh_github_identity(
-        service,
-        repository,
-        branch,
-        expected_current_head_sha,
-        expected_current_tree_sha,
-        expected_base_branch,
-        expected_base_sha,
+    repo, base_advance = _fresh_pinned_base_proof(
+        service, repository, branch, expected_current_head_sha,
+        expected_current_tree_sha, expected_base_branch,
+        expected_base_sha, expected_live_base_sha, confirm,
     )
     if drifted:
         old_tree = mygithub12._tree_sha(repo.get_commit(expected_previous_head_sha))
@@ -276,6 +327,10 @@ def recover_sessionless_workspace(
         "current_head_sha": expected_current_head_sha,
         "current_tree_sha": expected_current_tree_sha,
         "previous_head_sha": expected_previous_head_sha,
+        "base_advance": base_advance,
+        "required_expected_live_base_sha": (
+            base_advance["live_base_sha"] if base_advance["advanced"] else ""
+        ),
         "required_scope_expansion_paths": required,
         "reviewed_scope_expansion_paths": reviewed,
         "ancestry": ancestry,
@@ -341,14 +396,10 @@ def recover_sessionless_workspace(
                     "IDEMPOTENCY_CONFLICT", "recovery idempotency key already used"
                 )
             drift._verify_ownership_snapshot(db, ownership)
-            drift._fresh_github_identity(
-                service,
-                repository,
-                branch,
-                expected_current_head_sha,
-                expected_current_tree_sha,
-                expected_base_branch,
-                expected_base_sha,
+            _fresh_pinned_base_proof(
+                service, repository, branch, expected_current_head_sha,
+                expected_current_tree_sha, expected_base_branch,
+                expected_base_sha, expected_live_base_sha, True,
             )
             # Expand scope only to the exact, reviewed forward delta. No refs or code files move.
             cursor = db.execute(
@@ -381,6 +432,7 @@ def recover_sessionless_workspace(
                     "previous_head_sha": expected_previous_head_sha,
                     "reviewed_paths": reviewed,
                     "git_ref_changed": False,
+                    "base_advance": base_advance,
                 }
             }
             values = (
@@ -430,6 +482,7 @@ def recover_sessionless_workspace(
                     "old_head_sha": expected_previous_head_sha,
                     "current_head_sha": expected_current_head_sha,
                     "reviewed_paths": reviewed,
+                    "base_advance": base_advance,
                     "request_sha256": digest,
                 },
             )
@@ -458,6 +511,7 @@ def recover_sessionless_workspace(
         "workspace": recovered_workspace,
         "development_session": recovered_session,
         "ancestry": ancestry,
+        "base_advance": base_advance,
         "scope": scope,
         "index": index,
         "writer_ready": bool(index["ready"]),

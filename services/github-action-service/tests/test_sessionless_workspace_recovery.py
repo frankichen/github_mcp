@@ -2,6 +2,7 @@
 
 import json
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 import pytest
 
@@ -287,7 +288,7 @@ def test_changed_git_identity_within_transaction_rolls_back(tmp_path, monkeypatc
 def test_base_move_fails_closed(tmp_path, monkeypatch):
     service = seed(tmp_path, monkeypatch)
     service.client.heads[BASE] = "f" * 40
-    expect_error(service, "RECOVERY_BASE_CHANGED")
+    expect_error(service, "RECOVERY_ANCESTRY_MISMATCH")
     assert state()[0]["status"] == "drifted" and not state()[1]
 
 
@@ -299,3 +300,139 @@ def test_replay_fails_if_owner_changes(tmp_path, monkeypatch):
             "UPDATE workspaces SET owner='other' WHERE workspace_id=?", (WORKSPACE_ID,)
         )
     expect_error(service, "IDEMPOTENCY_CONFLICT", confirm=True)
+
+
+LIVE_BASE_SHA = "e" * 40
+
+
+def advanced_main(service, *, main_paths=None, task_paths=None, divergent=False):
+    """Replace only the fake GitHub compare surface, keeping the old-head proof."""
+    main_paths = main_paths if main_paths is not None else ["docs/main_only.md"]
+    task_paths = task_paths if task_paths is not None else ["allowed/feature.py"]
+    service.client.heads[BASE] = LIVE_BASE_SHA
+    service.repo.trees[LIVE_BASE_SHA] = "5" * 40
+    previous_compare = service.repo.compare
+
+    def compare(left, right):
+        if (left, right) == (BASE_SHA, LIVE_BASE_SHA):
+            return SimpleNamespace(
+                merge_base_commit=SimpleNamespace(
+                    sha=("f" * 40) if divergent else BASE_SHA
+                ),
+                ahead_by=1, behind_by=0,
+                files=[SimpleNamespace(filename=p, previous_filename=None)
+                       for p in main_paths],
+            )
+        if (left, right) == (BASE_SHA, NEW_HEAD):
+            return SimpleNamespace(
+                merge_base_commit=SimpleNamespace(sha=BASE_SHA),
+                ahead_by=2, behind_by=0,
+                files=[SimpleNamespace(filename=p, previous_filename=None)
+                       for p in task_paths],
+            )
+        return previous_compare(left, right)
+
+    service.repo.compare = compare
+    return service
+
+
+def test_advanced_main_preview_is_disjoint_read_only_and_explicit(tmp_path, monkeypatch):
+    service = advanced_main(seed(tmp_path, monkeypatch))
+    before, sessions_before = state()
+    preview = legacy.recover_sessionless_workspace(service, **args())
+    assert preview["ok"] and not preview["confirmed"]
+    assert preview["base_advance"]["advanced"]
+    assert preview["required_expected_live_base_sha"] == LIVE_BASE_SHA
+    assert preview["base_advance"]["overlapping_paths"] == []
+    assert state() == (before, sessions_before)
+
+
+def test_advanced_main_confirm_requires_reviewed_live_base(tmp_path, monkeypatch):
+    service = advanced_main(seed(tmp_path, monkeypatch))
+    expect_error(service, "RECOVERY_BASE_ADVANCE_REVIEW_REQUIRED", confirm=True)
+    assert state()[0]["status"] == "drifted" and not state()[1]
+
+
+def test_advanced_main_preserves_pinned_base_and_original_workspace(tmp_path, monkeypatch):
+    service = advanced_main(seed(tmp_path, monkeypatch))
+    request = args(confirm=True, expected_live_base_sha=LIVE_BASE_SHA)
+    result = legacy.recover_sessionless_workspace(service, **request)
+    assert result["confirmed"] and result["writer_ready"]
+    assert result["base_advance"]["advanced"]
+    workspace, records = state()
+    assert workspace["base_commit_sha"] == BASE_SHA
+    assert workspace["revision"] == 8 and workspace["status"] == "active"
+    assert len(records) == 1 and records[0]["base_commit_sha"] == BASE_SHA
+    assert records[0]["head_commit_sha"] == NEW_HEAD
+    assert legacy.recover_sessionless_workspace(service, **request)["replayed"]
+    assert len(state()[1]) == 1
+
+
+def test_advanced_main_overlapping_files_fails_closed(tmp_path, monkeypatch):
+    service = advanced_main(
+        seed(tmp_path, monkeypatch),
+        main_paths=["allowed/feature.py"],
+        task_paths=["allowed/feature.py"],
+    )
+    expect_error(service, "RECOVERY_BASE_OVERLAP",
+                 confirm=True, expected_live_base_sha=LIVE_BASE_SHA)
+    assert state()[0]["status"] == "drifted" and not state()[1]
+
+
+def test_advanced_main_rename_previous_file_overlap_fails_closed(tmp_path, monkeypatch):
+    service = advanced_main(seed(tmp_path, monkeypatch))
+    previous_compare = service.repo.compare
+
+    def rename_compare(left, right):
+        result = previous_compare(left, right)
+        if (left, right) == (BASE_SHA, LIVE_BASE_SHA):
+            result.files[0].previous_filename = "allowed/feature.py"
+        return result
+
+    service.repo.compare = rename_compare
+    expect_error(service, "RECOVERY_BASE_OVERLAP",
+                 confirm=True, expected_live_base_sha=LIVE_BASE_SHA)
+    assert not state()[1]
+
+
+def test_advanced_main_rewritten_history_fails_closed(tmp_path, monkeypatch):
+    service = advanced_main(seed(tmp_path, monkeypatch), divergent=True)
+    expect_error(service, "RECOVERY_ANCESTRY_MISMATCH",
+                 confirm=True, expected_live_base_sha=LIVE_BASE_SHA)
+    assert state()[0]["revision"] == 7 and not state()[1]
+
+
+def test_advanced_main_wrong_reviewed_live_sha_fails_closed(tmp_path, monkeypatch):
+    service = advanced_main(seed(tmp_path, monkeypatch))
+    expect_error(service, "RECOVERY_BASE_CHANGED",
+                 confirm=True, expected_live_base_sha="9" * 40)
+    assert not state()[1]
+
+
+def test_advanced_main_invalid_reviewed_live_sha_rejected(tmp_path, monkeypatch):
+    service = advanced_main(seed(tmp_path, monkeypatch))
+    expect_error(service, "SEARCH_QUERY_INVALID",
+                 confirm=True, expected_live_base_sha="not-a-commit")
+    assert not state()[1]
+
+
+def test_advanced_main_moves_between_preflight_and_transaction_rollback(
+    tmp_path, monkeypatch
+):
+    service = advanced_main(seed(tmp_path, monkeypatch))
+    original = legacy._fresh_pinned_base_proof
+    calls = {"total": 0}
+
+    def changed_base(*a, **kw):
+        calls["total"] += 1
+        if calls["total"] == 2:
+            service.client.heads[BASE] = "f" * 40
+        return original(*a, **kw)
+
+    monkeypatch.setattr(legacy, "_fresh_pinned_base_proof", changed_base)
+    with pytest.raises(mygithub12.MyGithub12Error) as exc:
+        legacy.recover_sessionless_workspace(
+            service, **args(confirm=True, expected_live_base_sha=LIVE_BASE_SHA)
+        )
+    assert exc.value.code == "RECOVERY_BASE_CHANGED"
+    assert state()[0]["revision"] == 7 and not state()[1]
