@@ -2,7 +2,8 @@
 
 import json
 import sys
-from types import SimpleNamespace
+from collections import UserDict, namedtuple
+from types import MappingProxyType, SimpleNamespace
 from pathlib import Path
 import pytest
 
@@ -24,6 +25,18 @@ from test_drift_recovery import (
     NEW_TREE,
     _workspace_row,
 )
+
+
+# These are intentionally nonempty and carry a plausible GitHub File shape:
+# validating only whether the conversion yields [] would not catch them.
+_MALFORMED_FILE = namedtuple("File", "filename status previous_filename")(
+    "docs/main_only.md", "modified", None
+)
+_MALFORMED_CONTAINERS = [
+    frozenset({_MALFORMED_FILE}),
+    MappingProxyType({_MALFORMED_FILE: None}),
+    UserDict({_MALFORMED_FILE: None}),
+]
 
 
 def seed(tmp_path, monkeypatch, *, drifted=True):
@@ -482,6 +495,116 @@ def test_original_pin_rename_previous_path_requires_scope_review(tmp_path, monke
     service.repo.compare = renamed_original_compare
     expect_error(service, "RECOVERY_SCOPE_VIOLATION", confirm=True)
     assert state()[0]["status"] == "drifted" and not state()[1]
+
+
+@pytest.mark.parametrize("invalid_files", [{}, "", [], None, set(), *_MALFORMED_CONTAINERS])
+def test_advanced_main_malformed_files_collection_fails_closed(tmp_path, monkeypatch, invalid_files):
+    service = advanced_main(seed(tmp_path, monkeypatch))
+    original = service.repo.compare
+
+    def bad_main_collection(left, right):
+        result = original(left, right)
+        if (left, right) == (BASE_SHA, LIVE_BASE_SHA):
+            result.files = invalid_files
+        return result
+
+    service.repo.compare = bad_main_collection
+    expect_error(service, "RECOVERY_SCOPE_INCOMPLETE", confirm=True,
+                 expected_live_base_sha=LIVE_BASE_SHA)
+    assert state()[0]["status"] == "drifted" and not state()[1]
+
+
+@pytest.mark.parametrize("invalid_files", [{}, "", [], set(), *_MALFORMED_CONTAINERS])
+def test_advanced_main_task_compare_malformed_collection_fails_closed(tmp_path, monkeypatch, invalid_files):
+    service = advanced_main(seed(tmp_path, monkeypatch))
+    original = service.repo.compare
+
+    def bad_task_collection(left, right):
+        result = original(left, right)
+        if (left, right) == (BASE_SHA, NEW_HEAD):
+            result.files = invalid_files
+        return result
+
+    service.repo.compare = bad_task_collection
+    expect_error(service, "RECOVERY_SCOPE_INCOMPLETE", confirm=True,
+                 expected_live_base_sha=LIVE_BASE_SHA)
+    assert not state()[1]
+
+
+@pytest.mark.parametrize("invalid_files", [{}, "", [], set(), *_MALFORMED_CONTAINERS])
+def test_original_pin_compare_malformed_collection_fails_closed(tmp_path, monkeypatch, invalid_files):
+    service = seed(tmp_path, monkeypatch)
+    original = service.repo.compare
+
+    def bad_pin_collection(left, right):
+        result = original(left, right)
+        if (left, right) == (OLD_HEAD, NEW_HEAD):
+            result.files = invalid_files
+        return result
+
+    service.repo.compare = bad_pin_collection
+    expect_error(service, "RECOVERY_SCOPE_INCOMPLETE", confirm=True)
+    assert not state()[1]
+
+
+def test_task_compare_zero_ahead_with_different_shas_fails_closed(tmp_path, monkeypatch):
+    # The task must not claim an empty delta when its HEAD differs from base.
+    service = advanced_main(
+        seed(tmp_path, monkeypatch), main_paths=["allowed/feature.py"]
+    )
+    original = service.repo.compare
+
+    def contradictory_task_compare(left, right):
+        result = original(left, right)
+        if (left, right) == (BASE_SHA, NEW_HEAD):
+            result.ahead_by = 0
+            result.files = []
+        return result
+
+    service.repo.compare = contradictory_task_compare
+    expect_error(service, "RECOVERY_ANCESTRY_MISMATCH", confirm=True,
+                 expected_live_base_sha=LIVE_BASE_SHA)
+    assert state()[0]["status"] == "drifted" and not state()[1]
+
+
+def test_compare_same_sha_cannot_claim_forward_commit(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    original = service.repo.compare
+
+    def incorrect_ahead(left, right):
+        if left == right == BASE_SHA:
+            return SimpleNamespace(
+                merge_base_commit=SimpleNamespace(sha=BASE_SHA),
+                ahead_by=1, behind_by=0,
+                files=[SimpleNamespace(
+                    filename="allowed/feature.py", status="modified",
+                    previous_filename=None
+                )],
+            )
+        return original(left, right)
+
+    service.repo.compare = incorrect_ahead
+    with pytest.raises(mygithub12.MyGithub12Error) as exc:
+        legacy._strict_compare_delta(
+            service.repo, BASE_SHA, BASE_SHA, label="same_commit_probe"
+        )
+    assert exc.value.code == "RECOVERY_ANCESTRY_MISMATCH"
+
+
+def test_compare_ahead_with_only_unchanged_status_fails_closed(tmp_path, monkeypatch):
+    service = advanced_main(seed(tmp_path, monkeypatch))
+    original = service.repo.compare
+
+    def unchanged_status(left, right):
+        result = original(left, right)
+        if (left, right) == (BASE_SHA, LIVE_BASE_SHA):
+            result.files[0].status = "unchanged"
+        return result
+
+    service.repo.compare = unchanged_status
+    expect_error(service, "RECOVERY_SCOPE_INCOMPLETE", confirm=True,
+                 expected_live_base_sha=LIVE_BASE_SHA)
+    assert not state()[1]
 
 
 def test_advanced_main_missing_files_compare_field_fails_closed(tmp_path, monkeypatch):

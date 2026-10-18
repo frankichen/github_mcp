@@ -76,10 +76,19 @@ def _strict_compare_delta(
         if not isinstance(merge_base, str) or not re.fullmatch(r"[0-9a-f]{40}", merge_base):
             raise Error("RECOVERY_ANCESTRY_MISMATCH",
                         f"{label} compare lacks a valid merge-base SHA")
-        if raw_files is None:
+        # PyGithub Comparison.files is a list[github.File.File]. Do not accept
+        # arbitrary iterables: empty mapping/string/set shapes silently become
+        # [] or iterate mapping keys, hiding an actual changed-file delta.
+        if not isinstance(raw_files, (list, tuple)):
             raise Error("RECOVERY_SCOPE_INCOMPLETE",
-                        f"{label} compare omitted the changed-file collection")
+                        f"{label} compare omitted a valid changed-file sequence")
         files = list(raw_files)
+        if (raw_ahead == 0) != (base_sha == head_sha):
+            raise Error("RECOVERY_ANCESTRY_MISMATCH",
+                        f"{label} zero ahead count conflicts with exact Git SHA identity")
+        if (raw_ahead == 0 and files) or (raw_ahead > 0 and not files):
+            raise Error("RECOVERY_SCOPE_INCOMPLETE",
+                        f"{label} changed-file sequence conflicts with ahead count")
     except Error:
         raise
     except Exception as exc:
@@ -124,6 +133,9 @@ def _strict_compare_delta(
             mygithub12._safe_path(old_path)
             changed.add(old_path)
         # A copy does not modify the source, even if previous_filename exists.
+    if raw_ahead > 0 and not changed:
+        raise Error("RECOVERY_SCOPE_INCOMPLETE",
+                    f"{label} advanced but no changed file paths were validated")
     return evidence, sorted(changed)
 
 
