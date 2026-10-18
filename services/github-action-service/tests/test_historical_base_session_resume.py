@@ -275,6 +275,8 @@ print(json.dumps({"replayed": r["replayed"], "after": r["after"]}))
 
 
 def test_real_mcp_dispatch_preserves_resume_contract(tmp_path, monkeypatch):
+    # The MCP response-resource fallback must stay inside the test sandbox.
+    monkeypatch.setenv("MYGITHUB12_SHARED_RESOURCE_DIR", str(tmp_path / "response-resources"))
     service, session = _seed_active_stale(tmp_path, monkeypatch)
     _patch_resume(service, monkeypatch)
     _advanced(service, monkeypatch)
