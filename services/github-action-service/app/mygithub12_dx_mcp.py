@@ -130,8 +130,10 @@ def register_dx_tools(
         description=(
             "Preview or explicitly reconcile the FIRST canonical Development Session onto an EXISTING "
             "legacy Workspace that never had a Session. For drifted Workspace requires exact durable old "
-            "index HEAD, forward-only ancestry, reviewed exact changed paths, owner, base, Tree, "
-            "Workspace CAS and overlap checks; no Git/Workspace/branch/PR creation. confirm=false by default."
+            "index HEAD, forward-only ancestry, reviewed exact changed paths, owner, Tree, "
+            "Workspace CAS and overlap checks. Disjoint forward main advance requires the caller's "
+            "explicit expected_live_base_sha and is checked again inside CAS. "
+            "No Git/Workspace/branch/PR creation; confirm=false by default."
         ),
         annotations=_ORCHESTRATION,
     )
@@ -141,7 +143,7 @@ def register_dx_tools(
         expected_current_head_sha: str, expected_current_tree_sha: str,
         expected_base_branch: str, expected_base_sha: str, idempotency_key: str,
         confirm: bool=False, lease_seconds: int=mygithub12.DEFAULT_LEASE_SECONDS,
-        reviewed_scope_expansion_paths_json: str="[]",
+        reviewed_scope_expansion_paths_json: str="[]", expected_live_base_sha: str="",
     ) -> str:
         try:
             result=await github_call(
@@ -149,7 +151,7 @@ def register_dx_tools(
                 workspace_id,expected_owner,expected_workspace_revision,expected_previous_head_sha,
                 expected_current_head_sha,expected_current_tree_sha,expected_base_branch,
                 expected_base_sha,idempotency_key,confirm,lease_seconds,
-                reviewed_scope_expansion_paths_json,
+                reviewed_scope_expansion_paths_json,expected_live_base_sha,
             )
             return json.dumps(result,ensure_ascii=False)
         except Exception as exc:

@@ -176,3 +176,17 @@ Development Session：
 本恢复要求 repository、branch、Workspace、Session、owner 与 pinned base 一致；Session 未 closed/finalized；Workspace lease 有效；Workspace 与 Session revision CAS 精确；旧 Session HEAD Tree 与持久记录一致；GitHub compare 证明 `merge_base=old_session_head`、`ahead_by>0`、`behind_by=0`；当前 HEAD/Tree 与 Workspace 一致；没有第二 canonical Session/Workspace/Writer 或 high-overlap Workspace。任何 branch rewrite、divergence、base change、unsafe overlap、未 review scope expansion 或 revision mismatch 均 fail-stop。
 
 成功时只更新原 Session 的 HEAD/Tree、Workspace revision、active 状态与 Session revision，并清空旧 fast/full CI、Attestation、failure-pack 与 Session Index 引用。Workspace 内容不变时不 bump Workspace revision；精确审查 scope expansion 时在同一事务中扩展原 Workspace scope 并 bump Workspace revision。随后复用 exact current-HEAD Index，或请求新 Index。Session event 与 metadata audit 记录 before/after、workspace、GitHub、ancestry、scope、overlap、证据失效状态和 idempotency identity；审计中不保存 Secret/Token。重复请求不重复推进 revision。Git branch、commit、Tree、PR、Workspace ID 和 Session ID 均保持原身份。
+
+## 11. LEGACY_SESSIONLESS_PINNED_BASE_ADVANCE
+
+`recover_sessionless_development_workspace` 只能补齐**原 Workspace 从未存在过的首个 Session**，不得创建替代 Workspace、Git branch/Commit/PR，也不得借此重绑定其他 Writer。旧 pinned `base_commit_sha` 持久保持原值。
+
+在 fresh `main` 与 pinned base 不一致时：
+
+1. 预览需以 exact Git commit 比较证明 `pinned base -> live main` 严格 forward-only，`pinned base -> task HEAD` forward-only；比较内容必须包含 renamed `previous_filename`、不得达到 bounded compare 上限。
+2. 如两侧 changed paths 有任何交集，返回 `RECOVERY_BASE_OVERLAP`，不得以一次普通 review 自动放行。
+3. 预览提供 `required_expected_live_base_sha`。正式 `confirm=true` 必须显式填入完全一致的 `expected_live_base_sha`，否则 `RECOVERY_BASE_ADVANCE_REVIEW_REQUIRED` 或 `RECOVERY_BASE_CHANGED`。
+4. 同一 Workspace/owner/base/HEAD/Tree/index-pin/Revision、Scope reviewed exact set、Lease、Session-absence、Ownership 与高重叠检查均继续生效；事务内重查 live base 与祖先关系，版本变化拒绝并回滚。
+5. Idempotency replay 仅能复用相同 `expected_live_base_sha` 与原确认 payload；若 live main 再次变化，不能凭旧证据通过。正常 `resume_development_task` 可在恢复后继续走现有受保护的 pinned base advance 规则。
+
+验收包含：只读预览、必须显式 review 的成功路径、base-overlap、rename prior path-overlap、main rewrite、错误 live SHA、格式错误 SHA、事务中主干前移、idempotent replay 与 pinned base 不变。GitHub compare 必须提供完整 `merge_base_commit.sha/ahead_by/behind_by/files[]` 证据与合法 changed-file `status/filename`；字段缺失、非列表/元组文件集合（包括 dict、MappingProxyType、UserDict、set、frozenset、字符串）、零 ahead 数量但 base/head SHA 不同、零 ahead 数量却含 changed files、正 ahead 数量但没有任何有效 changed path、或达到比较上限均一律拒绝。只有 base/head SHA 精确相等且 `ahead_by=0/behind_by=0/files=[]` 可证明零变更。`renamed` 同时纳入旧路径与新路径，缺 `previous_filename` 必须拒绝；`copied` 只纳入目标路径，不得把未改变的源文件误判为冲突。相应正反向故障注入属于合并门禁。
