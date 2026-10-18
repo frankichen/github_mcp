@@ -173,7 +173,7 @@ MyGithut12 `12.9.25` 的 compatibility registration 仍为 177 个工具，canon
 
 ### 首次 Session 恢复与安全前进的主干
 
-在既有 legacy Workspace 从未创建过 Development Session 时，`recover_sessionless_development_workspace` 以原 Workspace owner、旧 index pin、新 HEAD/Tree、revision CAS、无其他 Session/Writer/高重叠为前提，先执行只读预览，再使用 `confirm=true` 创建**第一份 canonical Session**，不创建替代 Workspace、分支、PR，也不移动 Git ref。若 `main` 已严格前进，预览必须证明原 pinned base 分别是新 `main` 和任务 HEAD 的祖先且两侧 rename-aware 文件差集无交集；真正确认时必须显式提交 `expected_live_base_sha`，事务内再次验证。旧 pinned base 保持原样，无法证明前向或发生文件重叠则拒绝；更改主干本身需要独立正常流程。
+在既有 legacy Workspace 从未创建过 Development Session 时，`recover_sessionless_development_workspace` 以原 Workspace owner、旧 index pin、新 HEAD/Tree、revision CAS、无其他 Session/Writer/高重叠为前提，先执行只读预览，再使用 `confirm=true` 创建**第一份 canonical Session**，不创建替代 Workspace、分支、PR，也不移动 Git ref。若 `main` 已严格前进，预览必须证明原 pinned base 分别是新 `main` 和任务 HEAD 的祖先且两侧 rename-aware 文件差集无交集；真正确认时必须显式提交 `expected_live_base_sha`，事务内再次验证。旧 pinned base 保持原样，无法证明前向或发生文件重叠则拒绝；GitHub compare 缺字段或 rename 源路径缺失必须 fail-closed，复制操作仅计目标文件变更，不把源路径误判为改动；更改主干本身需要独立正常流程。
 
 ## Historical MyGithut12 运行状态（12.9.17 及之前）
 

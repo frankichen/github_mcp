@@ -29,6 +29,18 @@ from test_drift_recovery import (
 def seed(tmp_path, monkeypatch, *, drifted=True):
     monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "legacy-recovery.db"))
     service = FakeService()
+    # Older general-purpose fixture does not model compare file statuses; this
+    # suite requires complete GitHub evidence even for original pin -> HEAD.
+    compare_original = service.repo.compare
+
+    def with_complete_file_evidence(old_sha, new_sha):
+        result = compare_original(old_sha, new_sha)
+        if (old_sha, new_sha) == (OLD_HEAD, NEW_HEAD):
+            for item in result.files:
+                item.status = "modified"
+        return result
+
+    service.repo.compare = with_complete_file_evidence
     sessions.init_session_db()
     original = _workspace_row(
         status="drifted" if drifted else "active",
@@ -288,7 +300,7 @@ def test_changed_git_identity_within_transaction_rolls_back(tmp_path, monkeypatc
 def test_base_move_fails_closed(tmp_path, monkeypatch):
     service = seed(tmp_path, monkeypatch)
     service.client.heads[BASE] = "f" * 40
-    expect_error(service, "RECOVERY_ANCESTRY_MISMATCH")
+    expect_error(service, "RECOVERY_SCOPE_INCOMPLETE")
     assert state()[0]["status"] == "drifted" and not state()[1]
 
 
@@ -320,14 +332,14 @@ def advanced_main(service, *, main_paths=None, task_paths=None, divergent=False)
                     sha=("f" * 40) if divergent else BASE_SHA
                 ),
                 ahead_by=1, behind_by=0,
-                files=[SimpleNamespace(filename=p, previous_filename=None)
+                files=[SimpleNamespace(filename=p, status="modified", previous_filename=None)
                        for p in main_paths],
             )
         if (left, right) == (BASE_SHA, NEW_HEAD):
             return SimpleNamespace(
                 merge_base_commit=SimpleNamespace(sha=BASE_SHA),
                 ahead_by=2, behind_by=0,
-                files=[SimpleNamespace(filename=p, previous_filename=None)
+                files=[SimpleNamespace(filename=p, status="modified", previous_filename=None)
                        for p in task_paths],
             )
         return previous_compare(left, right)
@@ -386,6 +398,7 @@ def test_advanced_main_rename_previous_file_overlap_fails_closed(tmp_path, monke
     def rename_compare(left, right):
         result = previous_compare(left, right)
         if (left, right) == (BASE_SHA, LIVE_BASE_SHA):
+            result.files[0].status = "renamed"
             result.files[0].previous_filename = "allowed/feature.py"
         return result
 
@@ -436,3 +449,148 @@ def test_advanced_main_moves_between_preflight_and_transaction_rollback(
         )
     assert exc.value.code == "RECOVERY_BASE_CHANGED"
     assert state()[0]["revision"] == 7 and not state()[1]
+
+
+def test_original_pin_missing_files_compare_evidence_fails_closed(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    original = service.repo.compare
+
+    def bad_original_compare(base_sha, head_sha):
+        if (base_sha, head_sha) == (OLD_HEAD, NEW_HEAD):
+            return SimpleNamespace(
+                merge_base_commit=SimpleNamespace(sha=OLD_HEAD),
+                ahead_by=1, behind_by=0,
+            )
+        return original(base_sha, head_sha)
+
+    service.repo.compare = bad_original_compare
+    expect_error(service, "RECOVERY_SCOPE_INCOMPLETE", confirm=True)
+    assert state()[0]["status"] == "drifted" and not state()[1]
+
+
+def test_original_pin_rename_previous_path_requires_scope_review(tmp_path, monkeypatch):
+    service = seed(tmp_path, monkeypatch)
+    original = service.repo.compare
+
+    def renamed_original_compare(base_sha, head_sha):
+        result = original(base_sha, head_sha)
+        if (base_sha, head_sha) == (OLD_HEAD, NEW_HEAD):
+            result.files[0].status = "renamed"
+            result.files[0].previous_filename = "external/old_file.py"
+        return result
+
+    service.repo.compare = renamed_original_compare
+    expect_error(service, "RECOVERY_SCOPE_VIOLATION", confirm=True)
+    assert state()[0]["status"] == "drifted" and not state()[1]
+
+
+def test_advanced_main_missing_files_compare_field_fails_closed(tmp_path, monkeypatch):
+    service = advanced_main(seed(tmp_path, monkeypatch))
+    previous = service.repo.compare
+
+    def missing_files(base, head):
+        if (base, head) == (BASE_SHA, LIVE_BASE_SHA):
+            return SimpleNamespace(
+                merge_base_commit=SimpleNamespace(sha=BASE_SHA),
+                ahead_by=1, behind_by=0,
+            )
+        return previous(base, head)
+
+    service.repo.compare = missing_files
+    expect_error(service, "RECOVERY_SCOPE_INCOMPLETE", confirm=True,
+                 expected_live_base_sha=LIVE_BASE_SHA)
+    assert state()[0]["status"] == "drifted" and not state()[1]
+
+
+def test_advanced_main_missing_behind_count_fails_closed(tmp_path, monkeypatch):
+    service = advanced_main(seed(tmp_path, monkeypatch))
+    previous = service.repo.compare
+
+    def missing_count(base, head):
+        result = previous(base, head)
+        if (base, head) == (BASE_SHA, LIVE_BASE_SHA):
+            del result.behind_by
+        return result
+
+    service.repo.compare = missing_count
+    expect_error(service, "RECOVERY_ANCESTRY_MISMATCH", confirm=True,
+                 expected_live_base_sha=LIVE_BASE_SHA)
+    assert not state()[1]
+
+
+def test_advanced_main_rename_without_previous_path_fails_closed(
+    tmp_path, monkeypatch
+):
+    service = advanced_main(seed(tmp_path, monkeypatch))
+    previous = service.repo.compare
+
+    def missing_rename_source(base, head):
+        result = previous(base, head)
+        if (base, head) == (BASE_SHA, LIVE_BASE_SHA):
+            result.files[0].status = "renamed"
+            result.files[0].previous_filename = None
+        return result
+
+    service.repo.compare = missing_rename_source
+    expect_error(service, "RECOVERY_SCOPE_INCOMPLETE", confirm=True,
+                 expected_live_base_sha=LIVE_BASE_SHA)
+    assert not state()[1]
+
+
+def test_advanced_main_copy_only_changes_destination(tmp_path, monkeypatch):
+    service = advanced_main(seed(tmp_path, monkeypatch))
+    previous = service.repo.compare
+
+    def copied_target(base, head):
+        result = previous(base, head)
+        if (base, head) == (BASE_SHA, LIVE_BASE_SHA):
+            result.files[0].status = "copied"
+            result.files[0].previous_filename = "allowed/feature.py"
+        return result
+
+    service.repo.compare = copied_target
+    result = legacy.recover_sessionless_workspace(
+        service, **args(confirm=True, expected_live_base_sha=LIVE_BASE_SHA)
+    )
+    assert result["confirmed"]
+    assert result["base_advance"]["base_changed_paths"] == ["docs/main_only.md"]
+    assert len(state()[1]) == 1
+
+
+def test_advanced_main_copy_destination_overlap_fails_closed(
+    tmp_path, monkeypatch
+):
+    service = advanced_main(
+        seed(tmp_path, monkeypatch),
+        main_paths=["allowed/feature.py"],
+        task_paths=["allowed/feature.py"],
+    )
+    previous = service.repo.compare
+
+    def copied_into_task(base, head):
+        result = previous(base, head)
+        if (base, head) == (BASE_SHA, LIVE_BASE_SHA):
+            result.files[0].status = "copied"
+            result.files[0].previous_filename = "docs/source.py"
+        return result
+
+    service.repo.compare = copied_into_task
+    expect_error(service, "RECOVERY_BASE_OVERLAP", confirm=True,
+                 expected_live_base_sha=LIVE_BASE_SHA)
+    assert not state()[1]
+
+
+def test_advanced_main_unknown_file_status_fails_closed(tmp_path, monkeypatch):
+    service = advanced_main(seed(tmp_path, monkeypatch))
+    previous = service.repo.compare
+
+    def unknown_status(base, head):
+        result = previous(base, head)
+        if (base, head) == (BASE_SHA, LIVE_BASE_SHA):
+            result.files[0].status = "unknown"
+        return result
+
+    service.repo.compare = unknown_status
+    expect_error(service, "RECOVERY_SCOPE_INCOMPLETE", confirm=True,
+                 expected_live_base_sha=LIVE_BASE_SHA)
+    assert not state()[1]

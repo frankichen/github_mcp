@@ -54,6 +54,79 @@ def _identity_payload(
     return request
 
 
+def _strict_compare_delta(
+    repo: Any, base_sha: str, head_sha: str, *,
+    label: str, require_advance: bool = False,
+) -> tuple[dict[str, Any], list[str]]:
+    """Never interpret incomplete GitHub compare evidence as a disjoint diff.
+
+    Copied files modify only their destination; renamed files modify both old
+    and new paths. Neither case may silently omit mandatory API metadata.
+    """
+    try:
+        comparison = repo.compare(base_sha, head_sha)
+        raw_ahead = getattr(comparison, "ahead_by", None)
+        raw_behind = getattr(comparison, "behind_by", None)
+        merge_base_commit = getattr(comparison, "merge_base_commit", None)
+        merge_base = getattr(merge_base_commit, "sha", None)
+        raw_files = getattr(comparison, "files", None)
+        if type(raw_ahead) is not int or type(raw_behind) is not int:
+            raise Error("RECOVERY_ANCESTRY_MISMATCH",
+                        f"{label} compare lacks exact ahead/behind counts")
+        if not isinstance(merge_base, str) or not re.fullmatch(r"[0-9a-f]{40}", merge_base):
+            raise Error("RECOVERY_ANCESTRY_MISMATCH",
+                        f"{label} compare lacks a valid merge-base SHA")
+        if raw_files is None:
+            raise Error("RECOVERY_SCOPE_INCOMPLETE",
+                        f"{label} compare omitted the changed-file collection")
+        files = list(raw_files)
+    except Error:
+        raise
+    except Exception as exc:
+        raise Error("RECOVERY_SCOPE_INCOMPLETE",
+                    f"{label} compare evidence could not be read",
+                    {"cause_type": type(exc).__name__}) from exc
+    verified = (
+        merge_base == base_sha and raw_behind == 0
+        and (raw_ahead > 0 if require_advance else raw_ahead >= 0)
+    )
+    evidence = {
+        "verified": verified, "label": label, "base_sha": base_sha,
+        "head_sha": head_sha, "merge_base": merge_base,
+        "ahead_by": raw_ahead, "behind_by": raw_behind,
+    }
+    if not verified:
+        raise Error("RECOVERY_ANCESTRY_MISMATCH",
+                    f"{label} is not a verified forward-only ancestry relation",
+                    {"ancestry": evidence})
+    if len(files) >= drift._COMPARE_FILE_LIMIT:
+        raise Error("RECOVERY_SCOPE_INCOMPLETE",
+                    f"{label} compare reached its bounded changed-file limit",
+                    {"file_count": len(files), "limit": drift._COMPARE_FILE_LIMIT})
+    changed: set[str] = set()
+    for item in files:
+        filename = getattr(item, "filename", None)
+        status = getattr(item, "status", None)
+        if not isinstance(filename, str) or not filename or status not in {
+            "added", "removed", "modified", "changed", "renamed", "copied", "unchanged"
+        }:
+            raise Error("RECOVERY_SCOPE_INCOMPLETE",
+                        f"{label} compare omitted a valid file path/status")
+        mygithub12._safe_path(filename)
+        if status == "unchanged":
+            continue
+        changed.add(filename)
+        if status == "renamed":
+            old_path = getattr(item, "previous_filename", None)
+            if not isinstance(old_path, str) or not old_path:
+                raise Error("RECOVERY_SCOPE_INCOMPLETE",
+                            f"{label} rename missing its previous path")
+            mygithub12._safe_path(old_path)
+            changed.add(old_path)
+        # A copy does not modify the source, even if previous_filename exists.
+    return evidence, sorted(changed)
+
+
 def _fresh_pinned_base_proof(
     service: Any, repository: str, branch: str, current_head_sha: str,
     current_tree_sha: str, base_branch: str, pinned_base_sha: str,
@@ -83,12 +156,11 @@ def _fresh_pinned_base_proof(
     if live_base_sha == pinned_base_sha:
         return repo, {"advanced": False, "pinned_base_sha": pinned_base_sha,
                       "live_base_sha": live_base_sha, "overlapping_paths": []}
-    from app.development_base_sync_recovery import _compare_delta
-    base_ancestry, base_paths = _compare_delta(
+    base_ancestry, base_paths = _strict_compare_delta(
         repo, pinned_base_sha, live_base_sha,
         label="sessionless_live_base_advance", require_advance=True,
     )
-    task_ancestry, task_paths = _compare_delta(
+    task_ancestry, task_paths = _strict_compare_delta(
         repo, pinned_base_sha, current_head_sha, label="sessionless_pinned_task",
     )
     overlapping = sorted(set(base_paths) & set(task_paths))
@@ -297,11 +369,11 @@ def recover_sessionless_workspace(
     )
     if drifted:
         old_tree = mygithub12._tree_sha(repo.get_commit(expected_previous_head_sha))
-        ancestry, changed = drift._verify_forward_only(
-            repo,
-            {"head_commit_sha": expected_previous_head_sha, "tree_sha": old_tree},
-            expected_current_head_sha,
+        ancestry, changed = _strict_compare_delta(
+            repo, expected_previous_head_sha, expected_current_head_sha,
+            label="sessionless_original_pin_to_head", require_advance=True,
         )
+        ancestry["old_commit_tree"] = old_tree
     else:
         ancestry, changed = {"verified": True, "kind": "exact_active_head"}, []
     scope_obj = (

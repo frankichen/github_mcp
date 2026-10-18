@@ -189,4 +189,4 @@ Development Session：
 4. 同一 Workspace/owner/base/HEAD/Tree/index-pin/Revision、Scope reviewed exact set、Lease、Session-absence、Ownership 与高重叠检查均继续生效；事务内重查 live base 与祖先关系，版本变化拒绝并回滚。
 5. Idempotency replay 仅能复用相同 `expected_live_base_sha` 与原确认 payload；若 live main 再次变化，不能凭旧证据通过。正常 `resume_development_task` 可在恢复后继续走现有受保护的 pinned base advance 规则。
 
-验收包含：只读预览、必须显式 review 的成功路径、base-overlap、rename prior path-overlap、main rewrite、错误 live SHA、格式错误 SHA、事务中主干前移、idempotent replay 与 pinned base 不变。
+验收包含：只读预览、必须显式 review 的成功路径、base-overlap、rename prior path-overlap、main rewrite、错误 live SHA、格式错误 SHA、事务中主干前移、idempotent replay 与 pinned base 不变。GitHub compare 必须提供完整 `merge_base_commit.sha/ahead_by/behind_by/files[]` 证据与合法 changed-file `status/filename`；字段缺失、格式异常或达到比较上限一律拒绝，不能把缺失文件集合当成零变更。`renamed` 同时纳入旧路径与新路径，缺 `previous_filename` 必须拒绝；`copied` 只纳入目标路径，不得把未改变的源文件误判为冲突。相应正反向故障注入属于合并门禁。
