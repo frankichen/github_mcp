@@ -665,7 +665,9 @@ def test_index_failure_does_not_undo_completed_control_plane_recovery(tmp_path, 
     assert workspace["head_sha"] == stored_session["head_commit_sha"] == NEW_HEAD
 
 
-def test_terminal_cancelled_full_validation_then_forward_drift_recovers_same_writer(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", ["fast", "full"])
+@pytest.mark.parametrize("entry,status", [("resume", "cancelled"), ("recover", "cancelled"), ("recover", "failed"), ("recover", "running"), ("race", "cancelled")])
+def test_terminal_cancelled_full_validation_then_forward_drift_recovers_same_writer(tmp_path, monkeypatch, mode, entry, status):
     """Regression for terminal CI + stale validating_full + branch_moved_externally deadlock."""
     monkeypatch.setenv("MYGITHUB12_DB_PATH", str(tmp_path / "managed-recovery.db"))
     monkeypatch.setattr(ci_database, "DB_PATH", str(tmp_path / "private-ci.db"))
@@ -682,7 +684,7 @@ def test_terminal_cancelled_full_validation_then_forward_drift_recovers_same_wri
     initial_workspace = mygithub12.get_workspace(service, WORKSPACE_ID)
     created = sessions.create_session(initial_workspace, idempotency_key="terminal-drift-e2e")
     validating = sessions.transition(
-        created["session_id"], created["session_revision"], "validating_full", allowed_from={"active"},
+        created["session_id"], created["session_revision"], f"validating_{mode}", allowed_from={"active"},
     )
 
     request_payload = {
@@ -695,8 +697,8 @@ def test_terminal_cancelled_full_validation_then_forward_drift_recovers_same_wri
         "branch": BRANCH,
         "commit_sha": OLD_HEAD,
         "tree_sha": OLD_TREE,
-        "profile": "repo-auto-check",
-        "mode": "full",
+        "profile": "repo-fast-check" if mode == "fast" else "repo-auto-check",
+        "mode": mode,
         "base_sha": BASE_SHA,
     }
     request_hash = ci_request_store.compute_normalized_request_hash(request_payload)
@@ -705,7 +707,7 @@ def test_terminal_cancelled_full_validation_then_forward_drift_recovers_same_wri
         branch=BRANCH,
         commit_sha=OLD_HEAD,
         tree_sha=OLD_TREE,
-        profile="repo-auto-check",
+        profile="repo-fast-check" if mode == "fast" else "repo-auto-check",
         effective_config_digest="d" * 64,
         idempotency_key="terminal-drift-ci-request",
         normalized_request_hash=request_hash,
@@ -715,7 +717,7 @@ def test_terminal_cancelled_full_validation_then_forward_drift_recovers_same_wri
         request["request_id"], request["revision"], "preparing", "preparing",
     )
     job = ci_database.create_or_get_job(
-        REPO, BRANCH, OLD_HEAD, "repo-auto-check", 100, 900, True, False,
+        REPO, BRANCH, OLD_HEAD, "repo-fast-check" if mode == "fast" else "repo-auto-check", 100, 900, True, False,
         BASE_SHA, ["allowed/feature.py"], 1, False,
     )
     request = ci_request_store.transition_ci_request(
@@ -725,21 +727,22 @@ def test_terminal_cancelled_full_validation_then_forward_drift_recovers_same_wri
         request["request_id"], request["revision"], "running", "running",
     )
     sessions.record_validation(
-        validating["session_id"], validating["session_revision"], "full", OLD_HEAD, OLD_TREE,
+        validating["session_id"], validating["session_revision"], mode, OLD_HEAD, OLD_TREE,
         request_id=request["request_id"], job_id=job["job_id"], status="running",
         evidence={
             "request_id": request["request_id"],
             "selection": {"complete": True, "changed_paths": ["allowed/feature.py"]},
         },
     )
-    assert ci_database.complete_job(
-        job["job_id"], -1, "cancelled", summary={"git_tree_sha": OLD_TREE},
-    ) is True
-    request = ci_request_store.transition_ci_request(
-        request["request_id"], request["revision"], "terminal", "cancelled",
-        terminal_reason="regression_cancelled",
-    )
-    assert request["phase"] == "terminal" and request["status"] == "cancelled"
+    if status != "running":
+        assert ci_database.complete_job(
+            job["job_id"], -1, status, summary={"git_tree_sha": OLD_TREE},
+        ) is True
+        request = ci_request_store.transition_ci_request(
+            request["request_id"], request["revision"], "terminal", status,
+            terminal_reason="regression_cancelled",
+        )
+        assert request["phase"] == "terminal" and request["status"] == status
 
     with sessions._LOCK, sessions._db() as db:
         db.execute(
@@ -786,18 +789,20 @@ def test_terminal_cancelled_full_validation_then_forward_drift_recovers_same_wri
         lambda _service, workspace_id: {"ok": True, "workspace_id": workspace_id, "items": []},
     )
 
-    resumed = resume.resume_task(service, REPO, branch=BRANCH, recover_stale_session=True)
-    resumed_session = resumed["development_session"]
-    assert resumed["workspace"]["workspace_id"] == WORKSPACE_ID
-    assert resumed["workspace"]["status"] == "drifted"
-    assert resumed_session["session_id"] == validating["session_id"]
-    assert resumed_session["status"] == "active"
-    assert resumed_session["head_commit_sha"] == OLD_HEAD
-    assert resumed_session["last_full_ci_job_id"] == job["job_id"]
-    assert resumed["recovery"]["transient"]["reconciled"] is True
-    assert resumed["recovery"]["transient"]["workspace_drift_pending_recovery"] is True
-    assert resumed["next_allowed_actions"][0] == "recover_drifted_development_task"
-    assert "continue_write" not in resumed["next_allowed_actions"]
+    resumed_session = validating
+    if entry == "resume":
+        resumed = resume.resume_task(service, REPO, branch=BRANCH, recover_stale_session=True)
+        resumed_session = resumed["development_session"]
+        assert resumed["workspace"]["workspace_id"] == WORKSPACE_ID
+        assert resumed["workspace"]["status"] == "drifted"
+        assert resumed_session["session_id"] == validating["session_id"]
+        assert resumed_session["status"] == "active"
+        assert resumed_session["head_commit_sha"] == OLD_HEAD
+        assert resumed_session["last_fast_ci_job_id" if mode == "fast" else "last_full_ci_job_id"] == job["job_id"]
+        assert resumed["recovery"]["transient"]["reconciled"] is True
+        assert resumed["recovery"]["transient"]["workspace_drift_pending_recovery"] is True
+        assert resumed["next_allowed_actions"][0] == "recover_drifted_development_task"
+        assert "continue_write" not in resumed["next_allowed_actions"]
 
     monkeypatch.setattr(
         recovery.mygithub12, "workspace_overlap",
@@ -814,6 +819,26 @@ def test_terminal_cancelled_full_validation_then_forward_drift_recovers_same_wri
         recovery.mygithub12, "request_index_build",
         lambda *args, **kwargs: pytest.fail("ready exact-head index must be reused"),
     )
+    if status == "running":
+        with pytest.raises(mygithub12.MyGithub12Error) as exc:
+            recovery.recover_drifted_task(service, **_args(validating))
+        assert exc.value.code == "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS"
+        assert sessions.get_session(validating["session_id"])["status"] == f"validating_{mode}"
+        assert mygithub12.get_workspace(service, WORKSPACE_ID)["status"] == "drifted"
+        return
+    if entry == "race":
+        reconcile = recovery.reconcile_drifted_validation
+        def competing_cas(session, workspace):
+            settled, evidence = reconcile(session, workspace)
+            sessions.transition(settled["session_id"], settled["session_revision"], "active", allowed_from={"active"})
+            return settled, evidence
+        monkeypatch.setattr(recovery, "reconcile_drifted_validation", competing_cas)
+        with pytest.raises(mygithub12.MyGithub12Error) as exc:
+            recovery.recover_drifted_task(service, **_args(validating))
+        assert exc.value.code == "DEVELOPMENT_SESSION_REVISION_MISMATCH"
+        assert mygithub12.get_workspace(service, WORKSPACE_ID)["status"] == "drifted"
+        monkeypatch.setattr(recovery, "reconcile_drifted_validation", reconcile)
+        resumed_session = sessions.get_session(validating["session_id"])
     recovered = recovery.recover_drifted_task(
         service,
         repository=REPO,
@@ -829,6 +854,10 @@ def test_terminal_cancelled_full_validation_then_forward_drift_recovers_same_wri
         idempotency_key="terminal-drift-recover",
         lease_seconds=7200,
     )
+    if entry == "recover":
+        assert recovered["audit"]["validation_reconciliation"]["reconciled"] is True
+        replay = recovery.recover_drifted_task(service, **_args(validating, idempotency_key="terminal-drift-recover", lease_seconds=7200))
+        assert replay["replayed"] is True
     recovered_session = recovered["development_session"]
     assert recovered["workspace"]["workspace_id"] == WORKSPACE_ID
     assert recovered_session["session_id"] == validating["session_id"]

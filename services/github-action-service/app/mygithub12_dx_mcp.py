@@ -723,6 +723,25 @@ def register_dx_tools(
                 )
             preflight_head=session["head_commit_sha"]
             resolved_base=base_sha or session["base_commit_sha"]
+            # Historical validation is reconciled before write/lease preflight:
+            # a drifted Workspace cannot pass that preflight by design.
+            if session.get("status") in {"validating_fast", "validating_full"}:
+                if int(session["session_revision"]) != int(expected_session_revision):
+                    raise mygithub12.MyGithub12Error("DEVELOPMENT_SESSION_REVISION_MISMATCH", "development session revision changed")
+                historical_ws = await github_call(mygithub12.get_workspace, service, session["workspace_id"])
+                if historical_ws.get("status") == "drifted":
+                    if base_sha and base_sha != session["base_commit_sha"]:
+                        raise mygithub12.MyGithub12Error("DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "validation base identity differs")
+                    recovered, evidence = await github_call(drift_recovery.reconcile_drifted_validation, session, historical_ws)
+                    return json.dumps({
+                        "ok": True, "development_session": recovered, "workspace": historical_ws,
+                        "mode": mode, "validation_started": False, "validation_reused": True,
+                        "reconciled": True, "terminal": True, "recovery_required": True,
+                        "writer_ready": False, "merge_eligible": False,
+                        "validation_recovery": evidence,
+                        "recovery_plan": resume._workspace_recovery_plan(historical_ws, session=recovered),
+                        "next_allowed_actions": ["resume_development_task", "recover_drifted_development_task"],
+                    }, ensure_ascii=False)
             maintenance=await github_call(dx.maybe_auto_renew_session_workspace,service,development_session_id,expected_session_revision,int(session["workspace_revision"]),session["head_commit_sha"],idempotency_key)
             session=maintenance["session"]; ws=maintenance["workspace"]; effective_session_revision=int(session["session_revision"])
             if session["head_commit_sha"]!=preflight_head or session["base_commit_sha"]!=resolved_base:

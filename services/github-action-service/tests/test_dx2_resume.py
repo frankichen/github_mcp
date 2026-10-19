@@ -681,6 +681,45 @@ def _stub_drifted_transient_recovery(monkeypatch, *, mode="full", status="cancel
     return ws, session, job
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["fast", "full"])
+@pytest.mark.parametrize("status", ["cancelled", "failed", "running", "identity_mismatch"])
+async def test_validate_api_reconciles_historical_ci_before_workspace_write_preflight(monkeypatch, mode, status):
+    from app import mygithub12_dx_mcp as api
+    from app.mcp_response import StructuredFastMCP
+    ws, session, job = _stub_drifted_transient_recovery(monkeypatch, mode=mode, status="cancelled" if status == "identity_mismatch" else status)
+    monkeypatch.setattr(api.sessions, "get_session", lambda *_: dict(session))
+    monkeypatch.setattr(api.mygithub12, "get_workspace", lambda *_: dict(ws))
+    monkeypatch.setattr(api.dx, "maybe_auto_renew_session_workspace", lambda *a, **k: pytest.fail("historical reconciliation cannot renew a drifted lease"))
+    monkeypatch.setattr(api.mygithub12, "workspace_write_preflight", lambda *a, **k: pytest.fail("historical reconciliation must precede write preflight"))
+    monkeypatch.setattr(api.dx, "start_validation_request", lambda *a, **k: pytest.fail("must not create another validation"))
+    monkeypatch.setattr(resume.dx, "validation_result", lambda *a, **k: {"terminal": True, "merge_eligible": False, "attestation": None, "failure_pack": None})
+    if status == "identity_mismatch":
+        job["commit_sha"] = SHA_B
+    if status in {"running", "identity_mismatch"}:
+        monkeypatch.setattr(resume.sessions, "transition", lambda *a, **k: pytest.fail("unproven/live validation must not settle"))
+    else:
+        monkeypatch.setattr(resume.sessions, "transition", lambda *a, **k: {**session, "status": "active", "session_revision": session["session_revision"] + 1})
+    async def call(fn, *a, **k):
+        return fn(*a, **k)
+    async def finalize(*a, **k):
+        return {}
+    mcp = StructuredFastMCP("drifted-validation-api")
+    api.register_dx_tools(mcp, call, FakeService(), finalize)
+    raw = await mcp.call_tool("validate_development_task", {"development_session_id": session["session_id"], "expected_session_revision": session["session_revision"], "mode": mode, "force_rerun": True})
+    result = raw[1] if isinstance(raw, tuple) else raw.structuredContent
+    if status in {"running", "identity_mismatch"}:
+        assert result["ok"] is False
+        assert result["error"]["code"] == ("DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS" if status == "running" else "DEVELOPMENT_SESSION_RECOVERY_REQUIRED")
+    else:
+        assert result["ok"] is True
+        assert result["development_session"]["status"] == "active"
+        assert result["workspace"]["status"] == "drifted"
+        assert result["writer_ready"] is False and result["merge_eligible"] is False
+        assert result["validation_started"] is False
+        assert "recover_drifted_development_task" in result["next_allowed_actions"]
+
+
 @pytest.mark.parametrize(
     ("mode", "status"),
     [("full", "cancelled"), ("full", "failed"), ("fast", "cancelled"), ("fast", "failed")],
