@@ -1,4 +1,4 @@
-# 验证中 Session 与漂移 Workspace 的恢复（12.9.27）
+# 验证中 Session 与漂移 Workspace 的恢复（12.9.28）
 
 当 Session 仍为 `validating_fast` / `validating_full`，而 Workspace 已经标记
 `branch_moved_externally` 时，旧版直接恢复会报 Session 状态错误，直接验证
@@ -42,6 +42,23 @@ Scope、Overlap、Owner、Lease 和 Index。
 以上是排查时的真实 Session 示例；调用前必须 fresh-read 当前 Revision。
 本次发布没有替业务 Worker 续租或接管该 Session。
 
+## active/no-drift 同 HEAD 的 Session 验证恢复（12.9.28）
+
+当原 Workspace 仍为 active/no-drift、GitHub 与 Session 的 HEAD/Tree 完全一致，
+但验证中的 Session 落后 Workspace revision 或 lease 时，先调用
+`resume_development_task(recover_stale_session=false, renew_lease=false)`
+只读取得 `recovery.retry_arguments`，并从
+`status_summary.recovery_retry_arguments` 获得相同的精确 CAS 参数。
+原 Worker 使用此计划正式调用 `resume_development_task`，由现有安全门禁
+同步原 Session revision 并尝试结清已有终态验证，不新建 CI Request/Worker，
+不新建 Session/Workspace/Branch，不修改 Git refs。
+
+`recovery_performed` 现在统计 Session-only 修订同步及已证明的验证结清，
+不再仅统计 HEAD adoption。只读调用永不变更状态。
+独立 `start_private_ci_job` 的相同 HEAD PASS 并不归属原 managed Session；
+缺少原 Request/Worker durable correlation、CI 仍运行、身份不符或 CAS 冲突，
+必须安全拒绝，不以相同 HEAD CI 伪造会话验证成功。
+
 ## CAS、幂等与发布
 
 验证结清是独立的历史证据持久化；分支采用仍由原 Workspace/Session CAS 事务执行。
@@ -50,6 +67,6 @@ Scope、Overlap、Owner、Lease 和 Index。
 若结清后发生竞争或进程中断，Workspace 不会被提前激活；fresh-read 最新修订号
 再恢复。已有的 SHA/Tree、Ancestry、Scope、Overlap、Owner、Lease 与 Index 检查保留。
 
-控制面发布为 12.9.27，MCP 输入 schema 不变，无数据库 schema 迁移。
+控制面发布为 12.9.28，MCP 输入 schema 不变，无数据库 schema 迁移。
 通过保留的旧 Controller 容器可回滚；历史验证审计仍可由旧版读取。
 回滚到旧版会恢复旧接口限制，需要使用 `resume_development_task` 的历史恢复路径。

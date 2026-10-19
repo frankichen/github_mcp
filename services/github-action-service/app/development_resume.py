@@ -2293,6 +2293,34 @@ def resume_task(
                     session = recovery_result["session"]
                     workspace = recovery_result["workspace"]
             else:
+                # Expose the original Session's exact guarded CAS retry to
+                # read-only callers; do not mutate or guess external CI ownership.
+                if (
+                    session.get("status") in TRANSIENT_VALIDATION_STATUSES
+                    and workspace.get("status") == "active"
+                    and workspace.get("drift_reason") is None
+                    and workspace.get("head_sha") == branch_head
+                    and workspace.get("tree_sha") == branch_tree
+                    and session.get("owner") not in (None, "")
+                    and session.get("owner") == workspace.get("owner")
+                    and _session_workspace_identity_exact(session, workspace)
+                ):
+                    recovery = {
+                        **(recovery or {}),
+                        "action": "resume_development_task",
+                        "recovery_required": True,
+                        "recovery_classification": "ACTIVE_WORKSPACE_VALIDATION_REVISION_STALE",
+                        "recovery_blocker": "RECOVERY_NOT_REQUESTED",
+                        "next_allowed_actions": ["resume_development_task"],
+                        "retry_arguments": {
+                            "repository": repository,
+                            "branch": effective_branch,
+                            "recover_stale_session": True,
+                            "renew_lease": False,
+                            "expected_workspace_revision": int(workspace["revision"]),
+                            "expected_session_revision": int(session["session_revision"]),
+                        },
+                    }
                 blockers.append("DEVELOPMENT_SESSION_RECOVERY_REQUIRED")
         if branch_drift:
             blockers.append("WORKSPACE_BRANCH_DRIFTED")
@@ -2512,7 +2540,11 @@ def resume_task(
                 )
             )
         ),
-        "recovery_performed": bool((workspace_recovery or {}).get("recovery_performed")),
+        "recovery_performed": bool(
+            (workspace_recovery or {}).get("recovery_performed")
+            or ((workspace_recovery or {}).get("session") or {}).get("recovered")
+            or ((workspace_recovery or {}).get("transient") or {}).get("reconciled")
+        ),
         "recovery_kind": (workspace_recovery or {}).get("recovery_kind"),
         "recovery_classification": (workspace_recovery or {}).get("recovery_classification"),
         "recovery_blocker": (workspace_recovery or {}).get("recovery_blocker"),
@@ -2557,6 +2589,7 @@ def resume_task(
         "recovery_required": response["recovery_required"],
         "recovery_classification": response["recovery_classification"],
         "recovery_blocker": response["recovery_blocker"],
+        "recovery_retry_arguments": (workspace_recovery or {}).get("retry_arguments"),
         "blockers": blockers, "next_allowed_actions": next_actions,
         "writer_ready": bool(response["exact_head"] and not blockers and (workspace or {}).get("lease_valid") and (session or {}).get("lease_valid")),
     }

@@ -251,6 +251,75 @@ def _stub_transient_recovery(monkeypatch, *, mode="fast", status="passed", corre
     return ws, session, job
 
 
+@pytest.mark.parametrize("mode", ["fast", "full"])
+def test_same_head_validation_stale_workspace_readonly_yields_exact_cas_plan(monkeypatch, mode):
+    ws, session, _ = _stub_transient_recovery(monkeypatch, mode=mode, status="passed")
+    ws["revision"] += 1
+    ws["lease_expires_at"] += 300
+    ws["owner"] = session["owner"] = "WORKER-B"
+    monkeypatch.setattr(
+        resume.dx, "recover_stale_session",
+        lambda *args, **kwargs: pytest.fail("read-only resume must not mutate a Session"),
+    )
+    result = resume.resume_task(
+        FakeService(), "owner/repo", branch="ai/resume", recover_stale_session=False,
+    )
+    plan = result["recovery"]
+    assert plan["recovery_classification"] == "ACTIVE_WORKSPACE_VALIDATION_REVISION_STALE"
+    assert plan["retry_arguments"] == {
+        "repository": "owner/repo", "branch": "ai/resume",
+        "recover_stale_session": True, "renew_lease": False,
+        "expected_workspace_revision": ws["revision"],
+        "expected_session_revision": session["session_revision"],
+    }
+    assert result["status_summary"]["recovery_retry_arguments"] == plan["retry_arguments"]
+    assert result["next_allowed_actions"] == ["resume_development_task"]
+    assert result["status_summary"]["writer_ready"] is False
+    assert result["status_summary"]["recovery_performed"] is False
+
+
+def test_same_head_terminal_full_ci_recovers_original_session_without_duplicate_ci(monkeypatch):
+    ws, session, job = _stub_transient_recovery(monkeypatch, mode="full", status="passed")
+    ws["revision"] += 1
+    ws["lease_expires_at"] += 300
+    ws["owner"] = session["owner"] = "WORKER-B"
+    recovered_calls = []
+
+    def recover(_service, session_id, expected_session_revision, expected_workspace_revision, head, key):
+        recovered_calls.append((session_id, expected_session_revision, expected_workspace_revision, head))
+        return {
+            "recovered": True, "workspace": ws,
+            "session": {
+                **session, "workspace_revision": ws["revision"],
+                "lease_expires_at": ws["lease_expires_at"],
+                "session_revision": session["session_revision"] + 1,
+            },
+        }
+
+    def reconcile(current, workspace, **kwargs):
+        assert current["workspace_revision"] == workspace["revision"]
+        return ({
+            **current, "status": "pr_ready",
+            "session_revision": current["session_revision"] + 1,
+            "last_full_ci_job_id": job["job_id"],
+        }, {"reconciled": True, "validation_result": {"terminal": True}}, None)
+
+    monkeypatch.setattr(resume.dx, "recover_stale_session", recover)
+    monkeypatch.setattr(resume, "_reconcile_transient_validation", reconcile)
+    result = resume.resume_task(
+        FakeService(), "owner/repo", branch="ai/resume",
+        recover_stale_session=True,
+        expected_workspace_revision=ws["revision"],
+        expected_session_revision=session["session_revision"],
+    )
+    assert len(recovered_calls) == 1
+    assert result["development_session"]["status"] == "pr_ready"
+    assert result["development_session"]["last_full_ci_job_id"] == job["job_id"]
+    assert result["status_summary"]["recovery_performed"] is True
+    assert result["status_summary"]["writer_ready"] is True
+    assert result["status_summary"]["exact_head"] is True
+
+
 def _stub_request_only_transient_recovery(monkeypatch, *, mode="fast", status="preflight_failed"):
     ws, session, _ = _stub_transient_recovery(monkeypatch, mode=mode, status="queued")
     rows = [{
