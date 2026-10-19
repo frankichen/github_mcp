@@ -1,11 +1,15 @@
-# 验证中 Session 与漂移 Workspace 的恢复（12.9.26）
+# 验证中 Session 与漂移 Workspace 的恢复（12.9.27）
 
 当 Session 仍为 `validating_fast` / `validating_full`，而 Workspace 已经标记
 `branch_moved_externally` 时，旧版直接恢复会报 Session 状态错误，直接验证
 又会在 Writer/Lease 预检处拒绝漂移 Workspace。
 
 现在两个入口都先核对旧验证的准确 generation、Request/Worker、SHA/Tree、
-Profile、Base 和终态证据。验证仍在运行或证据不完整时继续拒绝接管，
+Profile、Base 和终态证据。若 Session pin 的 base 与 Request 不同，只有 Request payload
+与 Worker 记录同一个完整 40 位 base SHA 时，才允许结清为不可合并的历史结果；Full PASS
+不复用旧 Attestation。后续 branch recovery 仍须重新证明当前 HEAD/Tree、Git ancestry、
+Scope、Overlap、Owner、Lease 和 Index。
+验证仍在运行或证据不完整时继续拒绝接管，
 返回 `DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS` 或
 `DEVELOPMENT_SESSION_RECOVERY_REQUIRED`，并提供查询/恢复动作。
 `force_rerun` 不会跳过这一步，也不会启动第二次 CI。
@@ -46,6 +50,6 @@ Profile、Base 和终态证据。验证仍在运行或证据不完整时继续�
 若结清后发生竞争或进程中断，Workspace 不会被提前激活；fresh-read 最新修订号
 再恢复。已有的 SHA/Tree、Ancestry、Scope、Overlap、Owner、Lease 与 Index 检查保留。
 
-控制面发布为 12.9.26，MCP 输入 schema 不变，无数据库 schema 迁移。
+控制面发布为 12.9.27，MCP 输入 schema 不变，无数据库 schema 迁移。
 通过保留的旧 Controller 容器可回滚；历史验证审计仍可由旧版读取。
 回滚到旧版会恢复旧接口限制，需要使用 `resume_development_task` 的历史恢复路径。
