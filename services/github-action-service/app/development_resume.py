@@ -2542,7 +2542,11 @@ def resume_task(
         ),
         "recovery_performed": bool(
             (workspace_recovery or {}).get("recovery_performed")
-            or ((workspace_recovery or {}).get("session") or {}).get("recovered")
+            or (
+                ((workspace_recovery or {}).get("session") or {}).get("recovered")
+                and not ((workspace_recovery or {}).get("session") or {}).get("replayed")
+                and not (workspace_recovery or {}).get("replayed")
+            )
             or ((workspace_recovery or {}).get("transient") or {}).get("reconciled")
         ),
         "recovery_kind": (workspace_recovery or {}).get("recovery_kind"),

@@ -293,6 +293,7 @@ def test_same_head_terminal_full_ci_recovers_original_session_without_duplicate_
                 **session, "workspace_revision": ws["revision"],
                 "lease_expires_at": ws["lease_expires_at"],
                 "session_revision": session["session_revision"] + 1,
+                "lease_valid": True,
             },
         }
 
