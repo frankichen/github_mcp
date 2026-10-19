@@ -1269,6 +1269,26 @@ def _validation_request_summary(request: dict[str, Any], worker_job_id: str = ""
     }
 
 
+def _validation_base_identity_matches(
+    payload: dict[str, Any], job: dict[str, Any], expected_base: str, *, allow_advanced_base: bool,
+) -> bool:
+    """Bind Worker evidence to its durable request while keeping a changed pinned base explicit.
+
+    Drift recovery only settles the historical validation to ``active``; it does
+    not make that validation merge eligible. A newer base is acceptable for this
+    settlement only when the exact request payload records it and the Worker ran
+    against that same exact SHA. The later branch recovery still proves ancestry
+    and current branch/tree identity before adopting anything.
+    """
+    payload_base = str(payload.get("base_sha") or "")
+    worker_base = str(job.get("base_sha") or "")
+    if not payload_base or payload_base != worker_base:
+        return False
+    if payload_base == expected_base:
+        return True
+    return bool(allow_advanced_base and _EXACT_COMMIT_SHA.fullmatch(payload_base))
+
+
 def _reconcile_terminal_validation_set(
     session: dict[str, Any],
     workspace: dict[str, Any],
@@ -1333,6 +1353,10 @@ def _reconcile_terminal_validation_set(
             return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
         payload = ci_request_store.get_ci_request_payload(request_id)
         request_tree = str(request.get("tree_sha") or "")
+        payload_base = str(payload.get("base_sha") or "")
+        payload_base_matches = payload_base == expected_base or bool(
+            drift_reconciliation and _EXACT_COMMIT_SHA.fullmatch(payload_base)
+        )
         request_identity_matches = (
             request.get("repository") == session.get("repository")
             and request.get("branch") == session.get("branch")
@@ -1345,7 +1369,7 @@ def _reconcile_terminal_validation_set(
             and payload.get("tree_sha") == session.get("tree_sha")
             and payload.get("profile") == expected_profile
             and payload.get("mode") == mode
-            and payload.get("base_sha") == expected_base
+            and payload_base_matches
             and payload.get("base_branch") in (None, "", session.get("base_branch"))
             and payload.get("development_session_id") == session_id
             and payload.get("workspace_id") == workspace.get("workspace_id")
@@ -1394,7 +1418,9 @@ def _reconcile_terminal_validation_set(
             and job.get("branch") == session.get("branch")
             and job.get("commit_sha") == session.get("head_commit_sha")
             and job.get("profile") == expected_profile
-            and job.get("base_sha") == expected_base
+            and _validation_base_identity_matches(
+                payload, job, expected_base, allow_advanced_base=drift_reconciliation,
+            )
         )
         tree_proven = bool(job_tree == session.get("tree_sha")) if job_tree else bool(
             request_tree == session.get("tree_sha")
@@ -1445,6 +1471,12 @@ def _reconcile_terminal_validation_set(
         members.append({
             "request": _validation_request_summary(request, worker_job_id),
             "job": _ci_summary(job),
+            "validation_base": {
+                "pinned_base_sha": expected_base,
+                "request_base_sha": payload_base,
+                "worker_base_sha": str(job.get("base_sha") or ""),
+                "differs_from_pinned_base": payload_base != expected_base,
+            },
             "tree_evidence": "ci_job_summary" if job_tree else "request_tree_worker_pair",
         })
         pair_bindings.append({"request_id": request_id, "job_id": worker_job_id, "status": status})
@@ -1598,6 +1630,7 @@ def _reconcile_transient_validation(
 
     payload = ci_request_store.get_ci_request_payload(request_id)
     request_tree = str(request.get("tree_sha") or "")
+    payload_base = str(payload.get("base_sha") or "")
     historical_generation = generation_revision != session_revision
     payload_generation_matches = bool(
         not historical_generation
@@ -1620,7 +1653,10 @@ def _reconcile_transient_validation(
         and payload.get("tree_sha") == session.get("tree_sha")
         and payload.get("profile") == expected_profile
         and payload.get("mode") == mode
-        and payload.get("base_sha") == expected_base
+        and (
+            payload_base == expected_base
+            or (drift_reconciliation and bool(_EXACT_COMMIT_SHA.fullmatch(payload_base)))
+        )
         and payload.get("base_branch") in (None, "", session.get("base_branch"))
         and payload.get("development_session_id") in (None, "", session_id)
         and payload.get("workspace_id") in (None, "", workspace.get("workspace_id"))
@@ -1660,6 +1696,13 @@ def _reconcile_transient_validation(
             recovery = _transient_recovery_failure(
                 session, "validation_request_worker_missing_terminal",
                 request_id=request_id, request_phase=request_phase, request_status=request_status,
+            )
+            return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+        if payload_base != expected_base:
+            recovery = _transient_recovery_failure(
+                session, "validation_request_identity_mismatch",
+                request_id=request_id, expected_base_sha=expected_base,
+                request_base_sha=payload_base,
             )
             return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
         try:
@@ -1722,7 +1765,9 @@ def _reconcile_transient_validation(
         and job.get("branch") == session.get("branch")
         and job.get("commit_sha") == session.get("head_commit_sha")
         and job.get("profile") == expected_profile
-        and job.get("base_sha") == expected_base
+        and _validation_base_identity_matches(
+            payload, job, expected_base, allow_advanced_base=drift_reconciliation,
+        )
     )
     job_tree = (job.get("summary") or {}).get("git_tree_sha") if isinstance(job.get("summary"), dict) else None
     tree_proven = bool(job_tree == session.get("tree_sha")) if job_tree else bool(
@@ -1748,8 +1793,10 @@ def _reconcile_transient_validation(
             session, "validation_pass_exit_code_invalid", job_id=worker_job_id,
         )
         return session, recovery, "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    validation_base_changed = payload_base != expected_base
+    historical_only = drift_reconciliation and validation_base_changed
     reusable_attestation = None
-    if status == "passed" and mode == "full":
+    if status == "passed" and mode == "full" and not historical_only:
         if job.get("exit_code") != 0:
             recovery = _transient_recovery_failure(
                 session, "validation_full_pass_exit_code_invalid", job_id=worker_job_id,
@@ -1822,12 +1869,23 @@ def _reconcile_transient_validation(
     )
     evidence = correlation.get("evidence") if isinstance(correlation.get("evidence"), dict) else {}
     selection = evidence.get("selection") if isinstance(evidence.get("selection"), dict) else {}
-    result = dx.validation_result(
-        session_id, session_revision, mode, job, selection, True,
-        request_id=request_id, reusable_attestation=reusable_attestation,
-        allow_attestation_creation=False,
-    )
-    if status == "passed" and mode == "full" and not result.get("merge_eligible"):
+    if historical_only:
+        result = {
+            "terminal": True,
+            "merge_eligible": False,
+            "attestation": None,
+            "failure_pack": None,
+            "historical_only": True,
+            "status": status,
+            "job": _ci_summary(job),
+        }
+    else:
+        result = dx.validation_result(
+            session_id, session_revision, mode, job, selection, True,
+            request_id=request_id, reusable_attestation=reusable_attestation,
+            allow_attestation_creation=False,
+        )
+    if status == "passed" and mode == "full" and not historical_only and not result.get("merge_eligible"):
         recovery = _transient_recovery_failure(
             session, "validation_full_pass_not_merge_eligible", job_id=worker_job_id,
         )
@@ -1859,6 +1917,12 @@ def _reconcile_transient_validation(
         "tree_evidence": "ci_job_summary" if job_tree else "request_tree_worker_pair",
         "job": _ci_summary(job),
         "validation_result": result,
+        "validation_base": {
+            "pinned_base_sha": expected_base,
+            "request_base_sha": payload_base,
+            "worker_base_sha": str(job.get("base_sha") or ""),
+            "differs_from_pinned_base": payload_base != expected_base,
+        },
         "workspace_drift_pending_recovery": drift_reconciliation,
     }, None
 
@@ -2229,6 +2293,34 @@ def resume_task(
                     session = recovery_result["session"]
                     workspace = recovery_result["workspace"]
             else:
+                # Expose the original Session's exact guarded CAS retry to
+                # read-only callers; do not mutate or guess external CI ownership.
+                if (
+                    session.get("status") in TRANSIENT_VALIDATION_STATUSES
+                    and workspace.get("status") == "active"
+                    and workspace.get("drift_reason") is None
+                    and workspace.get("head_sha") == branch_head
+                    and workspace.get("tree_sha") == branch_tree
+                    and session.get("owner") not in (None, "")
+                    and session.get("owner") == workspace.get("owner")
+                    and _session_workspace_identity_exact(session, workspace)
+                ):
+                    recovery = {
+                        **(recovery or {}),
+                        "action": "resume_development_task",
+                        "recovery_required": True,
+                        "recovery_classification": "ACTIVE_WORKSPACE_VALIDATION_REVISION_STALE",
+                        "recovery_blocker": "RECOVERY_NOT_REQUESTED",
+                        "next_allowed_actions": ["resume_development_task"],
+                        "retry_arguments": {
+                            "repository": repository,
+                            "branch": effective_branch,
+                            "recover_stale_session": True,
+                            "renew_lease": False,
+                            "expected_workspace_revision": int(workspace["revision"]),
+                            "expected_session_revision": int(session["session_revision"]),
+                        },
+                    }
                 blockers.append("DEVELOPMENT_SESSION_RECOVERY_REQUIRED")
         if branch_drift:
             blockers.append("WORKSPACE_BRANCH_DRIFTED")
@@ -2448,7 +2540,15 @@ def resume_task(
                 )
             )
         ),
-        "recovery_performed": bool((workspace_recovery or {}).get("recovery_performed")),
+        "recovery_performed": bool(
+            (workspace_recovery or {}).get("recovery_performed")
+            or (
+                ((workspace_recovery or {}).get("session") or {}).get("recovered")
+                and not ((workspace_recovery or {}).get("session") or {}).get("replayed")
+                and not (workspace_recovery or {}).get("replayed")
+            )
+            or ((workspace_recovery or {}).get("transient") or {}).get("reconciled")
+        ),
         "recovery_kind": (workspace_recovery or {}).get("recovery_kind"),
         "recovery_classification": (workspace_recovery or {}).get("recovery_classification"),
         "recovery_blocker": (workspace_recovery or {}).get("recovery_blocker"),
@@ -2493,6 +2593,7 @@ def resume_task(
         "recovery_required": response["recovery_required"],
         "recovery_classification": response["recovery_classification"],
         "recovery_blocker": response["recovery_blocker"],
+        "recovery_retry_arguments": (workspace_recovery or {}).get("retry_arguments"),
         "blockers": blockers, "next_allowed_actions": next_actions,
         "writer_ready": bool(response["exact_head"] and not blockers and (workspace or {}).get("lease_valid") and (session or {}).get("lease_valid")),
     }

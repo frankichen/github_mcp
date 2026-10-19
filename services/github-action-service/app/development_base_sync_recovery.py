@@ -794,7 +794,7 @@ def _atomic_recover_base_sync(
     workspace_id = request["workspace_id"]
     session_id = request["development_session_id"]
     expected_workspace_revision = request["expected_workspace_revision"]
-    expected_session_revision = request["expected_session_revision"]
+    expected_session_revision = same_base.recovery_session_revision(request, verification)
     old_base_sha = request["expected_old_base_sha"]
     new_base_sha = request["expected_new_base_sha"]
     base_branch = request["expected_base_branch"]
@@ -927,6 +927,7 @@ def _atomic_recover_base_sync(
                 "scope": verification["scope"].get("resulting_scope") or {},
             }
             audit = {
+                "validation_reconciliation": verification.get("validation_reconciliation"),
                 "repository": repository,
                 "branch": branch,
                 "workspace_id": workspace_id,
@@ -1262,6 +1263,9 @@ def recover_base_synced_task(
         "scope": scope,
         "ownership": ownership,
     }
+    session, settlement = same_base.reconcile_drifted_validation(session, workspace)
+    if settlement:
+        verification["validation_reconciliation"] = settlement
     recovered = _atomic_recover_base_sync(
         service, request=request, idempotency_key=idempotency_key, verification=verification,
     )

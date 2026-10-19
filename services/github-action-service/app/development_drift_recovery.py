@@ -24,6 +24,40 @@ _COMPARE_FILE_LIMIT = 300
 _EXACT_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
 
 
+def reconcile_drifted_validation(session: dict[str, Any], workspace: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Settle old-head CI evidence only; never adopt a HEAD or renew a lease."""
+    if session.get("status") not in {"validating_fast", "validating_full"}:
+        return session, None
+    from app import development_resume as resume
+    if workspace.get("owner") != session.get("owner"):
+        raise MyGithub12Error("RECOVERY_OWNER_MISMATCH", "validation recovery Writer ownership differs")
+    recovered, evidence, blocker = resume._reconcile_transient_validation(
+        session, workspace, allow_branch_drift=True,
+    )
+    if blocker:
+        raise MyGithub12Error(blocker, "old-head validation must be resolved before branch recovery", {
+            "validation_recovery": evidence,
+            "expected_workspace_revision": workspace["revision"],
+            "expected_session_revision": recovered["session_revision"],
+            "next_allowed_actions": ["get_private_ci_job", "resume_development_task"],
+        })
+    if not evidence.get("reconciled") or recovered.get("status") != "active":
+        raise MyGithub12Error("DEVELOPMENT_SESSION_RECOVERY_REQUIRED", "validation did not settle to an active historical Session")
+    return recovered, {**evidence, "session_revision_before": session["session_revision"],
+                       "session_revision_after": recovered["session_revision"]}
+
+
+def recovery_session_revision(request: dict[str, Any], verification: dict[str, Any]) -> int:
+    evidence = verification.get("validation_reconciliation")
+    if not evidence:
+        return int(request["expected_session_revision"])
+    if (not evidence.get("reconciled")
+            or int(evidence["session_revision_before"]) != int(request["expected_session_revision"])
+            or int(evidence["session_revision_after"]) != int(request["expected_session_revision"]) + 1):
+        raise MyGithub12Error("DEVELOPMENT_SESSION_REVISION_MISMATCH", "validation settlement CAS proof changed")
+    return int(evidence["session_revision_after"])
+
+
 def _recovery_record_key(recovery_kind: str) -> str:
     if recovery_kind == "active_workspace_stale_session":
         return "last_active_workspace_stale_session_recovery"
@@ -423,7 +457,7 @@ def _atomic_recover(
     workspace_id = request["workspace_id"]
     session_id = request["development_session_id"]
     expected_workspace_revision = request["expected_workspace_revision"]
-    expected_session_revision = request["expected_session_revision"]
+    expected_session_revision = recovery_session_revision(request, verification)
     current_head = request["expected_current_head_sha"]
     current_tree = request["expected_current_tree_sha"]
     base_branch = request["expected_base_branch"]
@@ -657,6 +691,8 @@ def _atomic_recover(
                 "ownership": verification["ownership"],
                 "idempotency_identity": hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest(),
             }
+            if verification.get("validation_reconciliation"):
+                audit["validation_reconciliation"] = verification["validation_reconciliation"]
             if active_workspace_stale_session:
                 audit.update({
                     "recovery_kind": "active_workspace_stale_session",
@@ -932,7 +968,7 @@ def recover_drifted_task(
         raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH", "workspace revision changed before drift recovery")
     if int(session.get("session_revision") or 0) != int(expected_session_revision):
         raise MyGithub12Error("DEVELOPMENT_SESSION_REVISION_MISMATCH", "development session revision changed before drift recovery")
-    if session.get("status") not in _ALLOWED_SESSION_STATES:
+    if session.get("status") not in _ALLOWED_SESSION_STATES | {"validating_fast", "validating_full"}:
         raise MyGithub12Error("DEVELOPMENT_SESSION_STATE_INVALID", "development session state does not permit manual drift recovery")
     if workspace.get("head_sha") != expected_current_head_sha or workspace.get("tree_sha") != expected_current_tree_sha:
         raise MyGithub12Error(
@@ -953,6 +989,9 @@ def recover_drifted_task(
     scope = _verify_scope(workspace, changed_paths, reviewed_scope_expansion_paths)
     ownership = _verify_ownership(service, workspace)
     verification = {"github": github_identity, "ancestry": ancestry, "scope": scope, "ownership": ownership}
+    session, settlement = reconcile_drifted_validation(session, workspace)
+    if settlement:
+        verification["validation_reconciliation"] = settlement
     recovered = _atomic_recover(service, request=request, idempotency_key=idempotency_key, verification=verification)
     recovered_workspace = mygithub12.get_workspace(service, workspace_id)
     recovered_session = sessions.get_session(development_session_id)

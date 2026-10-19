@@ -549,7 +549,7 @@ def _atomic_recover_retarget(
     workspace_id = request["workspace_id"]
     session_id = request["development_session_id"]
     expected_workspace_revision = int(request["expected_workspace_revision"])
-    expected_session_revision = int(request["expected_session_revision"])
+    expected_session_revision = same_base.recovery_session_revision(request, verification)
     old_base_branch = request["expected_old_base_branch"]
     old_base_sha = request["expected_old_base_sha"]
     new_base_branch = request["expected_new_base_branch"]
@@ -732,6 +732,7 @@ def _atomic_recover_retarget(
             )
             stale_attestation_cleared = bool(session_row["last_attestation_id"])
             audit = {
+                "validation_reconciliation": verification.get("validation_reconciliation"),
                 "repository": repository,
                 "branch": branch,
                 "pull_number": pull_number,
@@ -1174,6 +1175,9 @@ def recover_retargeted_task(
         "scope": scope,
         "ownership": ownership,
     }
+    session, settlement = same_base.reconcile_drifted_validation(session, workspace)
+    if settlement:
+        verification["validation_reconciliation"] = settlement
     recovered = _atomic_recover_retarget(
         service,
         request=request,

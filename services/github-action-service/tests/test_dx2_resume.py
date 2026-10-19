@@ -251,6 +251,76 @@ def _stub_transient_recovery(monkeypatch, *, mode="fast", status="passed", corre
     return ws, session, job
 
 
+@pytest.mark.parametrize("mode", ["fast", "full"])
+def test_same_head_validation_stale_workspace_readonly_yields_exact_cas_plan(monkeypatch, mode):
+    ws, session, _ = _stub_transient_recovery(monkeypatch, mode=mode, status="passed")
+    ws["revision"] += 1
+    ws["lease_expires_at"] += 300
+    ws["owner"] = session["owner"] = "WORKER-B"
+    monkeypatch.setattr(
+        resume.dx, "recover_stale_session",
+        lambda *args, **kwargs: pytest.fail("read-only resume must not mutate a Session"),
+    )
+    result = resume.resume_task(
+        FakeService(), "owner/repo", branch="ai/resume", recover_stale_session=False,
+    )
+    plan = result["recovery"]
+    assert plan["recovery_classification"] == "ACTIVE_WORKSPACE_VALIDATION_REVISION_STALE"
+    assert plan["retry_arguments"] == {
+        "repository": "owner/repo", "branch": "ai/resume",
+        "recover_stale_session": True, "renew_lease": False,
+        "expected_workspace_revision": ws["revision"],
+        "expected_session_revision": session["session_revision"],
+    }
+    assert result["status_summary"]["recovery_retry_arguments"] == plan["retry_arguments"]
+    assert result["next_allowed_actions"] == ["resume_development_task"]
+    assert result["status_summary"]["writer_ready"] is False
+    assert result["status_summary"]["recovery_performed"] is False
+
+
+def test_same_head_terminal_full_ci_recovers_original_session_without_duplicate_ci(monkeypatch):
+    ws, session, job = _stub_transient_recovery(monkeypatch, mode="full", status="passed")
+    ws["revision"] += 1
+    ws["lease_expires_at"] += 300
+    ws["owner"] = session["owner"] = "WORKER-B"
+    recovered_calls = []
+
+    def recover(_service, session_id, expected_session_revision, expected_workspace_revision, head, key):
+        recovered_calls.append((session_id, expected_session_revision, expected_workspace_revision, head))
+        return {
+            "recovered": True, "workspace": ws,
+            "session": {
+                **session, "workspace_revision": ws["revision"],
+                "lease_expires_at": ws["lease_expires_at"],
+                "session_revision": session["session_revision"] + 1,
+                "lease_valid": True,
+            },
+        }
+
+    def reconcile(current, workspace, **kwargs):
+        assert current["workspace_revision"] == workspace["revision"]
+        return ({
+            **current, "status": "pr_ready",
+            "session_revision": current["session_revision"] + 1,
+            "last_full_ci_job_id": job["job_id"],
+        }, {"reconciled": True, "validation_result": {"terminal": True}}, None)
+
+    monkeypatch.setattr(resume.dx, "recover_stale_session", recover)
+    monkeypatch.setattr(resume, "_reconcile_transient_validation", reconcile)
+    result = resume.resume_task(
+        FakeService(), "owner/repo", branch="ai/resume",
+        recover_stale_session=True,
+        expected_workspace_revision=ws["revision"],
+        expected_session_revision=session["session_revision"],
+    )
+    assert len(recovered_calls) == 1
+    assert result["development_session"]["status"] == "pr_ready"
+    assert result["development_session"]["last_full_ci_job_id"] == job["job_id"]
+    assert result["status_summary"]["recovery_performed"] is True
+    assert result["status_summary"]["writer_ready"] is True
+    assert result["status_summary"]["exact_head"] is True
+
+
 def _stub_request_only_transient_recovery(monkeypatch, *, mode="fast", status="preflight_failed"):
     ws, session, _ = _stub_transient_recovery(monkeypatch, mode=mode, status="queued")
     rows = [{
@@ -679,6 +749,45 @@ def _stub_drifted_transient_recovery(monkeypatch, *, mode="full", status="cancel
         },
     )
     return ws, session, job
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["fast", "full"])
+@pytest.mark.parametrize("status", ["cancelled", "failed", "running", "identity_mismatch"])
+async def test_validate_api_reconciles_historical_ci_before_workspace_write_preflight(monkeypatch, mode, status):
+    from app import mygithub12_dx_mcp as api
+    from app.mcp_response import StructuredFastMCP
+    ws, session, job = _stub_drifted_transient_recovery(monkeypatch, mode=mode, status="cancelled" if status == "identity_mismatch" else status)
+    monkeypatch.setattr(api.sessions, "get_session", lambda *_: dict(session))
+    monkeypatch.setattr(api.mygithub12, "get_workspace", lambda *_: dict(ws))
+    monkeypatch.setattr(api.dx, "maybe_auto_renew_session_workspace", lambda *a, **k: pytest.fail("historical reconciliation cannot renew a drifted lease"))
+    monkeypatch.setattr(api.mygithub12, "workspace_write_preflight", lambda *a, **k: pytest.fail("historical reconciliation must precede write preflight"))
+    monkeypatch.setattr(api.dx, "start_validation_request", lambda *a, **k: pytest.fail("must not create another validation"))
+    monkeypatch.setattr(resume.dx, "validation_result", lambda *a, **k: {"terminal": True, "merge_eligible": False, "attestation": None, "failure_pack": None})
+    if status == "identity_mismatch":
+        job["commit_sha"] = SHA_B
+    if status in {"running", "identity_mismatch"}:
+        monkeypatch.setattr(resume.sessions, "transition", lambda *a, **k: pytest.fail("unproven/live validation must not settle"))
+    else:
+        monkeypatch.setattr(resume.sessions, "transition", lambda *a, **k: {**session, "status": "active", "session_revision": session["session_revision"] + 1})
+    async def call(fn, *a, **k):
+        return fn(*a, **k)
+    async def finalize(*a, **k):
+        return {}
+    mcp = StructuredFastMCP("drifted-validation-api")
+    api.register_dx_tools(mcp, call, FakeService(), finalize)
+    raw = await mcp.call_tool("validate_development_task", {"development_session_id": session["session_id"], "expected_session_revision": session["session_revision"], "mode": mode, "force_rerun": True})
+    result = raw[1] if isinstance(raw, tuple) else raw.structuredContent
+    if status in {"running", "identity_mismatch"}:
+        assert result["ok"] is False
+        assert result["error"]["code"] == ("DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS" if status == "running" else "DEVELOPMENT_SESSION_RECOVERY_REQUIRED")
+    else:
+        assert result["ok"] is True
+        assert result["development_session"]["status"] == "active"
+        assert result["workspace"]["status"] == "drifted"
+        assert result["writer_ready"] is False and result["merge_eligible"] is False
+        assert result["validation_started"] is False
+        assert "recover_drifted_development_task" in result["next_allowed_actions"]
 
 
 @pytest.mark.parametrize(
@@ -1866,6 +1975,84 @@ def test_resume_revision_only_workspace_recovery_reconciles_queued_request_and_p
     assert result["recovery"]["transient"]["reconciled"] is True
     assert result["recovery"]["transient"]["request"]["request_id"] == "ci_req_97db061be503489fa02a7ad5"
     assert no_new_ci == {"requests": 0, "workers": 0}
+
+
+@pytest.mark.parametrize("mode", ["fast", "full"])
+def test_forward_drift_settles_validation_on_exact_changed_base_without_merge_eligibility(monkeypatch, mode):
+    ws, session, _, payload, job, no_new_ci = _production_validation_case(
+        monkeypatch, mode=mode, repository="owner/repo", branch="ai/forward-drift",
+        head=SHA_A, tree=TREE_A, base=SHA_A, request_id="ci_req_newer_base", job_id="job-newer-base",
+    )
+    session.update({"session_revision": 9, "workspace_revision": 7})
+    ws.update({
+        "revision": 8, "status": "drifted", "drift_reason": "branch_moved_externally",
+        "head_sha": SHA_B, "tree_sha": TREE_B,
+    })
+    payload["base_sha"] = SHA_B
+    job["base_sha"] = SHA_B
+    if mode == "full":
+        monkeypatch.setattr(
+            resume.attestation_registry, "find_reusable_attestation_for_job",
+            lambda *args, **kwargs: pytest.fail("drifted full validation cannot reuse a merge attestation"),
+        )
+    else:
+        monkeypatch.setattr(
+            resume.dx, "validation_result",
+            lambda *args, **kwargs: {
+                "terminal": True, "merge_eligible": False, "attestation": None, "failure_pack": None,
+            },
+        )
+    monkeypatch.setattr(
+        resume.sessions, "transition",
+        lambda *args, **kwargs: {**session, "status": "active", "session_revision": 10},
+    )
+
+    recovered, evidence, blocker = resume._reconcile_transient_validation(
+        session, ws, allow_branch_drift=True,
+    )
+
+    assert blocker is None
+    assert recovered["status"] == "active"
+    assert evidence["reconciled"] is True
+    assert evidence["validation_base"] == {
+        "pinned_base_sha": SHA_A,
+        "request_base_sha": SHA_B,
+        "worker_base_sha": SHA_B,
+        "differs_from_pinned_base": True,
+    }
+    assert evidence["validation_result"]["merge_eligible"] is False
+    assert evidence["workspace_drift_pending_recovery"] is True
+    assert no_new_ci == {"requests": 0, "workers": 0}
+
+
+def test_forward_drift_rejects_worker_base_that_differs_from_request_evidence(monkeypatch):
+    ws, session, _, payload, job, _ = _production_validation_case(
+        monkeypatch, mode="fast", repository="owner/repo", branch="ai/forward-drift",
+        head=SHA_A, tree=TREE_A, base=SHA_A, request_id="ci_req_base_mismatch", job_id="job-base-mismatch",
+    )
+    session.update({"session_revision": 9, "workspace_revision": 7})
+    ws.update({
+        "revision": 8, "status": "drifted", "drift_reason": "branch_moved_externally",
+        "head_sha": SHA_B, "tree_sha": TREE_B,
+    })
+    payload["base_sha"] = SHA_B
+    job["base_sha"] = "c" * 40
+    monkeypatch.setattr(
+        resume.sessions, "bind_validation_request_worker",
+        lambda *args, **kwargs: pytest.fail("mismatched base evidence must not be bound"),
+    )
+    monkeypatch.setattr(
+        resume.sessions, "transition",
+        lambda *args, **kwargs: pytest.fail("mismatched base evidence must not settle the Session"),
+    )
+
+    recovered, evidence, blocker = resume._reconcile_transient_validation(
+        session, ws, allow_branch_drift=True,
+    )
+
+    assert recovered is session
+    assert blocker == "DEVELOPMENT_SESSION_RECOVERY_REQUIRED"
+    assert evidence["reason"] == "validation_job_identity_mismatch"
 
 
 def test_request_exists_without_worker_keeps_validation_in_progress_and_starts_nothing(monkeypatch):

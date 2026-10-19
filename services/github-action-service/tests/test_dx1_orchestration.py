@@ -996,6 +996,7 @@ async def test_validate_transient_terminal_evidence_is_reused_without_duplicate_
         return recovered, evidence, None
 
     monkeypatch.setattr(dx_mcp.resume, "_reconcile_transient_validation", reconcile)
+    monkeypatch.setattr(mygithub12, "get_workspace", lambda *args: workspace)
     monkeypatch.setattr(
         dx, "start_validation_request",
         lambda *args, **kwargs: pytest.fail("transient validation must not create another Request"),
@@ -1039,6 +1040,7 @@ async def test_validate_transient_running_evidence_is_reused_without_new_request
         "mode": "full", "request": request, "job": {"job_id": "job-running", "status": "running"},
     }
     monkeypatch.setattr(sessions, "get_session", lambda *_args: dict(session))
+    monkeypatch.setattr(mygithub12, "get_workspace", lambda *args: workspace)
     monkeypatch.setattr(
         dx, "maybe_auto_renew_session_workspace",
         lambda *args, **kwargs: {"renewed": False, "session": dict(session), "workspace": workspace, "remaining_seconds": 3600.0, "audit": None, "recovery": None},
@@ -1079,6 +1081,7 @@ async def test_validate_transient_ambiguity_fails_closed_even_with_force_rerun(m
     }
     recovery = {"transient_validation": True, "reconciled": False, "reason": "validation_request_correlation_not_unique", "request_ids": ["ci_req_a", "ci_req_b"]}
     monkeypatch.setattr(sessions, "get_session", lambda *_args: dict(session))
+    monkeypatch.setattr(mygithub12, "get_workspace", lambda *args: workspace)
     monkeypatch.setattr(
         dx, "maybe_auto_renew_session_workspace",
         lambda *args, **kwargs: {"renewed": False, "session": dict(session), "workspace": workspace, "remaining_seconds": 3600.0, "audit": None, "recovery": None},
