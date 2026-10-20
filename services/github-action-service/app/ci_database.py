@@ -1034,6 +1034,8 @@ def complete_job(
             )
         _upsert_repo_queue_state(db, row["repository"], running_delta=-1)
         _add_event(db, job_id, "completed", json.dumps({"status": status, "exit_code": exit_code}))
+        from app.ci_request_store import reconcile_worker_request_in_db
+        reconcile_worker_request_in_db(db, job_id)
         completed_lifecycle = {
             "created_at": row["created_at"],
             "queued_at": row["queued_at"],
@@ -1093,6 +1095,8 @@ def cancel_queued_job(job_id: str) -> bool:
             return False
         _upsert_repo_queue_state(db, row["repository"], queued_delta=-1)
         _add_event(db, job_id, "cancelled", "{}")
+        from app.ci_request_store import reconcile_worker_request_in_db
+        reconcile_worker_request_in_db(db, job_id)
         db.commit()
     _notify_job_change(job_id)
     return True
@@ -1196,6 +1200,8 @@ def recover_expired_leases():
                 db, row["job_id"], "lease_expired",
                 json.dumps({"attempts": attempts, "max_attempts": max_attempts}),
             )
+            from app.ci_request_store import reconcile_worker_request_in_db
+            reconcile_worker_request_in_db(db, row["job_id"])
             recovered.append(row["job_id"])
         if rows:
             db.commit()
@@ -1219,6 +1225,9 @@ def set_job_status(
             )
         else:
             cursor = db.execute("UPDATE ci_jobs SET status = ? WHERE job_id = ?", (status, job_id))
+        if cursor.rowcount and status == "running":
+            from app.ci_request_store import reconcile_worker_request_in_db
+            reconcile_worker_request_in_db(db, job_id)
         db.commit()
     if cursor.rowcount:
         _notify_job_change(job_id)

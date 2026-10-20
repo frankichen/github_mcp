@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -14,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from app.ci_database import get_job
+
+_logger = logging.getLogger(__name__)
 
 
 ATTESTATION_ERRORS = {
@@ -163,6 +166,12 @@ def create_attestation_for_passed_job(*, job_id: str, expires_in_seconds: int = 
         "SELECT * FROM ci_tree_attestations WHERE attestation_id=?", (attestation_id,)
     ).fetchone()
     db.close()
+    try:
+        from app.ci_request_store import reconcile_worker_request
+        reconcile_worker_request(job_id)
+    except Exception:
+        # The attestation is durable; startup replay will retry the link.
+        _logger.exception("CI Request attestation projection deferred for job %s", job_id)
     return _row(row)
 
 

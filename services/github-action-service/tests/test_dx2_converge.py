@@ -548,6 +548,12 @@ async def test_passed_ci_waits_for_all_required_analysis_evidence(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_evidence_complete_after_ci_pass_is_the_only_success(monkeypatch):
+    # This test isolates the Convergence gate. Separate tests prove the
+    # full CI/attestation -> original Session CAS handoff.
+    monkeypatch.setattr(
+        converge, "_sync_full_ci_session_evidence",
+        lambda session, snapshot, request, attestation_id: dict(session),
+    )
     session = _session()
     _install_identity_mocks(monkeypatch, session)
     _install_index_mocks(monkeypatch, [{"status": "ready", "tree_sha": TREE_B}])

@@ -2296,7 +2296,8 @@ def resume_task(
                 # Expose the original Session's exact guarded CAS retry to
                 # read-only callers; do not mutate or guess external CI ownership.
                 if (
-                    session.get("status") in TRANSIENT_VALIDATION_STATUSES
+                    session.get("status") in (ACTIVE_SESSION_STATUSES | set(TRANSIENT_VALIDATION_STATUSES))
+                    and workspace.get("lease_valid")
                     and workspace.get("status") == "active"
                     and workspace.get("drift_reason") is None
                     and workspace.get("head_sha") == branch_head
@@ -2309,7 +2310,11 @@ def resume_task(
                         **(recovery or {}),
                         "action": "resume_development_task",
                         "recovery_required": True,
-                        "recovery_classification": "ACTIVE_WORKSPACE_VALIDATION_REVISION_STALE",
+                        "recovery_classification": (
+                            "ACTIVE_WORKSPACE_VALIDATION_REVISION_STALE"
+                            if session.get("status") in TRANSIENT_VALIDATION_STATUSES
+                            else "ACTIVE_WORKSPACE_SAME_HEAD_REVISION_STALE"
+                        ),
                         "recovery_blocker": "RECOVERY_NOT_REQUESTED",
                         "next_allowed_actions": ["resume_development_task"],
                         "retry_arguments": {

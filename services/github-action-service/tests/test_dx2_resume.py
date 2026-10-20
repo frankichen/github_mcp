@@ -278,6 +278,40 @@ def test_same_head_validation_stale_workspace_readonly_yields_exact_cas_plan(mon
     assert result["status_summary"]["recovery_performed"] is False
 
 
+
+def test_same_head_pr_ready_lease_revision_readonly_offers_exact_cas(monkeypatch):
+    """Pure renewal must not strand the original Writer's pr_ready session."""
+    ws = _workspace(revision=75)
+    ws["owner"] = "WORKER-B"
+    ws["lease_expires_at"] += 300
+    session = {
+        **_ready_session(workspace_revision=74),
+        "workspace_id": ws["workspace_id"],
+        "owner": "WORKER-B",
+        "status": "pr_ready",
+        "last_full_ci_job_id": "job-current-head",
+        "last_attestation_id": "att-current-head",
+    }
+    _stub_resume_context(monkeypatch, ws=ws, session=session)
+    monkeypatch.setattr(
+        resume.dx, "recover_stale_session",
+        lambda *args, **kwargs: pytest.fail("read-only resume must not write"),
+    )
+    result = resume.resume_task(
+        FakeService(), "owner/repo", branch="ai/resume", recover_stale_session=False,
+    )
+    plan = result["recovery"]
+    assert plan["recovery_classification"] == "ACTIVE_WORKSPACE_SAME_HEAD_REVISION_STALE"
+    assert plan["retry_arguments"] == {
+        "repository": "owner/repo", "branch": "ai/resume",
+        "recover_stale_session": True, "renew_lease": False,
+        "expected_workspace_revision": 75, "expected_session_revision": 4,
+    }
+    assert result["status_summary"]["writer_ready"] is False
+    assert result["status_summary"]["recovery_retry_arguments"] == plan["retry_arguments"]
+    assert result["development_session"]["last_attestation_id"] == "att-current-head"
+
+
 def test_same_head_terminal_full_ci_recovers_original_session_without_duplicate_ci(monkeypatch):
     ws, session, job = _stub_transient_recovery(monkeypatch, mode="full", status="passed")
     ws["revision"] += 1
