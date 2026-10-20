@@ -738,10 +738,8 @@ def test_terminal_cancelled_full_validation_then_forward_drift_recovers_same_wri
         assert ci_database.complete_job(
             job["job_id"], -1, status, summary={"git_tree_sha": OLD_TREE},
         ) is True
-        request = ci_request_store.transition_ci_request(
-            request["request_id"], request["revision"], "terminal", status,
-            terminal_reason="regression_cancelled",
-        )
+        # complete_job() now projects a matching terminal Worker atomically.
+        request = ci_request_store.get_ci_request(request["request_id"])
         assert request["phase"] == "terminal" and request["status"] == status
 
     with sessions._LOCK, sessions._db() as db:
@@ -974,10 +972,9 @@ def test_two_terminal_cancelled_correlations_then_forward_drift_recovers_same_wr
         assert ci_database.complete_job(
             job["job_id"], -1, "cancelled", summary={"git_tree_sha": OLD_TREE},
         ) is True
-        request = ci_request_store.transition_ci_request(
-            request["request_id"], request["revision"], "terminal", "cancelled",
-            terminal_reason=f"regression_set_cancelled_{index}",
-        )
+        # The terminal Request has already been durably projected.
+        request = ci_request_store.get_ci_request(request["request_id"])
+        assert request["phase"] == "terminal" and request["status"] == "cancelled"
         requests.append(request)
         jobs.append(job)
 
