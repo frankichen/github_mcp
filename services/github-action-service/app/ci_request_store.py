@@ -825,10 +825,17 @@ def reconcile_worker_request_in_db(db, worker_job_id: str) -> bool:
         summary = json.loads(job["summary_json"] or "{}")
     except (TypeError, ValueError):
         return False
-    tree_sha = summary.get("git_tree_sha") if isinstance(summary, dict) else None
-    if not _SHA_RE.fullmatch(str(request["tree_sha"] or "")) or tree_sha != request["tree_sha"]:
+    job_tree_sha = summary.get("git_tree_sha") if isinstance(summary, dict) else None
+    tree_sha = request["tree_sha"]
+    if not _SHA_RE.fullmatch(str(tree_sha or "")):
+        return False
+    # Failed/cancelled/lost Workers may not provide source metadata, while the
+    # Request Tree was pinned at dispatch. A passed Worker must prove its Tree.
+    if job_tree_sha and job_tree_sha != tree_sha:
         return False
     status = str(job["status"])
+    if status == "passed" and job_tree_sha != tree_sha:
+        return False
     if status == "passed" and job["exit_code"] != 0:
         return False
     if status in _TERMINAL_STATUSES - {"preflight_failed"}:
