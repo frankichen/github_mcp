@@ -1,6 +1,6 @@
 {
   "service_name": "MyGithut12",
-  "service_version": "12.9.28",
+  "service_version": "12.9.29",
   "development_recovery": {
     "supports_active_workspace_stale_session_recovery": true,
     "recovery_kind": "active_workspace_stale_session",
@@ -229,16 +229,16 @@
       "tool_manifest_count": 166,
       "compatibility_tool_count": 177,
       "hidden_deprecated_tool_count": 11,
-      "tool_schema_sha256": "787dfba6abb7282d5607e77ba371763e0cf11c63b274a4ee2706963c5d5da6a2",
-      "schema_generation_id": "schema-v1:787dfba6abb7282d"
+      "tool_schema_sha256": "786166de2dff96b337a9031ffab60e829e6428f421213b10155965f4b4df31e5",
+      "schema_generation_id": "schema-v1:786166de2dff96b3"
     },
     "compatibility": {
       "tool_count": 177,
       "tool_manifest_count": 177,
       "compatibility_tool_count": 177,
       "hidden_deprecated_tool_count": 0,
-      "tool_schema_sha256": "ebb6b13ad3023d53ded10ecee1aacfd58365fe5a4bef1e4769c7b0247992dca1",
-      "schema_generation_id": "schema-v1:ebb6b13ad3023d53"
+      "tool_schema_sha256": "ddbd90f811a34555a19ffdf4f4626999a1f519c2de37c895cff2a6020825712d",
+      "schema_generation_id": "schema-v1:ddbd90f811a34555"
     }
   },
   "new_tools": [

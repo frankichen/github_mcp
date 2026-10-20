@@ -341,9 +341,9 @@ def test_new_workspace_converges_legacy_expired_branch_owner(tmp_path, monkeypat
     assert tuple(old) == ("expired", 2)
 
 
-def test_default_workspace_lease_is_two_hours():
-    assert workspace.DEFAULT_LEASE_SECONDS == 7200
-    assert workspace.MAX_LEASE_SECONDS == 14400
+def test_default_workspace_lease_is_renewable_without_two_hour_timebox():
+    assert workspace.DEFAULT_LEASE_SECONDS == 30 * 24 * 60 * 60
+    assert workspace.MAX_LEASE_SECONDS == 30 * 24 * 60 * 60
 
 
 def test_workspace_branch_ownership_allows_parallel_branches_but_not_duplicates(

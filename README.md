@@ -1,5 +1,7 @@
 # MCP 与 CI 部署服务
 
+MyGithut12 `12.9.29` 将两小时默认 Writer 时间框改为按活动续期的 30 天闲置租约；在 HEAD/Tree/Lease/Owner/CAS/Index 精确一致时，运行中的 fast/full CI 不再单独阻断后续代码开发。保留真实 Git 写入并发校验、认证安全、审核及发布门禁。
+
 MyGithut12 `12.9.28` 补齐原 active/no-drift Workspace 与 validating Session 同 HEAD/Tree 但 Revision 落后的只读精确 CAS 恢复计划及真实 recovery_performed 结果，复用原 Request/Worker 持久验证且不重复 CI；会话归属、HEAD、租约或 CAS 无法证明时继续安全拒绝。12.9.27 的漂移恢复详见 [验证漂移恢复说明](docs/MYGITHUB12_VALIDATING_DRIFT_RECOVERY.md)。
 
 MyGithut12 `12.9.24` 为 `frankichen/devhub` 增加显式、固定的生产部署契约：Controller policy 只允许 `devhub-production / control-plane`，WSL Executor 只接受权威 `frankichen/devhub.git` main 的 exact SHA，并固定执行仓库内 `scripts/deploy_production.sh`；调用方不能提供 host、shell、Compose 路径、Docker volume、Secret 或 rollback 行为。DevHub 的正式 CI 仍使用本地 Private CI，不引入 GitHub Actions 额度依赖。
@@ -121,7 +123,7 @@ MyGithut12 源码当前版本为 `12.9.28`；生产运行版本必须以 `get_my
 
 DX-1 的 `apply_development_change_set` 对小 Candidate 保留 `change_set_json`，对大或 exact-byte-sensitive Candidate 使用 MCP runtime `change_set_file`；当 ChatGPT connector 对该字段未稳定注册 fileParam 时，可使用同工具内的 `bundle_file` 作为传输别名，服务端仍按 ChangeSet artifact 处理并返回 `payload_source=change_set_file`。服务端先校验下载原始 bytes 的长度、SHA-256 与可选 Git Blob SHA，再 strict UTF-8 decode、JSON parse 和 ChangeSet validation；不执行 CRLF、Unicode、BOM 或末尾换行规范化。raw strict dry-run 会持久化一个默认 30 分钟、Session/Workspace/HEAD/blob scope 绑定的 `prepared_change_set_id`，真实 write 使用该 ID 并重新执行全部 CAS，而不要求 AI 再传一次 Candidate。下载安全实现与 `put_generated_files(bundle_file)` 共享。
 
-Workspace 写 Lease 默认 7200 秒（2 小时），最大仍为 14400 秒（4 小时）。DX2-WS-01 使用 activity-driven renew：仅受控 Development Session 动作在剩余 Lease 不超过 1800 秒时尝试自动续签，并在 fresh GitHub HEAD/Tree、Workspace/Session identity、revision CAS、drift 和有效 Lease 全部成立后，原子同步 Workspace 与 Session revision；闲置窗口不会后台无限续命。已经过期的 Workspace 不会被普通 renew 或自动续签复活，必须显式调用 `resume_development_workspace` 重新验证 branch/base/Tree 后恢复。
+Workspace 写 Lease 不再是两小时开发时间框。新建/明确续签的 Workspace 默认 30 天可续期空闲租约，最长单次 30 天；DX2-WS-01 保留 activity-driven renew：活跃 Development Session 在剩余 Lease 不超过 1800 秒时自动续期，使用 GitHub HEAD/Tree、Workspace/Session identity、CAS、drift 和 owner 核验后原子同步。现有短租约仍在原到期前按实际活动续期，历史已过期的 Workspace 通过官方 resume 重新验证 branch/base/Tree；不得绕过真实 Writer 身份或外部漂移检查。
 
 DX2-SESSION-01 在 Development Session 活动作业入口增加受控 stale Session recovery：只有 fresh GitHub branch HEAD/Tree 与 Workspace 完全一致、且旧 Session HEAD 能证明是 Workspace HEAD 的祖先时，才允许用 Session revision CAS 前进；真实 external drift 或 identity 无法证明时保持 fail-stop。HEAD 发生恢复时旧 fast/full CI、attestation 和 failure evidence 不再复用，并重新确认或请求 recovered exact HEAD Index；仅 Workspace revision/Lease stale 且 HEAD/Tree 未变时保留仍然 exact-head 的 CI 证据。`session_recovered`、`external_drift_detected`、`recovery_refused` 进入 Development Session event audit，审计持久化异常不会遮蔽主 drift/refusal 错误。
 
@@ -169,7 +171,7 @@ docker compose up -d --build
 
 ## MyGithut12 运行状态
 
-MyGithut12 `12.9.28` 的 compatibility registration 仍为 177 个工具，canonical production Schema 仍为 166 个可见工具，并隐藏 11 个 deprecated/compatibility-only 工具。新能力 `supports_active_workspace_stale_session_recovery=true` 经 `resume_development_task` 暴露；它只 adoption 原 Session 到 active/no-drift Workspace 的 exact current HEAD/Tree，保留原 Workspace、Session、branch 与 PR。旧 `recover_drifted_development_task` 合同继续要求 `drifted + branch_moved_externally`，scope review 仍按 exact changed-path set 验证。
+MyGithut12 `12.9.29` 的 compatibility registration 仍为 177 个工具，canonical production Schema 仍为 166 个可见工具，并隐藏 11 个 deprecated/compatibility-only 工具。新能力 `supports_active_workspace_stale_session_recovery=true` 经 `resume_development_task` 暴露；它只 adoption 原 Session 到 active/no-drift Workspace 的 exact current HEAD/Tree，保留原 Workspace、Session、branch 与 PR。旧 `recover_drifted_development_task` 合同继续要求 `drifted + branch_moved_externally`，scope review 仍按 exact changed-path set 验证。
 
 ### 首次 Session 恢复与安全前进的主干
 

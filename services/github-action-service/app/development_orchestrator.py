@@ -31,6 +31,7 @@ from app.development_failure_pack import build_failure_pack
 from app.mcp_response import store_response_resource
 
 MyGithub12Error=mygithub12.MyGithub12Error
+# Refresh active Writers near inactivity expiry, not on every edit.
 AUTO_RENEW_THRESHOLD_SECONDS=1800
 AUTO_RENEW_SESSION_STATES=frozenset({"active","validating_fast","validating_full","pr_ready"})
 
