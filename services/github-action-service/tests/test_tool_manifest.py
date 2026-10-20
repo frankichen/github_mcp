@@ -89,7 +89,7 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     resume_schema = tools["resume_development_task"].inputSchema["properties"]
     assert resume_schema["recover_stale_session"]["default"] is True
     assert resume_schema["renew_lease"]["default"] is False
-    assert resume_schema["lease_seconds"]["default"] == 7200
+    assert resume_schema["lease_seconds"]["default"] == 30 * 24 * 60 * 60
     assert resume_schema["reviewed_scope_expansion_paths_json"]["default"] == "[]"
     recovery_schema = tools["recover_drifted_development_task"].inputSchema
     assert {"repository", "branch", "workspace_id", "development_session_id", "expected_workspace_revision", "expected_session_revision", "expected_current_head_sha", "expected_current_tree_sha", "expected_base_branch", "expected_base_sha", "idempotency_key"} <= set(recovery_schema["required"])
