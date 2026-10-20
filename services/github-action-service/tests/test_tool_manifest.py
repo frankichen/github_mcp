@@ -93,7 +93,7 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert resume_schema["reviewed_scope_expansion_paths_json"]["default"] == "[]"
     recovery_schema = tools["recover_drifted_development_task"].inputSchema
     assert {"repository", "branch", "workspace_id", "development_session_id", "expected_workspace_revision", "expected_session_revision", "expected_current_head_sha", "expected_current_tree_sha", "expected_base_branch", "expected_base_sha", "idempotency_key"} <= set(recovery_schema["required"])
-    assert recovery_schema["properties"]["lease_seconds"]["default"] == 7200
+    assert recovery_schema["properties"]["lease_seconds"]["default"] == 30 * 24 * 60 * 60
     assert recovery_schema["properties"]["reviewed_scope_expansion_paths_json"]["default"] == "[]"
     assert recovery_schema["properties"]["reviewed_scope_expansion_paths_json"]["type"] == "string"
     assert "exactly equal" in tools["recover_drifted_development_task"].description
@@ -106,7 +106,7 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
         "expected_old_session_head_sha", "expected_current_head_sha",
         "expected_current_tree_sha", "idempotency_key",
     } <= set(base_sync_schema["required"])
-    assert base_sync_schema["properties"]["lease_seconds"]["default"] == 7200
+    assert base_sync_schema["properties"]["lease_seconds"]["default"] == 30 * 24 * 60 * 60
     assert "reviewed_overlap_paths_json" not in set(base_sync_schema["required"])
     assert base_sync_schema["properties"]["reviewed_overlap_paths_json"]["default"] == "[]"
     assert base_sync_schema["properties"]["reviewed_overlap_paths_json"]["type"] == "string"
@@ -122,7 +122,7 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
         "expected_new_base_branch", "expected_new_base_sha", "expected_old_session_head_sha",
         "expected_current_head_sha", "expected_current_tree_sha", "idempotency_key",
     } <= set(retarget_schema["required"])
-    assert retarget_schema["properties"]["lease_seconds"]["default"] == 7200
+    assert retarget_schema["properties"]["lease_seconds"]["default"] == 30 * 24 * 60 * 60
     assert "reviewed_overlap_paths_json" not in set(retarget_schema["required"])
     assert retarget_schema["properties"]["reviewed_overlap_paths_json"]["default"] == "[]"
     assert retarget_schema["properties"]["reviewed_overlap_paths_json"]["type"] == "string"
@@ -170,7 +170,7 @@ async def test_registered_tool_manifest_is_stable_and_unique(monkeypatch):
     assert "operation" not in builder_schema["required"]
     for lease_tool_name in ("create_development_workspace", "renew_development_workspace_lease", "resume_development_workspace", "prepare_development_task"):
         lease_schema = tools[lease_tool_name].inputSchema["properties"]["lease_seconds"]
-        assert lease_schema["default"] == 7200
+        assert lease_schema["default"] == 30 * 24 * 60 * 60
     assert tools["resume_development_workspace"].annotations.readOnlyHint is False
     assert tools["search_repository_text"].annotations.readOnlyHint is True
     assert tools["analyze_repository_patch_from_ref"].annotations.readOnlyHint is True
