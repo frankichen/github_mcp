@@ -188,6 +188,7 @@ def init_ci_request_schema(db) -> None:
         db.execute("BEGIN IMMEDIATE")
         try:
             _backfill_legacy_jobs(db)
+            reconcile_pending_worker_requests_in_db(db)
             db.commit()
         except Exception:
             db.rollback()
@@ -778,6 +779,125 @@ def _insert_event(
         ),
     )
     return int(cursor.lastrowid)
+
+
+
+def _matching_attestation_in_db(db, request, job, tree_sha):
+    """Find only an active exact job/commit/tree attestation; never synthesize one."""
+    if str(job["status"]) != "passed":
+        return None
+    if not db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ci_tree_attestations'"
+    ).fetchone():
+        return None
+    row = db.execute(
+        """SELECT attestation_id FROM ci_tree_attestations
+           WHERE private_ci_job_id = ? AND repository = ?
+             AND tested_commit_sha = ? AND tested_tree_sha = ?
+             AND profile = ? AND status = 'active' AND revoked_at IS NULL
+             AND expires_at > ?
+           ORDER BY created_at DESC, attestation_id DESC LIMIT 1""",
+        (job["job_id"], request["repository"], request["commit_sha"],
+         tree_sha, request["profile"], db_core.now_ts()),
+    ).fetchone()
+    return str(row["attestation_id"]) if row else None
+
+
+def reconcile_worker_request_in_db(db, worker_job_id: str) -> bool:
+    """Reconcile durable Worker truth under an existing serialized CI DB transaction.
+
+    Intermediate Worker events can be lost; the exact, persisted terminal Worker
+    is authoritative. This cannot schedule/re-run CI, change a Worker, or reopen
+    a terminal Request. All projection changes are audited and revision-CASed.
+    """
+    request = db.execute(
+        "SELECT * FROM ci_requests WHERE worker_job_id = ?", (worker_job_id,)
+    ).fetchone()
+    job = db.execute(
+        "SELECT * FROM ci_jobs WHERE job_id = ?", (worker_job_id,)
+    ).fetchone()
+    if request is None or job is None:
+        return False
+    if any(request[field] != job[field] for field in
+           ("repository", "branch", "commit_sha", "profile")):
+        return False
+    try:
+        summary = json.loads(job["summary_json"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    tree_sha = summary.get("git_tree_sha") if isinstance(summary, dict) else None
+    if not _SHA_RE.fullmatch(str(request["tree_sha"] or "")) or tree_sha != request["tree_sha"]:
+        return False
+    status = str(job["status"])
+    if status == "passed" and job["exit_code"] != 0:
+        return False
+    if status in _TERMINAL_STATUSES - {"preflight_failed"}:
+        target = ("terminal", status)
+    elif status == "running":
+        target = ("running", "running")
+    else:
+        return False
+    current = (str(request["phase"]), str(request["status"]))
+    if current[0] not in {"queued", "running", "terminal"}:
+        return False
+    if current[0] == "terminal" and current != target:
+        return False
+    if current[0] == "running" and target == ("running", "running"):
+        return False
+    attestation_id = _matching_attestation_in_db(db, request, job, tree_sha)
+    state_changed = current != target
+    attestation_changed = bool(attestation_id and attestation_id != request["attestation_id"])
+    if not state_changed and not attestation_changed:
+        return False
+    revision = int(request["revision"])
+    event_id = _insert_event(
+        db, request_id=request["request_id"], revision=revision + 1,
+        event_type=("worker_terminal_reconciled" if state_changed and target[0] == "terminal"
+                    else "worker_running_reconciled" if state_changed
+                    else "worker_attestation_linked"),
+        from_phase=current[0], from_status=current[1],
+        to_phase=target[0], to_status=target[1],
+        event_data={"source": "durable_ci_job", "worker_job_id": worker_job_id,
+                    "worker_status": status, "commit_sha": request["commit_sha"],
+                    "tree_sha": tree_sha, "attestation_id": attestation_id},
+    )
+    cursor = db.execute(
+        """UPDATE ci_requests SET phase = ?, status = ?, revision = revision + 1,
+               updated_at = ?, last_event_id = ?,
+               attestation_id = COALESCE(?, attestation_id)
+           WHERE request_id = ? AND revision = ? AND phase = ? AND status = ?
+             AND worker_job_id = ? AND tree_sha = ?""",
+        (target[0], target[1], db_core.now_ts(), event_id, attestation_id,
+         request["request_id"], revision, current[0], current[1], worker_job_id, tree_sha),
+    )
+    if cursor.rowcount != 1:
+        raise CIRequestRevisionConflictError(request["request_id"])
+    return True
+
+
+def reconcile_pending_worker_requests_in_db(db) -> int:
+    """Startup repair; Worker truth is replayed without creating new CI Jobs."""
+    rows = db.execute(
+        """SELECT worker_job_id FROM ci_requests WHERE worker_job_id IS NOT NULL
+           AND (phase != 'terminal' OR (status = 'passed' AND attestation_id IS NULL))
+           ORDER BY created_at, request_id"""
+    ).fetchall()
+    return sum(bool(reconcile_worker_request_in_db(db, row["worker_job_id"]))
+               for row in rows)
+
+
+def reconcile_worker_request(worker_job_id: str) -> bool:
+    """Atomic, idempotent reconciliation after Worker/Attestation writes."""
+    db = db_core._get_db()
+    with db_core._db_write_lock:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            changed = reconcile_worker_request_in_db(db, worker_job_id)
+            db.commit()
+            return changed
+        except Exception:
+            db.rollback()
+            raise
 
 
 def _request_row_to_dict(row) -> dict:
