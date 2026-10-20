@@ -158,15 +158,108 @@ def _workspace_cas(workspace_id: str, expected: int) -> sqlite3.Row:
 
 
 def renew_workspace_lease(service: Any, workspace_id: str, expected_workspace_revision: int, lease_seconds: int=DEFAULT_LEASE_SECONDS) -> dict[str,Any]:
-    public=get_workspace(service,workspace_id); _workspace_cas(workspace_id,expected_workspace_revision)
-    if public["status"]=="drifted": raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED","drifted workspace lease cannot be renewed")
-    if public["status"]=="expired": raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED","expired workspace requires explicit resume",{"workspace_id":workspace_id,"requires_resume":True})
-    if public["status"]!="active": raise MyGithub12Error("WORKSPACE_CLOSED","workspace is not active")
-    now=_now(); expires=now+max(60,min(lease_seconds,MAX_LEASE_SECONDS))
-    with _LOCK,_db() as db:
-        cur=db.execute("UPDATE workspaces SET lease_expires_at=?,revision=revision+1,updated_at=? WHERE workspace_id=? AND revision=?",(expires,now,workspace_id,expected_workspace_revision))
-        if cur.rowcount!=1: raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH","workspace changed while renewing lease")
-    return {"ok":True,**get_workspace(service,workspace_id)}
+    """Renew a bare Workspace or atomically renew its canonical Development Session.
+
+    A Workspace-only renewal invalidates a managed Session's pinned Workspace
+    revision, even when no Git bytes changed. The same original Writer must be
+    kept: resolve the unique existing active Session and use the shared-DB
+    Workspace/Session CAS primitive. Never create or replace a Session.
+    """
+    public = get_workspace(service, workspace_id)
+    _workspace_cas(workspace_id, expected_workspace_revision)
+    if public["status"] == "drifted":
+        raise MyGithub12Error("WORKSPACE_BRANCH_DRIFTED", "drifted workspace lease cannot be renewed")
+    if public["status"] == "expired":
+        raise MyGithub12Error("WORKSPACE_LEASE_REQUIRED", "expired workspace requires explicit resume", {"workspace_id": workspace_id, "requires_resume": True})
+    if public["status"] != "active":
+        raise MyGithub12Error("WORKSPACE_CLOSED", "workspace is not active")
+
+    from app import development_session_store as sessions
+    session = sessions.find_active_session_for_workspace(workspace_id)
+    if session is not None:
+        # A blocked/drifted/closing Writer must not receive a synthetic heartbeat.
+        if session["status"] not in {"preparing", "active", "pr_ready", "validating_fast", "validating_full"}:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_STATE_INVALID",
+                "managed Workspace cannot renew while its original Session is blocked",
+                {"development_session_id": session["session_id"], "status": session["status"]},
+            )
+        identity_pairs = (
+            ("workspace_id", "workspace_id"), ("repository", "repository"),
+            ("branch", "branch"), ("owner", "owner"), ("base_branch", "base_branch"),
+            ("base_commit_sha", "base_commit_sha"),
+            ("head_commit_sha", "head_sha"), ("tree_sha", "tree_sha"),
+        )
+        mismatches = [
+            left for left, right in identity_pairs if session.get(left) != public.get(right)
+        ]
+        if mismatches:
+            raise MyGithub12Error(
+                "DEVELOPMENT_SESSION_WORKSPACE_MISMATCH",
+                "managed Workspace and original Session differ in persistent identity",
+                {"workspace_id": workspace_id, "development_session_id": session["session_id"],
+                 "mismatch_fields": mismatches},
+            )
+        # Read the true Git ref before *any* managed lease write. Neither a
+        # stale control-plane row nor a spoofed renewal may mask branch drift.
+        state = service.client.get_branch(public["repository"], public["branch"])
+        actual_head = str(state.commit.sha) if state else ""
+        actual_tree = (
+            _tree_sha(_service_repo(service, public["repository"]).get_commit(actual_head))
+            if actual_head else ""
+        )
+        if actual_head != public["head_sha"] or actual_tree != public["tree_sha"]:
+            raise MyGithub12Error(
+                "WORKSPACE_BRANCH_DRIFTED",
+                "managed Workspace Git identity changed before lease renewal",
+                {"workspace_id": workspace_id, "actual_head_sha": actual_head,
+                 "expected_head_sha": public["head_sha"]},
+            )
+        if (int(session["workspace_revision"]) != int(expected_workspace_revision)
+                or abs(float(session["lease_expires_at"]) - float(public["lease_expires_at"])) > 0.001):
+            # Repair a *previous* lease-only revision split with the existing
+            # GitHub-verified, same-Writer forward recovery. A changed HEAD
+            # already failed the identity gate above and never reaches here.
+            from app import development_orchestrator as orchestrator
+            repaired = orchestrator.recover_stale_session(
+                service, session["session_id"], int(session["session_revision"]),
+                int(expected_workspace_revision), str(public["head_sha"]),
+                idempotency_key=(
+                    f"managed-lease-reconcile:{session['session_id']}:"
+                    f"{session['session_revision']}:{expected_workspace_revision}:"
+                    f"{public['head_sha']}"
+                ),
+            )
+            session = repaired["session"]
+        renewed = sessions.auto_renew_session_workspace_lease(
+            session["session_id"], int(session["session_revision"]),
+            workspace_id, int(expected_workspace_revision),
+            lease_seconds=lease_seconds,
+            event_data={"source": "renew_development_workspace_lease",
+                        "writer_owner": session["owner"]},
+        )
+        return {
+            "ok": True, **get_workspace(service, workspace_id),
+            "managed_session_coordinated": True,
+            "development_session_id": session["session_id"],
+            "session_revision": renewed["session"]["session_revision"],
+            "session_workspace_revision": renewed["session"]["workspace_revision"],
+            "lease_renewal_audit": renewed["audit"],
+        }
+
+    # Legacy Workspace without a Development Session keeps the same
+    # workspace-only renewal semantics.
+    now = _now()
+    expires = now + max(60, min(lease_seconds, MAX_LEASE_SECONDS))
+    with _LOCK, _db() as db:
+        cur = db.execute(
+            "UPDATE workspaces SET lease_expires_at=?,revision=revision+1,updated_at=? "
+            "WHERE workspace_id=? AND revision=?",
+            (expires, now, workspace_id, expected_workspace_revision),
+        )
+        if cur.rowcount != 1:
+            raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH", "workspace changed while renewing lease")
+    return {"ok": True, **get_workspace(service, workspace_id)}
 
 
 def resume_workspace(service: Any, workspace_id: str, expected_workspace_revision: int, lease_seconds: int=DEFAULT_LEASE_SECONDS) -> dict[str,Any]:
