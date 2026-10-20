@@ -30,8 +30,8 @@ from app.ci_mcp import build_private_ci_job_list_item
 from app.ci_models import REQUEST_ONLY_TERMINAL_STATUSES
 
 MyGithub12Error = mygithub12.MyGithub12Error
-ACTIVE_SESSION_STATUSES = {"active", "pr_ready"}
-BLOCKED_SESSION_STATUSES = {"blocked", "drifted", "closing", "validating_fast", "validating_full"}
+ACTIVE_SESSION_STATUSES = {"active", "pr_ready", "validating_fast", "validating_full"}
+BLOCKED_SESSION_STATUSES = {"blocked", "drifted", "closing"}
 _EXACT_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
 TRANSIENT_VALIDATION_STATUSES = {"validating_fast": "fast", "validating_full": "full"}
 VALIDATION_IN_PROGRESS_STATUSES = {"queued", "leased", "downloading", "preparing", "running", "cancel_requested"}
@@ -1951,7 +1951,24 @@ def _next_actions(
     ):
         return ["resume_development_task"]
     if "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS" in blockers:
-        return ["get_private_ci_job", "resume_development_task"]
+        # Pinned CI may finish independently while the exact owner develops a new HEAD.
+        other_blockers = [item for item in blockers if item != "DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS"]
+        can_continue = bool(
+            not other_blockers and workspace and session and index
+            and session.get("status") in TRANSIENT_VALIDATION_STATUSES
+            and workspace.get("status") == "active"
+            and workspace.get("lease_valid") and session.get("lease_valid")
+            and session.get("repository") == workspace.get("repository")
+            and session.get("branch") == workspace.get("branch")
+            and session.get("owner") and session.get("owner") == workspace.get("owner")
+            and int(session.get("workspace_revision") or 0) == int(workspace.get("revision") or 0)
+            and session.get("head_commit_sha") == workspace.get("head_sha")
+            and session.get("tree_sha") == workspace.get("tree_sha")
+            and index.get("status") == "ready"
+            and index.get("commit_sha") == workspace.get("head_sha")
+            and index.get("tree_sha") == workspace.get("tree_sha")
+        )
+        return (["continue_write"] if can_continue else []) + ["get_private_ci_job", "resume_development_task"]
     if (recovery_plan or {}).get("recovery_required") and (recovery_plan or {}).get("next_allowed_actions"):
         return list(recovery_plan["next_allowed_actions"])
     if workspace.get("status") == "expired":
@@ -1969,6 +1986,8 @@ def _next_actions(
         actions.append("request_index")
     if not blockers and workspace.get("lease_valid") and session.get("status") in ACTIVE_SESSION_STATUSES and index and index.get("status") == "ready":
         actions.append("continue_write")
+        if session.get("status") in TRANSIENT_VALIDATION_STATUSES:
+            return actions + ["get_private_ci_job", "resume_development_task"]
         if bool((policy.get("policy") or {}).get("private_ci")):
             pending_modes = {
                 str(item.get("mode") or "") for item in (pending_convergences or [])
@@ -2600,6 +2619,11 @@ def resume_task(
         "recovery_blocker": response["recovery_blocker"],
         "recovery_retry_arguments": (workspace_recovery or {}).get("retry_arguments"),
         "blockers": blockers, "next_allowed_actions": next_actions,
-        "writer_ready": bool(response["exact_head"] and not blockers and (workspace or {}).get("lease_valid") and (session or {}).get("lease_valid")),
+        # Current write eligibility is independent of pinned CI completion.
+        "writer_ready": bool(
+            response["exact_head"] and "continue_write" in next_actions
+            and (workspace or {}).get("lease_valid")
+            and (session or {}).get("lease_valid")
+        ),
     }
     return response

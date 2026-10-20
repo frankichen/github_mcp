@@ -1,5 +1,7 @@
 # MCP 与 CI 部署服务
 
+MyGithut12 `12.9.29` 将两小时默认 Writer 时间框改为按活动续期的 30 天闲置租约；在 HEAD/Tree/Lease/Owner/CAS/Index 精确一致时，运行中的 fast/full CI 不再单独阻断后续代码开发。保留真实 Git 写入并发校验、认证安全、审核及发布门禁。
+
 MyGithut12 `12.9.28` 补齐原 active/no-drift Workspace 与 validating Session 同 HEAD/Tree 但 Revision 落后的只读精确 CAS 恢复计划及真实 recovery_performed 结果，复用原 Request/Worker 持久验证且不重复 CI；会话归属、HEAD、租约或 CAS 无法证明时继续安全拒绝。12.9.27 的漂移恢复详见 [验证漂移恢复说明](docs/MYGITHUB12_VALIDATING_DRIFT_RECOVERY.md)。
 
 MyGithut12 `12.9.24` 为 `frankichen/devhub` 增加显式、固定的生产部署契约：Controller policy 只允许 `devhub-production / control-plane`，WSL Executor 只接受权威 `frankichen/devhub.git` main 的 exact SHA，并固定执行仓库内 `scripts/deploy_production.sh`；调用方不能提供 host、shell、Compose 路径、Docker volume、Secret 或 rollback 行为。DevHub 的正式 CI 仍使用本地 Private CI，不引入 GitHub Actions 额度依赖。

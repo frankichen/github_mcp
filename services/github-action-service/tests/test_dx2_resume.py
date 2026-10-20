@@ -474,6 +474,23 @@ def test_resume_reconciles_exact_terminal_fast_validation(monkeypatch):
     assert "continue_write" in result["next_allowed_actions"]
 
 
+def test_pending_validation_is_advisory_for_exact_writer():
+    ws = {**_workspace(), "owner": "writer", "lease_valid": True}
+    session = {**_ready_session(), "owner": "writer", "status": "validating_full",
+               "workspace_revision": ws["revision"], "lease_valid": True}
+    index = {"status": "ready", "commit_sha": ws["head_sha"], "tree_sha": ws["tree_sha"]}
+    actions = resume._next_actions(
+        ["DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS"], ws, session, index,
+        None, {"policy": {"private_ci": True}},
+    )
+    assert actions == ["continue_write", "get_private_ci_job", "resume_development_task"]
+    denied = resume._next_actions(
+        ["DEVELOPMENT_SESSION_VALIDATION_IN_PROGRESS", "WORKSPACE_BRANCH_DRIFTED"],
+        ws, session, index, None, {"policy": {"private_ci": True}},
+    )
+    assert "continue_write" not in denied
+
+
 def test_resume_keeps_running_validation_fail_closed(monkeypatch):
     _, session, _ = _stub_transient_recovery(monkeypatch, status="running")
     monkeypatch.setattr(resume.dx, "validation_result", lambda *args, **kwargs: pytest.fail("running CI must not be observed as terminal"))

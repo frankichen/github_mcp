@@ -31,7 +31,8 @@ from app.development_failure_pack import build_failure_pack
 from app.mcp_response import store_response_resource
 
 MyGithub12Error=mygithub12.MyGithub12Error
-AUTO_RENEW_THRESHOLD_SECONDS=1800
+# Refresh active Writers during the last week of the inactivity lease.
+AUTO_RENEW_THRESHOLD_SECONDS=7 * 24 * 60 * 60
 AUTO_RENEW_SESSION_STATES=frozenset({"active","validating_fast","validating_full","pr_ready"})
 
 

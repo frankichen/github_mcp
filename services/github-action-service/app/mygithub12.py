@@ -38,8 +38,9 @@ MAX_INDEX_PROGRESS_INTERVAL_SECONDS = 5.0
 MAX_RESULTS = 500
 MAX_BATCH_FILES = 100
 MAX_BATCH_BYTES = 4 * 1024 * 1024
-DEFAULT_LEASE_SECONDS = 7200
-MAX_LEASE_SECONDS = 14400
+# Renewable inactivity lease, not a two-hour work-time limit.
+DEFAULT_LEASE_SECONDS = 30 * 24 * 60 * 60
+MAX_LEASE_SECONDS = 30 * 24 * 60 * 60
 _EXCLUDED = {".git", "node_modules", "vendor", "dist", "build", "target", ".next", ".venv", "venv", "__pycache__"}
 _SENSITIVE = {".env", "id_rsa", "id_ed25519", "credentials", "credentials.json", "secrets.json", "private.key", "server.key"}
 _BINARY_SUFFIXES = frozenset({
