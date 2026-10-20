@@ -12,6 +12,7 @@ import inspect
 import json
 from typing import Any, Awaitable, Callable, Mapping
 
+from app import attestation_registry
 from app import ci_database
 from app import ci_request_store
 from app import development_convergence_store as convergence_store
@@ -1438,6 +1439,120 @@ async def _advance_index_and_analysis(
     return snapshot, index, analysis
 
 
+
+def _sync_full_ci_session_evidence(
+    session: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    request: Mapping[str, Any],
+    attestation_id: str | None,
+) -> dict[str, Any]:
+    """Bind one existing full PASS to the *current* original Session by CAS.
+
+    A Convergence may retain an older creation revision after harmless
+    Workspace lease changes. Never write that historical revision back into
+    the Session: use the current Session revision only, and independently
+    validate the exact current HEAD/Tree Worker and reusable attestation.
+    """
+    request_id = str(request.get("request_id") or "")
+    worker_job_id = str(request.get("worker_job_id") or "")
+    if (not request_id or not worker_job_id or not attestation_id
+            or request.get("status") != "passed" or request.get("phase") != "terminal"
+            or session.get("status") not in {"active", "pr_ready"}):
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+            "full CI evidence cannot bind to an inactive or incomplete original Session",
+            {"development_session_id": session.get("session_id"),
+             "ci_request_id": request_id, "recovery_required": True},
+        )
+    _validate_ci_request_identity(request, snapshot, "full")
+    if _identity_drift(snapshot, session, str(snapshot["base_sha"])):
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+            "full CI evidence differs from the current Session Git identity",
+            {"development_session_id": session.get("session_id"), "recovery_required": True},
+        )
+
+    job = get_job(worker_job_id)
+    summary = (job or {}).get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+    if not job or any((
+        job.get("repository") != snapshot["repository"],
+        job.get("branch") != snapshot["branch"],
+        job.get("commit_sha") != snapshot["head_sha"],
+        job.get("profile") != "repo-auto-check",
+        job.get("status") != "passed",
+        job.get("exit_code") != 0,
+        summary.get("git_tree_sha") != snapshot["tree_sha"],
+    )):
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+            "full CI Worker does not prove the current exact Commit/Tree",
+            {"ci_request_id": request_id, "worker_job_id": worker_job_id,
+             "recovery_required": True},
+        )
+    verified = attestation_registry.validate_attestation(str(attestation_id))
+    attestation = verified.get("attestation") if isinstance(verified, dict) else None
+    if (not isinstance(attestation, dict)
+            or verified.get("ok") is not True
+            or verified.get("reusable") is not True
+            or any((
+                attestation.get("repository") != snapshot["repository"],
+                attestation.get("tested_commit_sha") != snapshot["head_sha"],
+                attestation.get("tested_tree_sha") != snapshot["tree_sha"],
+                attestation.get("base_sha") != snapshot["base_sha"],
+                attestation.get("private_ci_job_id") != worker_job_id,
+                attestation.get("profile") != "repo-auto-check",
+            ))):
+        raise MyGithub12Error(
+            "DEVELOPMENT_SESSION_RECOVERY_REQUIRED",
+            "full CI attestation is not reusable for the current exact Commit/Tree",
+            {"attestation_id": attestation_id, "ci_request_id": request_id,
+             "recovery_required": True},
+        )
+
+    if (session.get("last_full_ci_job_id") == worker_job_id
+            and session.get("last_attestation_id") == attestation_id):
+        return dict(session)
+
+    # This records an existing verified validation; it does not start another
+    # CI, change a Git ref, create a Writer, or mark a DevHub Worker complete.
+    session_id = str(session["session_id"])
+    revision = int(session["session_revision"])
+    sessions.record_validation(
+        session_id, revision, "full",
+        str(snapshot["head_sha"]), str(snapshot["tree_sha"]),
+        request_id=request_id, job_id=worker_job_id, status="passed",
+        merge_eligible=True, attestation_id=str(attestation_id),
+        evidence={"source": "convergence_exact_head_reconciled",
+                  "ci_request_id": request_id, "convergence_id": snapshot["convergence_id"]},
+        finished=True,
+    )
+    fields = {
+        "last_full_ci_job_id": worker_job_id,
+        "last_attestation_id": str(attestation_id),
+    }
+    try:
+        return sessions.transition(
+            session_id, revision, str(session["status"]),
+            event_type="convergence_full_ci_reconciled",
+            allowed_from={str(session["status"])}, fields=fields,
+        )
+    except MyGithub12Error as exc:
+        if exc.code != "DEVELOPMENT_SESSION_REVISION_MISMATCH":
+            raise
+        # Concurrent identical success may have won the CAS. A different
+        # HEAD or Writer still fails closed; never force the older revision.
+        fresh = sessions.get_session(session_id)
+        if (fresh.get("head_commit_sha") == snapshot["head_sha"]
+                and fresh.get("tree_sha") == snapshot["tree_sha"]
+                and fresh.get("workspace_id") == snapshot["workspace_id"]
+                and fresh.get("last_full_ci_job_id") == worker_job_id
+                and fresh.get("last_attestation_id") == attestation_id):
+            return fresh
+        raise
+
+
 async def _finalize_ci_state(
     snapshot: dict[str, Any],
     session: Mapping[str, Any],
@@ -1448,7 +1563,7 @@ async def _finalize_ci_state(
     *,
     include_failure_pack: bool,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    del session, include_failure_pack
+    del include_failure_pack
     status = _ci_request_status(request)
     if not _ci_request_terminal(request):
         target = "ci_running" if status == "running" else "ci_requested"
@@ -1549,6 +1664,9 @@ async def _finalize_ci_state(
             },
         )
     else:
+        session = _sync_full_ci_session_evidence(
+            session, snapshot, request, attestation_id
+        )
         snapshot = _transition_if_needed(
             snapshot,
             "post_ci_finalize",
@@ -1686,6 +1804,10 @@ async def converge_task(
             if snapshot.get("ci_request_id")
             else None
         )
+        if snapshot.get("phase") == "passed" and mode == "full" and request:
+            session = _sync_full_ci_session_evidence(
+                session, snapshot, request, snapshot.get("attestation_id")
+            )
         validation = _validation_snapshot(
             request,
             ci_job_id=snapshot.get("ci_job_id"),
@@ -1817,6 +1939,8 @@ async def converge_task(
         analysis,
         include_failure_pack=include_failure_pack,
     )
+    if snapshot.get("phase") == "passed" and mode == "full":
+        session = sessions.get_session(development_session_id)
     return _response(
         snapshot,
         session,
