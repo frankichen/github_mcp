@@ -90,11 +90,17 @@ def test_sxt_runtime_overrides_request_only_lenshub_services_and_hooks():
 
 def test_sxt_runtime_overrides_include_react_console_node_workspace():
     data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
+    workspaces = data["repositories"]["frankichen/sxt"]["workspaces"]
     react = next(
-        item for item in data["repositories"]["frankichen/sxt"]["workspaces"]
+        item for item in workspaces
         if item["path"] == "h5/lenshub-console-react"
     )
 
+    assert {item["path"] for item in workspaces} == {
+        ".",
+        "h5/lenshub-console-react",
+        "h5/lenshub-storage-mall",
+    }
     assert react["type"] == "node"
     assert react["package_manager"] == "npm"
     assert react["required_scripts"] == ["test:run", "typecheck", "build"]
