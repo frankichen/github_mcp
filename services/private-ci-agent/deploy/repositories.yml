@@ -26,6 +26,7 @@ repositories:
       - node-check
       - openapi-check
     max_timeout_seconds: 900
+    # Archived admin v1/v2 are intentionally excluded; keep v3 and storage mall explicit.
     workspaces:
       - path: .
         type: auto
@@ -38,15 +39,6 @@ repositories:
         hooks:
           - go-migrate
           - ai-integrity
-      - path: h5/lenshub-console
-        type: node
-        package_manager: npm
-        required_scripts:
-          - test:run
-          - typecheck
-          - build
-        optional_scripts:
-          - lint
       - path: h5/lenshub-console-react
         type: node
         package_manager: npm
