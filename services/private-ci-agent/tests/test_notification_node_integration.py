@@ -6,12 +6,16 @@ from private_ci_agent.notification_node_integration import (
     SIMULATOR_TEST, notification_node_integration_required,
     sxt_go_only_image_allowed)
 
-def test_exact_sxt_full_ci_only():
+def test_exact_sxt_full_ci_only(monkeypatch):
+    monkeypatch.delenv("SXT_LEGACY_SIMULATOR_CI_ENABLED", raising=False)
+    assert not notification_node_integration_required("frankichen/sxt", "repo-auto-check")
+    monkeypatch.setenv("SXT_LEGACY_SIMULATOR_CI_ENABLED", "1")
     assert notification_node_integration_required("frankichen/sxt", "repo-auto-check")
     assert not notification_node_integration_required("frankichen/sxt", "go-check")
     assert not notification_node_integration_required("other/repo", "repo-auto-check")
 
-def test_one_test_delegated_not_removed(tmp_path):
+def test_one_test_delegated_not_removed(tmp_path, monkeypatch):
+    monkeypatch.setenv("SXT_LEGACY_SIMULATOR_CI_ENABLED", "1")
     (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n")
     executor = object.__new__(JobExecutor)
     job = SimpleNamespace(repository="frankichen/sxt", profile="repo-auto-check")
@@ -19,7 +23,12 @@ def test_one_test_delegated_not_removed(tmp_path):
     assert next(c["command"] for c in checks if c["name"] == "gotest") == GO_ONLY_TEST_COMMAND
     job.profile = "go-check"
     checks = executor._workspace_commands({"path": ".", "stack": "go"}, str(tmp_path), job=job)["check"]
-    assert next(c["command"] for c in checks if c["name"] == "gotest") != GO_ONLY_TEST_COMMAND
+    assert next(c["command"] for c in checks if c["name"] == "gotest") == GO_ONLY_TEST_COMMAND
+    monkeypatch.delenv("SXT_LEGACY_SIMULATOR_CI_ENABLED", raising=False)
+    job.profile = "repo-auto-check"
+    checks = executor._workspace_commands({"path": ".", "stack": "go"}, str(tmp_path), job=job)["check"]
+    assert next(c["command"] for c in checks if c["name"] == "gotest") == GO_ONLY_TEST_COMMAND
+    assert not notification_node_integration_required(job.repository, job.profile)
     assert f"--- PASS: {SIMULATOR_TEST}" in NODE_INTEGRATION_COMMAND
     assert f"--- SKIP: {SIMULATOR_TEST}" in NODE_INTEGRATION_COMMAND
 
@@ -35,7 +44,8 @@ class Podman:
         self.runs.append((image, command, kwargs))
         return {"exit_code": 0, "stdout": "", "stderr": "", "timed_out": False}
 
-def test_stage_fails_closed_and_uses_same_real_service(tmp_path):
+def test_stage_fails_closed_and_uses_same_real_service(tmp_path, monkeypatch):
+    monkeypatch.setenv("SXT_LEGACY_SIMULATOR_CI_ENABLED", "1")
     worker = Podman()
     e = object.__new__(JobExecutor)
     e.podman, e.cache_map, e.cancel_event = worker, {"go":str(tmp_path)}, None
@@ -57,7 +67,8 @@ def test_stage_fails_closed_and_uses_same_real_service(tmp_path):
     assert worker.runs[-1][2]["env"]["CI_PROFILE"] == "repo-auto-check"
     assert worker.runs[-1][2]["env"]["SXT_NOTIFICATION_NODE_CI_ENABLED"] == "1"
 
-def test_profile_is_explicit_and_only_full_ci_enables_node_gate(tmp_path):
+def test_profile_is_explicit_and_only_full_ci_enables_node_gate(tmp_path, monkeypatch):
+    monkeypatch.setenv("SXT_LEGACY_SIMULATOR_CI_ENABLED", "1")
     worker = Podman()
     e = object.__new__(JobExecutor)
     e.podman, e.cache_map, e.cancel_event = worker, {"go": str(tmp_path)}, None

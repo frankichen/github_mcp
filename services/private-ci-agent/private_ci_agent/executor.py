@@ -15,6 +15,7 @@ from private_ci_agent.notification_node_integration import (
     GO_ONLY_TEST_COMMAND, NODE_INTEGRATION_COMMAND,
     NODE_INTEGRATION_IMAGE, notification_node_integration_required,
     sxt_go_only_image_allowed,
+    SXT_REPOSITORY,
 )
 from private_ci_agent.affected_selection import select_affected
 from private_ci_agent.contract_integrity import verify_product_contract_integrity
@@ -614,8 +615,11 @@ class JobExecutor:
         ):
             return {"error": "configuration_error",
                     "message": "CI_GO_ONLY_IMAGE_CONTRACT_VIOLATION"}
+        # The retired local App's Node simulator must not run inside either
+        # of SXT's Go-only profiles; optional legacy integration is separate.
         if (job is not None and workspace.get("stack") == "go"
-                and notification_node_integration_required(job.repository, job.profile)
+                and job.repository == SXT_REPOSITORY
+                and job.profile in {"repo-auto-check", "go-check"}
                 and not commands.get("error")):
             checks = [dict(c) for c in commands.get("check", [])]
             for check in checks:

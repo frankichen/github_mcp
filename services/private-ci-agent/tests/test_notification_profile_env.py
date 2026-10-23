@@ -11,7 +11,7 @@ from private_ci_agent.podman import PodmanRunner
 @pytest.mark.parametrize(
     ("repository", "profile", "marker_expected"),
     [
-        ("frankichen/sxt", "repo-auto-check", True),
+        ("frankichen/sxt", "repo-auto-check", False),
         ("frankichen/sxt", "go-check", False),
         ("frankichen/sxt", "repo-fast-check", False),
         ("other/repository", "repo-auto-check", False),
