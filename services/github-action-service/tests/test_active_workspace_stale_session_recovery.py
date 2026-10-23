@@ -342,6 +342,88 @@ def test_idempotent_active_workspace_recovery_does_not_bump_revisions_twice(tmp_
     assert second["development_session"]["session_revision"] == first["development_session"]["session_revision"]
 
 
+
+def _fake_shared_file_overlap(_service, workspace_id):
+    return {
+        "ok": True,
+        "workspace_id": workspace_id,
+        "comparison_verified": True,
+        "items": [{"workspace_id": "ws_other", "level": "high", "evidence": [
+            {"kind": "paths", "items": ["allowed/feature.py"]},
+            {"kind": "changed_paths", "items": ["allowed/feature.py"]},
+        ]}],
+    }
+
+
+@pytest.mark.parametrize("reviewed", ["[]", '["allowed/feature.py","unrelated.py"]'])
+def test_active_shared_file_requires_exact_independent_review(tmp_path, monkeypatch, reviewed):
+    service, session = _seed_active_stale(tmp_path, monkeypatch)
+    monkeypatch.setattr(recovery.mygithub12, "workspace_overlap", _fake_shared_file_overlap)
+    before_workspace, before_session, _ = _db_state(session["session_id"])
+    with pytest.raises(mygithub12.MyGithub12Error) as exc:
+        _call(service, session, reviewed_active_overlap_paths_json=reviewed)
+    assert exc.value.code == "RECOVERY_WORKSPACE_OVERLAP"
+    assert exc.value.details["required_reviewed_active_overlap_paths"] == ["allowed/feature.py"]
+    after_workspace, after_session, _ = _db_state(session["session_id"])
+    assert after_workspace["revision"] == before_workspace["revision"]
+    assert after_session["session_revision"] == before_session["session_revision"]
+
+
+def test_active_shared_file_independently_reviewed_metadata_recovery(tmp_path, monkeypatch):
+    service, session = _seed_active_stale(tmp_path, monkeypatch)
+    monkeypatch.setattr(recovery.mygithub12, "workspace_overlap", _fake_shared_file_overlap)
+    refs_before = dict(service.client.heads)
+    result = _call(service, session, reviewed_active_overlap_paths_json='["allowed/feature.py"]')
+    assert result["recovery_kind"] == "active_workspace_stale_session"
+    assert result["writer_ready"] is True
+    assert result["git_ref_changed"] is False
+    assert service.client.heads == refs_before
+    assert result["verification"]["ownership"]["reviewed_active_overlap_paths"] == ["allowed/feature.py"]
+    assert result["verification"]["ownership"]["required_active_overlap_paths"] == ["allowed/feature.py"]
+    assert result["audit"]["recovery_kind"] == "active_workspace_stale_session"
+    assert result["development_session"]["workspace_revision"] == result["workspace"]["revision"]
+
+
+@pytest.mark.parametrize("unreviewable_kind", ["apis", "tables", "migrations", "symbols", "configs"])
+def test_active_shared_file_cannot_waive_other_contract_conflict(
+    tmp_path, monkeypatch, unreviewable_kind,
+):
+    service, session = _seed_active_stale(tmp_path, monkeypatch)
+    def overlap(_service, workspace_id):
+        response = _fake_shared_file_overlap(_service, workspace_id)
+        response["items"][0]["evidence"].append({"kind": unreviewable_kind, "items": ["collision"]})
+        return response
+    monkeypatch.setattr(recovery.mygithub12, "workspace_overlap", overlap)
+    with pytest.raises(mygithub12.MyGithub12Error) as exc:
+        _call(service, session, reviewed_active_overlap_paths_json='["allowed/feature.py"]')
+    assert exc.value.code == "RECOVERY_WORKSPACE_OVERLAP"
+    assert exc.value.details["unreviewable_workspace_ids"] == ["ws_other"]
+
+
+@pytest.mark.parametrize("reviewed", ['["allowed/feature.py","allowed/feature.py"]', '["../invalid.py"]', '[1]'])
+def test_active_shared_file_review_parser_remains_fail_closed(tmp_path, monkeypatch, reviewed):
+    service, session = _seed_active_stale(tmp_path, monkeypatch)
+    monkeypatch.setattr(recovery.mygithub12, "workspace_overlap", _fake_shared_file_overlap)
+    with pytest.raises(mygithub12.MyGithub12Error) as exc:
+        _call(service, session, reviewed_active_overlap_paths_json=reviewed)
+    assert exc.value.code == "SEARCH_QUERY_INVALID"
+
+
+def test_resume_public_entrypoint_carries_exact_shared_file_review(tmp_path, monkeypatch):
+    service, session = _seed_active_stale(tmp_path, monkeypatch)
+    _patch_resume(service, monkeypatch)
+    monkeypatch.setattr(recovery.mygithub12, "workspace_overlap", _fake_shared_file_overlap)
+    resumed = resume.resume_task(
+        service, REPO, branch=BRANCH, expected_workspace_revision=5,
+        expected_session_revision=session["session_revision"],
+        idempotency_key="resume-exact-active-file-overlap",
+        reviewed_active_overlap_paths_json='["allowed/feature.py"]',
+    )
+    assert resumed["recovery_performed"] is True
+    assert resumed["recovery_required"] is False
+    assert resumed["exact_head"] is True
+
+
 def _patch_resume(service, monkeypatch):
     monkeypatch.setattr(resume, "_repository_policy", lambda repository: {
         "ok": True, "repository": repository, "policy": {"github": True, "private_ci": True},

@@ -20,6 +20,19 @@ Missing files do not count as matching blob identities. A different blob, an abs
 ## Preserved recovery gates
 
 - `reviewed_overlap_paths_json` must still exactly equal the server-recomputed rename-aware overlap set. Absorption never skips this check.
+
+## Explicit concurrent-file review (opt-in)
+
+A base-synchronized Workspace may share *files* with an independently owned, still-active Writer. This must not be confused with imported-base overlap:
+
+- `reviewed_overlap_paths_json` applies **only** to changed paths shared by the imported `old_base -> new_base` delta and the task. It remains exact-match and fail-closed.
+- The new optional `reviewed_active_overlap_paths_json` applies **only** to other active Workspaces' `changed_paths` intersecting this task's authoritative current paths. Defaults to `[]`; without exact explicit review, any high active-Writer overlap continues to fail.
+- The server recomputes the full active path set at each recovery, compares it exactly (no missing, extra or duplicate paths), and fails when overlap evidence cannot be verified or involves an unreviewable API/table/Migration conflict. Active Writers are never closed, replaced or re-leased by this recovery.
+- Explicit review allows only *metadata adoption of an already-forward-merged Git branch*. It does not write source files, merge another Writer's changes, waive Git Blob/HEAD or Workspace/Session CAS, alter a branch's Owner, or grant permission to release/deploy/merge a PR. Later commits still require the normal exact-blob checks, and the later Writer resolves same-file conflicts.
+- Recovery records both the independent base overlap review and the active-Workspace reviewed paths/identities in durable audit data. The review set becomes part of the idempotency identity when nonempty.
+
+Example: imported-base overlap is `[]`, independently active shared file is `internal/modules/account/service.go`. Then supply `reviewed_overlap_paths_json="[]"` and `reviewed_active_overlap_paths_json='["internal/modules/account/service.go"]'`. Mixing the two sets is rejected.
+
 - `reviewed_scope_expansion_paths_json` must still exactly equal every authoritative current path outside the declared Workspace scope. Absorbed historical paths do not grant scope to any other path.
 - Repository/branch identity, old/new base identity, current HEAD/Tree, Workspace and Session revision CAS, branch ownership, lease, and final GitHub reread remain required.
 - Recovery clears old-HEAD CI, Attestation, failure-pack, and Session Index references in the same atomic control-plane transition.
@@ -27,3 +40,17 @@ Missing files do not count as matching blob identities. A different blob, an abs
 ## Deterministic regression fixture
 
 `services/github-action-service/tests/fixtures/base_sync/sxt_task_140_base_absorbed.json` records the SXT Task #140 Rev2 repository, branch, old/new base, old Session HEAD, current HEAD/Tree, reviewed overlap paths, and exact supplied blobs for `i18n/app/latest.v` and `i18n/app/manifest.json`. Tests use a deterministic in-memory Git graph and do not contact SXT or GitHub.
+
+## Active Workspace stale-Session recovery (independent of base-sync)
+
+When `resume_development_task` finds an exact active/no-drift Workspace whose
+Development Session is stale, use the **separate** optional
+`reviewed_active_overlap_paths_json` argument. Its default is `[]` (fail-closed).
+The server recomputes every other active Workspace's branch-changed shared path
+and requires an **exact match** of safe, unique paths. Actual shared-file edits
+may be independently reviewed and the Session metadata recovered without closing
+or replacing either Writer. API/table/migration, symbol or configuration conflicts,
+unverified comparisons and missing/extra reviewed paths remain blocked.
+This is metadata-only recovery; subsequent source edits still require exact
+HEAD/Blob, original Workspace/Session revisions and the ordinary writer CAS.
+No implicit merge, automatic rebase or production release is permitted.
