@@ -160,7 +160,7 @@ def test_drifted_revision_handoff_recovers_original_workspace_without_git_write(
 
 
 @pytest.mark.parametrize("changes,expected_code", [
-    ({"expected_previous_head_sha": "a" * 40}, "RECOVERY_ANCESTRY_MISMATCH"),
+    ({"expected_previous_head_sha": NEW_HEAD}, "RECOVERY_ANCESTRY_MISMATCH"),
     ({"expected_workspace_revision": 6}, "WORKSPACE_REVISION_MISMATCH"),
     ({"expected_current_head_sha": "e" * 40}, "RECOVERY_IDENTITY_MISMATCH"),
     ({"reviewed_base_overlap_paths_json": "[]"}, "RECOVERY_BASE_OVERLAP"),
