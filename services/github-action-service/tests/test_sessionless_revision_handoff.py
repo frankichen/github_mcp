@@ -1,7 +1,10 @@
 """Authorized manager-only first-session revision handoff, no Git ref moves."""
 import json
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 import pytest
+sys.path.insert(0, str(Path(__file__).parent))
 from app import development_sessionless_recovery as recovery
 from app import development_session_store as sessions
 from app import mygithub12
