@@ -9,6 +9,8 @@ from fastapi import APIRouter, HTTPException, Request
 from app.config import settings
 from app.deployment_service import acknowledge_cancelled_deployment, append_deployment_log_batch, complete_test_deployment, fail_test_deployment, list_delegated_deployments, update_test_deployment_progress
 
+from app.manual_release_reconciliation import preflight_manual_release, reconcile_manual_release
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/internal/deployments", tags=["Deployments"])
 
@@ -20,6 +22,28 @@ async def _authorize(request: Request) -> None:
         raise HTTPException(status_code=503, detail={"error": "deployment_callback_not_configured"})
     if not supplied or not hmac.compare_digest(supplied, configured):
         raise HTTPException(status_code=401, detail={"error": "deployment_callback_unauthorized"})
+
+
+@router.post("/manual-release/preflight")
+async def manual_release_preflight(request: Request):
+    await _authorize(request)
+    body = await request.json()
+    result = preflight_manual_release(body if isinstance(body, dict) else {})
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error"))
+    return result
+
+
+@router.post("/manual-release/complete")
+async def manual_release_complete(request: Request):
+    await _authorize(request)
+    body = await request.json()
+    result = reconcile_manual_release(body if isinstance(body, dict) else {})
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error"))
+    logger.info("Manual release reconciled id=%s idempotent=%s",
+                result.get("deployment_id"), result.get("idempotent"))
+    return result
 
 
 @router.get("/assigned")

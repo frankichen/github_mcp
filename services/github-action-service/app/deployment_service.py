@@ -300,9 +300,19 @@ def _persist_release_snapshot(release: dict, repository: str = REPOSITORY) -> No
     })
     safe = {key: value for key, value in current.items() if key not in {"env", "secrets", "credentials"}}
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(safe, handle, ensure_ascii=False)
-        handle.write("\n")
+    # Atomic replace protects the previous verified registry if fsync or disk
+    # access fails. The temporary path stays in the same filesystem.
+    temp_path = f"{path}.tmp-{uuid.uuid4().hex}"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(safe, handle, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def _repo_state(repository, commit_sha):
