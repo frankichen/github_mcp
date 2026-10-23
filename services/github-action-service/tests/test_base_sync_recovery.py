@@ -1538,6 +1538,99 @@ def test_t16_active_overlapping_writer_is_never_ignored_without_terminal_merged_
     assert exc.value.code == "RECOVERY_WORKSPACE_OVERLAP"
 
 
+
+def _stage_concurrent_file_writer(service, monkeypatch):
+    # Other Writer is active on a different branch. Its changed file overlaps,
+    # but it has no ownership of this task's branch, HEAD, or Lease.
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            "INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            _workspace_row(
+                workspace_id="ws_concurrent_file",
+                branch="ai/independent-feature",
+                status="active",
+                revision=1,
+                base_sha=OLD_BASE,
+                head=OTHER_HEAD,
+                tree=service.repo.trees[OTHER_HEAD],
+                scope={"paths": ["allowed/**"]},
+            ),
+        )
+    other_ws = mygithub12.get_workspace(service, "ws_concurrent_file")
+    sessions.create_session(other_ws, idempotency_key="independent-feature")
+    monkeypatch.setattr(
+        recovery.mygithub12,
+        "workspace_overlap",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "comparison_verified": True,
+            "workspace_id": WORKSPACE_ID,
+            "items": [{
+                "workspace_id": "ws_concurrent_file",
+                "branch": "ai/independent-feature",
+                "level": "high",
+                "evidence": [{"kind": "changed_paths", "items": ["allowed/feature.py"]}],
+            }],
+        },
+    )
+
+
+def test_active_shared_file_reviewed_exactly_recovers_without_base_overlap(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _stage_concurrent_file_writer(service, monkeypatch)
+    result = _call(
+        service, session,
+        reviewed_active_overlap_paths_json=json.dumps(["allowed/feature.py"]),
+    )
+    assert result["control_plane_recovery"] == "CONTROL_PLANE_BASE_SYNC_RECOVERY_SUCCESS"
+    assert result["verification"]["deltas"]["actual_overlap_paths"] == []
+    assert result["verification"]["ownership"]["reviewed_active_overlap_paths"] == ["allowed/feature.py"]
+    assert result["audit"]["reviewed_active_overlap_paths"] == ["allowed/feature.py"]
+    assert result["workspace"]["status"] == "active"
+    assert result["workspace"]["head_sha"] == CURRENT_HEAD
+    assert result["development_session"]["head_commit_sha"] == CURRENT_HEAD
+    assert mygithub12.get_workspace(service, "ws_concurrent_file")["status"] == "active"
+
+
+@pytest.mark.parametrize("reviewed", [[], ["some/other.py"], ["allowed/feature.py", "extra.py"]])
+def test_active_shared_file_review_is_fail_closed_for_nonexact_set(tmp_path, monkeypatch, reviewed):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _stage_concurrent_file_writer(service, monkeypatch)
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(
+            service, session,
+            reviewed_active_overlap_paths_json=json.dumps(reviewed),
+        )
+    assert exc.value.code == "RECOVERY_WORKSPACE_OVERLAP"
+    assert mygithub12.get_workspace(service, WORKSPACE_ID)["status"] == "drifted"
+
+
+def test_reviewed_active_file_does_not_waive_base_delta_overlap(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _stage_concurrent_file_writer(service, monkeypatch)
+    # Base merge changed the same file as this task. Explicitly approving the
+    # other Writer must not approve an unrelated imported-base overlap.
+    service.repo.set_compare(OLD_BASE, NEW_BASE, paths=["allowed/feature.py"])
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(
+            service, session,
+            reviewed_active_overlap_paths_json=json.dumps(["allowed/feature.py"]),
+        )
+    assert exc.value.code == "RECOVERY_BASE_SYNC_OVERLAP"
+
+
+def test_active_overlap_unverified_comparison_is_unavailable(tmp_path, monkeypatch):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _stage_concurrent_file_writer(service, monkeypatch)
+    original_overlap = recovery.mygithub12.workspace_overlap
+    def not_verified(*args, **kwargs):
+        return {**original_overlap(*args, **kwargs), "comparison_verified": False}
+    monkeypatch.setattr(recovery.mygithub12, "workspace_overlap", not_verified)
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session, reviewed_active_overlap_paths_json=json.dumps(["allowed/feature.py"]))
+    assert exc.value.code == "RECOVERY_WORKSPACE_OVERLAP_UNAVAILABLE"
+
+
 def test_imported_base_path_does_not_create_false_current_task_overlap(tmp_path, monkeypatch):
     service, session, _ = _seed(tmp_path, monkeypatch)
     monkeypatch.setattr(

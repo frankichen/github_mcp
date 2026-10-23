@@ -20,6 +20,19 @@ Missing files do not count as matching blob identities. A different blob, an abs
 ## Preserved recovery gates
 
 - `reviewed_overlap_paths_json` must still exactly equal the server-recomputed rename-aware overlap set. Absorption never skips this check.
+
+## Explicit concurrent-file review (opt-in)
+
+A base-synchronized Workspace may share *files* with an independently owned, still-active Writer. This must not be confused with imported-base overlap:
+
+- `reviewed_overlap_paths_json` applies **only** to changed paths shared by the imported `old_base -> new_base` delta and the task. It remains exact-match and fail-closed.
+- The new optional `reviewed_active_overlap_paths_json` applies **only** to other active Workspaces' `changed_paths` intersecting this task's authoritative current paths. Defaults to `[]`; without exact explicit review, any high active-Writer overlap continues to fail.
+- The server recomputes the full active path set at each recovery, compares it exactly (no missing, extra or duplicate paths), and fails when overlap evidence cannot be verified or involves an unreviewable API/table/Migration conflict. Active Writers are never closed, replaced or re-leased by this recovery.
+- Explicit review allows only *metadata adoption of an already-forward-merged Git branch*. It does not write source files, merge another Writer's changes, waive Git Blob/HEAD or Workspace/Session CAS, alter a branch's Owner, or grant permission to release/deploy/merge a PR. Later commits still require the normal exact-blob checks, and the later Writer resolves same-file conflicts.
+- Recovery records both the independent base overlap review and the active-Workspace reviewed paths/identities in durable audit data. The review set becomes part of the idempotency identity when nonempty.
+
+Example: imported-base overlap is `[]`, independently active shared file is `internal/modules/account/service.go`. Then supply `reviewed_overlap_paths_json="[]"` and `reviewed_active_overlap_paths_json='["internal/modules/account/service.go"]'`. Mixing the two sets is rejected.
+
 - `reviewed_scope_expansion_paths_json` must still exactly equal every authoritative current path outside the declared Workspace scope. Absorbed historical paths do not grant scope to any other path.
 - Repository/branch identity, old/new base identity, current HEAD/Tree, Workspace and Session revision CAS, branch ownership, lease, and final GitHub reread remain required.
 - Recovery clears old-HEAD CI, Attestation, failure-pack, and Session Index references in the same atomic control-plane transition.
