@@ -31,8 +31,17 @@ _FIELDS = {
     "idempotency_key",
     "lease_seconds",
     "reviewed_scope_expansion_paths_json",
+    "expected_live_base_sha",
+    "next_owner",
+    "reviewed_base_overlap_paths_json",
+    "expected_writer_lease_id",
+    "expected_active_binding_id",
 }
-_REQUIRED = _FIELDS - {"lease_seconds", "reviewed_scope_expansion_paths_json"}
+_REQUIRED = _FIELDS - {
+    "lease_seconds", "reviewed_scope_expansion_paths_json",
+    "expected_live_base_sha", "next_owner", "reviewed_base_overlap_paths_json",
+    "expected_writer_lease_id", "expected_active_binding_id",
+}
 
 
 def main() -> int:
@@ -86,6 +95,9 @@ def main() -> int:
                 "confirmed": False,
                 "workspace_id": result["workspace_id"],
                 "owner": result["owner"],
+                "next_owner": result.get("next_owner", result["owner"]),
+                "reviewed_base_overlap_paths": result.get("reviewed_base_overlap_paths", []),
+                "base_advance": result.get("base_advance", {}),
                 "workspace_revision": result["workspace_revision"],
                 "current_head_sha": result["current_head_sha"],
                 "required_scope_expansion_paths": result[

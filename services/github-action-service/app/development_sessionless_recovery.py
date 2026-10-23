@@ -34,6 +34,10 @@ def _identity_payload(
     lease_seconds: int,
     paths: list[str],
     expected_live_base_sha: str,
+    next_owner: str = "",
+    reviewed_base_overlap_paths: list[str] | None = None,
+    expected_writer_lease_id: int = 0,
+    expected_active_binding_id: int = 0,
 ) -> dict[str, Any]:
     request = {
         "repository": repository,
@@ -51,6 +55,12 @@ def _identity_payload(
     }
     if expected_live_base_sha:
         request["expected_live_base_sha"] = expected_live_base_sha
+    if next_owner:
+        request["next_owner"] = next_owner
+        request["expected_writer_lease_id"] = expected_writer_lease_id
+        request["expected_active_binding_id"] = expected_active_binding_id
+    if reviewed_base_overlap_paths:
+        request["reviewed_base_overlap_paths"] = sorted(reviewed_base_overlap_paths)
     return request
 
 
@@ -143,6 +153,7 @@ def _fresh_pinned_base_proof(
     service: Any, repository: str, branch: str, current_head_sha: str,
     current_tree_sha: str, base_branch: str, pinned_base_sha: str,
     expected_live_base_sha: str, confirm: bool,
+    reviewed_base_overlap_paths: list[str] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Keep the historical pinned base, but prove disjoint forward main progress.
 
@@ -181,10 +192,20 @@ def _fresh_pinned_base_proof(
                 "base_ancestry": base_ancestry, "task_ancestry": task_ancestry,
                 "base_changed_paths": base_paths, "task_changed_paths": task_paths,
                 "overlapping_paths": overlapping}
-    if overlapping:
+    # Creating a Session does NOT sync or move the task branch. An operator can
+    # acknowledge an EXACT reviewed overlap under the live-base SHA guard.
+    # Existing public MCP callers do not expose this operator-only parameter.
+    approved = sorted(reviewed_base_overlap_paths or [])
+    if overlapping and not reviewed_base_overlap_paths:
         raise Error("RECOVERY_BASE_OVERLAP",
                     "advanced main overlaps the pinned task delta; manual review required",
                     evidence)
+    if approved != overlapping:
+        raise Error("RECOVERY_BASE_OVERLAP_REVIEW_MISMATCH",
+                    "explicit reviewed overlap paths must match the fresh exact path set",
+                    {**evidence, "reviewed_overlap_paths": approved})
+    evidence["reviewed_overlap_paths"] = approved
+    evidence["no_base_sync_or_merge"] = True
     return repo, evidence
 
 
@@ -205,6 +226,10 @@ def recover_sessionless_workspace(
     lease_seconds: int = mygithub12.DEFAULT_LEASE_SECONDS,
     reviewed_scope_expansion_paths_json: str = "[]",
     expected_live_base_sha: str = "",
+    next_owner: str = "",
+    reviewed_base_overlap_paths_json: str = "[]",
+    expected_writer_lease_id: int = 0,
+    expected_active_binding_id: int = 0,
 ) -> dict[str, Any]:
     """Preview or CAS-reconcile a unique original Workspace without any Session.
 
@@ -251,6 +276,24 @@ def recover_sessionless_workspace(
     reviewed = drift._parse_reviewed_scope_expansion_paths(
         reviewed_scope_expansion_paths_json
     )
+    reviewed_base_overlap = drift._parse_reviewed_scope_expansion_paths(
+        reviewed_base_overlap_paths_json
+    )
+    if next_owner:
+        before = re.fullmatch(r"(WORKER-[ABC]):#([1-9][0-9]*):([1-9][0-9]*)", expected_owner)
+        after = re.fullmatch(r"(WORKER-[ABC]):#([1-9][0-9]*):([1-9][0-9]*)", next_owner)
+        if (not before or not after or before.group(1,2) != after.group(1,2)
+                or int(after.group(3)) != int(before.group(3)) + 1):
+            raise Error("RECOVERY_OWNER_TRANSITION_INVALID",
+                        "only same Worker and Task to immediate next Revision is allowed")
+        if expected_writer_lease_id <= 0 or expected_active_binding_id <= 0:
+            raise Error("RECOVERY_OPERATOR_ATTESTATION_REQUIRED",
+                        "operator must cite exact fresh DevHub Writer Lease and active new Revision Binding")
+        if not expected_live_base_sha:
+            raise Error("RECOVERY_BASE_ADVANCE_REVIEW_REQUIRED",
+                        "owner transfer must pin the exact live main SHA")
+    elif expected_writer_lease_id or expected_active_binding_id:
+        raise Error("SEARCH_QUERY_INVALID", "lease/binding attestation requires a new owner")
     request = _identity_payload(
         repository,
         branch,
@@ -265,6 +308,10 @@ def recover_sessionless_workspace(
         lease_seconds,
         reviewed,
         expected_live_base_sha,
+        next_owner,
+        reviewed_base_overlap,
+        expected_writer_lease_id,
+        expected_active_binding_id,
     )
     digest = hashlib.sha256(
         json.dumps(request, sort_keys=True, ensure_ascii=False).encode()
@@ -285,8 +332,8 @@ def recover_sessionless_workspace(
             or existing.get("branch") != branch
             or workspace.get("repository") != repository
             or workspace.get("branch") != branch
-            or existing.get("owner") != expected_owner
-            or workspace.get("owner") != expected_owner
+            or existing.get("owner") != (next_owner or expected_owner)
+            or workspace.get("owner") != (next_owner or expected_owner)
             or workspace.get("base_branch") != expected_base_branch
             or workspace.get("base_commit_sha") != expected_base_sha
             or existing.get("base_commit_sha") != expected_base_sha
@@ -312,6 +359,7 @@ def recover_sessionless_workspace(
             service, repository, branch, expected_current_head_sha,
             expected_current_tree_sha, expected_base_branch,
             expected_base_sha, expected_live_base_sha, True,
+            reviewed_base_overlap,
         )
         drift._verify_ownership(service, workspace)
         return {
@@ -350,6 +398,9 @@ def recover_sessionless_workspace(
         and workspace.get("drift_reason") is None
         and workspace.get("lease_valid")
     )
+    if next_owner and not active:
+        raise Error("RECOVERY_OWNER_TRANSITION_INVALID",
+                    "revision handoff requires active no-drift Workspace and valid original lease")
     if not (drifted or active):
         raise Error(
             "RECOVERY_DRIFT_REASON_UNSUPPORTED",
@@ -378,6 +429,7 @@ def recover_sessionless_workspace(
         service, repository, branch, expected_current_head_sha,
         expected_current_tree_sha, expected_base_branch,
         expected_base_sha, expected_live_base_sha, confirm,
+        reviewed_base_overlap,
     )
     if drifted:
         old_tree = mygithub12._tree_sha(repo.get_commit(expected_previous_head_sha))
@@ -407,6 +459,10 @@ def recover_sessionless_workspace(
         "git_ref_changed": False,
         "workspace_id": workspace_id,
         "owner": expected_owner,
+        "next_owner": next_owner or expected_owner,
+        "expected_writer_lease_id": expected_writer_lease_id or None,
+        "expected_active_binding_id": expected_active_binding_id or None,
+        "reviewed_base_overlap_paths": reviewed_base_overlap,
         "workspace_revision": int(expected_workspace_revision),
         "current_head_sha": expected_current_head_sha,
         "current_tree_sha": expected_current_tree_sha,
@@ -484,11 +540,12 @@ def recover_sessionless_workspace(
                 service, repository, branch, expected_current_head_sha,
                 expected_current_tree_sha, expected_base_branch,
                 expected_base_sha, expected_live_base_sha, True,
+                reviewed_base_overlap,
             )
             # Expand scope only to the exact, reviewed forward delta. No refs or code files move.
             cursor = db.execute(
                 """UPDATE workspaces SET status='active',drift_reason=NULL,
-                   lease_expires_at=?,index_commit_sha=?,scope_json=?,
+                   lease_expires_at=?,index_commit_sha=?,scope_json=?,owner=?,
                    revision=revision+1,updated_at=?
                    WHERE workspace_id=? AND revision=?""",
                 (
@@ -499,6 +556,7 @@ def recover_sessionless_workspace(
                         ensure_ascii=False,
                         separators=(",", ":"),
                     ),
+                    next_owner or expected_owner,
                     now,
                     workspace_id,
                     int(expected_workspace_revision),
@@ -515,6 +573,11 @@ def recover_sessionless_workspace(
                     "source": "first_canonical_session",
                     "previous_head_sha": expected_previous_head_sha,
                     "reviewed_paths": reviewed,
+                    "reviewed_base_overlap_paths": reviewed_base_overlap,
+                    "old_owner": expected_owner,
+                    "new_owner": next_owner or expected_owner,
+                    "devhub_writer_lease_id": expected_writer_lease_id or None,
+                    "devhub_new_binding_id": expected_active_binding_id or None,
                     "git_ref_changed": False,
                     "base_advance": base_advance,
                 }
@@ -531,7 +594,7 @@ def recover_sessionless_workspace(
                 1,
                 new_revision,
                 "active",
-                expected_owner,
+                next_owner or expected_owner,
                 new_lease,
                 expected_current_head_sha,
                 None,
@@ -566,6 +629,11 @@ def recover_sessionless_workspace(
                     "old_head_sha": expected_previous_head_sha,
                     "current_head_sha": expected_current_head_sha,
                     "reviewed_paths": reviewed,
+                    "reviewed_base_overlap_paths": reviewed_base_overlap,
+                    "old_owner": expected_owner,
+                    "new_owner": next_owner or expected_owner,
+                    "devhub_writer_lease_id": expected_writer_lease_id or None,
+                    "devhub_new_binding_id": expected_active_binding_id or None,
                     "base_advance": base_advance,
                     "request_sha256": digest,
                 },
@@ -587,7 +655,7 @@ def recover_sessionless_workspace(
     return {
         "ok": True,
         "confirmed": True,
-        "recovery_kind": "first_canonical_session",
+        "recovery_kind": "revision_handoff_first_session" if next_owner else "first_canonical_session",
         "created_first_session": True,
         "replayed": False,
         "no_replacement_workspace": True,
