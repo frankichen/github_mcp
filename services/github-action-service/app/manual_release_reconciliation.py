@@ -39,16 +39,20 @@ def _eligible_sha(sha: str, job_id: str = "") -> tuple[str | None, str | None]:
     if sha != current_main:
         return "COMMIT_NOT_CURRENT_MAIN", None
     try:
+        if job_id:
+            # The original preflight-selected job remains valid even after
+            # dozens of unrelated later CI runs. No list pagination cutoff.
+            reason, _ = ds._ci_gate(ds.REPOSITORY, job_id, sha)
+            return (reason, None) if reason else (None, job_id)
         jobs = list_jobs(repository=ds.REPOSITORY, branch="main",
                          commit_sha=sha, status="passed", limit=30)
+        for job in jobs:
+            candidate = job.get("job_id", "")
+            reason, _ = ds._ci_gate(ds.REPOSITORY, candidate, sha)
+            if not reason:
+                return None, candidate
     except Exception:
         return "PRIVATE_CI_UNAVAILABLE", None
-    candidates = [item for item in jobs if not job_id or item.get("job_id") == job_id]
-    for job in candidates:
-        candidate = job.get("job_id", "")
-        reason, _ = ds._ci_gate(ds.REPOSITORY, candidate, sha)
-        if not reason:
-            return None, candidate
     return "PRIVATE_CI_REQUIRED", None
 
 
@@ -139,8 +143,6 @@ def reconcile_manual_release(body: dict) -> dict:
         if _active_deployment(db):
             return _error("DEPLOYMENT_ALREADY_ACTIVE")
         actual = _registered_current()
-        if expected != actual:
-            return _error("DEPLOYMENT_RELEASE_DRIFT")
         existing = db.execute(
             "SELECT * FROM deployments WHERE repository=? AND environment=? "
             "AND target_release=? AND status='passed' ORDER BY created_at DESC LIMIT 1",
@@ -149,6 +151,19 @@ def reconcile_manual_release(body: dict) -> dict:
         if existing and existing["commit_sha"] != sha:
             return _error("MANUAL_RELEASE_ID_CONFLICT")
         already = bool(existing and existing["commit_sha"] == sha)
+        if already and actual == body["release_id"]:
+            # An HTTP response can be lost after the first successful write.
+            # Retrying the same original CAS ticket is safe and must not
+            # rewrite previous_release_id to point at the current release.
+            return {
+                "ok": True, "idempotent": True,
+                "deployment_id": existing["deployment_id"],
+                "release_id": body["release_id"],
+                "git_sha": sha, "status": "passed",
+                "source": "verified_manual_script",
+            }
+        if expected != actual:
+            return _error("DEPLOYMENT_RELEASE_DRIFT")
         deployment_id = existing["deployment_id"] if already else "dep_" + uuid.uuid4().hex
         now = ds._now()
         if not already:

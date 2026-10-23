@@ -62,9 +62,17 @@ def test_registration_is_durable_idempotent_and_audited(monkeypatch, tmp_path):
     first = manual.reconcile_manual_release(proof)
     assert first["ok"] and first["idempotent"] is False
     assert manual._registered_current() == RID
-    second = manual.reconcile_manual_release({**proof, "expected_current_release_id": RID})
+    # Retry with the SAME ticket if the success HTTP response was lost.
+    second = manual.reconcile_manual_release(proof)
     assert second["ok"] and second["idempotent"] is True
     assert second["deployment_id"] == first["deployment_id"]
+    snapshot = manual.ds._status_snapshot("frankichen/sxt")
+    assert snapshot["previous_release_id"] == "old"
+    assert snapshot["current_release_id"] == RID
+    # A newer ticket is also idempotent without mutating history.
+    third = manual.reconcile_manual_release({**proof, "expected_current_release_id": RID})
+    assert third["ok"] and third["idempotent"] is True
+    assert manual.ds._status_snapshot("frankichen/sxt")["previous_release_id"] == "old"
     row = manual.ds._get_deploy_db().execute(
         "SELECT requested_by, status, private_ci_job_id FROM deployments "
         "WHERE deployment_id=?", (first["deployment_id"],),
@@ -108,3 +116,13 @@ def test_active_managed_deployment_blocks_manual_adoption(monkeypatch, tmp_path)
         "git_sha": SHA,
     })["error"]["code"] == "DEPLOYMENT_ALREADY_ACTIVE"
     assert manual.reconcile_manual_release(_evidence())["error"]["code"] == "DEPLOYMENT_ALREADY_ACTIVE"
+
+
+def test_selected_private_ci_job_ignores_list_pagination(monkeypatch):
+    calls = []
+    monkeypatch.setattr(manual.ds, "_repo_state", lambda repo, sha: (sha, []))
+    monkeypatch.setattr(manual.ds, "_ci_gate", lambda repo, job_id, sha: (None, {"job_id": job_id}))
+    monkeypatch.setattr(manual, "list_jobs", lambda **kwargs: calls.append(kwargs) or [])
+    reason, job_id = manual._eligible_sha(SHA, "old-but-still-valid-main-ci")
+    assert reason is None and job_id == "old-but-still-valid-main-ci"
+    assert calls == []
