@@ -168,6 +168,67 @@ def _step(line: str) -> str:
     return "running"
 
 
+def _extract_release_evidence(
+    output: str, expected_git_sha: str, repository: str = EXPECTED_REPOSITORY
+) -> tuple[str, str] | None:
+    """Extract real release success evidence, including blue/green single-line reports."""
+    if repository != EXPECTED_REPOSITORY:
+        # The shared executor also serves DevHub and auto_gupiao, whose scripts
+        # retain the legacy standalone release_id/current output contract.
+        release_match = re.search(r"^release_id=(\S+)$", output, re.MULTILINE)
+        current_match = re.search(r"^current=(\S+)$", output, re.MULTILINE)
+        release_id = release_match.group(1) if release_match else None
+        release_path = current_match.group(1) if current_match else f"/home/dly/releases/{release_id}"
+        if not release_id or not release_path or os.path.basename(release_path.rstrip("/")) != release_id:
+            return None
+        return release_id, release_path
+
+    # The SXT blue/green contract emits one line of key=value tokens.
+    # Historical non-blue/green releases emit a bounded multiline REPORT.
+    lines = output.splitlines()
+    last_report = None
+    for index, line in enumerate(lines):
+        if not line.startswith("release_id="):
+            continue
+        parts = line.split()
+        if len(parts) == 1:
+            parts = []
+            for next_line in lines[index:index + 9]:
+                tokens = next_line.split()
+                if len(tokens) != 1 or "=" not in tokens[0]:
+                    break
+                key, _sep, _value = tokens[0].partition("=")
+                if next_line != line and key == "release_id":
+                    break
+                parts.append(tokens[0])
+        fields = {}
+        for part in parts:
+            key, sep, value = part.partition("=")
+            if sep and key in {"release_id", "git_sha", "current", "health", "strategy"}:
+                if key in fields:
+                    fields = {}
+                    break
+                fields[key] = value
+        if "current" in fields or "health" in fields:
+            last_report = fields
+
+    if not last_report or last_report.get("health") != "passed":
+        return None
+    if last_report.get("git_sha") != expected_git_sha:
+        return None
+    release_id = last_report.get("release_id", "")
+    release_path = last_report.get("current", "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", release_id):
+        return None
+    if not os.path.isabs(release_path) or os.path.normpath(release_path) != release_path:
+        return None
+    if os.path.basename(release_path.rstrip("/")) != release_id:
+        return None
+    if os.path.dirname(release_path) != "/home/dly/releases":
+        return None
+    return release_id, release_path
+
+
 def execute(row: dict) -> None:
     deployment_id = row["deployment_id"]
     contract = CONTRACTS.get(row.get("repository"))
@@ -226,13 +287,11 @@ def execute(row: dict) -> None:
         if process.returncode != 0:
             _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": process.returncode, "error_code": "DEPLOYMENT_FAILED", "error_message": "WSL deployment script failed"})
             return
-        release_match = re.search(r"^release_id=(\S+)$", text, re.MULTILINE)
-        current_match = re.search(r"^current=(\S+)$", text, re.MULTILINE)
-        release_id = release_match.group(1) if release_match else None
-        release_path = current_match.group(1) if current_match else f"/home/dly/releases/{release_id}"
-        if not release_id or not release_path or os.path.basename(release_path.rstrip("/")) != release_id:
-            _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": 1, "error_code": "RELEASE_EVIDENCE_INVALID", "error_message": "release id and current path do not match"})
+        evidence = _extract_release_evidence(text, row["commit_sha"], row["repository"])
+        if evidence is None:
+            _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": 1, "error_code": "RELEASE_EVIDENCE_INVALID", "error_message": "release id, git SHA, health and current path do not match"})
             return
+        release_id, release_path = evidence
         proof = {
             "release_id": release_id,
             "repository": row["repository"],
