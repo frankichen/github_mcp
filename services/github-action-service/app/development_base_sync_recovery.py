@@ -633,7 +633,9 @@ def _current_task_overlap(overlap: dict[str, Any], current_task_paths: list[str]
         item["evidence"] = evidence
         if had_changed_paths:
             kinds = {entry.get("kind") for entry in evidence}
-            item["level"] = "high" if kinds & {"changed_paths", "migrations", "tables", "apis"} else "medium" if evidence else "none"
+            # Imported-base filtering must not re-escalate same-file changes
+            # that workspace_overlap classifies as advisory across branches.
+            item["level"] = "high" if kinds & {"migrations", "tables", "apis"} else "medium" if evidence else "none"
         normalized_items.append(item)
     return {**overlap, "items": normalized_items, "current_task_delta_paths": current_task_paths}
 
