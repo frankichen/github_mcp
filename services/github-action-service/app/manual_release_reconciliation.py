@@ -203,6 +203,15 @@ def reconcile_manual_release(body: dict) -> dict:
         try:
             ds._persist_release_snapshot(release, ds.REPOSITORY)
         except OSError:
+            # Never leave a PASSED audit row after registry persistence failed.
+            if not already:
+                db.execute(
+                    "UPDATE deployments SET status='failed', current_step='failed', "
+                    "error_code='MANUAL_RELEASE_REGISTRY_WRITE_FAILED', updated_at=? "
+                    "WHERE deployment_id=? AND requested_by='manual-script'",
+                    (ds._now(), deployment_id),
+                )
+                db.commit()
             return _error("MANUAL_RELEASE_REGISTRY_WRITE_FAILED")
         if _registered_current() != body["release_id"]:
             return _error("MANUAL_RELEASE_REGISTRY_VERIFY_FAILED")

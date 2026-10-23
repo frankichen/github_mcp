@@ -101,6 +101,23 @@ def test_wrong_previous_release_cas_fails_closed(monkeypatch, tmp_path):
     assert manual._registered_current() == "old"
 
 
+def test_registry_write_failure_keeps_previous_and_failed_audit(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    status_path = tmp_path / "status.json"
+    previous = status_path.read_bytes()
+    def fail_atomic_replace(*_args):
+        raise OSError("simulated disk write failure")
+    monkeypatch.setattr(manual.ds.os, "replace", fail_atomic_replace)
+    res = manual.reconcile_manual_release(_evidence())
+    assert res["error"]["code"] == "MANUAL_RELEASE_REGISTRY_WRITE_FAILED"
+    assert status_path.read_bytes() == previous
+    assert manual._registered_current() == "old"
+    row = manual.ds._get_deploy_db().execute(
+        "SELECT status, error_code FROM deployments ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    assert tuple(row) == ("failed", "MANUAL_RELEASE_REGISTRY_WRITE_FAILED")
+
+
 def test_active_managed_deployment_blocks_manual_adoption(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
     db = manual.ds._get_deploy_db()
