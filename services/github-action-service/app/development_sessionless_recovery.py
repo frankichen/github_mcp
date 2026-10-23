@@ -398,9 +398,14 @@ def recover_sessionless_workspace(
         and workspace.get("drift_reason") is None
         and workspace.get("lease_valid")
     )
-    if next_owner and not active:
+    # The original Workspace may have a forward-only external commit and an
+    # expired Rev1 lease before any canonical Session exists. The operator-only
+    # Rev2 handoff still requires exact pin-to-HEAD ancestry, reviewed scope
+    # and base overlap, new DevHub lease/binding attestations, no other Session
+    # and an atomic Workspace CAS. Other drift reasons remain fail-closed.
+    if next_owner and not (active or drifted):
         raise Error("RECOVERY_OWNER_TRANSITION_INVALID",
-                    "revision handoff requires active no-drift Workspace and valid original lease")
+                    "revision handoff requires exact active or forward-drifted original Workspace")
     if not (drifted or active):
         raise Error(
             "RECOVERY_DRIFT_REASON_UNSUPPORTED",
