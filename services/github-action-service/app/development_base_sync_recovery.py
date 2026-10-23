@@ -709,9 +709,19 @@ def _verify_base_sync_ownership(
             "another active or drifted Workspace claims the recovery branch",
             {"workspace_id": workspace_id, "conflicting_workspace_ids": [item.get("workspace_id") for item in conflicts]},
         )
-    overlap = _current_task_overlap(
-        mygithub12.workspace_overlap(service, workspace_id), current_task_paths,
-    )
+    overlap_evidence = mygithub12.workspace_overlap(service, workspace_id)
+    if (
+        not isinstance(overlap_evidence, dict)
+        or overlap_evidence.get("ok") is False
+        or overlap_evidence.get("comparison_verified") is False
+        or not isinstance(overlap_evidence.get("items"), list)
+    ):
+        raise MyGithub12Error(
+            "RECOVERY_WORKSPACE_OVERLAP_UNAVAILABLE",
+            "active Workspace comparison cannot be verified",
+            {"workspace_id": workspace_id},
+        )
+    overlap = _current_task_overlap(overlap_evidence, current_task_paths)
     blocked: list[dict[str, Any]] = []
     ignored_merged: list[dict[str, Any]] = []
     for item in (overlap.get("items") or []):

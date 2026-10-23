@@ -1918,3 +1918,84 @@ def test_resume_keeps_same_base_drift_on_existing_recovery_action(tmp_path, monk
         branch_state={"commit_sha": CURRENT_HEAD, "tree_sha": CURRENT_TREE},
     )
     assert plan["action"] == "recover_drifted_development_task"
+
+
+def _seed_sxt_independent_branch_shared_file(service, monkeypatch):
+    """SXT's real failure mode: a different active branch edited the same path."""
+    with sessions._LOCK, sessions._db() as db:
+        db.execute(
+            "INSERT INTO workspaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            _workspace_row(
+                workspace_id="ws_sxt_parallel",
+                branch="ai/sxt-other-feature",
+                status="active",
+                revision=1,
+                base_sha=OLD_BASE,
+                head=OTHER_HEAD,
+                tree=service.repo.trees[OTHER_HEAD],
+                scope={"paths": ["allowed/**"]},
+            ),
+        )
+    peer = mygithub12.get_workspace(service, "ws_sxt_parallel")
+    sessions.create_session(peer, idempotency_key="sxt-independent-branch")
+    # A legacy overlap provider may still return HIGH for a shared filename;
+    # current-task canonicalization must make it advisory across Git branches.
+    monkeypatch.setattr(
+        recovery.mygithub12,
+        "workspace_overlap",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "comparison_verified": True,
+            "workspace_id": WORKSPACE_ID,
+            "items": [{
+                "workspace_id": "ws_sxt_parallel",
+                "branch": "ai/sxt-other-feature",
+                "level": "high",
+                "evidence": [{"kind": "changed_paths", "items": ["allowed/feature.py"]}],
+            }],
+        },
+    )
+
+
+def test_sxt_shared_filename_base_sync_does_not_require_another_worker_approval(
+    tmp_path, monkeypatch,
+):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _seed_sxt_independent_branch_shared_file(service, monkeypatch)
+    result = _call(service, session)
+    assert result["control_plane_recovery"] == "CONTROL_PLANE_BASE_SYNC_RECOVERY_SUCCESS"
+    assert result["verification"]["deltas"]["actual_overlap_paths"] == []
+    assert result["verification"]["ownership"]["overlap"]["items"][0]["level"] == "medium"
+    assert result["verification"]["ownership"]["ignored_merged_workspaces"] == []
+    assert mygithub12.get_workspace(service, "ws_sxt_parallel")["status"] == "active"
+
+
+def test_sxt_shared_filename_does_not_waive_true_imported_base_conflict(
+    tmp_path, monkeypatch,
+):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _seed_sxt_independent_branch_shared_file(service, monkeypatch)
+    service.repo.set_compare(OLD_BASE, NEW_BASE, paths=["allowed/feature.py"])
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == "RECOVERY_BASE_SYNC_OVERLAP"
+    assert mygithub12.get_workspace(service, WORKSPACE_ID)["status"] == "drifted"
+
+
+def test_sxt_shared_filename_unverifiable_overlap_stays_blocked(
+    tmp_path, monkeypatch,
+):
+    service, session, _ = _seed(tmp_path, monkeypatch)
+    _seed_sxt_independent_branch_shared_file(service, monkeypatch)
+    original_overlap = recovery.mygithub12.workspace_overlap
+    monkeypatch.setattr(
+        recovery.mygithub12,
+        "workspace_overlap",
+        lambda *_args, **_kwargs: {
+            **original_overlap(*_args, **_kwargs),
+            "comparison_verified": False,
+        },
+    )
+    with pytest.raises(recovery.MyGithub12Error) as exc:
+        _call(service, session)
+    assert exc.value.code == "RECOVERY_WORKSPACE_OVERLAP_UNAVAILABLE"
