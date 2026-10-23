@@ -40,3 +40,17 @@ Example: imported-base overlap is `[]`, independently active shared file is `int
 ## Deterministic regression fixture
 
 `services/github-action-service/tests/fixtures/base_sync/sxt_task_140_base_absorbed.json` records the SXT Task #140 Rev2 repository, branch, old/new base, old Session HEAD, current HEAD/Tree, reviewed overlap paths, and exact supplied blobs for `i18n/app/latest.v` and `i18n/app/manifest.json`. Tests use a deterministic in-memory Git graph and do not contact SXT or GitHub.
+
+## Active Workspace stale-Session recovery (independent of base-sync)
+
+When `resume_development_task` finds an exact active/no-drift Workspace whose
+Development Session is stale, use the **separate** optional
+`reviewed_active_overlap_paths_json` argument. Its default is `[]` (fail-closed).
+The server recomputes every other active Workspace's branch-changed shared path
+and requires an **exact match** of safe, unique paths. Actual shared-file edits
+may be independently reviewed and the Session metadata recovered without closing
+or replacing either Writer. API/table/migration, symbol or configuration conflicts,
+unverified comparisons and missing/extra reviewed paths remain blocked.
+This is metadata-only recovery; subsequent source edits still require exact
+HEAD/Blob, original Workspace/Session revisions and the ordinary writer CAS.
+No implicit merge, automatic rebase or production release is permitted.

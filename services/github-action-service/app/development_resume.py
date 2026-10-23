@@ -2017,6 +2017,7 @@ def resume_task(
     lease_seconds: int = mygithub12.DEFAULT_LEASE_SECONDS,
     idempotency_key: str = "",
     reviewed_scope_expansion_paths_json: str = "[]",
+    reviewed_active_overlap_paths_json: str = "[]",
 ) -> dict[str, Any]:
     """Resume branch/PR development context without changing GitHub refs."""
     if not repository or "/" not in repository:
@@ -2082,7 +2083,7 @@ def resume_task(
                     int(expected_workspace_revision), int(expected_session_revision), branch_head, branch_tree,
                     str(live_base["branch"]), str(live_base["commit_sha"]),
                     idempotency_key or str(record["idempotency_key"]), lease_seconds,
-                    reviewed_scope_expansion_paths_json,
+                    reviewed_scope_expansion_paths_json, reviewed_active_overlap_paths_json,
                 )
                 workspace = replayed["workspace"]
                 session = replayed["development_session"]
@@ -2232,6 +2233,7 @@ def resume_task(
                             idempotency_key=recovery_idempotency_key,
                             lease_seconds=lease_seconds,
                             reviewed_scope_expansion_paths_json=reviewed_scope_expansion_paths_json,
+                            reviewed_active_overlap_paths_json=reviewed_active_overlap_paths_json,
                         )
                     except MyGithub12Error as exc:
                         if exc.code in {"WORKSPACE_REVISION_MISMATCH", "DEVELOPMENT_SESSION_REVISION_MISMATCH"}:
