@@ -1,5 +1,6 @@
 """Mandatory notification simulator integration in a separate Go+Node CI image."""
 
+import os
 import re
 
 SXT_REPOSITORY = "frankichen/sxt"
@@ -26,7 +27,13 @@ NODE_INTEGRATION_COMMAND = (
 )
 
 def notification_node_integration_required(repository: str, profile: str) -> bool:
-    return repository == SXT_REPOSITORY and profile == "repo-auto-check"
+    # The legacy local App simulator has been retired from SXT CI.
+    # Re-enable the dedicated Go+Node integration only by explicit operator opt-in.
+    return (
+        repository == SXT_REPOSITORY
+        and profile == "repo-auto-check"
+        and os.getenv("SXT_LEGACY_SIMULATOR_CI_ENABLED", "0") == "1"
+    )
 
 def sxt_go_only_image_allowed(repository: str, stack: str, image: str) -> bool:
     """SXT Go checks must never inherit the dedicated Go+Node test image."""

@@ -70,47 +70,35 @@ def test_deploy_profiles_cover_every_builtin_profile():
     assert set(data["profiles"]) == set(PROFILE_COMMANDS)
 
 
-def test_only_sxt_allows_openapi_check_on_agent_side():
+def test_sxt_only_allows_go_full_and_focused_checks():
     data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
-    repositories = data["repositories"]
-
-    assert "openapi-check" in repositories["frankichen/sxt"]["allowed_profiles"]
-    for repository, config in repositories.items():
-        if repository != "frankichen/sxt":
-            assert "openapi-check" not in (config.get("allowed_profiles") or [])
+    assert data["repositories"]["frankichen/sxt"]["allowed_profiles"] == [
+        "repo-auto-check", "go-check",
+    ]
 
 
-def test_sxt_runtime_overrides_request_only_lenshub_services_and_hooks():
-    data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
-    root = next(item for item in data["repositories"]["frankichen/sxt"]["workspaces"] if item["path"] == ".")
-
-    assert root["services"] == ["postgres-global", "postgres-regional-cn", "postgres-regional-de", "redis", "rabbitmq"]
-    assert root["hooks"] == ["go-migrate", "ai-integrity"]
-
-
-def test_sxt_runtime_overrides_include_react_console_node_workspace():
+def test_sxt_go_only_workspaces_keep_real_database_and_integrity_gates():
     data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
     workspaces = data["repositories"]["frankichen/sxt"]["workspaces"]
-    react = next(
-        item for item in workspaces
-        if item["path"] == "h5/lenshub-console-react"
-    )
-
-    assert {item["path"] for item in workspaces} == {
-        ".",
-        "h5/lenshub-console-react",
-        "h5/lenshub-storage-mall",
-    }
-    assert react["type"] == "node"
-    assert react["package_manager"] == "npm"
-    assert react["required_scripts"] == ["test:run", "typecheck", "build"]
+    assert workspaces == [{
+        "path": ".",
+        "type": "go",
+        "services": ["postgres-global", "postgres-regional-cn", "postgres-regional-de", "redis", "rabbitmq"],
+        "hooks": ["go-migrate", "ai-integrity"],
+    }]
 
 
-def test_sxt_allows_repo_fast_check_on_agent_side():
+def test_sxt_go_only_allowlist_ignores_node_manifests(tmp_path):
+    from private_ci_agent.profiles import discover_workspaces
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    for rel in ("h5/lenshub-console", "h5/lenshub-console-react", "h5/lenshub-storage-mall", "tests/e2e"):
+        p = tmp_path / rel
+        p.mkdir(parents=True)
+        (p / "package.json").write_text('{"scripts":{"test":"vitest run"}}', encoding="utf-8")
+        (p / "package-lock.json").write_text('{"lockfileVersion":3}', encoding="utf-8")
     data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
-    allowed = data["repositories"]["frankichen/sxt"]["allowed_profiles"]
-
-    assert "repo-fast-check" in allowed
+    plan = discover_workspaces(str(tmp_path), {"workspaces": data["repositories"]["frankichen/sxt"]["workspaces"]})
+    assert [(item["path"], item["stack"]) for item in plan["workspaces"]] == [(".", "go")]
 
 
 def test_deploy_repositories_keep_runtime_overrides():

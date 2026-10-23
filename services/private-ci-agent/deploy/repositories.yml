@@ -19,17 +19,16 @@ repositories:
   frankichen/sxt:
     enabled: true
     auto_detect: true
+    # User decision 2026-10-23: SXT private CI runs backend Go only.
+    # Archived Vue, React, storage mall, Android/local App and Playwright
+    # are excluded from automatic validation, not deleted from the repo.
     allowed_profiles:
       - repo-auto-check
-      - repo-fast-check
       - go-check
-      - node-check
-      - openapi-check
     max_timeout_seconds: 900
-    # Archived admin v1/v2 are intentionally excluded; keep v3 and storage mall explicit.
     workspaces:
       - path: .
-        type: auto
+        type: go
         services:
           - postgres-global
           - postgres-regional-cn
@@ -39,20 +38,6 @@ repositories:
         hooks:
           - go-migrate
           - ai-integrity
-      - path: h5/lenshub-console-react
-        type: node
-        package_manager: npm
-        required_scripts:
-          - test:run
-          - typecheck
-          - build
-      - path: h5/lenshub-storage-mall
-        type: node
-        package_manager: npm
-        required_scripts:
-          - test
-          - typecheck
-          - build
 
   frankichen/github_mcp:
     enabled: true
