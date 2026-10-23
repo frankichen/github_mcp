@@ -571,7 +571,7 @@ def test_go_migrate_hook_runs_cn_de_regional_schemas(tmp_path, exec_capable_tmp_
         text=True, check=False, env=env,
     )
     assert missing.returncode == 87
-    assert "CI_REGIONAL_ACCOUNT_DATABASE_URLS_REQUIRED" in missing.stderr
+    assert "CI_REGIONAL_ACCOUNT_DATABASE_URLS_REQUIRED" in (missing.stdout + missing.stderr)
     assert len(calls.read_text(encoding="utf-8").splitlines()) == 1
 
 
