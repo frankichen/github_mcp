@@ -633,8 +633,8 @@ def _current_task_overlap(overlap: dict[str, Any], current_task_paths: list[str]
         item["evidence"] = evidence
         if had_changed_paths:
             kinds = {entry.get("kind") for entry in evidence}
-            # Imported-base filtering must not re-escalate same-file changes
-            # that workspace_overlap classifies as advisory across branches.
+            # Separate branches can change the same filename; keep the evidence,
+            # but reserve hard conflicts for explicit shared contracts.
             item["level"] = "high" if kinds & {"migrations", "tables", "apis"} else "medium" if evidence else "none"
         normalized_items.append(item)
     return {**overlap, "items": normalized_items, "current_task_delta_paths": current_task_paths}
@@ -686,6 +686,7 @@ def _verify_base_sync_ownership(
     workspace: dict[str, Any],
     new_base_sha: str,
     current_task_paths: list[str],
+    reviewed_active_overlap_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     repository = str(workspace["repository"])
     branch = str(workspace["branch"])
@@ -718,7 +719,7 @@ def _verify_base_sync_ownership(
     ):
         raise MyGithub12Error(
             "RECOVERY_WORKSPACE_OVERLAP_UNAVAILABLE",
-            "active Workspace comparison cannot be verified",
+            "active Workspace overlap comparison cannot be verified",
             {"workspace_id": workspace_id},
         )
     overlap = _current_task_overlap(overlap_evidence, current_task_paths)
@@ -738,17 +739,63 @@ def _verify_base_sync_ownership(
             ignored_merged.append({"overlap": item, "merged_evidence": merged_evidence})
         else:
             blocked.append(item)
-    if blocked:
+    # 显式审核共享文件冲突仅豁免这一次元数据恢复中的 active-Writer overlap。
+    # Base Delta overlap、HEAD/Tree、scope、same-branch Writer/CAS 门禁完全独立。
+    actual_active_paths: set[str] = set()
+    unreviewable_evidence: list[dict[str, Any]] = []
+    for item in blocked:
+        changed = False
+        for entry in item.get("evidence") or []:
+            if entry.get("kind") == "changed_paths":
+                paths = entry.get("items")
+                if not isinstance(paths, list) or not paths or not all(
+                    isinstance(value, str) and value for value in paths
+                ):
+                    unreviewable_evidence.append(item)
+                    continue
+                actual_active_paths.update(paths)
+                changed = True
+            else:
+                # 表、Migration 或 API 身份重叠不能仅靠文件列表授权。
+                unreviewable_evidence.append(item)
+        if not changed:
+            unreviewable_evidence.append(item)
+    reviewed_active = sorted(reviewed_active_overlap_paths or [])
+    actual_active = sorted(actual_active_paths)
+    # Existing #175 callers may already carry an explicit reviewed set for
+    # file-only overlaps. Keep those *exact* prior reviews compatible even
+    # though new callers do not need to review independent-branch filenames.
+    if not blocked and reviewed_active:
+        advisory_paths = sorted({
+            path
+            for item in (overlap.get("items") or [])
+            if item.get("level") == "medium"
+            for evidence in (item.get("evidence") or [])
+            if evidence.get("kind") == "changed_paths"
+            for path in (evidence.get("items") or [])
+            if isinstance(path, str) and path
+        })
+        if reviewed_active == advisory_paths:
+            actual_active = reviewed_active
+    if unreviewable_evidence or reviewed_active != actual_active:
         raise MyGithub12Error(
             "RECOVERY_WORKSPACE_OVERLAP",
-            "high-overlap active Workspace blocks base-sync recovery",
-            {"workspace_id": workspace_id, "overlap": blocked},
+            "active Workspace conflict requires a separate exact reviewed path set",
+            {
+                "workspace_id": workspace_id,
+                "overlap": blocked,
+                "actual_active_overlap_paths": actual_active,
+                "reviewed_active_overlap_paths": reviewed_active,
+                "unreviewable_active_overlap": unreviewable_evidence,
+            },
         )
     return {
         "verified": True,
         "workspace_id": workspace_id,
         "overlap": overlap,
         "ignored_merged_workspaces": ignored_merged,
+        "reviewed_active_overlap_paths": reviewed_active,
+        "reviewed_active_workspaces": blocked,
     }
 
 
@@ -955,6 +1002,8 @@ def _atomic_recover_base_sync(
                 "current_tree": current_tree,
                 "actual_overlap_paths": verification["deltas"]["actual_overlap_paths"],
                 "reviewed_overlap_paths": verification["deltas"]["reviewed_overlap_paths"],
+                "reviewed_active_overlap_paths": verification["ownership"]["reviewed_active_overlap_paths"],
+                "reviewed_active_workspaces": verification["ownership"]["reviewed_active_workspaces"],
                 "base_ancestry": verification["deltas"]["base_ancestry"],
                 "old_task_ancestry": verification["deltas"]["old_task_ancestry"],
                 "task_ancestry": verification["deltas"]["task_ancestry"],
@@ -1105,8 +1154,9 @@ def recover_base_synced_task(
     lease_seconds: int = mygithub12.DEFAULT_LEASE_SECONDS,
     reviewed_overlap_paths_json: str = "[]",
     reviewed_scope_expansion_paths_json: str = "[]",
+    reviewed_active_overlap_paths_json: str = "[]",
 ) -> dict[str, Any]:
-    """Adopt a verified base sync with exact reviewed overlap and scope expansion sets."""
+    """Adopt a verified base sync with distinct base and active-Writer overlap reviews."""
     if not repository or "/" not in repository or not branch:
         raise MyGithub12Error("SEARCH_QUERY_INVALID", "repository and branch are required")
     if not workspace_id or not development_session_id or not idempotency_key:
@@ -1125,6 +1175,7 @@ def recover_base_synced_task(
             {"expected_old_base_sha": expected_old_base_sha, "expected_new_base_sha": expected_new_base_sha},
         )
     reviewed_overlap_paths = _parse_reviewed_overlap_paths(reviewed_overlap_paths_json)
+    reviewed_active_overlap_paths = _parse_reviewed_overlap_paths(reviewed_active_overlap_paths_json)
     reviewed_scope_expansion_paths = _parse_reviewed_scope_expansion_paths(reviewed_scope_expansion_paths_json)
     workspace = mygithub12.get_workspace(service, workspace_id)
     session = sessions.get_session(development_session_id)
@@ -1145,6 +1196,8 @@ def recover_base_synced_task(
         reviewed_scope_expansion_paths,
         lease_seconds,
     )
+    if reviewed_active_overlap_paths:
+        request["reviewed_active_overlap_paths"] = reviewed_active_overlap_paths
     identity_ok = (
         workspace.get("repository") == repository
         and workspace.get("branch") == branch
@@ -1175,6 +1228,7 @@ def recover_base_synced_task(
         ownership = _verify_base_sync_ownership(
             service, repo, workspace, expected_new_base_sha,
             list(replay_audit.get("new_task_delta_paths") or []),
+            reviewed_active_overlap_paths,
         )
         index = _base_sync_index_state(
             service, repository, expected_current_head_sha, expected_current_tree_sha,
@@ -1267,6 +1321,7 @@ def recover_base_synced_task(
     )
     ownership = _verify_base_sync_ownership(
         service, repo, workspace, expected_new_base_sha, recovery_scope_delta_paths,
+        reviewed_active_overlap_paths,
     )
     verification = {
         "github": github_identity,
