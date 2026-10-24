@@ -334,7 +334,11 @@ def workspace_overlap(service: Any, workspace_id: str, other_workspace_ids_json:
             # fail closed instead of treating an unreadable comparison as no overlap.
             comparison_verified=False
             evidence.append({"kind":"comparison_unavailable","code":exc.code})
-        level="high" if any(e["kind"] in {"changed_paths","migrations","tables","apis"} for e in evidence) else "medium" if evidence else "none"
+        # Separate Git branches are independent Git writers. A shared changed
+        # filename is advisory: the later integrator owns real Git conflicts.
+        # Only an identical protected API/table/migration contract is a hard
+        # overlap; branch ownership, scope, lease and HEAD/Tree CAS stay intact.
+        level="high" if any(e["kind"] in {"migrations","tables","apis"} for e in evidence) else "medium" if evidence else "none"
         results.append({"workspace_id":other["workspace_id"],"branch":other["branch"],"level":level,"evidence":evidence})
     return {"ok":True,"workspace_id":workspace_id,"items":results,"comparison_verified":comparison_verified}
 
