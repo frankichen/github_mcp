@@ -112,6 +112,7 @@ def _request_identity(
     lease_seconds: int,
     reviewed_scope_expansion_paths: list[str] | None = None,
     recovery_kind: str = "manual_branch_recovery",
+    reviewed_active_overlap_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     request = {
         "repository": repository,
@@ -130,6 +131,8 @@ def _request_identity(
     # Keep historical drift idempotency payloads compatible across upgrades.
     if recovery_kind != "manual_branch_recovery":
         request["recovery_kind"] = recovery_kind
+    if recovery_kind == "active_workspace_stale_session" and reviewed_active_overlap_paths:
+        request["reviewed_active_overlap_paths"] = sorted(reviewed_active_overlap_paths)
     return request
 
 
@@ -392,7 +395,20 @@ def _verify_ownership_snapshot(db: sqlite3.Connection, evidence: dict[str, Any])
         raise MyGithub12Error("WORKSPACE_REVISION_MISMATCH", "Workspace ownership/overlap inputs changed after verification")
 
 
-def _verify_ownership(service: Any, workspace: dict[str, Any]) -> dict[str, Any]:
+def _parse_reviewed_active_overlap_paths(value: str) -> list[str]:
+    """Use the exact/safe Git-path parser for an independent active-Writer review."""
+    try:
+        return _parse_reviewed_scope_expansion_paths(value)
+    except MyGithub12Error as exc:
+        raise MyGithub12Error(
+            "SEARCH_QUERY_INVALID",
+            "reviewed_active_overlap_paths_json must contain unique, safe Git paths",
+        ) from exc
+
+
+def _verify_ownership(
+    service: Any, workspace: dict[str, Any], reviewed_active_overlap_paths: list[str] | None = None,
+) -> dict[str, Any]:
     repository = str(workspace["repository"])
     branch = str(workspace["branch"])
     workspace_id = str(workspace["workspace_id"])
@@ -431,14 +447,44 @@ def _verify_ownership(service: Any, workspace: dict[str, Any]) -> dict[str, Any]
             {"workspace_id": workspace_id, "overlap": overlap},
         )
     high = [item for item in (overlap.get("items") or []) if item.get("level") == "high"]
-    if high:
+    reviewed = sorted(reviewed_active_overlap_paths or [])
+    changed_paths: set[str] = set()
+    unreviewable: list[str] = []
+    for item in high:
+        # File-level changed_paths are authoritative from both branches; scope
+        # declarations alone are not proof of an actual concurrent write.
+        items = item.get("evidence") if isinstance(item, dict) else None
+        if not isinstance(items, list):
+            unreviewable.append(str(item.get("workspace_id") if isinstance(item, dict) else "unknown"))
+            continue
+        kinds = {str(e.get("kind")) for e in items if isinstance(e, dict)}
+        # API/DB/Migration, same-symbol, config, or uncertain comparisons require
+        # a separate substantive resolution: this is not a universal waiver.
+        if not kinds or "changed_paths" not in kinds or (kinds - {"changed_paths", "paths"}):
+            unreviewable.append(str(item.get("workspace_id") or "unknown"))
+            continue
+        actual = [e.get("items") for e in items if isinstance(e, dict) and e.get("kind") == "changed_paths"]
+        if not actual or any(not isinstance(paths, list) or not paths or
+                             any(not isinstance(path, str) or not path for path in paths)
+                             for paths in actual):
+            unreviewable.append(str(item.get("workspace_id") or "unknown"))
+            continue
+        for paths in actual:
+            changed_paths.update(paths)
+    required = sorted(changed_paths)
+    if unreviewable or reviewed != required:
         raise MyGithub12Error(
             "RECOVERY_WORKSPACE_OVERLAP",
-            "high-overlap active Workspace blocks control-plane recovery",
-            {"workspace_id": workspace_id, "overlap": high},
+            "active Writer shared-file paths require an exact independent review",
+            {"workspace_id": workspace_id, "overlap": high,
+             "required_reviewed_active_overlap_paths": required,
+             "reviewed_active_overlap_paths": reviewed,
+             "unreviewable_workspace_ids": sorted(unreviewable)},
         )
     evidence = {"verified": True, "repository": repository, "workspace_id": workspace_id,
-                "overlap": overlap, "workspace_snapshot": snapshot}
+                "overlap": overlap, "workspace_snapshot": snapshot,
+                "reviewed_active_overlap_paths": reviewed,
+                "required_active_overlap_paths": required}
     with sessions._db() as db:
         _verify_ownership_snapshot(db, evidence)
     return evidence
@@ -1034,6 +1080,7 @@ def recover_active_workspace_stale_session(
     idempotency_key: str,
     lease_seconds: int = mygithub12.DEFAULT_LEASE_SECONDS,
     reviewed_scope_expansion_paths_json: str = "[]",
+    reviewed_active_overlap_paths_json: str = "[]",
 ) -> dict[str, Any]:
     """Adopt a verified active Workspace identity into its stale Session."""
     if not repository or "/" not in repository or not branch:
@@ -1045,6 +1092,7 @@ def recover_active_workspace_stale_session(
     if not expected_current_head_sha or not expected_current_tree_sha or not expected_base_branch or not expected_base_sha:
         raise MyGithub12Error("SEARCH_QUERY_INVALID", "exact current HEAD/Tree and base identity are required")
     reviewed_scope_expansion_paths = _parse_reviewed_scope_expansion_paths(reviewed_scope_expansion_paths_json)
+    reviewed_active_overlap_paths = _parse_reviewed_active_overlap_paths(reviewed_active_overlap_paths_json)
     workspace = mygithub12.get_workspace(service, workspace_id)
     session = sessions.get_session(development_session_id)
     identity = (
@@ -1075,6 +1123,7 @@ def recover_active_workspace_stale_session(
         lease_seconds,
         reviewed_scope_expansion_paths,
         recovery_kind="active_workspace_stale_session",
+        reviewed_active_overlap_paths=reviewed_active_overlap_paths,
     )
     pinned_base_sha = str(workspace.get("base_commit_sha") or "")
     if pinned_base_sha != expected_base_sha:
@@ -1090,7 +1139,7 @@ def recover_active_workspace_stale_session(
             expected_base_branch,
             expected_base_sha,
         )
-        _verify_ownership(service, workspace)
+        _verify_ownership(service, workspace, reviewed_active_overlap_paths)
         index = _index_state(
             service,
             repository,
@@ -1217,7 +1266,7 @@ def recover_active_workspace_stale_session(
     ancestry, changed_paths = _verify_forward_only(repo, session, expected_current_head_sha)
     base_advance = _verify_pinned_base_advance(repo, workspace, session, expected_base_sha)
     scope = _verify_scope(workspace, changed_paths, reviewed_scope_expansion_paths)
-    ownership = _verify_ownership(service, workspace)
+    ownership = _verify_ownership(service, workspace, reviewed_active_overlap_paths)
     verification = {"github": github_identity, "ancestry": ancestry, "scope": scope, "ownership": ownership, "base_advance": base_advance}
     try:
         recovered = _atomic_recover(service, request=request, idempotency_key=idempotency_key, verification=verification)
@@ -1267,9 +1316,10 @@ def reconcile_active_recovery(service: Any, request: dict[str, Any], idempotency
     _replay_result(fresh_session, workspace, request, winner_key)
     result = recover_active_workspace_stale_session(
         service, **{key: value for key, value in request.items()
-                    if key not in {"pinned_base_sha", "recovery_kind", "reviewed_scope_expansion_paths"}},
+                    if key not in {"pinned_base_sha", "recovery_kind", "reviewed_scope_expansion_paths", "reviewed_active_overlap_paths"}},
         idempotency_key=winner_key,
         reviewed_scope_expansion_paths_json=json.dumps(request.get("reviewed_scope_expansion_paths") or []),
+        reviewed_active_overlap_paths_json=json.dumps(request.get("reviewed_active_overlap_paths") or []),
     )
     result["reconciled"] = True
     result["recovery_performed"] = False
