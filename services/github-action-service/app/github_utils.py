@@ -81,16 +81,26 @@ def _parse_oauth_scopes(headers: dict) -> list[str]:
 
 def _github_auth_capabilities(credential_type: str, oauth_scopes: list[str], checks_status: int,
                               statuses_status: int) -> dict:
-    """Build capabilities from declared mode, scopes, and read-only API probes."""
+    """Build capabilities from declared mode, scopes, and read-only API probes.
+
+    OAuth scopes describe classic scope-based credentials. Fine-grained PAT and
+    GitHub App repository permissions are not represented by this scope list, so
+    their Contents/PR write capability is unknown rather than unsupported.
+    """
     repo_scope = "repo" in oauth_scopes
+    scope_based_credential = credential_type in {"classic_pat", "oauth_token"}
+    write_supported = repo_scope if scope_based_credential else None
     return {
         "credential_type": credential_type,
         "declared_auth_mode": settings.GITHUB_AUTH_MODE,
         "oauth_scopes": oauth_scopes,
         "checks_supported": checks_status == 200,
         "statuses_supported": statuses_status == 200,
-        "contents_write_supported": repo_scope,
-        "pull_requests_write_supported": repo_scope,
+        "contents_write_supported": write_supported,
+        "pull_requests_write_supported": write_supported,
+        "write_capability_source": (
+            "oauth_scopes" if scope_based_credential else "not_inferred_from_oauth_scopes"
+        ),
     }
 
 def _get_gh() -> Github:
