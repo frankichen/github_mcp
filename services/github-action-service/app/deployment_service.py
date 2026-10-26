@@ -544,6 +544,42 @@ def cancel_test_deployment(deployment_id):
     return get_test_deployment(deployment_id)
 
 
+
+def _verified_successor_for_unstarted_cancel(db, row, current):
+    """Only a separately PASSED, later-finished release of the SAME SHA is safe.
+
+    A different deployment may have completed while this one stayed unstarted
+    at claimed. Do not treat arbitrary current-release drift as proof.
+    The authenticated WSL executor must independently prove checkout absence.
+    """
+    if (not current
+            or not row["cancel_requested_at"]
+            or not current.get("release_id")
+            or current.get("release_id") in (row["current_release_before"], row["target_release"])
+            or current.get("git_sha") != row["commit_sha"]
+            or current.get("repository") != row["repository"]
+            or current.get("environment") != row["environment"]
+            or current.get("status") != "passed"
+            or not all(current.get(k) is True for k in (
+                "manifest_verified", "checksum_verified", "health_verified", "services_healthy"
+            ))
+            or Path(str(current.get("current_release_path") or "")).name != current.get("release_id")):
+        return None
+    # Require a separately completed deployment AFTER cancellation was requested.
+    return db.execute(
+        """SELECT deployment_id FROM deployments
+           WHERE deployment_id<>? AND repository=? AND environment=? AND requested_scope=?
+             AND status='passed' AND commit_sha=? AND target_release=?
+             AND current_release_path=? AND finished_at IS NOT NULL
+             AND finished_at>=?
+           ORDER BY finished_at DESC LIMIT 1""",
+        (
+            row["deployment_id"], row["repository"], row["environment"], row["requested_scope"],
+            row["commit_sha"], current["release_id"], current["current_release_path"],
+            row["cancel_requested_at"],
+        ),
+    ).fetchone()
+
 def acknowledge_cancelled_deployment(
     deployment_id: str, expected_log_revision: int, expected_current_release_id: str,
     expected_commit_sha: str, workspace_absent: bool = False,
@@ -596,26 +632,36 @@ def acknowledge_cancelled_deployment(
         db.rollback()
         return _error_response("DEPLOYMENT_CANCEL_ACK_GRACE", "cancellation grace not elapsed")
     current, _ = _release_snapshot(_status_snapshot(row["repository"]) or {})
-    if (not current or not row["current_release_before"]
-            or current.get("release_id") != row["current_release_before"]
-            or current.get("git_sha") == row["commit_sha"]
-            or not all(current.get(k) is True for k in (
-                "manifest_verified", "checksum_verified", "health_verified", "services_healthy"
-            ))):
-        db.rollback()
-        return _error_response("DEPLOYMENT_RELEASE_DRIFT", "original verified release changed or unavailable")
-    log_text, revision = _append_deployment_log(
-        db, row, "WSL confirmed no deployment checkout; verified previous release unchanged; cancelled"
+    original_unchanged = (
+        current is not None
+        and bool(row["current_release_before"])
+        and current.get("release_id") == row["current_release_before"]
+        and current.get("git_sha") != row["commit_sha"]
+        and all(current.get(k) is True for k in (
+            "manifest_verified", "checksum_verified", "health_verified", "services_healthy"
+        ))
     )
+    successor = None if original_unchanged else _verified_successor_for_unstarted_cancel(db, row, current)
+    if not original_unchanged and not successor:
+        db.rollback()
+        return _error_response("DEPLOYMENT_RELEASE_DRIFT",
+                               "original verified release or independent successor unavailable")
+    reason = ("wslexecutor_unstarted_cancel_ack_after_successor"
+              if successor else "wslexecutor_unstarted_cancel_ack")
+    message = ("WSL confirmed no checkout; independently completed deployment "
+               + successor["deployment_id"] + " owns current verified release; cancelled"
+               if successor else
+               "WSL confirmed no deployment checkout; verified previous release unchanged; cancelled")
+    log_text, revision = _append_deployment_log(db, row, message)
     changed = db.execute(
         """UPDATE deployments
            SET status='cancelled',current_step='cancelled',finished_at=?,updated_at=?,
-               reconciled_at=?,reconciliation_reason='wslexecutor_unstarted_cancel_ack',
+               reconciled_at=?,reconciliation_reason=?,
                error_code='CANCELLED_BEFORE_EXECUTION',error_message='confirmed no WSL checkout',
                log_revision=?,log_text=?
            WHERE deployment_id=? AND status='cancel_requested'
              AND current_step='claimed' AND cancel_requested=1 AND log_revision=? AND commit_sha=?""",
-        (now, now, now, revision, log_text, deployment_id, row["log_revision"], row["commit_sha"]),
+        (now, now, now, reason, revision, log_text, deployment_id, row["log_revision"], row["commit_sha"]),
     )
     if changed.rowcount != 1:
         db.rollback()

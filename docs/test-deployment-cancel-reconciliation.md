@@ -26,3 +26,35 @@ private-deploy-agent 的 claim-only 模式把请求置为 `running / claimed` �
 生效后先只读回读旧任务、当前 verified Release 和受控执行器，再执行 `plan_test_deployment` → `start_test_deployment`，使用原 Release CAS。最终必须由 Migration、services_healthy、current_git_sha 及真实接口共同证明已发布。
 
 历史 `PREVIOUS_RELEASE_ROLLBACK_UNSAFE: missing frontend/html/index.html` 属于独立的前端来源完整性问题：必须核对旧后端与旧前端的实际挂载及校验和，不能创建空前端文件、禁用校验或删除旧 Release 来消除错误。
+
+
+## 2026-10-26 successor release：取消任务后另一独立部署成功的收口规则
+
+故障：同一 main SHA 的旧任务仍为 cancel_requested/claimed、只有一次 WSL
+委托日志、固定 checkout 目录从未创建。但另一条独立任务已经成功发布该 SHA，
+可信 current release 与旧任务创建时的 current_release_before 不同，旧规则
+因 DEPLOYMENT_RELEASE_DRIFT 阻断取消，进一步导致 DEPLOYMENT_ALREADY_ACTIVE。
+
+保持原有安全条件不变：执行器必须直接检查 checkout 根目录存在、旧任务的
+固定 checkout 不存在；controller 继续检查 repository、environment、fullstack、
+commit、claim generation、log revision=1、委托记录、租约过期、取消宽限期和
+SQLite 事务 CAS。不得让已开始执行任务经这条路径取消。
+
+新增且仅新增受限的独立后继发布证明：
+- 当前 Release 必须为可信 passed、manifest/checksum/health/services_healthy
+  全部真实通过，repository/environment/commit SHA 与旧任务一致。
+- current release ID 不得是旧任务的 current_release_before 或 target_release；
+  release 目录名必须与 release ID 严格匹配。
+- 控制面自己查询到独立 deployment_id、同一 repository/environment/fullstack、
+  commit SHA、target_release、current_release_path 完全一致的 passed 任务。
+- 该独立任务必须存在真实 finished_at，且完成时间不早于旧任务的
+  cancel_requested_at。不存在证据、任一条件不匹配时继续拒绝
+  DEPLOYMENT_RELEASE_DRIFT。
+- 原 SQL 写事务与 log_revision/commit/status CAS 不变；成功仅把旧任务状态
+  收口为 cancelled 并记录独立审计标记
+  wslexecutor_unstarted_cancel_ack_after_successor，原已成功的后继发布不得改变。
+- 重复回执必须幂等，无 Migration、无任意主机/命令/Secret 传入。
+
+回归测试涵盖已发布独立后继成功、无后继、不同 SHA、错误 release、
+不同 repository/environment/scope、未完成、完成时间早于取消、健康失败、
+release 路径不符等 fail-closed 条件。
