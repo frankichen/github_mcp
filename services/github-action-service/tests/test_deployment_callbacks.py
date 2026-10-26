@@ -175,6 +175,82 @@ def test_cancel_ack_fails_closed_on_workspace_progress_and_drift(monkeypatch, tm
     assert db.execute("SELECT status FROM deployments WHERE deployment_id='dep_test'").fetchone()[0] == "cancel_requested"
 
 
+
+def _install_independent_successor(monkeypatch, tmp_path, db):
+    """Simulate another deployment completing while cancellation stayed unstarted."""
+    successor = "rel_successor"
+    proof = {**_proof(), "release_id": successor,
+             "current_release_path": "/home/dly/releases/" + successor, "status": "passed"}
+    status_path = tmp_path / "status.json"
+    status_path.write_text(json.dumps({
+        "environment": "gongshi-test", "current_release_id": successor,
+        "current_git_sha": "a" * 40,
+        "releases": [proof],
+    }), encoding="utf-8")
+    db.execute(
+        """INSERT INTO deployments(
+           deployment_id,repository,environment,commit_sha,private_ci_job_id,
+           requested_scope,current_release_before,target_release,status,
+           current_release_path,created_at,started_at,finished_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ("dep_successor", "frankichen/sxt", "gongshi-test", "a" * 40,
+         "job_successor", "fullstack", "rel_old", successor, "passed",
+         proof["current_release_path"], 100, 950, 1050, 1050),
+    )
+    db.commit()
+    return proof
+
+
+def test_cancel_ack_allows_later_verified_independent_same_sha_release(monkeypatch, tmp_path):
+    db = _prepare_claimed_cancel(monkeypatch, tmp_path)
+    monkeypatch.setattr(deployment_service, "_now", lambda: 1100)
+    proof = _install_independent_successor(monkeypatch, tmp_path, db)
+    result = _cancel_ack()
+    assert result["ok"] and result["deployment"]["status"] == "cancelled"
+    assert result["deployment"]["reconciliation_reason"] == "wslexecutor_unstarted_cancel_ack_after_successor"
+    assert result["deployment"]["error_code"] == "CANCELLED_BEFORE_EXECUTION"
+    assert _cancel_ack()["idempotent"] is True
+    assert deployment_service.list_delegated_deployments() == []
+    assert db.execute("SELECT status FROM deployments WHERE deployment_id='dep_successor'").fetchone()[0] == "passed"
+    assert db.execute("SELECT log_revision FROM deployments WHERE deployment_id='dep_test'").fetchone()[0] == 2
+    env = deployment_service.get_test_environment_status("frankichen/sxt", "gongshi-test")["status"]
+    assert env["current_release_id"] == proof["release_id"]
+    assert env["current_git_sha"] == "a" * 40
+
+
+def test_cancel_ack_successor_requires_independent_passed_evidence(monkeypatch, tmp_path):
+    db = _prepare_claimed_cancel(monkeypatch, tmp_path)
+    monkeypatch.setattr(deployment_service, "_now", lambda: 1100)
+    _install_independent_successor(monkeypatch, tmp_path, db)
+    blockers = [
+        ("status", "running"),
+        ("finished_at", None),
+        ("finished_at", 900),
+        ("commit_sha", "c" * 40),
+        ("target_release", "rel_other"),
+        ("current_release_path", "/home/dly/releases/rel_other"),
+        ("repository", "other/repo"),
+        ("environment", "production"),
+        ("requested_scope", "backend"),
+    ]
+    for column, wrong in blockers:
+        before = db.execute(f"SELECT {column} FROM deployments WHERE deployment_id='dep_successor'").fetchone()[0]
+        db.execute(f"UPDATE deployments SET {column}=? WHERE deployment_id='dep_successor'", (wrong,))
+        db.commit()
+        assert _cancel_ack()["error"]["code"] == "DEPLOYMENT_RELEASE_DRIFT", column
+        db.execute(f"UPDATE deployments SET {column}=? WHERE deployment_id='dep_successor'", (before,))
+        db.commit()
+    path = tmp_path / "status.json"
+    current = json.loads(path.read_text())
+    current["releases"][0]["services_healthy"] = False
+    path.write_text(json.dumps(current))
+    assert _cancel_ack()["error"]["code"] == "DEPLOYMENT_RELEASE_DRIFT"
+    current["releases"][0]["services_healthy"] = True
+    current["releases"][0]["current_release_path"] = "/home/dly/releases/not-the-release"
+    path.write_text(json.dumps(current))
+    assert _cancel_ack()["error"]["code"] == "DEPLOYMENT_RELEASE_DRIFT"
+    assert tuple(db.execute("SELECT status,log_revision FROM deployments WHERE deployment_id='dep_test'").fetchone()) == ("cancel_requested", 1)
+
 def test_cancel_ack_rejects_progress_active_lease_and_wrong_generation(monkeypatch, tmp_path):
     db = _prepare_claimed_cancel(monkeypatch, tmp_path)
     monkeypatch.setattr(deployment_service, "_now", lambda: 1100)
