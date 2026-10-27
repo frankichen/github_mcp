@@ -28,6 +28,18 @@ def test_prepare_uses_isolated_network_and_aliases(monkeypatch, tmp_path):
     assert any("private-ci.job=job-123" in item for command in commands for item in command)
     assert any("private-ci.worker=wsl-ci-01" in item for command in commands for item in command)
     assert any("private-ci.resource=postgres" in item for command in commands for item in command)
+    postgres_runs = [
+        command for command in commands
+        if command[1] == "run" and "docker.io/library/postgres:16-alpine" in command
+    ]
+    assert len(postgres_runs) == 1
+    postgres_args = set(zip(postgres_runs[0], postgres_runs[0][1:]))
+    assert {
+        ("-c", "fsync=off"),
+        ("-c", "synchronous_commit=off"),
+        ("-c", "checkpoint_timeout=30min"),
+        ("-c", "max_wal_size=1GB"),
+    } <= postgres_args
     volume_creates = [command for command in commands if command[1:3] == ["volume", "create"]]
     assert len(volume_creates) == 3
     assert all("private-ci.worker=wsl-ci-01" in command for command in volume_creates)
@@ -148,7 +160,16 @@ def test_multidataplane_prepare_provisions_three_independent_postgres_instances(
     ]
     assert len(postgres_runs) == 3
     assert all("--memory=160m" in command and "--cpus=0.30" in command for command in postgres_runs)
-    assert all("max_connections=100" in command for command in postgres_runs)
+    required_postgres_args = {
+        ("-c", "fsync=off"),
+        ("-c", "synchronous_commit=off"),
+        ("-c", "checkpoint_timeout=30min"),
+        ("-c", "max_wal_size=1GB"),
+        ("-c", "max_connections=100"),
+    }
+    for command in postgres_runs:
+        postgres_args = set(zip(command, command[1:]))
+        assert required_postgres_args <= postgres_args
     assert any("port=5432" in command for command in postgres_runs)
     assert any("port=5433" in command for command in postgres_runs)
     assert any("port=5434" in command for command in postgres_runs)
