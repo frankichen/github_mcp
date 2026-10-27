@@ -26,6 +26,16 @@ SERVICE_DATA_DESTINATIONS = {
     "redis": "/data",
     "rabbitmq": "/var/lib/rabbitmq",
 }
+# Every PostgreSQL instance created here is a per-job test database that is
+# destroyed during cleanup. Skipping durable flushes avoids long checkpoint
+# syncs on temporary volumes; a database crash fails that job and is never
+# recovered or reused by another job.
+_EPHEMERAL_POSTGRES_OPTIONS = (
+    "-c", "fsync=off",
+    "-c", "synchronous_commit=off",
+    "-c", "checkpoint_timeout=30min",
+    "-c", "max_wal_size=1GB",
+)
 
 
 def safe_job_suffix(job_id: str) -> str:
@@ -191,6 +201,7 @@ class ServiceManager:
                     "-e", f"POSTGRES_PASSWORD={db_password}",
                     "-e", "POSTGRES_DB=postgres",
                     self.images["postgres"],
+                    *_EPHEMERAL_POSTGRES_OPTIONS,
                 ], "POSTGRES_UNAVAILABLE", resource_type="postgres",
                     operation="start_container", image=self.images["postgres"],
                     resource_name=names["postgres"])
@@ -626,6 +637,7 @@ class MultiDataPlaneServiceManager(ServiceManager):
                         "-c", f"port={spec['port']}",
                         "-c", "shared_buffers=32MB",
                         "-c", "max_connections=100",
+                        *_EPHEMERAL_POSTGRES_OPTIONS,
                     ],
                     spec["error_code"],
                     resource_type=kind, operation="start_container",
