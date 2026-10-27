@@ -931,6 +931,7 @@ WORKSPACE_HOOKS = {
         "step": {
             "name": "migrate",
             "command": (
+                "set -eu; "
                 "if [ -f Makefile ] && grep -Eq '^migrate-up:' Makefile; then "
                 "echo '[go:.:migrate] shared Go cache active'; "
                 "if [ ! -x /ci-cache/.tool-bin/goose ]; then "
