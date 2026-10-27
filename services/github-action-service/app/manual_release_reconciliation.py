@@ -13,7 +13,12 @@ from pathlib import Path
 
 from app import deployment_service as ds
 from app.ci_database import list_jobs
-from app.github_utils import SHA_RE, _error_response
+from app.github_utils import (
+    SHA_RE,
+    _error_response,
+    _github_commit_tree_sha,
+    _private_ci_tree_sha,
+)
 
 RELEASE_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{12}$")
 ROOT = Path("/home/dly/releases")
@@ -23,6 +28,7 @@ ACTIVE_STATUSES = (
     "uploading", "migrating", "switching", "restarting_services",
     "health_checking", "cancel_requested", "rolling_back",
 )
+TREE_EQUIVALENT_CI_SEARCH_LIMIT = 200
 
 
 def _error(code: str) -> dict:
@@ -44,11 +50,39 @@ def _eligible_sha(sha: str, job_id: str = "") -> tuple[str | None, str | None]:
             # dozens of unrelated later CI runs. No list pagination cutoff.
             reason, _ = ds._ci_gate(ds.REPOSITORY, job_id, sha)
             return (reason, None) if reason else (None, job_id)
-        jobs = list_jobs(repository=ds.REPOSITORY, branch="main",
-                         commit_sha=sha, status="passed", limit=30)
-        for job in jobs:
+
+        # Preserve the ordinary exact-main-SHA path as the first choice.
+        main_jobs = list_jobs(
+            repository=ds.REPOSITORY, branch="main", commit_sha=sha,
+            status="passed", limit=30,
+        )
+        for job in main_jobs:
             candidate = job.get("job_id", "")
             reason, _ = ds._ci_gate(ds.REPOSITORY, candidate, sha)
+            if not reason:
+                return None, candidate
+
+        # Fast releases may reuse a passing PR job only when both the CI
+        # worker's measured Tree and GitHub's Tree for that exact CI commit
+        # equal the current main commit's Tree. The caller cannot nominate an
+        # arbitrary non-main branch: only repository-owned ai/* jobs qualify.
+        target_tree = _github_commit_tree_sha(ds.REPOSITORY, sha)
+        if not SHA_RE.fullmatch(target_tree):
+            return "PRIVATE_CI_TREE_UNAVAILABLE", None
+        tree_jobs = list_jobs(
+            repository=ds.REPOSITORY, status="passed",
+            limit=TREE_EQUIVALENT_CI_SEARCH_LIMIT,
+        )
+        for job in tree_jobs:
+            branch = job.get("branch")
+            if not isinstance(branch, str) or not branch.startswith("ai/"):
+                continue
+            if _private_ci_tree_sha(job) != target_tree:
+                continue
+            candidate = job.get("job_id", "")
+            reason, _ = ds._ci_gate(
+                ds.REPOSITORY, candidate, sha, expected_tree_sha=target_tree,
+            )
             if not reason:
                 return None, candidate
     except Exception:

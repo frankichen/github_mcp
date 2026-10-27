@@ -1367,6 +1367,7 @@ def capabilities(build_sha: str) -> dict[str, Any]:
         "supports_idempotency_key": True,
         "supports_operation_audit": True,
         "supports_tree_attestation": True,
+        "supports_tree_equivalent_sxt_test_deployment_ci": True,
         "supports_artifact_deployment": False,
         "supports_gofmt_autofix": False,
         "supports_gofmt_readonly_check": True,

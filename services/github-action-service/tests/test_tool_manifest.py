@@ -211,7 +211,7 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.9.29"
+    assert manifest["service_version"] == "12.9.30"
     assert manifest["executable_mode_write"] == {
         **mygithub10.capabilities("a" * 40)["executable_mode_write_semantics"],
         "supported": True,
@@ -224,6 +224,7 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     assert manifest["compatibility_tool_count"] == EXPECTED_REGISTERED_TOOL_COUNT
     assert set(manifest["hidden_deprecated_tools"]) == HIDDEN_DEPRECATED_TOOLS
     capability_contract = mygithub10.capabilities("a" * 40)
+    assert capability_contract["supports_tree_equivalent_sxt_test_deployment_ci"] is True
     assert capability_contract["supports_active_workspace_stale_session_recovery"] is True
     assert "active_workspace_stale_session" in capability_contract["development_recovery_kinds"]
     assert manifest["development_recovery"] == {

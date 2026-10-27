@@ -143,3 +143,73 @@ def test_selected_private_ci_job_ignores_list_pagination(monkeypatch):
     reason, job_id = manual._eligible_sha(SHA, "old-but-still-valid-main-ci")
     assert reason is None and job_id == "old-but-still-valid-main-ci"
     assert calls == []
+
+
+def test_manual_preflight_selects_tree_equivalent_sxt_pr_ci(monkeypatch, tmp_path):
+    tree_sha = "a" * 40
+    pr_job = {
+        "job_id": "passed-pr-tree-job",
+        "repository": manual.ds.REPOSITORY,
+        "branch": "ai/test-deploy",
+        "commit_sha": "3" * 40,
+        "summary": {"git_tree_sha": tree_sha},
+    }
+    monkeypatch.setenv("DEPLOYMENT_DB_PATH", str(tmp_path / "deployments.db"))
+    monkeypatch.setenv("DEPLOY_STATUS_FILE", str(tmp_path / "status.json"))
+    manual.ds._local.db = None
+    monkeypatch.setattr(manual.ds, "_repo_state", lambda _repo, sha: (sha, []))
+    monkeypatch.setattr(manual, "_github_commit_tree_sha", lambda _repo, _sha: tree_sha)
+
+    def list_passed_jobs(**kwargs):
+        if kwargs.get("branch") == "main":
+            return []
+        return [pr_job]
+
+    monkeypatch.setattr(manual, "list_jobs", list_passed_jobs)
+
+    def gate(repository, job_id, sha, expected_tree_sha=""):
+        assert repository == manual.ds.REPOSITORY
+        assert job_id == pr_job["job_id"]
+        assert sha == SHA
+        assert expected_tree_sha == tree_sha
+        return None, {"deployment_ci_evidence": {"mode": "tree_equivalent_pr"}}
+
+    monkeypatch.setattr(manual.ds, "_ci_gate", gate)
+
+    result = manual.preflight_manual_release({
+        "repository": manual.ds.REPOSITORY,
+        "environment": manual.ds.ENVIRONMENT,
+        "git_sha": SHA,
+    })
+
+    assert result["ok"] is True
+    assert result["private_ci_job_id"] == pr_job["job_id"]
+
+
+def test_manual_preflight_does_not_select_non_ai_tree_equivalent_job(monkeypatch, tmp_path):
+    tree_sha = "a" * 40
+    other_job = {
+        "job_id": "passed-other-branch-job",
+        "repository": manual.ds.REPOSITORY,
+        "branch": "feature/untrusted",
+        "commit_sha": "3" * 40,
+        "summary": {"git_tree_sha": tree_sha},
+    }
+    monkeypatch.setenv("DEPLOYMENT_DB_PATH", str(tmp_path / "deployments.db"))
+    monkeypatch.setenv("DEPLOY_STATUS_FILE", str(tmp_path / "status.json"))
+    manual.ds._local.db = None
+    monkeypatch.setattr(manual.ds, "_repo_state", lambda _repo, sha: (sha, []))
+    monkeypatch.setattr(manual, "_github_commit_tree_sha", lambda _repo, _sha: tree_sha)
+    monkeypatch.setattr(
+        manual, "list_jobs",
+        lambda **kwargs: [] if kwargs.get("branch") == "main" else [other_job],
+    )
+
+    result = manual.preflight_manual_release({
+        "repository": manual.ds.REPOSITORY,
+        "environment": manual.ds.ENVIRONMENT,
+        "git_sha": SHA,
+    })
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "PRIVATE_CI_REQUIRED"

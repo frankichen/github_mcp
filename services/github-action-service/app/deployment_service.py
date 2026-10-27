@@ -15,7 +15,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.ci_database import get_job
-from app.github_utils import SHA_RE, _get_gh, _error_response
+from app.github_utils import (
+    SHA_RE,
+    _error_response,
+    _get_gh,
+    _github_commit_tree_sha,
+    _private_ci_tree_sha,
+)
 from app.ci_repository_config import get_deployment_config, is_private_ci_enabled, get_allowed_repositories
 
 REPOSITORY = "frankichen/sxt"
@@ -323,19 +329,60 @@ def _repo_state(repository, commit_sha):
     return main_sha, files
 
 
-def _ci_gate(repository, job_id, commit_sha):
+def _ci_gate(repository, job_id, commit_sha, expected_tree_sha=""):
     spec = _deployment_spec(repository)
     if not spec.get("private_ci"):
         return None, {"required": False, "status": "not_required"}
     job = get_job(job_id)
     if not job: return "PRIVATE_CI_JOB_NOT_FOUND", None
     if job.get("repository") != repository: return "PRIVATE_CI_REPOSITORY_MISMATCH", job
-    if job.get("branch") != "main": return "PRIVATE_CI_BRANCH_MISMATCH", job
-    if job.get("commit_sha") != commit_sha: return "PRIVATE_CI_SHA_MISMATCH", job
+    branch = job.get("branch")
+    job_sha = job.get("commit_sha")
+    is_exact_main = branch == "main" and job_sha == commit_sha
+    is_tree_candidate = (
+        repository == REPOSITORY
+        and isinstance(branch, str)
+        and branch.startswith("ai/")
+        and len(branch) > len("ai/")
+    )
+    if branch == "main" and not is_exact_main:
+        return "PRIVATE_CI_SHA_MISMATCH", job
+    if branch != "main" and not is_tree_candidate:
+        return "PRIVATE_CI_BRANCH_MISMATCH", job
     if job.get("profile") != spec.get("profile", PROFILE): return "PRIVATE_CI_PROFILE_MISMATCH", job
     if job.get("status") != "passed" or job.get("exit_code") != 0: return "PRIVATE_CI_NOT_PASSED", job
     if job.get("superseded_by_job_id"): return "PRIVATE_CI_SUPERSEDED", job
-    return None, job
+    if is_exact_main:
+        evidence = {
+            "mode": "exact_main_sha",
+            "tested_commit_sha": job_sha,
+            "target_commit_sha": commit_sha,
+        }
+    else:
+        if not isinstance(job_sha, str) or not SHA_RE.fullmatch(job_sha):
+            return "PRIVATE_CI_SHA_MISMATCH", job
+        target_tree = expected_tree_sha or _github_commit_tree_sha(repository, commit_sha)
+        ci_tree = _private_ci_tree_sha(job)
+        source_tree = _github_commit_tree_sha(repository, job_sha)
+        if (
+            not isinstance(target_tree, str)
+            or not SHA_RE.fullmatch(target_tree)
+            or not isinstance(source_tree, str)
+            or not SHA_RE.fullmatch(source_tree)
+        ):
+            return "PRIVATE_CI_TREE_UNAVAILABLE", job
+        if not SHA_RE.fullmatch(ci_tree):
+            return "PRIVATE_CI_TREE_EVIDENCE_MISSING", job
+        if ci_tree != source_tree or source_tree != target_tree:
+            return "PRIVATE_CI_TREE_MISMATCH", job
+        evidence = {
+            "mode": "tree_equivalent_pr",
+            "tested_commit_sha": job_sha,
+            "tested_tree_sha": ci_tree,
+            "target_commit_sha": commit_sha,
+            "target_tree_sha": target_tree,
+        }
+    return None, {**job, "deployment_ci_evidence": evidence}
 
 
 def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope=SCOPE, expected_current_release_id="", allow_deploy_infrastructure_changes=False, artifact_id=""):
