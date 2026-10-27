@@ -147,7 +147,7 @@ MyGithut12 现在区分 canonical production Schema 与 compatibility registrati
 
 基础设施自部署的 `ciworker` 缓存预热通过 systemd 固定 User/Group broker 执行；Infrastructure Executor 本身继续保持 `NoNewPrivileges=true`，并在切换 Controller 前先验证 broker 能精确降权到 UID 1500，避免再次出现 Controller 已切换后才因 `runuser` 失败而把 deployment 标记失败。Goose 预热按 Python 权威 Worker allowlist 逐个写入各 Worker 自己的 writable Go cache，最终逐个验证 executable 和 `goose -version`；migration 缺少预热 binary 时以 `CI_INFRA_GOOSE_BINARY_UNAVAILABLE` 立即报告基础设施失败，不在 job 内联网安装。`get_infrastructure_deployment` 保持原工具名和 `deployment_id` 单参数兼容调用，并增加最长 55 秒的可选持久状态 long-poll、结构化阶段和显式 opt-in 的有限脱敏日志尾；默认响应仍不返回部署日志，也不新增 cancel/rollback/任意脚本能力。
 
-Go workspace 的 global、CN、DE migration 按 fail-fast 顺序执行；任何阶段失败都会阻止后续区域迁移并使 CI 正确失败。
+Go workspace 的 migration hook 优先调用仓库提供的 `ci-migrate-up`，并只为该一次性 Job 数据库设置 `CI_EPHEMERAL_DB=1`；未提供时继续使用 `migrate-up`。Global、CN、DE migration 按 fail-fast 顺序执行；任何阶段失败都会阻止后续区域迁移并使 CI 正确失败。
 
 MCP tool result 默认以真正的 `structuredContent` 对象返回；安全 inline budget 为 32 KiB，超过预算的完整 payload 会保存为短期 `mygithub12://response/...` Resource，并在小型 inline summary 的 `response_meta` 中返回 `inline_bytes`、`total_bytes`、`truncated`、`resource_uri`、`has_more` 和 SHA-256。`get_private_ci_job` 默认 `detail_level=summary`，只返回门禁所需状态；`detail_level=full` 保留 command、changed files、evidence 和 step offsets，但仍受统一 resource fallback 保护。
 

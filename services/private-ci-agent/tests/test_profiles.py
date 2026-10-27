@@ -519,6 +519,57 @@ def test_go_migration_uses_preheated_binary(tmp_path, exec_capable_tmp_path):
     ]
 
 
+def test_go_migration_prefers_ci_ephemeral_target_when_available(
+    tmp_path, exec_capable_tmp_path
+):
+    (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
+    (tmp_path / "Makefile").write_text(
+        "migrate-up:\nci-migrate-up:\n", encoding="utf-8"
+    )
+    goose = exec_capable_tmp_path / "goose"
+    goose.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    goose.chmod(0o700)
+    fake_dir = exec_capable_tmp_path / "bin"
+    fake_dir.mkdir()
+    calls = exec_capable_tmp_path / "migration-calls.log"
+    fake_make = fake_dir / "make"
+    fake_make.write_text(
+        "#!/bin/sh\n"
+        "printf '%s|%s\\n' \"$*\" \"${CI_EPHEMERAL_DB:-unset}\" "
+        ">> \"$MIGRATION_CALLS\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_make.chmod(0o700)
+    config = apply_workspace_hooks(
+        go_commands_for_workspace(str(tmp_path)),
+        {"path": ".", "stack": "go", "hooks": ["go-migrate"]},
+    )
+    command = next(s["command"] for s in config["setup"] if s["name"] == "migrate")
+    command = command.replace("/ci-cache/.tool-bin/goose", str(goose))
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_dir}:{env.get('PATH', '')}",
+            "MIGRATION_CALLS": str(calls),
+        }
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    recorded = calls.read_text(encoding="utf-8").splitlines()
+    assert len(recorded) == 1
+    assert recorded[0].endswith("ci-migrate-up|1")
+
+
 
 def test_go_migrate_hook_runs_cn_de_regional_schemas(tmp_path, exec_capable_tmp_path):
     (tmp_path / "go.mod").write_text("module example\ngo 1.26.4\n", encoding="utf-8")
