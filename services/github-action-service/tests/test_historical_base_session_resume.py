@@ -23,23 +23,45 @@ from tests.test_active_workspace_stale_session_recovery import (
 )
 
 LIVE_BASE = "e" * 40
+TASK_MERGE_BASE = "f" * 40
 
 
-def _advanced(service, monkeypatch, *, overlap=False, rewrite=False):
+def _advanced(service, monkeypatch, *, overlap=False, rewrite=False, diverged=False, no_merge_base=False):
     service.client.heads[BASE] = LIVE_BASE
-    service.repo.trees[LIVE_BASE] = "5" * 40
+    service.repo.trees.update({LIVE_BASE: "5" * 40, TASK_MERGE_BASE: "6" * 40})
     old_compare = service.repo.compare
 
     def compare(base, head):
         if base == OLD_HEAD and head == NEW_HEAD:
             return old_compare(base, head)
-        assert base == BASE_SHA
-        assert head in {LIVE_BASE, NEW_HEAD, OLD_HEAD}
-        paths = ["allowed/feature.py"] if head != LIVE_BASE or overlap else ["elsewhere/main.py"]
+        if base == head:
+            return SimpleNamespace(
+                merge_base_commit=SimpleNamespace(sha=base), ahead_by=0, behind_by=0, files=[],
+            )
+        main_paths = ["allowed/feature.py"] if overlap else ["elsewhere/main.py"]
+        task_paths = ["allowed/feature.py"]
+        if base == BASE_SHA and head == LIVE_BASE:
+            return SimpleNamespace(
+                merge_base_commit=SimpleNamespace(sha=OTHER_HEAD if rewrite else BASE_SHA),
+                ahead_by=2, behind_by=1 if rewrite else 0,
+                files=[SimpleNamespace(filename=path, previous_filename=None) for path in main_paths],
+            )
+        if base == BASE_SHA and head == NEW_HEAD:
+            merge_base = "" if no_merge_base else TASK_MERGE_BASE if diverged else BASE_SHA
+            return SimpleNamespace(
+                merge_base_commit=SimpleNamespace(sha=merge_base),
+                ahead_by=2, behind_by=1 if diverged else 0,
+                files=[SimpleNamespace(filename=path, previous_filename=None) for path in task_paths],
+            )
+        if diverged and base == TASK_MERGE_BASE and head in {BASE_SHA, LIVE_BASE, NEW_HEAD}:
+            paths = ["pin-only.py"] if head == BASE_SHA else main_paths if head == LIVE_BASE else task_paths
+            return SimpleNamespace(
+                merge_base_commit=SimpleNamespace(sha=TASK_MERGE_BASE),
+                ahead_by={BASE_SHA: 1, LIVE_BASE: 3, NEW_HEAD: 2}[head], behind_by=0,
+                files=[SimpleNamespace(filename=path, previous_filename=None) for path in paths],
+            )
         return SimpleNamespace(
-            merge_base_commit=SimpleNamespace(sha=OTHER_HEAD if rewrite else base),
-            ahead_by=2, behind_by=1 if rewrite else 0,
-            files=[SimpleNamespace(filename=path, previous_filename=None) for path in paths],
+            merge_base_commit=SimpleNamespace(sha=OTHER_HEAD), ahead_by=0, behind_by=1, files=[],
         )
 
     monkeypatch.setattr(service.repo, "compare", compare)
@@ -55,6 +77,8 @@ def test_main_advance_preserves_pinned_base_and_exact_writer_lease(tmp_path, mon
     result = _call(service, session, expected_base_sha=LIVE_BASE)
     assert result["verification"]["base_advance"]["base_advanced"] is True
     assert result["verification"]["base_advance"]["overlapping_paths"] == []
+    assert result["verification"]["base_advance"]["task_merge_base_sha"] == BASE_SHA
+    assert result["verification"]["base_advance"]["overlap_blocks_session_adoption"] is False
     assert result["workspace"]["base_commit_sha"] == result["development_session"]["base_commit_sha"] == BASE_SHA
     assert result["workspace"]["lease_expires_at"] == before["lease_expires_at"]
     assert result["development_session"]["lease_expires_at"] == before["lease_expires_at"]
@@ -62,17 +86,36 @@ def test_main_advance_preserves_pinned_base_and_exact_writer_lease(tmp_path, mon
     assert result["workspace"]["revision"] == before["revision"]
 
 
-@pytest.mark.parametrize("overlap,rewrite,code", [
-    (True, False, "RECOVERY_BASE_OVERLAP"),
-    (False, True, "RECOVERY_ANCESTRY_MISMATCH"),
-])
-def test_base_overlap_or_rewrite_refuses_without_mutation(tmp_path, monkeypatch, overlap, rewrite, code):
+def test_diverged_pinned_base_and_task_branch_resume_with_overlap_as_audit_only(tmp_path, monkeypatch):
     service, session = _seed_active_stale(tmp_path, monkeypatch)
-    _advanced(service, monkeypatch, overlap=overlap, rewrite=rewrite)
+    _advanced(service, monkeypatch, overlap=True, diverged=True)
+    refs_before = dict(service.client.heads)
+
+    result = _call(service, session, expected_base_sha=LIVE_BASE)
+
+    evidence = result["verification"]["base_advance"]
+    assert evidence["task_merge_base_sha"] == TASK_MERGE_BASE
+    assert evidence["merge_base_to_pinned"]["verified"] is True
+    assert evidence["merge_base_to_task_head"]["verified"] is True
+    assert evidence["merge_base_to_live_base"]["verified"] is True
+    assert evidence["overlapping_paths"] == ["allowed/feature.py"]
+    assert evidence["overlap_blocks_session_adoption"] is False
+    assert result["development_session"]["head_commit_sha"] == NEW_HEAD
+    assert result["git_ref_changed"] is False
+    assert service.client.heads == refs_before
+    assert result["workspace"]["base_commit_sha"] == BASE_SHA
+
+
+@pytest.mark.parametrize("rewrite,no_merge_base", [(True, False), (False, True)])
+def test_unverifiable_base_lineage_or_merge_base_refuses_without_mutation(
+    tmp_path, monkeypatch, rewrite, no_merge_base,
+):
+    service, session = _seed_active_stale(tmp_path, monkeypatch)
+    _advanced(service, monkeypatch, rewrite=rewrite, no_merge_base=no_merge_base)
     before = _db_state(session["session_id"])
     with pytest.raises(mygithub12.MyGithub12Error) as exc:
         _call(service, session, expected_base_sha=LIVE_BASE)
-    assert exc.value.code == code
+    assert exc.value.code == "RECOVERY_ANCESTRY_MISMATCH"
     assert _db_state(session["session_id"]) == before
 
 

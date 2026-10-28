@@ -211,7 +211,7 @@ def test_composed_mygithub12_manifest_matches_new_tools():
     root = Path(os.environ.get("CI_REPOSITORY_ROOT", "") or Path(__file__).resolve().parents[3])
     manifest = json.loads((root / "docs" / "MYGITHUB12_TOOL_MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["service_name"] == "MyGithut12"
-    assert manifest["service_version"] == "12.9.30"
+    assert manifest["service_version"] == "12.9.31"
     assert manifest["executable_mode_write"] == {
         **mygithub10.capabilities("a" * 40)["executable_mode_write_semantics"],
         "supported": True,
@@ -233,9 +233,9 @@ def test_composed_mygithub12_manifest_matches_new_tools():
         "entrypoint": "resume_development_task",
         "guards": [
             "active_workspace_no_drift_exact_github_head_tree",
-            "forward_only_ancestry_and_exact_base_lineage",
+            "forward_only_session_head_and_verified_merge_base_lineage",
             "exact_workspace_session_revision_cas",
-            "exact_scope_expansion_review_and_workspace_overlap",
+            "exact_scope_expansion_review_with_parallel_overlap_audit",
             "single_canonical_writer_and_session",
             "clear_old_head_ci_attestation_failure_index_evidence",
         ],

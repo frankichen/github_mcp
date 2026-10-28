@@ -262,8 +262,7 @@ def test_active_workspace_adopts_stale_session_from_supported_open_states(tmp_pa
         ("base_changed", "RECOVERY_BASE_CHANGED"),
         ("workspace_revision", "WORKSPACE_REVISION_MISMATCH"),
         ("session_revision", "DEVELOPMENT_SESSION_REVISION_MISMATCH"),
-        ("overlap", "RECOVERY_WORKSPACE_OVERLAP"),
-        ("overlap_unavailable", "RECOVERY_WORKSPACE_OVERLAP_UNAVAILABLE"),
+        ("same_branch_owner", "RECOVERY_BRANCH_OWNERSHIP_CONFLICT"),
         ("closed", "DEVELOPMENT_SESSION_CLOSED"),
     ],
 )
@@ -286,15 +285,13 @@ def test_active_workspace_stale_session_guards_fail_closed_without_mutation(
         overrides["expected_workspace_revision"] = 4
     elif mutation == "session_revision":
         overrides["expected_session_revision"] = session["session_revision"] + 1
-    elif mutation == "overlap":
+    elif mutation == "same_branch_owner":
         monkeypatch.setattr(
-            recovery.mygithub12, "workspace_overlap",
-            lambda *_args, **_kwargs: {"ok": True, "items": [{"workspace_id": "ws_other", "level": "high"}]},
-        )
-    elif mutation == "overlap_unavailable":
-        monkeypatch.setattr(
-            recovery.mygithub12, "workspace_overlap",
-            lambda *_args, **_kwargs: {"ok": True, "items": [], "comparison_verified": False},
+            recovery.mygithub12, "list_workspaces",
+            lambda *_args, **_kwargs: {"items": [
+                {"workspace_id": WORKSPACE_ID, "branch": BRANCH, "status": "active", "lease_valid": True},
+                {"workspace_id": "ws_other", "branch": BRANCH, "status": "active", "lease_valid": True},
+            ]},
         )
     elif mutation == "closed":
         with sessions._LOCK, sessions._db() as db:
@@ -355,49 +352,73 @@ def _fake_shared_file_overlap(_service, workspace_id):
     }
 
 
-@pytest.mark.parametrize("reviewed", ["[]", '["allowed/feature.py","unrelated.py"]'])
-def test_active_shared_file_requires_exact_independent_review(tmp_path, monkeypatch, reviewed):
+@pytest.mark.parametrize("reviewed", ["[]", '["allowed/feature.py"]'])
+def test_active_shared_file_overlap_is_informational_for_session_adoption(tmp_path, monkeypatch, reviewed):
     service, session = _seed_active_stale(tmp_path, monkeypatch)
     monkeypatch.setattr(recovery.mygithub12, "workspace_overlap", _fake_shared_file_overlap)
-    before_workspace, before_session, _ = _db_state(session["session_id"])
-    with pytest.raises(mygithub12.MyGithub12Error) as exc:
-        _call(service, session, reviewed_active_overlap_paths_json=reviewed)
-    assert exc.value.code == "RECOVERY_WORKSPACE_OVERLAP"
-    assert exc.value.details["required_reviewed_active_overlap_paths"] == ["allowed/feature.py"]
-    after_workspace, after_session, _ = _db_state(session["session_id"])
-    assert after_workspace["revision"] == before_workspace["revision"]
-    assert after_session["session_revision"] == before_session["session_revision"]
+    result = _call(service, session, reviewed_active_overlap_paths_json=reviewed)
+    ownership = result["verification"]["ownership"]
+    assert result["control_plane_recovery"] == "CONTROL_PLANE_RECOVERY_SUCCESS"
+    assert ownership["parallel_branch_overlap_non_blocking"] is True
+    assert ownership["parallel_branch_overlap_evidence_available"] is True
+    assert ownership["parallel_branch_overlap_count"] == 1
+    assert ownership["required_active_overlap_paths"] == []
+    assert ownership["overlap"]["items"][0]["workspace_id"] == "ws_other"
+    assert result["audit"]["recovery_kind"] == "active_workspace_stale_session"
 
 
-def test_active_shared_file_independently_reviewed_metadata_recovery(tmp_path, monkeypatch):
+def test_active_shared_file_overlap_does_not_change_refs_or_workspace_identity(tmp_path, monkeypatch):
     service, session = _seed_active_stale(tmp_path, monkeypatch)
     monkeypatch.setattr(recovery.mygithub12, "workspace_overlap", _fake_shared_file_overlap)
     refs_before = dict(service.client.heads)
-    result = _call(service, session, reviewed_active_overlap_paths_json='["allowed/feature.py"]')
+    result = _call(service, session)
     assert result["recovery_kind"] == "active_workspace_stale_session"
     assert result["writer_ready"] is True
     assert result["git_ref_changed"] is False
     assert service.client.heads == refs_before
-    assert result["verification"]["ownership"]["reviewed_active_overlap_paths"] == ["allowed/feature.py"]
-    assert result["verification"]["ownership"]["required_active_overlap_paths"] == ["allowed/feature.py"]
+    assert result["verification"]["ownership"]["reviewed_active_overlap_paths"] == []
+    assert result["verification"]["ownership"]["required_active_overlap_paths"] == []
     assert result["audit"]["recovery_kind"] == "active_workspace_stale_session"
     assert result["development_session"]["workspace_revision"] == result["workspace"]["revision"]
 
 
-@pytest.mark.parametrize("unreviewable_kind", ["apis", "tables", "migrations", "symbols", "configs"])
-def test_active_shared_file_cannot_waive_other_contract_conflict(
-    tmp_path, monkeypatch, unreviewable_kind,
+@pytest.mark.parametrize("unavailable", ["false_result", "exception"])
+def test_unavailable_cross_branch_overlap_diagnostic_does_not_block_session_adoption(
+    tmp_path, monkeypatch, unavailable,
+):
+    service, session = _seed_active_stale(tmp_path, monkeypatch)
+    if unavailable == "false_result":
+        monkeypatch.setattr(recovery.mygithub12, "workspace_overlap", lambda *_args, **_kwargs: {
+            "ok": True, "items": [], "comparison_verified": False,
+        })
+    else:
+        def fail_overlap(*_args, **_kwargs):
+            raise RuntimeError("comparison unavailable")
+        monkeypatch.setattr(recovery.mygithub12, "workspace_overlap", fail_overlap)
+
+    result = _call(service, session)
+
+    ownership = result["verification"]["ownership"]
+    assert result["control_plane_recovery"] == "CONTROL_PLANE_RECOVERY_SUCCESS"
+    assert ownership["parallel_branch_overlap_non_blocking"] is True
+    assert ownership["parallel_branch_overlap_evidence_available"] is False
+    assert ownership["overlap"]["comparison_unavailable"] is True
+
+
+@pytest.mark.parametrize("overlap_kind", ["apis", "tables", "migrations", "symbols", "configs"])
+def test_parallel_branch_contract_overlap_is_recorded_without_blocking_session_adoption(
+    tmp_path, monkeypatch, overlap_kind,
 ):
     service, session = _seed_active_stale(tmp_path, monkeypatch)
     def overlap(_service, workspace_id):
         response = _fake_shared_file_overlap(_service, workspace_id)
-        response["items"][0]["evidence"].append({"kind": unreviewable_kind, "items": ["collision"]})
+        response["items"][0]["evidence"].append({"kind": overlap_kind, "items": ["collision"]})
         return response
     monkeypatch.setattr(recovery.mygithub12, "workspace_overlap", overlap)
-    with pytest.raises(mygithub12.MyGithub12Error) as exc:
-        _call(service, session, reviewed_active_overlap_paths_json='["allowed/feature.py"]')
-    assert exc.value.code == "RECOVERY_WORKSPACE_OVERLAP"
-    assert exc.value.details["unreviewable_workspace_ids"] == ["ws_other"]
+    result = _call(service, session)
+    assert result["control_plane_recovery"] == "CONTROL_PLANE_RECOVERY_SUCCESS"
+    audit_overlap = result["audit"]["overlap"]
+    assert any(item["kind"] == overlap_kind for item in audit_overlap["items"][0]["evidence"])
 
 
 @pytest.mark.parametrize("reviewed", ['["allowed/feature.py","allowed/feature.py"]', '["../invalid.py"]', '[1]'])
@@ -417,7 +438,6 @@ def test_resume_public_entrypoint_carries_exact_shared_file_review(tmp_path, mon
         service, REPO, branch=BRANCH, expected_workspace_revision=5,
         expected_session_revision=session["session_revision"],
         idempotency_key="resume-exact-active-file-overlap",
-        reviewed_active_overlap_paths_json='["allowed/feature.py"]',
     )
     assert resumed["recovery_performed"] is True
     assert resumed["recovery_required"] is False
