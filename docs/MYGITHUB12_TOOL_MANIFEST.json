@@ -1,15 +1,15 @@
 {
   "service_name": "MyGithut12",
-  "service_version": "12.9.30",
+  "service_version": "12.9.31",
   "development_recovery": {
     "supports_active_workspace_stale_session_recovery": true,
     "recovery_kind": "active_workspace_stale_session",
     "entrypoint": "resume_development_task",
     "guards": [
       "active_workspace_no_drift_exact_github_head_tree",
-      "forward_only_ancestry_and_exact_base_lineage",
+      "forward_only_session_head_and_verified_merge_base_lineage",
       "exact_workspace_session_revision_cas",
-      "exact_scope_expansion_review_and_workspace_overlap",
+      "exact_scope_expansion_review_with_parallel_overlap_audit",
       "single_canonical_writer_and_session",
       "clear_old_head_ci_attestation_failure_index_evidence"
     ]

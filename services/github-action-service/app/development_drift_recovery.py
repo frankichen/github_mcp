@@ -186,28 +186,132 @@ def _replay_result(
 def _verify_pinned_base_advance(
     repo: Any, workspace: dict[str, Any], session: dict[str, Any], live_base_sha: str,
 ) -> dict[str, Any]:
-    """Prove a historical base remains valid without adopting or moving live main."""
+    """Prove the pinned base and task branch descend from a verified common commit.
+
+    A Workspace can be pinned to a newer main commit than the feature branch's
+    actual fork point. Session adoption does not merge either side, so this is
+    safe when Git proves both lineages and the exact task/live deltas. Their
+    overlapping paths are audit information for later integration, not a
+    reason to block this control-plane-only recovery.
+    """
     pinned = str(workspace.get("base_commit_sha") or "")
     if pinned != session.get("base_commit_sha"):
         raise MyGithub12Error("RECOVERY_BASE_CHANGED", "Workspace and Session pinned bases differ")
     evidence = {"pinned_base_sha": pinned, "live_base_sha": live_base_sha, "base_advanced": pinned != live_base_sha}
     if pinned == live_base_sha:
-        return evidence
-    # Exact immutable comparisons, including rename sources, bounded by GitHub's
-    # compare API limit. A rewritten base or an unreadable delta cannot qualify.
+        return {
+            **evidence,
+            "base_ancestry": {
+                "verified": True,
+                "label": "resume_base_advance",
+                "base_sha": pinned,
+                "head_sha": live_base_sha,
+                "merge_base": pinned,
+                "ahead_by": 0,
+                "behind_by": 0,
+            },
+            "overlapping_paths": [],
+            "overlap_blocks_session_adoption": False,
+        }
     from app.development_base_sync_recovery import _compare_delta
-    base_ancestry, base_paths = _compare_delta(repo, pinned, live_base_sha, label="resume_base_advance", require_advance=True)
-    task_ancestry, task_paths = _compare_delta(repo, pinned, str(workspace["head_sha"]), label="resume_pinned_task")
-    if session["head_commit_sha"] != pinned:
-        _compare_delta(repo, pinned, str(session["head_commit_sha"]), label="resume_pinned_session")
-    overlap = sorted(set(base_paths) & set(task_paths))
-    evidence.update({"base_ancestry": base_ancestry, "task_ancestry": task_ancestry,
-                     "base_changed_paths": base_paths, "task_changed_paths": task_paths, "overlapping_paths": overlap})
-    if overlap:
-        raise MyGithub12Error(
-            "RECOVERY_BASE_OVERLAP", "base advancement overlaps task files; explicit base synchronization review is required",
-            {**evidence, "next_allowed_actions": ["plan_development_workspace_sync", "manual_review"]},
+
+    def compare_delta(
+        base_sha: str,
+        head_sha: str,
+        *,
+        label: str,
+        require_advance: bool = False,
+        allow_non_ancestor_path_classification: bool = False,
+    ) -> tuple[dict[str, Any], list[str]]:
+        if base_sha == head_sha:
+            if require_advance:
+                raise MyGithub12Error(
+                    "RECOVERY_ANCESTRY_MISMATCH",
+                    f"{label} must be a strict forward advance",
+                    {"base_sha": base_sha, "head_sha": head_sha},
+                )
+            return {
+                "verified": True,
+                "label": label,
+                "base_sha": base_sha,
+                "head_sha": head_sha,
+                "merge_base": base_sha,
+                "ahead_by": 0,
+                "behind_by": 0,
+            }, []
+        return _compare_delta(
+            repo,
+            base_sha,
+            head_sha,
+            label=label,
+            require_advance=require_advance,
+            allow_non_ancestor_path_classification=allow_non_ancestor_path_classification,
         )
+
+    # The historical pin must still be on the live base's forward lineage.
+    # A branch rewrite or unreadable base delta remains a hard failure.
+    base_ancestry, _ = compare_delta(pinned, live_base_sha, label="resume_base_advance", require_advance=True)
+
+    # Do not assume the historical pin is an ancestor of the task branch. Ask
+    # Git for their exact merge-base, then independently prove that it is an
+    # ancestor of the pin, current task HEAD, and live base.
+    task_ancestry, _ = compare_delta(
+        pinned,
+        str(workspace["head_sha"]),
+        label="resume_pinned_task_merge_base",
+        allow_non_ancestor_path_classification=True,
+    )
+    task_merge_base = str(task_ancestry.get("merge_base") or "")
+    if not _EXACT_COMMIT_SHA.fullmatch(task_merge_base):
+        raise MyGithub12Error(
+            "RECOVERY_ANCESTRY_MISMATCH",
+            "historical pinned base and task branch have no verifiable exact merge-base",
+            {"pinned_base_sha": pinned, "task_head_sha": workspace.get("head_sha"), "ancestry": task_ancestry},
+        )
+    task_head = str(workspace["head_sha"])
+    ahead_by = int(task_ancestry.get("ahead_by") or 0)
+    behind_by = int(task_ancestry.get("behind_by") or 0)
+    coherent_compare = (
+        (pinned == task_head and task_merge_base == pinned and ahead_by == 0 and behind_by == 0)
+        or (task_merge_base == pinned and ahead_by > 0 and behind_by == 0)
+        or (task_merge_base == task_head and ahead_by == 0 and behind_by > 0)
+        or (task_merge_base not in {pinned, task_head} and ahead_by > 0 and behind_by > 0)
+    )
+    if not coherent_compare:
+        raise MyGithub12Error(
+            "RECOVERY_ANCESTRY_MISMATCH",
+            "historical base/task comparison did not provide a coherent Git ancestry result",
+            {"pinned_base_sha": pinned, "task_head_sha": task_head, "ancestry": task_ancestry},
+        )
+
+    merge_base_to_pin, _ = compare_delta(
+        task_merge_base, pinned, label="resume_task_merge_base_to_pinned", require_advance=task_merge_base != pinned,
+    )
+    merge_base_to_task, task_paths = compare_delta(
+        task_merge_base,
+        str(workspace["head_sha"]),
+        label="resume_task_merge_base_to_head",
+        require_advance=task_merge_base != str(workspace["head_sha"]),
+    )
+    merge_base_to_live, base_paths = compare_delta(
+        task_merge_base,
+        live_base_sha,
+        label="resume_task_merge_base_to_live_base",
+        require_advance=task_merge_base != live_base_sha,
+    )
+    overlap = sorted(set(base_paths) & set(task_paths))
+    evidence.update({
+        "base_ancestry": base_ancestry,
+        "task_ancestry": task_ancestry,
+        "task_merge_base_sha": task_merge_base,
+        "merge_base_to_pinned": merge_base_to_pin,
+        "merge_base_to_task_head": merge_base_to_task,
+        "merge_base_to_live_base": merge_base_to_live,
+        "base_changed_paths": base_paths,
+        "task_changed_paths": task_paths,
+        "overlapping_paths": overlap,
+        "overlap_blocks_session_adoption": False,
+    })
     return evidence
 
 
@@ -407,7 +511,11 @@ def _parse_reviewed_active_overlap_paths(value: str) -> list[str]:
 
 
 def _verify_ownership(
-    service: Any, workspace: dict[str, Any], reviewed_active_overlap_paths: list[str] | None = None,
+    service: Any,
+    workspace: dict[str, Any],
+    reviewed_active_overlap_paths: list[str] | None = None,
+    *,
+    allow_parallel_branch_overlap: bool = False,
 ) -> dict[str, Any]:
     repository = str(workspace["repository"])
     branch = str(workspace["branch"])
@@ -433,8 +541,47 @@ def _verify_ownership(
             "another active or drifted Workspace claims the recovery branch",
             {"workspace_id": workspace_id, "conflicting_workspace_ids": [item.get("workspace_id") for item in conflicts]},
         )
-    overlap = mygithub12.workspace_overlap(service, workspace_id)
-    if not isinstance(overlap, dict) or overlap.get("ok") is False or not isinstance(overlap.get("items"), list):
+    try:
+        overlap = mygithub12.workspace_overlap(service, workspace_id)
+    except Exception as exc:
+        if not allow_parallel_branch_overlap:
+            raise MyGithub12Error(
+                "RECOVERY_WORKSPACE_OVERLAP_UNAVAILABLE",
+                "Workspace overlap could not be verified for control-plane recovery",
+                {"workspace_id": workspace_id, "cause_type": type(exc).__name__},
+            ) from exc
+        overlap = None
+    overlap_valid = (
+        isinstance(overlap, dict)
+        and overlap.get("ok") is not False
+        and isinstance(overlap.get("items"), list)
+    )
+    if allow_parallel_branch_overlap and (
+        not overlap_valid or overlap.get("comparison_verified") is not True
+    ):
+        # This recovery does not write Git refs or files, so unavailable
+        # cross-branch overlap diagnostics are not an ownership conflict.
+        # Preserve the fact that the diagnostic was unavailable in the audit.
+        overlap = {
+            "ok": False,
+            "workspace_id": workspace_id,
+            "comparison_verified": False,
+            "items": [],
+            "comparison_unavailable": True,
+        }
+        return {
+            "verified": True,
+            "repository": repository,
+            "workspace_id": workspace_id,
+            "overlap": overlap,
+            "workspace_snapshot": snapshot,
+            "reviewed_active_overlap_paths": sorted(reviewed_active_overlap_paths or []),
+            "required_active_overlap_paths": [],
+            "parallel_branch_overlap_non_blocking": True,
+            "parallel_branch_overlap_evidence_available": False,
+            "parallel_branch_overlap_count": None,
+        }
+    if not overlap_valid:
         raise MyGithub12Error(
             "RECOVERY_WORKSPACE_OVERLAP_UNAVAILABLE",
             "Workspace overlap could not be verified for control-plane recovery",
@@ -448,6 +595,23 @@ def _verify_ownership(
         )
     high = [item for item in (overlap.get("items") or []) if item.get("level") == "high"]
     reviewed = sorted(reviewed_active_overlap_paths or [])
+    if allow_parallel_branch_overlap:
+        # Session adoption only updates control-plane identity; it does not
+        # write Git refs or files. Cross-branch overlap is retained as audit
+        # evidence for later integration, while same-branch Writer uniqueness
+        # and the transactional Workspace snapshot CAS remain mandatory.
+        return {
+            "verified": True,
+            "repository": repository,
+            "workspace_id": workspace_id,
+            "overlap": overlap,
+            "workspace_snapshot": snapshot,
+            "reviewed_active_overlap_paths": reviewed,
+            "required_active_overlap_paths": [],
+            "parallel_branch_overlap_non_blocking": True,
+            "parallel_branch_overlap_evidence_available": True,
+            "parallel_branch_overlap_count": len(high),
+        }
     changed_paths: set[str] = set()
     unreviewable: list[str] = []
     for item in high:
@@ -1139,7 +1303,9 @@ def recover_active_workspace_stale_session(
             expected_base_branch,
             expected_base_sha,
         )
-        _verify_ownership(service, workspace, reviewed_active_overlap_paths)
+        _verify_ownership(
+            service, workspace, reviewed_active_overlap_paths, allow_parallel_branch_overlap=True,
+        )
         index = _index_state(
             service,
             repository,
@@ -1266,7 +1432,9 @@ def recover_active_workspace_stale_session(
     ancestry, changed_paths = _verify_forward_only(repo, session, expected_current_head_sha)
     base_advance = _verify_pinned_base_advance(repo, workspace, session, expected_base_sha)
     scope = _verify_scope(workspace, changed_paths, reviewed_scope_expansion_paths)
-    ownership = _verify_ownership(service, workspace, reviewed_active_overlap_paths)
+    ownership = _verify_ownership(
+        service, workspace, reviewed_active_overlap_paths, allow_parallel_branch_overlap=True,
+    )
     verification = {"github": github_identity, "ancestry": ancestry, "scope": scope, "ownership": ownership, "base_advance": base_advance}
     try:
         recovered = _atomic_recover(service, request=request, idempotency_key=idempotency_key, verification=verification)
