@@ -70,10 +70,10 @@ def test_deploy_profiles_cover_every_builtin_profile():
     assert set(data["profiles"]) == set(PROFILE_COMMANDS)
 
 
-def test_sxt_only_allows_go_full_and_focused_checks():
+def test_sxt_allows_full_fast_and_go_checks():
     data = yaml.safe_load((DEPLOY_DIR / "repositories.yml").read_text(encoding="utf-8"))
     assert data["repositories"]["frankichen/sxt"]["allowed_profiles"] == [
-        "repo-auto-check", "go-check",
+        "repo-auto-check", "repo-fast-check", "go-check",
     ]
 
 
