@@ -9,18 +9,21 @@ Only frankichen/sxt repo-auto-check uses this special stage. Absent Node,
 Go, DB, image/digest, test, required PASS, nonzero exit or SKIP fails the
 whole job. The Node+Go image is operator-prewarmed on both CI Workers, never
 built or pulled by normal CI execution. The image is NOT a production image.
+The stage is mandatory for every exact SXT `repo-auto-check` job; there is
+no environment opt-in or repository-controlled switch that can disable it.
 
 Rollout requires separate infrastructure merge and deployment authorization:
 review/merge the github_mcp PR; build the image on both authorized workers
-using prewarm-sxt-notification-go-node.sh; deploy Worker; validate exact
-SXT payment PR HEAD with full repo-auto-check, Worker idle and attestation.
+using prewarm-sxt-notification-go-node.sh; deploy Worker; validate the exact
+SXT PR HEAD with full repo-auto-check, Worker idle and attestation.
 No API/OpenAPI, database Migration, APP, payment or business rules change.
 
-CI Worker sets `CI_PROFILE` on every check. The LensHub test wiring guard
-only requires a dedicated Node phase for `repo-auto-check`; `go-check` and
-`repo-fast-check` are ordinary feedback profiles and do not certify the real
-simulator integration. An absent/unknown profile with `CI_COMMIT_SHA` remains
-fail-closed until the managed Worker is active.
+CI Worker sets `CI_PROFILE` on every check. Only the dedicated Node phase
+receives `SXT_NOTIFICATION_NODE_CI_ENABLED=1`, injected by the Worker through
+the explicit Podman environment allowlist. Ordinary Go checks do not receive
+that marker and remain on the official Go image. `go-check` and
+`repo-fast-check` do not certify the real simulator integration. An absent
+or unknown profile with `CI_COMMIT_SHA` remains fail-closed.
 
 The offline prewarm script intentionally uses `buildah bud --network=none`
 with explicit temporary directories: rootless Podman `podman build` had a

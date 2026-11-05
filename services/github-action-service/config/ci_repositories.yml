@@ -36,12 +36,13 @@ repositories:
   frankichen/sxt:
     enabled: true
     auto_detect: true
+    # SXT's automatic workspace is backend Go-only; the Worker separately runs
+    # the mandatory notification simulator in its dedicated Go+Node test stage.
+    # Frontend workspaces remain outside automatic repo-auto-check.
     allowed_profiles:
       - repo-auto-check
       - repo-fast-check
       - go-check
-      - node-check
-      - openapi-check
     max_timeout_seconds: 900
     merge_policy:
       private_ci_authoritative: true
@@ -59,31 +60,19 @@ repositories:
       profile: repo-auto-check
       script: scripts/deploy_gongshi_test.sh
       status_file_env: DEPLOY_STATUS_FILE
-    # Archived admin v1/v2 are intentionally excluded; keep v3 and storage mall explicit.
+    # Keep Controller planning identical to services/private-ci-agent/deploy/repositories.yml.
     workspaces:
       - path: .
-        type: auto
+        type: go
         services:
-          - postgres
+          - postgres-global
+          - postgres-regional-cn
+          - postgres-regional-de
           - redis
           - rabbitmq
         hooks:
           - go-migrate
           - ai-integrity
-      - path: h5/lenshub-console-react
-        type: node
-        package_manager: npm
-        required_scripts:
-          - test:run
-          - typecheck
-          - build
-      - path: h5/lenshub-storage-mall
-        type: node
-        package_manager: npm
-        required_scripts:
-          - test
-          - typecheck
-          - build
 
   frankichen/github_mcp:
     enabled: true

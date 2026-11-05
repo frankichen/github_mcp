@@ -51,6 +51,43 @@ def test_profile_and_dedicated_stage_reach_real_podman_arguments(
     assert "--env-host" not in args
 
 
+def test_dedicated_notification_phase_forwards_marker_through_podman(
+    monkeypatch, tmp_path
+):
+    """The Worker alone marks the real Go+Node stage after the Go checks pass."""
+    calls = []
+
+    def capture_subprocess(command, **_kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("private_ci_agent.podman.subprocess.run", capture_subprocess)
+    executor = object.__new__(JobExecutor)
+    executor.podman = PodmanRunner("podman")
+    monkeypatch.setattr(executor.podman, "image_available", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(executor.podman, "image_digest", lambda *_args, **_kwargs: "sha256:prewarmed")
+    executor.cache_map = {"go": str(tmp_path)}
+    executor.client = SimpleNamespace(start_step=lambda *_args: None)
+    executor.log_manager = SimpleNamespace(upload=lambda *_args: None)
+    job = SimpleNamespace(
+        job_id="integration-check", repository="frankichen/sxt",
+        profile="repo-auto-check", commit_sha="a" * 40,
+        timeout_seconds=30, source_dir=str(tmp_path),
+    )
+    service = SimpleNamespace(
+        network="ci-network", database_url="postgres://ci@postgres/test",
+        redis_addr="", redis_db="", rabbitmq_url="",
+    )
+
+    result = executor._run_notification_node_integration(job, service)
+
+    assert result["status"] == "passed"
+    args = calls[-1]
+    assert "CI_PROFILE=repo-auto-check" in args
+    assert "SXT_NOTIFICATION_NODE_CI_ENABLED=1" in args
+    assert "DATABASE_URL=postgres://ci@postgres/test" in args
+
+
 def test_unapproved_or_secret_keys_never_enter_container_argv(monkeypatch, tmp_path):
     calls = []
 

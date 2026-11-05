@@ -52,8 +52,32 @@ _DEFAULT_CONFIG = {
         },
         "frankichen/sxt": {
             "enabled": True,
-            "allowed_profiles": ["repo-auto-check", "repo-fast-check", "go-check", "node-check", "openapi-check"],
+            "private_ci": True,
+            "auto_detect": True,
+            "allowed_profiles": ["repo-auto-check", "repo-fast-check", "go-check"],
             "max_timeout_seconds": 900,
+            "merge_policy": {
+                "private_ci_authoritative": True,
+                "required_private_ci_profile": "repo-auto-check",
+                "github_checks_mode": "required_only",
+                "allow_non_required_check_failures": True,
+                "allow_quota_or_infrastructure_failures": True,
+                "required_workflows": [],
+            },
+            "workspaces": [
+                {
+                    "path": ".",
+                    "type": "go",
+                    "services": [
+                        "postgres-global",
+                        "postgres-regional-cn",
+                        "postgres-regional-de",
+                        "redis",
+                        "rabbitmq",
+                    ],
+                    "hooks": ["go-migrate", "ai-integrity"],
+                }
+            ],
             "deployment": {
                 "enabled": True,
                 "self_deploy": False,

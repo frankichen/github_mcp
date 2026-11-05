@@ -615,8 +615,8 @@ class JobExecutor:
         ):
             return {"error": "configuration_error",
                     "message": "CI_GO_ONLY_IMAGE_CONTRACT_VIOLATION"}
-        # The retired local App's Node simulator must not run inside either
-        # of SXT's Go-only profiles; optional legacy integration is separate.
+        # Keep the ordinary Go workspace on the official Go image. The full
+        # repo-auto-check runs its required simulator in a separate Go+Node stage.
         if (job is not None and workspace.get("stack") == "go"
                 and job.repository == SXT_REPOSITORY
                 and job.profile in {"repo-auto-check", "go-check"}
@@ -956,7 +956,9 @@ class JobExecutor:
             job, "go-node:notification", NODE_INTEGRATION_IMAGE,
             job.source_dir, {"go": self.cache_map["go"]},
             "real-simulator", NODE_INTEGRATION_COMMAND,
-            service_env=service_env, pass_proxy=False)
+            service_env=service_env,
+            extra_env={"SXT_NOTIFICATION_NODE_CI_ENABLED": "1"},
+            pass_proxy=False)
 
     def _run_setup(self, job, label, image, source_dir, caches, step_name, command, service_env=None, pass_proxy=False):
         name = f"{label}:{step_name}"
@@ -991,8 +993,6 @@ class JobExecutor:
             env.update(extra_env)
         env["CI_COMMIT_SHA"] = job.commit_sha
         env["CI_PROFILE"] = job.profile
-        if notification_node_integration_required(job.repository, job.profile):
-            env["SXT_NOTIFICATION_NODE_CI_ENABLED"] = "1"
         env["CI_REPOSITORY_ROOT"] = "/repo"
         result = self.podman.run_command(image, job.job_id, source_dir, caches, command, job.timeout_seconds,
                                          network=True if service_env else False, env=env if env else None,
