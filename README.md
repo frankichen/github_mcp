@@ -1,6 +1,6 @@
 # MCP 与 CI 部署服务
 
-MyGithut12 `12.9.32` 修正 `frankichen/sxt` 的 Controller/Worker CI 策略漂移：完整 `repo-auto-check` 仅规划根 Go workspace 和三库 PostgreSQL 拓扑，不再自动纳入 React 控制台或存储商城 Node workspace；Node 检查仍由各自明确的任务验收负责。
+MyGithut12 `12.9.32` 修正 `frankichen/sxt` 的 Controller/Worker CI 策略漂移：完整 `repo-auto-check` 仅规划根 Go workspace 和三库 PostgreSQL 拓扑，不自动纳入 React 控制台或存储商城 Node workspace；Go 检查通过后，Worker 必须在同一隔离 PostgreSQL 网络中用独立 Go+Node 测试镜像执行真实通知模拟器集成。普通 Node workspace 检查仍由各自明确的任务验收负责。
 
 MyGithut12 `12.9.31` 修复 active stale Session 恢复对分叉 pinned base 的误拒绝：用 Git 精确 merge-base 验证 pinned base、任务 HEAD 与 live base 各自的前进链；跨分支文件/API 重叠诊断只进入审计，诊断不可用也不阻止只更新 Session 控制面身份。恢复不修改 Git refs 或 Workspace 基线，仍保留同分支 Writer 唯一性、Lease、HEAD/Tree、Scope 与 Session/Workspace CAS。
 

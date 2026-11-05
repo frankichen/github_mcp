@@ -53,7 +53,7 @@ def test_checked_in_sxt_config_excludes_node_workspaces():
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     policy = data["repositories"]["frankichen/sxt"]
 
-    assert policy["allowed_profiles"] == ["repo-auto-check", "go-check"]
+    assert policy["allowed_profiles"] == ["repo-auto-check", "repo-fast-check", "go-check"]
     assert policy["workspaces"] == [
         {
             "path": ".",

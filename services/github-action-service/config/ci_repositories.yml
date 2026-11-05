@@ -36,10 +36,12 @@ repositories:
   frankichen/sxt:
     enabled: true
     auto_detect: true
-    # SXT's authoritative Worker policy is Go-only; frontend workspaces remain
-    # outside automatic repo-auto-check and are validated by their own task gates.
+    # SXT's automatic workspace is backend Go-only; the Worker separately runs
+    # the mandatory notification simulator in its dedicated Go+Node test stage.
+    # Frontend workspaces remain outside automatic repo-auto-check.
     allowed_profiles:
       - repo-auto-check
+      - repo-fast-check
       - go-check
     max_timeout_seconds: 900
     merge_policy:

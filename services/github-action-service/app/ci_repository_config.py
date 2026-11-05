@@ -54,7 +54,7 @@ _DEFAULT_CONFIG = {
             "enabled": True,
             "private_ci": True,
             "auto_detect": True,
-            "allowed_profiles": ["repo-auto-check", "go-check"],
+            "allowed_profiles": ["repo-auto-check", "repo-fast-check", "go-check"],
             "max_timeout_seconds": 900,
             "merge_policy": {
                 "private_ci_authoritative": True,

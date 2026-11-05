@@ -44,7 +44,7 @@ def test_sxt_repo_auto_check_ignores_nested_node_manifests(monkeypatch):
     result = mygithub12.plan_private_ci_job(_PlanService(), "frankichen/sxt", "a" * 40, "repo-auto-check")
 
     assert result["applicable"] is True
-    assert result["allowed_profiles"] == ["repo-auto-check", "go-check"]
+    assert result["allowed_profiles"] == ["repo-auto-check", "repo-fast-check", "go-check"]
     assert result["detected_stacks"] == ["go"]
     assert result["selected_profiles"] == ["go-check"]
     assert result["workspaces"] == [{"path": ".", "stack": "go"}]
@@ -56,6 +56,6 @@ def test_sxt_fallback_policy_is_go_only(monkeypatch, tmp_path):
 
     fallback = ci_repository_config.get_repository_config("frankichen/sxt")
 
-    assert fallback["allowed_profiles"] == ["repo-auto-check", "go-check"]
+    assert fallback["allowed_profiles"] == ["repo-auto-check", "repo-fast-check", "go-check"]
     assert fallback["workspaces"] == _sxt_policy(CONFIG_PATH)["workspaces"]
     assert fallback["merge_policy"] == _sxt_policy(CONFIG_PATH)["merge_policy"]

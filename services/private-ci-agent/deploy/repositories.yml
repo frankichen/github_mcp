@@ -19,11 +19,12 @@ repositories:
   frankichen/sxt:
     enabled: true
     auto_detect: true
-    # User decision 2026-10-23: SXT private CI runs backend Go only.
-    # Archived Vue, React, storage mall, Android/local App and Playwright
-    # are excluded from automatic validation, not deleted from the repo.
+    # Keep ordinary backend execution Go-only. The full repo-auto-check also
+    # runs the mandatory notification simulator in its isolated Go+Node stage.
+    # User-facing React/H5/App UI remains outside this backend CI workspace.
     allowed_profiles:
       - repo-auto-check
+      - repo-fast-check
       - go-check
     max_timeout_seconds: 900
     workspaces:
