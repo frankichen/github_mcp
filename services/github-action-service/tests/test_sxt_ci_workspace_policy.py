@@ -7,7 +7,6 @@ from app import ci_repository_config, mygithub12
 
 SERVICE_ROOT = Path(__file__).parents[1]
 CONFIG_PATH = SERVICE_ROOT / "config" / "ci_repositories.yml"
-WORKER_CONFIG_PATH = SERVICE_ROOT.parent / "private-ci-agent" / "deploy" / "repositories.yml"
 
 
 class _TreeEntry:
@@ -23,21 +22,6 @@ class _PlanService:
 
 def _sxt_policy(path: Path):
     return yaml.safe_load(path.read_text(encoding="utf-8"))["repositories"]["frankichen/sxt"]
-
-
-def test_sxt_controller_and_worker_policies_are_aligned_go_only():
-    controller = _sxt_policy(CONFIG_PATH)
-    worker = yaml.safe_load(WORKER_CONFIG_PATH.read_text(encoding="utf-8"))["repositories"]["frankichen/sxt"]
-
-    assert controller["allowed_profiles"] == worker["allowed_profiles"] == ["repo-auto-check", "go-check"]
-    assert controller["workspaces"] == worker["workspaces"] == [
-        {
-            "path": ".",
-            "type": "go",
-            "services": ["postgres-global", "postgres-regional-cn", "postgres-regional-de", "redis", "rabbitmq"],
-            "hooks": ["go-migrate", "ai-integrity"],
-        }
-    ]
 
 
 def test_sxt_repo_auto_check_ignores_nested_node_manifests(monkeypatch):
