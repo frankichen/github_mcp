@@ -42,3 +42,20 @@ def test_unrelated_queue_does_not_execute(monkeypatch):
     monkeypatch.setattr(p.base, "_callback",
                         lambda *a, **k: pytest.fail("foreign repo got callback"))
     p.execute(dict(ROW, repository="frankichen/sxt"))
+
+
+
+def test_success_release_callback_includes_current_git_sha(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    script = tmp_path / "scripts" / "deploy_gongshi_p2p_lab.sh"
+    script.parent.mkdir()
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(p, "prepare_workspace", lambda row: (str(tmp_path), []))
+    monkeypatch.setattr(p.subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=0, stdout=GOOD))
+    calls = []
+    monkeypatch.setattr(p.base, "_callback", lambda path, payload: calls.append((path, payload)))
+    p.execute(ROW)
+    assert calls[-1][0].endswith("/complete")
+    assert calls[-1][1]["release"]["current_git_sha"] == SHA
+    assert calls[-1][1]["release"]["git_sha"] == SHA

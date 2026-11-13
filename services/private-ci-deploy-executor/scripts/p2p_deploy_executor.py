@@ -152,6 +152,7 @@ def execute(row):
         release_id, current_path = evidence
         release = {"release_id": release_id, "repository": REPOSITORY,
                    "environment": ENVIRONMENT, "git_sha": row["commit_sha"],
+                   "current_git_sha": row["commit_sha"],
                    "current_release_path": current_path, "frontend_included": False,
                    "manifest_verified": True, "checksum_verified": True,
                    "health_verified": True, "services_healthy": True,
