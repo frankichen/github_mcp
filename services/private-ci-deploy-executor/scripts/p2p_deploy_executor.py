@@ -2,6 +2,7 @@
 """Dedicated, fixed P2P lab deployment runner. Never operates on SXT."""
 import os
 import re
+import stat
 import subprocess
 import time
 
@@ -13,9 +14,8 @@ ENVIRONMENT = "gongshi-p2p-lab"
 SCOPE = "p2p-lab"
 SCRIPT = "scripts/deploy_gongshi_p2p_lab.sh"
 RELEASE_ROOT = "/opt/p2p-server-lab/releases"
-MIRROR = os.environ.get("P2P_DEPLOY_MIRROR", "/home/xiaowu/work/private-deploy-cache/frankichen-p2p-server.git")
-ORIGIN = "https://github.com/frankichen/p2p-server.git"
-WORKSPACES = os.environ.get("P2P_DEPLOY_WORKSPACES", "/home/xiaowu/work/private-deploy-cache/p2p-workspaces")
+BUNDLE = "/var/lib/mygithub12-p2p-source/main.bundle"
+WORKSPACES = "/home/xiaowu/work/private-deploy-cache/p2p-workspaces"
 
 
 def approved(row):
@@ -26,27 +26,73 @@ def approved(row):
             and re.fullmatch(r"dep_[0-9a-f]{32}", str(row.get("deployment_id", ""))) is not None)
 
 
-def prepare_workspace(row):
-    """Use existing exact SHA source verification with an isolated P2P mirror."""
-    if not os.path.isdir(MIRROR):
-        # Fixed public source mirror: no user-supplied URL, host or shell.
-        os.makedirs(os.path.dirname(MIRROR), exist_ok=True)
-        cloned = subprocess.run(["git", "clone", "--mirror", "--", ORIGIN, MIRROR],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                timeout=180, check=False)
-        if cloned.returncode:
-            raise base.DeploymentSourceError("P2P_MIRROR_BOOTSTRAP_FAILED",
-                                             "fixed P2P repository mirror unavailable")
-    names = ("DEPLOY_MIRROR", "AUTHORITATIVE_REPOSITORY_URL", "DEPLOY_WORKSPACES")
-    original = {name: getattr(base, name) for name in names}
+def _git(*args, cwd=None, timeout=45):
+    p = subprocess.run(["git", *map(str, args)], cwd=cwd, capture_output=True,
+                       text=True, timeout=timeout, check=False)
+    if p.returncode:
+        raise base.DeploymentSourceError("P2P_BUNDLE_CHECKOUT_FAILED",
+                                         "Git verified source bundle checkout failed")
+    return p.stdout.strip()
+
+
+def _trusted_bundle(path):
     try:
-        base.DEPLOY_MIRROR = MIRROR
-        base.AUTHORITATIVE_REPOSITORY_URL = ORIGIN
-        base.DEPLOY_WORKSPACES = WORKSPACES
-        return base.prepare_workspace(row)
-    finally:
-        for name, value in original.items():
-            setattr(base, name, value)
+        info = os.lstat(path)
+        return stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not (info.st_mode & 0o022)
+    except OSError:
+        return False
+
+
+def _bundle_sha(path):
+    if not _trusted_bundle(path):
+        return None
+    try:
+        lines = _git("bundle", "list-heads", path, timeout=10).splitlines()
+    except (base.DeploymentSourceError, subprocess.TimeoutExpired):
+        return None
+    if len(lines) != 1:
+        return None
+    parts = lines[0].split()
+    if len(parts) != 2 or parts[1] != "refs/heads/main":
+        return None
+    return parts[0] if re.fullmatch(r"[a-f0-9]{40}", parts[0]) else None
+
+
+def _wait_for_source(expected_sha, timeout_seconds=120):
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if _bundle_sha(BUNDLE) == expected_sha:
+            return
+        if time.monotonic() >= deadline:
+            raise base.DeploymentSourceError("P2P_BUNDLE_SHA_UNAVAILABLE",
+                                             "private CI source bundle is absent or stale")
+        time.sleep(2)
+
+
+def prepare_workspace(row):
+    """Clone exact main from the credential-free, root-exported CI Git bundle."""
+    if not approved(row):
+        raise base.DeploymentSourceError("P2P_REPOSITORY_NOT_ALLOWED",
+                                         "fixed P2P deployment identity mismatch")
+    expected = row["commit_sha"]
+    _wait_for_source(expected)
+    os.makedirs(WORKSPACES, mode=0o700, exist_ok=True)
+    workspace = os.path.join(WORKSPACES, row["deployment_id"])
+    if os.path.lexists(workspace):
+        raise base.DeploymentSourceError("DEPLOY_WORKSPACE_EXISTS",
+                                         "isolated P2P deployment workspace exists")
+    _git("clone", "--no-hardlinks", "--branch", "main", "--",
+         BUNDLE, workspace, timeout=80)
+    head = _git("-C", workspace, "rev-parse", "HEAD")
+    branch = _git("-C", workspace, "branch", "--show-current")
+    dirty = _git("-C", workspace, "status", "--porcelain")
+    origin = _git("-C", workspace, "remote", "get-url", "origin")
+    if head != expected or branch != "main" or dirty or origin != BUNDLE:
+        raise base.DeploymentSourceError("P2P_BUNDLE_IDENTITY_MISMATCH",
+                                         "Git bundle checkout is not exact clean main")
+    return workspace, ["verified_bundle_sha=" + head,
+                       "source=private_ci_credential_free_bundle",
+                       "branch=main", "clean_worktree=true"]
 
 
 def release_evidence(output, expected_sha):
