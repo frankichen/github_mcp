@@ -8,6 +8,7 @@ EXPECTED_WORKSPACES = [
     {"path": "services/github-action-service", "type": "python"},
     {"path": "services/private-ci-agent", "type": "python"},
     {"path": "services/private-deploy-agent", "type": "python"},
+    {"path": "services/private-ci-deploy-executor", "type": "python"},
 ]
 
 

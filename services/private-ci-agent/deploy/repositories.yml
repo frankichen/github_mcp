@@ -54,6 +54,8 @@ repositories:
         type: python
       - path: services/private-deploy-agent
         type: python
+      - path: services/private-ci-deploy-executor
+        type: python
 
   # XYZL owns these parent build contexts.  Nested projects are deliberately
   # not workspace roots: app owns the .NET solution and the Android
