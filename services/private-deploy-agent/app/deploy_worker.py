@@ -24,6 +24,15 @@ CONTRACTS = {
         "status_file": "DEPLOY_STATUS_FILE",
         "status_default": "/var/lib/private-ci/gongshi-test-status.json",
     },
+    "frankichen/p2p-server": {
+        "workspace": "P2P_DEPLOY_WORKSPACE",
+        "workspace_default": "/srv/private-ci/deploy-workspace/p2p-server",
+        "script": "scripts/deploy_gongshi_p2p_lab.sh",
+        "environment": "gongshi-p2p-lab",
+        "scope": "p2p-lab",
+        "status_file": "P2P_DEPLOY_STATUS_FILE",
+        "status_default": "/var/lib/private-ci/gongshi-p2p-lab-status.json",
+    },
     "frankichen/devhub": {
         "workspace": "DEVHUB_DEPLOY_WORKSPACE",
         "workspace_default": "/srv/private-ci/deploy-workspace/devhub",
@@ -61,7 +70,7 @@ def _should_delegate_to_wsl(repository):
     """Delegate WSL-owned fixed contracts; auto_gupiao executes locally."""
     return (
         os.environ.get("DEPLOY_EXECUTION_MODE") == "claim_only"
-        and repository in {"frankichen/sxt", "frankichen/devhub"}
+        and repository in {"frankichen/sxt", "frankichen/devhub", "frankichen/p2p-server"}
     )
 
 
@@ -124,9 +133,9 @@ def process_once() -> bool:
     init_deployment_db(); db = get_deploy_db()
     rows = db.execute(
         "SELECT deployment_id, repository FROM deployments "
-        "WHERE status='queued' AND repository IN (?, ?, ?) "
+        "WHERE status='queued' AND repository IN (?, ?, ?, ?) "
         "ORDER BY created_at LIMIT 20",
-        ("frankichen/sxt", "frankichen/devhub", "frankichen/auto_gupiao"),
+        ("frankichen/sxt", "frankichen/devhub", "frankichen/auto_gupiao", "frankichen/p2p-server"),
     ).fetchall()
     if rows:
         _status_repository = rows[0]["repository"]
