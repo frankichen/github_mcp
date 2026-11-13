@@ -1,0 +1,22 @@
+[Unit]
+Description=MyGithut12 P2P isolated test deployment runner
+After=network-online.target private-ci-deploy-executor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xiaowu
+WorkingDirectory=/home/xiaowu/work/private-ci-controller-node-workspace
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=-/etc/private-ci/p2p-deploy-executor.env
+ExecStart=/usr/bin/python3 -m scripts.p2p_deploy_executor
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/xiaowu/work/private-deploy-cache
+
+[Install]
+WantedBy=multi-user.target
