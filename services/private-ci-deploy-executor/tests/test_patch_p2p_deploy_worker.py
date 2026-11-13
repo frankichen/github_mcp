@@ -4,7 +4,9 @@ from scripts import patch_p2p_deploy_worker as patcher
 
 BASE = '''CONTRACTS = {
     "frankichen/sxt": {},
-    "frankichen/devhub": {},
+    "frankichen/devhub": {
+        "workspace": "TEST",
+    },
 }
 def delegate(repository):
     return repository in {"frankichen/sxt", "frankichen/devhub"}
