@@ -1,0 +1,19 @@
+[Unit]
+Description=Export private-CI-verified P2P main into a credential-free Git bundle
+After=private-ci-agent.service
+Wants=private-ci-agent.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /usr/local/libexec/mygithub12/p2p-source-export.py
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/srv/private-ci/cache/git
+ReadWritePaths=/var/lib/mygithub12-p2p-source
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER

@@ -22,7 +22,7 @@ COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 
 
 def _git(*argv, timeout=75):
-    result = subprocess.run(["git", *map(str, argv)], capture_output=True,
+    result = subprocess.run(["git", "-c", "safe.directory=" + str(SOURCE), *map(str, argv)], capture_output=True,
                             text=True, check=False, timeout=timeout)
     if result.returncode:
         raise RuntimeError("P2P_SOURCE_GIT_OPERATION_FAILED")

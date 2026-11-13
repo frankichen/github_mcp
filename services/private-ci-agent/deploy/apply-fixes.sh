@@ -256,6 +256,8 @@ log "Delegated deploy executor synchronized and active"
 P2P_RUNTIME_INSTALLER="$REPO_ROOT/services/private-ci-deploy-executor/scripts/install_p2p_runtime.py"
 PYTHONPATH="$REPO_ROOT/services/private-ci-deploy-executor" python3 -m scripts.install_p2p_runtime || die "P2P runtime controlled installation failed"
 systemctl daemon-reload
+systemctl enable --now mygithub12-p2p-source-export.timer || die "P2P source mirror exporter timer unavailable"
+systemctl start mygithub12-p2p-source-export.service || die "P2P private CI source export failed"
 systemctl restart private-deploy-agent.service || die "P2P queue Worker restart failed"
 sleep 2
 systemctl is-active --quiet private-deploy-agent.service || die "P2P queue Worker not active"

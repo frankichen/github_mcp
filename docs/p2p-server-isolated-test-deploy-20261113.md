@@ -24,3 +24,18 @@ Release root = /opt/p2p-server-lab/releases
 MyGithut12 代码合并及当前 main 私有 CI → 授权升级 MyGithut12 控制器和 Worker → 独立安装 P2P 执行器 → 为 p2p-server 开发并合并受控发布脚本 → 新 SHA 的 repo-auto-check → 用户明确授权 P2P 实际发布 → 验证发布记录、进程、独立 status、UDP 测试。
 
 在部署脚本、Runner、安全配置及端到端验收缺失时，本开发变更只是发布能力的候选，不表示已具备实际发布就绪状态。严禁使用 root SSH 临时替代经过验证的正式发布通道。
+
+
+## Private source mirror fix
+
+The P2P repository is private. Its deployment executor does NOT fetch from
+GitHub, read CI credentials or reuse the SXT deploy mirror. A root-owned,
+network-denied systemd one-shot exporter reads ONLY the private CI worker
+mirror at /srv/private-ci/cache/git/frankichen-p2p-server.git, verifies
+the canonical repository remote and exact refs/heads/main SHA, then produces
+an atomic Git bundle in /var/lib/mygithub12-p2p-source/main.bundle.
+The bundle is root:xiaowu (0640) in a root-owned directory (0750).
+A fixed one-minute timer refreshes it as the CI mirror advances. The P2P
+runner uses git clone from this local Git bundle only, verifies a clean main
+branch at the requested exact SHA and fails closed if the bundle is missing
+or stale. The exporter never copies .git/config or logs credentials.
