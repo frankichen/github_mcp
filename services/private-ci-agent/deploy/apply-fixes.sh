@@ -250,6 +250,20 @@ sleep 2
 systemctl is-active --quiet private-ci-deploy-executor.service     || die "delegated deploy executor is not active after update"
 log "Delegated deploy executor synchronized and active"
 
+# P2P lab is a distinct service and a separate controller policy. Reuse only
+# the existing callback key's FILE PATH, never its value. The install helper
+# preserves all live Worker attempt-lease/claim fencing code.
+P2P_RUNTIME_INSTALLER="$REPO_ROOT/services/private-ci-deploy-executor/scripts/install_p2p_runtime.py"
+PYTHONPATH="$REPO_ROOT/services/private-ci-deploy-executor" python3 -m scripts.install_p2p_runtime || die "P2P runtime controlled installation failed"
+systemctl daemon-reload
+systemctl restart private-deploy-agent.service || die "P2P queue Worker restart failed"
+sleep 2
+systemctl is-active --quiet private-deploy-agent.service || die "P2P queue Worker not active"
+systemctl enable --now mygithub12-p2p-deploy-executor.service || die "P2P runner activation failed"
+sleep 2
+systemctl is-active --quiet mygithub12-p2p-deploy-executor.service || die "P2P runner not active"
+log "P2P Worker and isolated runner active; no P2P release was started"
+
 # Controller/Agent 的 attempt-lease 协议必须先升级现有 Agent，再切换 Controller。
 # 新 Agent 给旧 Controller 多发送受控 header 是向后兼容的；反向顺序会让
 # 旧 Agent 在 Controller 切换到严格 fencing 后无法提交 log/step/finish。

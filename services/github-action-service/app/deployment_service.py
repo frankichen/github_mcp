@@ -25,6 +25,7 @@ from app.github_utils import (
 from app.ci_repository_config import get_deployment_config, is_private_ci_enabled, get_allowed_repositories
 
 REPOSITORY = "frankichen/sxt"
+P2P_REPOSITORY = "frankichen/p2p-server"
 ENVIRONMENT = "gongshi-test"
 SCOPE = "fullstack"
 PROFILE = "repo-auto-check"
@@ -405,6 +406,15 @@ def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id,
         if not artifact_result.get("ok"):
             reasons.append(artifact_result.get("error_code", "ARTIFACT_INVALID"))
     spec = _deployment_spec(repository)
+    # A P2P deployment must reference a reviewed script at the exact main SHA.
+    # An explicit repository policy alone never makes the queue executable.
+    if repository == P2P_REPOSITORY:
+        try:
+            item = _get_gh().get_repo(repository).get_contents(spec["script"], ref=commit_sha)
+            if isinstance(item, list) or getattr(item, "type", None) != "file":
+                reasons.append("P2P_DEPLOY_SCRIPT_UNAVAILABLE")
+        except Exception:
+            reasons.append("P2P_DEPLOY_SCRIPT_UNAVAILABLE")
     infra_changed = any(path == spec.get("script") or path == "scripts/deploy_gongshi_test.sh" or path == "scripts/sync_test_env.sh" or path.startswith("deploy/") for path in files)
     if infra_changed and not allow_deploy_infrastructure_changes: reasons.append("DEPLOY_INFRASTRUCTURE_CHANGE_REQUIRES_EXPLICIT_ALLOW")
     migrations_changed = any(path.startswith("db/migrations/") for path in files)
@@ -419,10 +429,10 @@ def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id,
             "target_release_id": f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{commit_sha[:12]}",
             "changed_files": files, "migrations_changed": migrations_changed, "deploy_infrastructure_changed": infra_changed,
             "artifact_id": artifact_id or None, "artifact": artifact,
-            "backend_components": [] if repository == "frankichen/auto_gupiao" else ["lenshub-api", "lenshub-worker", "lenshub-scheduler", "lenshub-admin-bootstrap", "goose"],
-            "frontend_components": [] if repository == "frankichen/auto_gupiao" else ["admin", "newadmin", "root", "app", "h5", "tester", "docs", "openapi"],
-            "restart_services": ["auto-gupiao"] if repository == "frankichen/auto_gupiao" else ["api", "worker", "scheduler", "web"],
-            "health_endpoints": ["/"] if repository == "frankichen/auto_gupiao" else ["/public/v1/health", "/nginx-health", "/", "/app/", "/h5/", "/admin/", "/newadmin/", "/tester/", "/docs/"],
+            "backend_components": ["p2p-gateway", "p2p-signaling"] if repository == P2P_REPOSITORY else ([] if repository == "frankichen/auto_gupiao" else ["lenshub-api", "lenshub-worker", "lenshub-scheduler", "lenshub-admin-bootstrap", "goose"]),
+            "frontend_components": [] if repository in ("frankichen/auto_gupiao", P2P_REPOSITORY) else ["admin", "newadmin", "root", "app", "h5", "tester", "docs", "openapi"],
+            "restart_services": ["p2p-lab"] if repository == P2P_REPOSITORY else (["auto-gupiao"] if repository == "frankichen/auto_gupiao" else ["api", "worker", "scheduler", "web"]),
+            "health_endpoints": ["loopback-only-udp-smoke"] if repository == P2P_REPOSITORY else (["/"] if repository == "frankichen/auto_gupiao" else ["/public/v1/health", "/nginx-health", "/", "/app/", "/h5/", "/admin/", "/newadmin/", "/tester/", "/docs/"]),
             "rollback_plan": "flock 后恢复 previous current；不执行 goose down，不删除 release", "expected_current_release_id": expected_current_release_id}
 
 
@@ -441,7 +451,7 @@ def start_test_deployment(repository, environment, commit_sha, private_ci_job_id
             return _error_response("ALREADY_DEPLOYED", "same SHA already passed")
         deployment_id = "dep_" + uuid.uuid4().hex
         now = _now()
-        db.execute("INSERT INTO deployments(deployment_id,repository,environment,commit_sha,private_ci_job_id,requested_scope,current_release_before,target_release,status,created_at,updated_at,requested_by,frontend_included,artifact_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,?)", (deployment_id, repository, environment, commit_sha, private_ci_job_id, scope, plan.get("current_release_id"), plan["target_release_id"], "queued", now, now, requested_by, artifact_id or None))
+        db.execute("INSERT INTO deployments(deployment_id,repository,environment,commit_sha,private_ci_job_id,requested_scope,current_release_before,target_release,status,created_at,updated_at,requested_by,frontend_included,artifact_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (deployment_id, repository, environment, commit_sha, private_ci_job_id, scope, plan.get("current_release_id"), plan["target_release_id"], "queued", now, now, requested_by, 0 if repository == P2P_REPOSITORY else 1, artifact_id or None))
         db.commit()
     return {"ok": True, "deployment_id": deployment_id, "status": "queued", "target_release_id": plan["target_release_id"], "message": "queued for private-deploy-agent"}
 
@@ -454,7 +464,7 @@ def get_test_deployment(deployment_id):
     # Current release identity is authoritative in the verified registry/status
     # snapshot, not in a possibly stale deployment row.  Keep this response
     # consistent with environment status, planning, and release listing.
-    snapshot = _status_snapshot() or {}
+    snapshot = _status_snapshot(deployment["repository"]) or {}
     current, _ = _release_snapshot(snapshot)
     if current:
         deployment.update({
@@ -803,6 +813,8 @@ def list_test_releases(repository, environment, limit=20):
 
 
 def rollback_test_deployment(repository, environment, target_release_id, expected_current_release_id, confirm=False, requested_by="mcp"):
+    if repository == P2P_REPOSITORY:
+        return _error_response("P2P_LAB_ROLLBACK_NOT_IMPLEMENTED", "P2P lab rollback requires an independently verified contract")
     if not confirm: return _error_response("CONFIRM_REQUIRED", "confirm must be true")
     spec = _deployment_spec(repository)
     if not spec: return _error_response("REPOSITORY_NOT_ALLOWED", "repository is not allowed")
