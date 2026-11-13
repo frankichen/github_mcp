@@ -21,3 +21,11 @@ def test_callback_file_comes_from_fixed_existing_service(tmp_path):
 def test_invalid_credential_file_fails_closed(bad):
     with pytest.raises(ValueError):
         runtime.callback_path(bad)
+
+
+
+def test_exporter_is_root_owned_and_in_separate_systemd_units():
+    assert str(runtime.EXPORT_DST).startswith("/usr/local/libexec/mygithub12/")
+    assert str(runtime.EXPORT_DIR) == "/var/lib/mygithub12-p2p-source"
+    assert runtime.EXPORT_SERVICE_DST.name == "mygithub12-p2p-source-export.service"
+    assert runtime.EXPORT_TIMER_DST.name == "mygithub12-p2p-source-export.timer"

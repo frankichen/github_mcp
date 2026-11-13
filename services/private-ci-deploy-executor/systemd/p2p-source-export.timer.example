@@ -1,0 +1,12 @@
+[Unit]
+Description=Synchronize private P2P source bundle from verified private CI mirror
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=mygithub12-p2p-source-export.service
+
+[Install]
+WantedBy=timers.target
