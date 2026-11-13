@@ -254,7 +254,7 @@ log "Delegated deploy executor synchronized and active"
 # the existing callback key's FILE PATH, never its value. The install helper
 # preserves all live Worker attempt-lease/claim fencing code.
 P2P_RUNTIME_INSTALLER="$REPO_ROOT/services/private-ci-deploy-executor/scripts/install_p2p_runtime.py"
-python3 "$P2P_RUNTIME_INSTALLER" || die "P2P runtime controlled installation failed"
+PYTHONPATH="$REPO_ROOT/services/private-ci-deploy-executor" python3 -m scripts.install_p2p_runtime || die "P2P runtime controlled installation failed"
 systemctl daemon-reload
 systemctl restart private-deploy-agent.service || die "P2P queue Worker restart failed"
 sleep 2

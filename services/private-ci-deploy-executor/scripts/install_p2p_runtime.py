@@ -8,7 +8,7 @@ import stat
 import subprocess
 import tempfile
 
-import patch_p2p_deploy_worker as overlay
+from scripts import patch_p2p_deploy_worker as overlay
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 WORKER = pathlib.Path("/opt/private-deploy-agent/app/deploy_worker.py")
