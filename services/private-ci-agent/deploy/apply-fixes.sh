@@ -250,6 +250,51 @@ sleep 2
 systemctl is-active --quiet private-ci-deploy-executor.service     || die "delegated deploy executor is not active after update"
 log "Delegated deploy executor synchronized and active"
 
+# P2P isolated deployment capability: retain the installed agent's lease and
+# fencing code. Never replace its live file with the older tracked template.
+P2P_WORKER_OVERLAY="$REPO_ROOT/services/private-ci-deploy-executor/scripts/patch_p2p_deploy_worker.py"
+test -f "$P2P_WORKER_OVERLAY" || die "P2P Worker lease-safe overlay missing"
+python3 "$P2P_WORKER_OVERLAY" /opt/private-deploy-agent/app/deploy_worker.py \
+    || die "P2P Worker lease-safe overlay rejected the live runtime"
+/opt/private-deploy-agent/venv/bin/python -m py_compile /opt/private-deploy-agent/app/deploy_worker.py \
+    || die "P2P Worker syntax validation failed"
+systemctl restart private-deploy-agent.service || die "P2P Worker restart failed"
+sleep 2
+systemctl is-active --quiet private-deploy-agent.service \
+    || die "P2P Worker unhealthy after restart"
+
+# Install the new P2P-only runner as a separate service. Do not modify
+# the existing SXT/DevHub delegated executor or its callback credentials.
+P2P_RUNNER_SOURCE="$REPO_ROOT/services/private-ci-deploy-executor/scripts/p2p_deploy_executor.py"
+P2P_RUNNER_TARGET="/home/xiaowu/work/private-ci-controller-node-workspace/scripts/p2p_deploy_executor.py"
+test -f "$P2P_RUNNER_SOURCE" || die "P2P deploy runner source missing"
+install -D -o xiaowu -g xiaowu -m 0644 "$P2P_RUNNER_SOURCE" "$P2P_RUNNER_TARGET"
+python3 -m py_compile "$P2P_RUNNER_TARGET" || die "P2P runner compile failed"
+P2P_RUNNER_UNIT="$REPO_ROOT/services/private-ci-deploy-executor/systemd/p2p-deploy-executor.service.example"
+test -f "$P2P_RUNNER_UNIT" || die "P2P runner systemd unit missing"
+install -D -o root -g root -m 0644 "$P2P_RUNNER_UNIT" \
+    /etc/systemd/system/mygithub12-p2p-deploy-executor.service
+
+# Reuse the existing credential *file path* only; never read, copy, log,
+# or expose the callback key itself.
+P2P_CALLBACK_KEY_FILE="$(systemctl show private-ci-deploy-executor.service -p Environment --value | tr ' ' '\n' | sed -n 's/^DEPLOY_CALLBACK_API_KEY_FILE=//p')"
+test -n "$P2P_CALLBACK_KEY_FILE" || die "P2P callback credential path missing"
+case "$P2P_CALLBACK_KEY_FILE" in *" "*|*"
+"*) die "unsafe P2P callback credential path";; esac
+test -f "$P2P_CALLBACK_KEY_FILE" || die "P2P callback credential file missing"
+install -d -o root -g root -m 0700 /etc/private-ci
+printf 'DEPLOY_CONTROLLER_URL=http://127.0.0.1:8765\nDEPLOY_CALLBACK_API_KEY_FILE=%s\n' \
+    "$P2P_CALLBACK_KEY_FILE" > /etc/private-ci/p2p-deploy-executor.env
+chown root:root /etc/private-ci/p2p-deploy-executor.env
+chmod 0600 /etc/private-ci/p2p-deploy-executor.env
+systemctl daemon-reload
+systemctl enable --now mygithub12-p2p-deploy-executor.service \
+    || die "P2P dedicated deploy executor activation failed"
+sleep 2
+systemctl is-active --quiet mygithub12-p2p-deploy-executor.service \
+    || die "P2P dedicated deploy executor unhealthy"
+log "P2P isolated worker/runner active; no P2P release queued"
+
 # Controller/Agent 的 attempt-lease 协议必须先升级现有 Agent，再切换 Controller。
 # 新 Agent 给旧 Controller 多发送受控 header 是向后兼容的；反向顺序会让
 # 旧 Agent 在 Controller 切换到严格 fencing 后无法提交 log/step/finish。

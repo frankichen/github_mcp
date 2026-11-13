@@ -28,6 +28,15 @@ def approved(row):
 
 def prepare_workspace(row):
     """Use existing exact SHA source verification with an isolated P2P mirror."""
+    if not os.path.isdir(MIRROR):
+        # Fixed public source mirror: no user-supplied URL, host or shell.
+        os.makedirs(os.path.dirname(MIRROR), exist_ok=True)
+        cloned = subprocess.run(["git", "clone", "--mirror", "--", ORIGIN, MIRROR],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=180, check=False)
+        if cloned.returncode:
+            raise base.DeploymentSourceError("P2P_MIRROR_BOOTSTRAP_FAILED",
+                                             "fixed P2P repository mirror unavailable")
     names = ("DEPLOY_MIRROR", "AUTHORITATIVE_REPOSITORY_URL", "DEPLOY_WORKSPACES")
     original = {name: getattr(base, name) for name in names}
     try:

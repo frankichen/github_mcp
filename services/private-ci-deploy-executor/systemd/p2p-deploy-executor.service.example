@@ -8,7 +8,7 @@ Type=simple
 User=xiaowu
 WorkingDirectory=/home/xiaowu/work/private-ci-controller-node-workspace
 Environment=PYTHONDONTWRITEBYTECODE=1
-EnvironmentFile=-/etc/private-ci/p2p-deploy-executor.env
+EnvironmentFile=/etc/private-ci/p2p-deploy-executor.env
 ExecStart=/usr/bin/python3 -m scripts.p2p_deploy_executor
 Restart=on-failure
 RestartSec=5

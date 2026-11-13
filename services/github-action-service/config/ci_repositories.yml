@@ -123,6 +123,8 @@ repositories:
         type: python
       - path: services/private-deploy-agent
         type: python
+      - path: services/private-ci-deploy-executor
+        type: python
     infrastructure_deployment:
       enabled: true
       environment: mygithub12-production
