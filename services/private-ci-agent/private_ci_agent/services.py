@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 from private_ci_agent.config import resolve_worker_id
-from private_ci_agent.podman_resources import PodmanResourceManager
+from private_ci_agent.podman_resources import PodmanCleanupError, PodmanResourceManager
 
 logger = logging.getLogger(__name__)
 JOB_ID_RE = re.compile(r"[^a-z0-9]+")
@@ -379,6 +379,58 @@ class ServiceManager:
             f"reason={sanitize_service_stderr(reason)}"
         )
 
+    def _confirmed_side_effect(self, args: list[str], error_code: str,
+                               resource_type: str, resource_name: str | None) -> bool:
+        """Recover only an existing, exact-owner pod or running detached container.
+
+        A timed-out Podman command may commit its create before losing the CLI
+        response. Blindly retrying that create generates a misleading name
+        conflict and can leave the new service stranded. Fail closed unless
+        the resource's immutable job/worker/type labels match exactly.
+        """
+        if not resource_name or "--name" not in args:
+            return False
+        name_pos = args.index("--name") + 1
+        if name_pos >= len(args) or args[name_pos] != resource_name:
+            return False
+        pod_create = args[:2] == ["pod", "create"]
+        detached_run = args[:1] == ["run"] and "-d" in args
+        if not (pod_create or detached_run):
+            return False
+        labels = {}
+        for index, item in enumerate(args[:-1]):
+            if item == "--label":
+                key, sep, value = args[index + 1].partition("=")
+                if sep:
+                    labels[key] = value
+        worker = labels.get("private-ci.worker")
+        job_id = labels.get("private-ci.job")
+        resource = labels.get("private-ci.resource")
+        if worker != self.worker_id or not job_id or resource != resource_type:
+            return False
+        kind = "pod" if pod_create else "container"
+        try:
+            if not self.resources._exists(kind, resource_name):
+                return False
+            actual_labels = self.resources._inspect_labels(kind, resource_name)
+            self.resources._verify_owned_labels(actual_labels, job_id, resource_type)
+            if detached_run:
+                state = self._container_state(resource_name)
+                if not state or state.get("status") != "running":
+                    return False
+        except PodmanCleanupError as exc:
+            raise ServiceSetupError(
+                error_code,
+                self._diagnostic(error_code, "verify_create", resource_type,
+                                 -1, False, "ownership_verification_failed",
+                                 resource_name=resource_name),
+            ) from exc
+        logger.warning(
+            "services recovered verified create worker=%s job=%s resource=%s name=%s",
+            self.worker_id, job_id, resource_type, resource_name,
+        )
+        return True
+
     def _run(self, args: list[str], error_code: str, *, resource_type: str | None = None,
              operation: str | None = None, image: str | None = None,
              resource_name: str | None = None) -> None:
@@ -388,9 +440,10 @@ class ServiceManager:
         exit_code = None
         timed_out = False
         reason = "unknown"
+        command_timeout = 30 if args[:2] == ["pod", "create"] else (45 if args[:1] == ["run"] and "-d" in args else 20)
         for attempt in range(attempts):
             try:
-                result = subprocess.run([self.podman, *args], capture_output=True, text=True, timeout=20)
+                result = subprocess.run([self.podman, *args], capture_output=True, text=True, timeout=command_timeout)
                 exit_code = result.returncode
                 timed_out = False
                 reason = (result.stderr or "").strip() or f"podman_exit_{result.returncode}"
@@ -409,6 +462,8 @@ class ServiceManager:
                     "services operation=%s resource=%s name=%s exit_code=0 image=%s",
                     operation, resource_type, resource_name or "-", image or "-",
                 )
+                return
+            if self._confirmed_side_effect(args, error_code, resource_type, resource_name):
                 return
             if attempt + 1 < attempts:
                 time.sleep(1)
