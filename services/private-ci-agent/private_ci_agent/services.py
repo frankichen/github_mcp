@@ -582,7 +582,7 @@ _MULTI_POSTGRES = {
 }
 _MULTI_POSTGRES_SERVICES = tuple(_MULTI_POSTGRES)
 _MULTI_POSTGRES_LIMITS = (
-    "--pids-limit=128", "--memory=160m", "--memory-swap=192m", "--cpus=0.30",
+    "--pids-limit=128", "--memory=256m", "--memory-swap=320m", "--cpus=0.50",
 )
 _MULTI_REDIS_LIMITS = (
     "--pids-limit=96", "--memory=64m", "--memory-swap=96m", "--cpus=0.15",

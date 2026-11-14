@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from private_ci_agent.services import ServiceManager, ServiceSetupError
+from private_ci_agent.services import ServiceManager, ServiceSetupError, _MULTI_POSTGRES_LIMITS
 
 
 def output(code=0, stdout='', stderr=''):
@@ -20,6 +20,11 @@ class ServiceCreateRecoveryTests(unittest.TestCase):
         self.pg_name = 'ci-wsl-ci-01-job123-postgres-global'
         self.pg_args = ['run', '-d', '--name', self.pg_name,
                         *self.manager.resources.label_args('job123', 'postgres-global')]
+
+    def test_multi_postgres_has_adequate_ci_cpu_and_memory_quota(self):
+        self.assertEqual(_MULTI_POSTGRES_LIMITS, (
+            "--pids-limit=128", "--memory=256m", "--memory-swap=320m", "--cpus=0.50",
+        ))
 
     def test_pod_timeout_created_then_confirmed_without_duplicate_retry(self):
         calls = []

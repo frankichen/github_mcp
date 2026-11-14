@@ -7,7 +7,7 @@ SXT_REPOSITORY = "frankichen/sxt"
 NODE_INTEGRATION_IMAGE = "localhost/sxt-notification-go-node:1.26.4-22"
 SIMULATOR_TEST = "TestPreferenceDNDSimulatorFullMigrationIntegration"
 GO_ONLY_TEST_COMMAND = (
-    "go test -p 2 -count=1 -skip '^TestPreferenceDNDSimulatorFullMigrationIntegration$' ./... 2>&1"
+    "go test -p 1 -count=1 -skip '^TestPreferenceDNDSimulatorFullMigrationIntegration$' ./... 2>&1"
 )
 NODE_INTEGRATION_COMMAND = (
     "set -eu; command -v go >/dev/null; command -v node >/dev/null; "
