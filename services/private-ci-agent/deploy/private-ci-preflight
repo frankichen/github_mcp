@@ -98,31 +98,14 @@ run_preflight() {
     fi
     [ -n "${pm_storage}" ] && log_pass "Podman storage: ${pm_storage}" || log_warn "Could not query Podman storage path"
 
-    # Pre-cleanup: kill stale catatonit and reset runtime before namespace test
-    pkill -9 -u ${CIWORKER_UID} catatonit 2>/dev/null || true
-    sleep 0.5
-    rm -rf "${XDG_RUNTIME_DIR}/containers" "${XDG_RUNTIME_DIR}/libpod" 2>/dev/null || true
-    mkdir -p "${XDG_RUNTIME_DIR}/containers" "${XDG_RUNTIME_DIR}/libpod" 2>/dev/null || true
-    chown ${CIWORKER_UID}:${CIWORKER_GID} "${XDG_RUNTIME_DIR}/containers" "${XDG_RUNTIME_DIR}/libpod" 2>/dev/null || true
-    podman_run_as_ciworker system migrate >/dev/null 2>&1 || true
-    echo "[PREFLIGHT] Pre-cleaned podman runtime before unshare check"
-    if podman_run_as_ciworker unshare true 2>/dev/null; then
-        log_pass "podman unshare successful"
+    # Both CI Worker services use the same Rootless Podman runroot.
+    # Do not kill catatonit, remove the global runroot or run `podman system migrate`
+    # from one Worker's preflight: the other Worker may have live containers.
+    # Resource cleanup belongs to each Job's ownership-verified reconciliation.
+    if podman_run_as_ciworker ps --format '{{.ID}}' >/dev/null 2>&1; then
+        log_pass "Shared rootless Podman state is readable; runroot left unchanged"
     else
-        # A WSL restart can leave a stale rootless pause namespace behind.
-        # Migrate only when there is no running container; never reset/prune.
-        local running_containers
-        running_containers=$(podman_run_as_ciworker ps --format '{{.ID}}' 2>/dev/null | sed '/^[[:space:]]*$/d' | wc -l)
-        if [ "${running_containers}" -eq 0 ]; then
-            log_warn "podman unshare failed; no running containers, attempting safe system migrate"
-            if podman_run_as_ciworker system migrate >/dev/null 2>&1 && podman_run_as_ciworker unshare true 2>/dev/null; then
-                log_pass "podman system migrate restored rootless namespace"
-            else
-                log_warn "podman unshare failed after safe system migrate (non-critical)"
-            fi
-        else
-            log_warn "podman unshare failed while ${running_containers} container(s) are running (non-critical)"
-        fi
+        log_warn "Shared rootless Podman status unavailable; no destructive repair attempted"
     fi
 
     if timeout 5 bash -c "echo >/dev/tcp/${CONTROLLER_HOST}/${CONTROLLER_PORT}" 2>/dev/null; then
