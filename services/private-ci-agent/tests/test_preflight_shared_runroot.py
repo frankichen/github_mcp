@@ -5,7 +5,7 @@ import unittest
 
 class SharedPodmanRunrootPreflightTests(unittest.TestCase):
     def test_worker_preflight_never_mutates_shared_runroot(self):
-        script = (Path(__file__).resolve().parents[1] / 'bin' / 'private-ci-preflight').read_text()
+        script = (Path(__file__).resolve().parents[1] / 'deploy' / 'private-ci-preflight').read_text()
         executable_lines = [line.split('#', 1)[0].strip() for line in script.splitlines()
                             if line.strip() and not line.lstrip().startswith('#')]
         executable = '\n'.join(executable_lines)
