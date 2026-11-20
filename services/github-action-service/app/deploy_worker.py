@@ -122,7 +122,7 @@ def process_once() -> bool:
         return True
     argv = ["bash", os.path.join(WORKSPACE, SCRIPT), "--yes", "--expected-sha", row["commit_sha"]]
     frontend_included = bool(row["frontend_included"])
-    icon_checks_required = bool(row.get("icon_checks_required", 0))
+    icon_checks_required = bool(row["icon_checks_required"])
     if frontend_included:
         argv.insert(3, "--with-frontend")
     if icon_checks_required:
