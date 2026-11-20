@@ -120,9 +120,20 @@ def process_once() -> bool:
         logger.info("claim-only mode: deployment_id=%s delegated to WSL", dep_id)
         write_status("online", "polling", retained_release, retained_previous, f"deployment {dep_id} delegated to WSL")
         return True
-    argv = ["bash", os.path.join(WORKSPACE, SCRIPT), "--yes", "--with-frontend", "--expected-sha", row["commit_sha"]]
+    argv = ["bash", os.path.join(WORKSPACE, SCRIPT), "--yes", "--expected-sha", row["commit_sha"]]
+    frontend_included = bool(row["frontend_included"])
+    icon_checks_required = bool(row.get("icon_checks_required", 0))
+    if frontend_included:
+        argv.insert(3, "--with-frontend")
+    if icon_checks_required:
+        argv.insert(3, "--with-icon-checks")
     try:
         deploy_env = os.environ.copy()
+        ci_job_id = str(row.get("private_ci_job_id") or "")
+        if not ci_job_id or ci_job_id == "not_required":
+            raise RuntimeError("SXT deployment is missing its validated private CI job")
+        deploy_env["DEPLOYMENT_CI_VERIFIED"] = "1"
+        deploy_env["DEPLOYMENT_CI_JOB_ID"] = ci_job_id
         date_shim_dir = deploy_env.get("DEPLOY_DATE_SHIM_DIR")
         if date_shim_dir:
             deploy_env["PATH"] = f"{date_shim_dir}:{deploy_env.get('PATH', '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin')}"
@@ -137,8 +148,12 @@ def process_once() -> bool:
             db.commit()
             write_status("busy", step, retained_release, retained_previous, f"deployment {dep_id} {step}")
         proc.wait()
-        final_status = "passed" if proc.returncode == 0 else "failed"
-        db.execute("UPDATE deployments SET status=?,current_step=?,exit_code=?,finished_at=?,log_text=? WHERE deployment_id=?", (final_status, "completed" if proc.returncode == 0 else "failed", proc.returncode, time.time(), "".join(output)[-200000:], dep_id)); db.commit()
+        icon_evidence_missing = icon_checks_required and "APP_ICON_CHECKS_VERIFIED=true" not in "".join(output)
+        final_exit_code = 1 if icon_evidence_missing else proc.returncode
+        final_status = "passed" if final_exit_code == 0 else "failed"
+        if icon_evidence_missing:
+            output.append("\\nICON_CHECK_EVIDENCE_MISSING")
+        db.execute("UPDATE deployments SET status=?,current_step=?,exit_code=?,finished_at=?,log_text=? WHERE deployment_id=?", (final_status, "completed" if final_exit_code == 0 else "failed", final_exit_code, time.time(), "".join(output)[-200000:], dep_id)); db.commit()
         logger.info("deployment finished: deployment_id=%s status=%s exit_code=%s", dep_id, final_status, proc.returncode)
         write_status("online", "idle", retained_release, retained_previous, f"deployment {dep_id} {final_status}")
     except Exception as exc:
