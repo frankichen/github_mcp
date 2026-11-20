@@ -35,6 +35,7 @@ FRONTEND_PATH_PREFIXES = ("h5/", "api/openapi/", "deploy/nginx/", "deploy/icon-a
 FRONTEND_PATHS = {
     "deploy/compose/docker-compose.https.override.yml",
     "deploy/compose/docker-compose.bluegreen.override.yml",
+    "deploy/compose/docker-compose.test.yml",
     "scripts/build_issue312_icon_catalog.py",
 }
 APP_ICON_PATH_PREFIXES = ("deploy/icon-assets/", "internal/modules/appicons/")
@@ -113,7 +114,7 @@ def init_deployment_db():
       status TEXT NOT NULL, current_step TEXT, exit_code INTEGER, error_code TEXT,
       error_message TEXT, rollback_attempted INTEGER NOT NULL DEFAULT 0,
       rollback_succeeded INTEGER NOT NULL DEFAULT 0, cancel_requested INTEGER NOT NULL DEFAULT 0,
-      frontend_included INTEGER NOT NULL DEFAULT 1, icon_checks_required INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL,
+      frontend_included INTEGER NOT NULL DEFAULT 1, icon_checks_required INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,
       started_at REAL, finished_at REAL, updated_at REAL, log_revision INTEGER NOT NULL DEFAULT 0,
       current_release_path TEXT, current_git_sha TEXT, lease_token TEXT,
       artifact_id TEXT,
@@ -132,7 +133,7 @@ def init_deployment_db():
         "lease_token": "TEXT",
         "performance_json": "TEXT NOT NULL DEFAULT '{}'",
         "artifact_id": "TEXT",
-        "icon_checks_required": "INTEGER NOT NULL DEFAULT 1",
+        "icon_checks_required": "INTEGER NOT NULL DEFAULT 0",
         "cancel_requested_at": "REAL",
         "reconciled_at": "REAL",
         "reconciliation_reason": "TEXT",
@@ -154,7 +155,7 @@ def _row(row):
     for key in ("created_at", "started_at", "finished_at", "updated_at"):
         data[key] = _iso(data[key])
     data["frontend_included"] = bool(data["frontend_included"])
-    data["icon_checks_required"] = bool(data.get("icon_checks_required", 1))
+    data["icon_checks_required"] = bool(data.get("icon_checks_required", 0))
     data["rollback_attempted"] = bool(data["rollback_attempted"])
     data["rollback_succeeded"] = bool(data["rollback_succeeded"])
     data["cancel_requested"] = bool(data["cancel_requested"])
@@ -253,10 +254,11 @@ def complete_test_deployment(deployment_id: str, exit_code: int, message: str = 
     if row["repository"] == REPOSITORY:
         if type(release.get("frontend_included")) is not bool or release["frontend_included"] != bool(row["frontend_included"]):
             return _error_response("RELEASE_COMPONENT_SCOPE_MISMATCH", "frontend inclusion does not match the approved deployment plan")
-        if type(release.get("icon_checks_required")) is not bool or release["icon_checks_required"] != bool(row["icon_checks_required"]):
-            return _error_response("RELEASE_ICON_SCOPE_MISMATCH", "icon smoke scope does not match the approved deployment plan")
-        if type(release.get("icon_checks_verified")) is not bool or (row["icon_checks_required"] and not release["icon_checks_verified"]):
-            return _error_response("RELEASE_ICON_CHECK_EVIDENCE_REQUIRED", "required icon checks were not verified")
+        if row["icon_checks_required"]:
+            if release.get("icon_checks_required") is not True or release.get("icon_checks_verified") is not True:
+                return _error_response("RELEASE_ICON_CHECK_EVIDENCE_REQUIRED", "required icon checks were not verified")
+        elif release.get("icon_checks_required") not in (None, False):
+            return _error_response("RELEASE_ICON_SCOPE_MISMATCH", "unexpected icon smoke execution")
     release_path = str(release.get("current_release_path") or "")
     if (Path(release_path).name != str(release.get("release_id"))
             or release.get("repository") != row["repository"]
@@ -550,15 +552,27 @@ def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id,
     snapshot = _status_snapshot(repository) or {}
     current_release, _ = _release_snapshot(snapshot)
     component_scope = _deployment_change_scope(repository, commit_sha, current_release)
-    files = component_scope["changed_files"]
-    if not component_scope["changed_files_complete"]:
-        # Retain the target commit's own files for diagnostics; component gates
-        # remain fullstack and infrastructure/migration-sensitive above.
+    if repository == REPOSITORY:
+        files = component_scope["changed_files"]
+        if not component_scope["changed_files_complete"]:
+            # Retain the target commit's own files for diagnostics; component gates
+            # remain fullstack and infrastructure/migration-sensitive above.
+            files = commit_files
+        infra_changed = component_scope["deploy_infrastructure_changed"]
+        migrations_changed = component_scope["migrations_changed"]
+    else:
+        # Preserve each other repository's existing fixed-contract file checks.
         files = commit_files
-    infra_changed = component_scope["deploy_infrastructure_changed"]
+        infra_changed = any(
+            path == spec.get("script")
+            or path == "scripts/deploy_gongshi_test.sh"
+            or path == "scripts/sync_test_env.sh"
+            or path.startswith("deploy/")
+            for path in files
+        )
+        migrations_changed = any(path.startswith("db/migrations/") for path in files)
     if infra_changed and not allow_deploy_infrastructure_changes:
         reasons.append("DEPLOY_INFRASTRUCTURE_CHANGE_REQUIRES_EXPLICIT_ALLOW")
-    migrations_changed = component_scope["migrations_changed"]
     current_release_id = (current_release or {}).get("release_id")
     frontend_included = component_scope["frontend_included"]
     icon_checks_required = component_scope["icon_checks_required"]
