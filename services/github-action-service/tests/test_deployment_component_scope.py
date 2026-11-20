@@ -128,3 +128,30 @@ def test_start_persists_backend_only_component_selection(monkeypatch, tmp_path):
         (result["deployment_id"],),
     ).fetchone()
     assert tuple(row) == (0, 0)
+
+
+def test_renamed_frontend_path_is_not_misclassified_as_backend(monkeypatch):
+    class Comparison:
+        status = "ahead"
+        ahead_by = 1
+        behind_by = 0
+        total_commits = 1
+        files = [type("File", (), {
+            "filename": "internal/modules/device/renamed.go",
+            "previous_filename": "h5/lenshub-console/src/old.ts",
+        })()]
+
+    class Repo:
+        def compare(self, base, head):
+            return Comparison()
+
+    class GitHub:
+        def get_repo(self, repository):
+            return Repo()
+
+    monkeypatch.setattr(deployment, "_get_gh", lambda: GitHub())
+    files, state = deployment._compare_changed_files(REPOSITORY, "a" * 40, TARGET_SHA)
+    assert state == "complete"
+    assert "h5/lenshub-console/src/old.ts" in files
+    assert "internal/modules/device/renamed.go" in files
+    assert deployment._is_frontend_change(files[0]) or deployment._is_frontend_change(files[1])
