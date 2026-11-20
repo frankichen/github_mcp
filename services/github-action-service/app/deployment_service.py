@@ -381,11 +381,15 @@ def _compare_changed_files(repository: str, base_sha: str, target_sha: str) -> t
         files = list(raw_files)
         if len(files) >= MAX_DEPLOYMENT_COMPARE_FILES:
             return None, "comparison_file_limit"
-        paths = {
-            str(item.filename)
-            for item in files
-            if isinstance(getattr(item, "filename", None), str) and item.filename
-        }
+        paths = set()
+        for item in files:
+            filename = getattr(item, "filename", None)
+            if isinstance(filename, str) and filename:
+                paths.add(filename)
+            # Rename across component boundaries changes the old path too.
+            previous_filename = getattr(item, "previous_filename", None)
+            if isinstance(previous_filename, str) and previous_filename:
+                paths.add(previous_filename)
         return sorted(paths), "complete"
     except Exception:
         return None, "comparison_unavailable"
