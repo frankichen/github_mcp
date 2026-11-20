@@ -31,6 +31,21 @@ SCOPE = "fullstack"
 PROFILE = "repo-auto-check"
 STATUSES = ("queued", "claimed", "running", "preparing", "validating_main", "testing", "building", "packaging", "checksum_verification", "uploading", "migrating", "switching", "restarting_services", "health_checking", "completed", "passed", "failed", "cancel_requested", "cancelled", "rolling_back", "rollback_failed", "rolled_back")
 INFRA_FILES = ("scripts/deploy_gongshi_test.sh", "deploy/", "scripts/sync_test_env.sh")
+FRONTEND_PATH_PREFIXES = ("h5/", "api/openapi/", "deploy/nginx/", "deploy/icon-assets/")
+FRONTEND_PATHS = {
+    "deploy/compose/docker-compose.https.override.yml",
+    "deploy/compose/docker-compose.bluegreen.override.yml",
+    "scripts/build_issue312_icon_catalog.py",
+}
+APP_ICON_PATH_PREFIXES = ("deploy/icon-assets/", "internal/modules/appicons/")
+APP_ICON_PATHS = {
+    "scripts/build_issue312_icon_catalog.py",
+    "scripts/smoke-app-icon-api.sh",
+    "scripts/smoke-three-brand-icon-api.sh",
+    "scripts/smoke-issue312-icon-compat.sh",
+}
+MAX_DEPLOYMENT_COMPARE_COMMITS = 250
+MAX_DEPLOYMENT_COMPARE_FILES = 300
 CANCEL_ACK_GRACE_SECONDS = 60
 DELEGATED_CLAIM_MARKER = "execution delegated to WSL"
 _lock = threading.Lock()
@@ -98,7 +113,7 @@ def init_deployment_db():
       status TEXT NOT NULL, current_step TEXT, exit_code INTEGER, error_code TEXT,
       error_message TEXT, rollback_attempted INTEGER NOT NULL DEFAULT 0,
       rollback_succeeded INTEGER NOT NULL DEFAULT 0, cancel_requested INTEGER NOT NULL DEFAULT 0,
-      frontend_included INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL,
+      frontend_included INTEGER NOT NULL DEFAULT 1, icon_checks_required INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL,
       started_at REAL, finished_at REAL, updated_at REAL, log_revision INTEGER NOT NULL DEFAULT 0,
       current_release_path TEXT, current_git_sha TEXT, lease_token TEXT,
       artifact_id TEXT,
@@ -117,6 +132,7 @@ def init_deployment_db():
         "lease_token": "TEXT",
         "performance_json": "TEXT NOT NULL DEFAULT '{}'",
         "artifact_id": "TEXT",
+        "icon_checks_required": "INTEGER NOT NULL DEFAULT 1",
         "cancel_requested_at": "REAL",
         "reconciled_at": "REAL",
         "reconciliation_reason": "TEXT",
@@ -138,6 +154,7 @@ def _row(row):
     for key in ("created_at", "started_at", "finished_at", "updated_at"):
         data[key] = _iso(data[key])
     data["frontend_included"] = bool(data["frontend_included"])
+    data["icon_checks_required"] = bool(data.get("icon_checks_required", 1))
     data["rollback_attempted"] = bool(data["rollback_attempted"])
     data["rollback_succeeded"] = bool(data["rollback_succeeded"])
     data["cancel_requested"] = bool(data["cancel_requested"])
@@ -233,6 +250,13 @@ def complete_test_deployment(deployment_id: str, exit_code: int, message: str = 
     row = db.execute("SELECT * FROM deployments WHERE deployment_id=?", (deployment_id,)).fetchone()
     if not row:
         return _error_response("DEPLOYMENT_NOT_FOUND", "deployment not found")
+    if row["repository"] == REPOSITORY:
+        if type(release.get("frontend_included")) is not bool or release["frontend_included"] != bool(row["frontend_included"]):
+            return _error_response("RELEASE_COMPONENT_SCOPE_MISMATCH", "frontend inclusion does not match the approved deployment plan")
+        if type(release.get("icon_checks_required")) is not bool or release["icon_checks_required"] != bool(row["icon_checks_required"]):
+            return _error_response("RELEASE_ICON_SCOPE_MISMATCH", "icon smoke scope does not match the approved deployment plan")
+        if type(release.get("icon_checks_verified")) is not bool or (row["icon_checks_required"] and not release["icon_checks_verified"]):
+            return _error_response("RELEASE_ICON_CHECK_EVIDENCE_REQUIRED", "required icon checks were not verified")
     release_path = str(release.get("current_release_path") or "")
     if (Path(release_path).name != str(release.get("release_id"))
             or release.get("repository") != row["repository"]
@@ -246,7 +270,6 @@ def complete_test_deployment(deployment_id: str, exit_code: int, message: str = 
         result["deployment"] = _row(db.execute("SELECT * FROM deployments WHERE deployment_id=?", (deployment_id,)).fetchone())
         _persist_release_snapshot(release, row["repository"])
     return result
-
 
 def fail_test_deployment(deployment_id: str, exit_code: int, error_code: str, error_message: str = "") -> dict:
     result = _deployment_callback_update(deployment_id, "failed", error_message, status="failed", exit_code=exit_code, error_code=error_code, error_message=error_message)
@@ -282,7 +305,7 @@ def _persist_release_snapshot(release: dict, repository: str = REPOSITORY) -> No
     previous = current.get("current_release_id")
     item = {key: release.get(key) for key in (
         "release_id", "repository", "environment", "git_sha", "current_release_path", "created_at",
-        "frontend_included", "manifest_verified", "checksum_verified", "health_verified", "services_healthy",
+        "frontend_included", "icon_checks_required", "icon_checks_verified", "manifest_verified", "checksum_verified", "health_verified", "services_healthy",
         "deployment_id", "status",
     ) if key in release}
     item.update({"is_current": True, "is_previous": False})
@@ -328,6 +351,112 @@ def _repo_state(repository, commit_sha):
     main_sha = repo.get_branch("main").commit.sha
     files = [f.filename for f in repo.get_commit(commit_sha).files]
     return main_sha, files
+
+
+def _compare_changed_files(repository: str, base_sha: str, target_sha: str) -> tuple[list[str] | None, str]:
+    """Compare the deployed release to the target main SHA; incomplete diffs fail closed."""
+    if not isinstance(base_sha, str) or not SHA_RE.fullmatch(base_sha):
+        return None, "release_base_unavailable"
+    if base_sha == target_sha:
+        return [], "identical"
+    try:
+        repo = _get_gh().get_repo(repository)
+        comparison = repo.compare(base_sha, target_sha)
+        status = str(getattr(comparison, "status", "") or "").lower()
+        ahead_by = int(getattr(comparison, "ahead_by", 0) or 0)
+        behind_by = int(getattr(comparison, "behind_by", 0) or 0)
+        total_commits = int(getattr(comparison, "total_commits", 0) or 0)
+        if (
+            status != "ahead"
+            or behind_by != 0
+            or ahead_by != total_commits
+            or total_commits > MAX_DEPLOYMENT_COMPARE_COMMITS
+        ):
+            return None, "comparison_incomplete"
+        raw_files = getattr(comparison, "files", None)
+        if raw_files is None:
+            return None, "comparison_files_unavailable"
+        files = list(raw_files)
+        if len(files) >= MAX_DEPLOYMENT_COMPARE_FILES:
+            return None, "comparison_file_limit"
+        paths = {
+            str(item.filename)
+            for item in files
+            if isinstance(getattr(item, "filename", None), str) and item.filename
+        }
+        return sorted(paths), "complete"
+    except Exception:
+        return None, "comparison_unavailable"
+
+
+def _is_frontend_change(path: str) -> bool:
+    return path.startswith(FRONTEND_PATH_PREFIXES) or path in FRONTEND_PATHS
+
+
+def _is_app_icon_change(path: str) -> bool:
+    return path.startswith(APP_ICON_PATH_PREFIXES) or path in APP_ICON_PATHS
+
+
+def _deployment_change_scope(repository: str, target_sha: str, current_release: dict | None) -> dict:
+    """Classify only a complete diff from the verified deployed release to exact target main."""
+    if repository != REPOSITORY:
+        frontend = repository not in (P2P_REPOSITORY, "frankichen/auto_gupiao")
+        return {
+            "changed_files": [],
+            "changed_files_complete": False,
+            "comparison_state": "fixed_repository_contract",
+            "change_classification": "fixed_repository_contract",
+            "frontend_included": frontend,
+            "icon_checks_required": False,
+            "migrations_changed": False,
+            "deploy_infrastructure_changed": False,
+        }
+
+    base_sha = (current_release or {}).get("git_sha") if isinstance(current_release, dict) else ""
+    files, comparison_state = _compare_changed_files(repository, base_sha or "", target_sha)
+    if files is None:
+        # Never omit a component when the deployed baseline or complete diff is unknown.
+        return {
+            "changed_files": [],
+            "changed_files_complete": False,
+            "comparison_state": comparison_state,
+            "change_classification": "fullstack_fallback",
+            "frontend_included": True,
+            "icon_checks_required": True,
+            "migrations_changed": True,
+            "deploy_infrastructure_changed": True,
+        }
+
+    frontend = any(_is_frontend_change(path) for path in files)
+    icon_checks = any(_is_app_icon_change(path) for path in files)
+    migrations = any(
+        path.startswith(("db/migrations/", "db/regional_account_migrations/"))
+        for path in files
+    )
+    infra = any(
+        path == "scripts/deploy_gongshi_test.sh"
+        or path == "scripts/sync_test_env.sh"
+        or path.startswith("deploy/")
+        for path in files
+    )
+    if frontend and icon_checks:
+        classification = "frontend_and_icons"
+    elif frontend:
+        classification = "frontend"
+    elif icon_checks:
+        classification = "icon_api"
+    else:
+        classification = "backend_only"
+    return {
+        "changed_files": files,
+        "changed_files_complete": True,
+        "comparison_state": comparison_state,
+        "change_classification": classification,
+        "frontend_included": frontend,
+        "icon_checks_required": icon_checks,
+        "migrations_changed": migrations,
+        "deploy_infrastructure_changed": infra,
+    }
 
 
 def _ci_gate(repository, job_id, commit_sha, expected_tree_sha=""):
@@ -392,12 +521,14 @@ def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id,
     if reason: return {"ok": True, "ready": False, "reasons": [reason]}
     reasons = []
     try:
-        main_sha, files = _repo_state(repository, commit_sha)
+        main_sha, commit_files = _repo_state(repository, commit_sha)
     except Exception as exc:
         return {"ok": True, "ready": False, "reasons": ["GITHUB_STATE_UNAVAILABLE"], "message": str(exc)}
-    if commit_sha != main_sha: reasons.append("COMMIT_NOT_CURRENT_MAIN")
+    if commit_sha != main_sha:
+        reasons.append("COMMIT_NOT_CURRENT_MAIN")
     ci_reason, ci_job = _ci_gate(repository, private_ci_job_id, commit_sha)
-    if ci_reason: reasons.append(ci_reason)
+    if ci_reason:
+        reasons.append(ci_reason)
     artifact = None
     if artifact_id:
         from app.attestation_registry import validate_artifact
@@ -415,46 +546,110 @@ def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id,
                 reasons.append("P2P_DEPLOY_SCRIPT_UNAVAILABLE")
         except Exception:
             reasons.append("P2P_DEPLOY_SCRIPT_UNAVAILABLE")
-    infra_changed = any(path == spec.get("script") or path == "scripts/deploy_gongshi_test.sh" or path == "scripts/sync_test_env.sh" or path.startswith("deploy/") for path in files)
-    if infra_changed and not allow_deploy_infrastructure_changes: reasons.append("DEPLOY_INFRASTRUCTURE_CHANGE_REQUIRES_EXPLICIT_ALLOW")
-    migrations_changed = any(path.startswith("db/migrations/") for path in files)
+
     snapshot = _status_snapshot(repository) or {}
     current_release, _ = _release_snapshot(snapshot)
+    component_scope = _deployment_change_scope(repository, commit_sha, current_release)
+    files = component_scope["changed_files"]
+    if not component_scope["changed_files_complete"]:
+        # Retain the target commit's own files for diagnostics; component gates
+        # remain fullstack and infrastructure/migration-sensitive above.
+        files = commit_files
+    infra_changed = component_scope["deploy_infrastructure_changed"]
+    if infra_changed and not allow_deploy_infrastructure_changes:
+        reasons.append("DEPLOY_INFRASTRUCTURE_CHANGE_REQUIRES_EXPLICIT_ALLOW")
+    migrations_changed = component_scope["migrations_changed"]
     current_release_id = (current_release or {}).get("release_id")
-    return {"ok": True, "ready": not reasons, "reasons": reasons, "repository": repository, "environment": environment,
-            "commit_sha": commit_sha, "exact_main_sha": main_sha, "private_ci": ci_job,
-            "current_release_id": current_release_id, "previous_release_id": snapshot.get("previous_release_id"),
-            "current_git_sha": (current_release or {}).get("git_sha"),
-            "current_release_path": (current_release or {}).get("current_release_path"),
-            "target_release_id": f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{commit_sha[:12]}",
-            "changed_files": files, "migrations_changed": migrations_changed, "deploy_infrastructure_changed": infra_changed,
-            "artifact_id": artifact_id or None, "artifact": artifact,
-            "backend_components": ["p2p-gateway", "p2p-signaling"] if repository == P2P_REPOSITORY else ([] if repository == "frankichen/auto_gupiao" else ["lenshub-api", "lenshub-worker", "lenshub-scheduler", "lenshub-admin-bootstrap", "goose"]),
-            "frontend_components": [] if repository in ("frankichen/auto_gupiao", P2P_REPOSITORY) else ["admin", "newadmin", "root", "app", "h5", "tester", "docs", "openapi"],
-            "restart_services": ["p2p-lab"] if repository == P2P_REPOSITORY else (["auto-gupiao"] if repository == "frankichen/auto_gupiao" else ["api", "worker", "scheduler", "web"]),
-            "health_endpoints": ["loopback-only-udp-smoke"] if repository == P2P_REPOSITORY else (["/"] if repository == "frankichen/auto_gupiao" else ["/public/v1/health", "/nginx-health", "/", "/app/", "/h5/", "/admin/", "/newadmin/", "/tester/", "/docs/"]),
-            "rollback_plan": "flock 后恢复 previous current；不执行 goose down，不删除 release", "expected_current_release_id": expected_current_release_id}
+    frontend_included = component_scope["frontend_included"]
+    icon_checks_required = component_scope["icon_checks_required"]
+    frontend_components = (
+        []
+        if not frontend_included or repository in ("frankichen/auto_gupiao", P2P_REPOSITORY)
+        else ["admin", "newadmin", "root", "app", "h5", "tester", "docs", "openapi"]
+    )
+    if repository == P2P_REPOSITORY:
+        restart_services = ["p2p-lab"]
+        health_endpoints = ["loopback-only-udp-smoke"]
+    elif repository == "frankichen/auto_gupiao":
+        restart_services = ["auto-gupiao"]
+        health_endpoints = ["/"]
+    elif repository == REPOSITORY and not frontend_included:
+        restart_services = ["api", "worker", "scheduler"]
+        health_endpoints = ["/public/v1/health"]
+    else:
+        restart_services = ["api", "worker", "scheduler", "web"]
+        health_endpoints = ["/public/v1/health", "/nginx-health", "/", "/app/", "/h5/", "/admin/", "/newadmin/", "/tester/", "/docs/"]
 
+    return {
+        "ok": True,
+        "ready": not reasons,
+        "reasons": reasons,
+        "repository": repository,
+        "environment": environment,
+        "commit_sha": commit_sha,
+        "exact_main_sha": main_sha,
+        "private_ci": ci_job,
+        "current_release_id": current_release_id,
+        "previous_release_id": snapshot.get("previous_release_id"),
+        "current_git_sha": (current_release or {}).get("git_sha"),
+        "current_release_path": (current_release or {}).get("current_release_path"),
+        "target_release_id": f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{commit_sha[:12]}",
+        "changed_files": files,
+        "changed_files_complete": component_scope["changed_files_complete"],
+        "comparison_state": component_scope["comparison_state"],
+        "change_classification": component_scope["change_classification"],
+        "frontend_included": frontend_included,
+        "icon_checks_required": icon_checks_required,
+        "migrations_changed": migrations_changed,
+        "deploy_infrastructure_changed": infra_changed,
+        "artifact_id": artifact_id or None,
+        "artifact": artifact,
+        "backend_components": ["p2p-gateway", "p2p-signaling"] if repository == P2P_REPOSITORY else ([] if repository == "frankichen/auto_gupiao" else ["lenshub-api", "lenshub-worker", "lenshub-scheduler", "lenshub-admin-bootstrap", "goose"]),
+        "frontend_components": frontend_components,
+        "restart_services": restart_services,
+        "health_endpoints": health_endpoints,
+        "rollback_plan": "flock 后恢复 previous current；不执行 goose down，不删除 release",
+        "expected_current_release_id": expected_current_release_id,
+    }
 
 def start_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope=SCOPE, expected_current_release_id="", allow_deploy_infrastructure_changes=False, force_redeploy=False, confirm=False, requested_by="mcp", artifact_id=""):
     if artifact_id and os.environ.get("MYGITHUB10_ARTIFACT_DEPLOY_ENABLED", "false").lower() not in {"1", "true", "yes", "on"}: return _error_response("FEATURE_DISABLED", "artifact deployment is disabled")
     if not confirm: return _error_response("CONFIRM_REQUIRED", "confirm must be true")
     plan = plan_test_deployment(repository, environment, commit_sha, private_ci_job_id, scope, expected_current_release_id, allow_deploy_infrastructure_changes, artifact_id)
-    if not plan.get("ready"): return {**plan, "error": {"code": plan.get("reasons", ["NOT_READY"])[0]}}
+    if not plan.get("ready"):
+        return {**plan, "error": {"code": plan.get("reasons", ["NOT_READY"])[0]}}
     if not private_ci_job_id and not _deployment_spec(repository).get("private_ci"):
         private_ci_job_id = "not_required"
     init_deployment_db(); db = _get_deploy_db()
     with _lock:
         active = db.execute("SELECT deployment_id FROM deployments WHERE environment=? AND status IN ('queued','preparing','building','uploading','migrating','switching','verifying','cancel_requested')", (environment,)).fetchone()
-        if active: return _error_response("DEPLOYMENT_ALREADY_ACTIVE", "another deployment is active", details={"deployment_id": active[0]})
+        if active:
+            return _error_response("DEPLOYMENT_ALREADY_ACTIVE", "another deployment is active", details={"deployment_id": active[0]})
         if not force_redeploy and db.execute("SELECT 1 FROM deployments WHERE environment=? AND commit_sha=? AND status='passed'", (environment, commit_sha)).fetchone():
             return _error_response("ALREADY_DEPLOYED", "same SHA already passed")
         deployment_id = "dep_" + uuid.uuid4().hex
         now = _now()
-        db.execute("INSERT INTO deployments(deployment_id,repository,environment,commit_sha,private_ci_job_id,requested_scope,current_release_before,target_release,status,created_at,updated_at,requested_by,frontend_included,artifact_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (deployment_id, repository, environment, commit_sha, private_ci_job_id, scope, plan.get("current_release_id"), plan["target_release_id"], "queued", now, now, requested_by, 0 if repository == P2P_REPOSITORY else 1, artifact_id or None))
+        db.execute(
+            "INSERT INTO deployments(deployment_id,repository,environment,commit_sha,private_ci_job_id,requested_scope,current_release_before,target_release,status,created_at,updated_at,requested_by,frontend_included,icon_checks_required,artifact_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                deployment_id, repository, environment, commit_sha, private_ci_job_id,
+                scope, plan.get("current_release_id"), plan["target_release_id"], "queued",
+                now, now, requested_by, int(bool(plan.get("frontend_included"))),
+                int(bool(plan.get("icon_checks_required"))), artifact_id or None,
+            ),
+        )
         db.commit()
-    return {"ok": True, "deployment_id": deployment_id, "status": "queued", "target_release_id": plan["target_release_id"], "message": "queued for private-deploy-agent"}
-
+    return {
+        "ok": True,
+        "deployment_id": deployment_id,
+        "status": "queued",
+        "target_release_id": plan["target_release_id"],
+        "frontend_included": plan.get("frontend_included", True),
+        "icon_checks_required": plan.get("icon_checks_required", False),
+        "change_classification": plan.get("change_classification", "fixed_repository_contract"),
+        "message": "queued for private-deploy-agent",
+    }
 
 def get_test_deployment(deployment_id):
     init_deployment_db(); row = _get_deploy_db().execute("SELECT * FROM deployments WHERE deployment_id=?", (deployment_id,)).fetchone()
