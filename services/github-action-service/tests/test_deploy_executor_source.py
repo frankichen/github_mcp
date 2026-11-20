@@ -158,3 +158,28 @@ def test_controller_read_timeout_does_not_crash_executor(monkeypatch):
     monkeypatch.setattr(executor.time, "sleep", lambda _: (_ for _ in ()).throw(StopIteration()))
     with pytest.raises(StopIteration):
         executor.main()
+
+
+
+def test_sxt_executor_uses_planned_components_and_verified_ci():
+    from pathlib import Path
+
+    source = Path(executor.__file__).read_text(encoding="utf-8")
+    assert 'frontend_included = row.get("frontend_included") is True' in source
+    assert 'icon_checks_required = row.get("icon_checks_required") is True' in source
+    assert 'deploy_env["DEPLOYMENT_CI_VERIFIED"] = "1"' in source
+    assert 'deploy_env["DEPLOYMENT_CI_JOB_ID"] = ci_job_id' in source
+    assert 'if icon_checks_required:' in source
+    assert '"icon_checks_verified": icon_checks_verified' in source
+
+
+def test_legacy_deploy_worker_uses_planned_components_and_ci():
+    from pathlib import Path
+
+    worker = Path(executor.__file__).parents[1] / "app" / "deploy_worker.py"
+    source = worker.read_text(encoding="utf-8")
+    assert 'frontend_included = bool(row["frontend_included"])' in source
+    assert 'icon_checks_required = bool(row.get("icon_checks_required", 0))' in source
+    assert 'deploy_env["DEPLOYMENT_CI_VERIFIED"] = "1"' in source
+    assert 'if icon_checks_required:' in source
+    assert 'APP_ICON_CHECKS_VERIFIED=true' in source

@@ -20,7 +20,8 @@ def _proof():
     return {"release_id": "rel_test", "repository": "frankichen/sxt", "environment": "gongshi-test", "git_sha": "a" * 40,
             "current_release_path": "/home/dly/releases/rel_test", "manifest_verified": True,
             "checksum_verified": True, "health_verified": True, "services_healthy": True,
-            "frontend_included": True, "status": "passed"}
+            "frontend_included": True, "icon_checks_required": False,
+            "icon_checks_verified": False, "status": "passed"}
 
 
 def test_progress_complete_is_idempotent_and_terminal(monkeypatch, tmp_path):
@@ -285,3 +286,27 @@ def test_queued_cancel_is_terminal_and_late_callback_cannot_restart(monkeypatch,
     assert deployment_service.update_test_deployment_progress(
         "dep_test", "building", "late", status="running"
     )["deployment"]["status"] == "cancelled"
+
+
+
+def test_complete_rejects_frontend_scope_mismatch(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    db = deployment_service._get_deploy_db()
+    db.execute("UPDATE deployments SET frontend_included=0 WHERE deployment_id='dep_test'")
+    db.commit()
+    deployment_service.update_test_deployment_progress("dep_test", "running", "started", status="running")
+    result = deployment_service.complete_test_deployment("dep_test", 0, "wrong component scope", _proof())
+    assert result["error"]["code"] == "RELEASE_COMPONENT_SCOPE_MISMATCH"
+
+
+def test_complete_requires_icon_checks_when_plan_requires_them(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    db = deployment_service._get_deploy_db()
+    db.execute("UPDATE deployments SET icon_checks_required=1 WHERE deployment_id='dep_test'")
+    db.commit()
+    deployment_service.update_test_deployment_progress("dep_test", "running", "started", status="running")
+    missing = deployment_service.complete_test_deployment("dep_test", 0, "missing icon proof", _proof())
+    assert missing["error"]["code"] == "RELEASE_ICON_CHECK_EVIDENCE_REQUIRED"
+    proof = {**_proof(), "icon_checks_required": True, "icon_checks_verified": True}
+    complete = deployment_service.complete_test_deployment("dep_test", 0, "verified icons", proof)
+    assert complete["deployment"]["status"] == "passed"
