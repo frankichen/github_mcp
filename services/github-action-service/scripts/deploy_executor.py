@@ -253,12 +253,25 @@ def execute(row: dict) -> None:
         if not os.path.isfile(script):
             raise DeploymentSourceError("DEPLOY_COMMIT_NOT_FOUND", "deployment script is missing from exact checkout")
         deploy_env = {**os.environ, "DEPLOYMENT_ID": deployment_id}
-        # The release script's integration tests share the WSL PostgreSQL
-        # fixture. Serialize Go packages to avoid cross-package fixture races.
-        deploy_env["GOFLAGS"] = (deploy_env.get("GOFLAGS", "") + " -p=1").strip()
+        if row.get("repository") == EXPECTED_REPOSITORY:
+            ci_job_id = row.get("private_ci_job_id")
+            if not isinstance(ci_job_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", ci_job_id) or ci_job_id == "not_required":
+                raise DeploymentSourceError("PRIVATE_CI_JOB_MISSING", "SXT deployment has no validated private CI job")
+            # The Controller only queues a deployment after the exact-SHA/tree repo-auto-check gate passes.
+            deploy_env["DEPLOYMENT_CI_VERIFIED"] = "1"
+            deploy_env["DEPLOYMENT_CI_JOB_ID"] = ci_job_id
+            frontend_included = row.get("frontend_included") is True
+            icon_checks_required = row.get("icon_checks_required") is True
+        else:
+            # Preserve the other repositories' existing fixed execution contract.
+            deploy_env["GOFLAGS"] = (deploy_env.get("GOFLAGS", "") + " -p=1").strip()
+            frontend_included = bool(contract["frontend"])
+            icon_checks_required = False
         args = ["bash", script, "--yes", "--expected-sha", row["commit_sha"]]
-        if contract["frontend"]:
+        if frontend_included:
             args.insert(3, "--with-frontend")
+        if icon_checks_required:
+            args.insert(3, "--with-icon-checks")
         process = subprocess.Popen(
             args,
             cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -292,13 +305,23 @@ def execute(row: dict) -> None:
             _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": 1, "error_code": "RELEASE_EVIDENCE_INVALID", "error_message": "release id, git SHA, health and current path do not match"})
             return
         release_id, release_path = evidence
+        icon_checks_verified = icon_checks_required and "APP_ICON_CHECKS_VERIFIED=true" in text
+        if icon_checks_required and not icon_checks_verified:
+            _callback(f"/internal/deployments/{deployment_id}/fail", {
+                "exit_code": 1,
+                "error_code": "ICON_CHECK_EVIDENCE_MISSING",
+                "error_message": "required public icon checks did not emit verified evidence",
+            })
+            return
         proof = {
             "release_id": release_id,
             "repository": row["repository"],
             "environment": contract["environment"],
             "git_sha": row["commit_sha"],
             "current_release_path": release_path,
-            "frontend_included": contract["frontend"],
+            "frontend_included": frontend_included,
+            "icon_checks_required": icon_checks_required,
+            "icon_checks_verified": icon_checks_verified,
             "manifest_verified": True,
             "checksum_verified": True,
             "health_verified": True,
@@ -306,7 +329,7 @@ def execute(row: dict) -> None:
             "deployment_id": deployment_id,
             "status": "passed",
         }
-        _callback(f"/internal/deployments/{deployment_id}/complete", {"exit_code": 0, "message": "WSL deployment completed with verified manifest, checksum, services and health", "release": proof})
+        _callback(f"/internal/deployments/{deployment_id}/complete", {"exit_code": 0, "message": "WSL deployment completed with verified release manifest, checksums, services and health", "release": proof})
     except DeploymentSourceError as exc:
         _callback(f"/internal/deployments/{deployment_id}/fail", {"exit_code": 1, "error_code": exc.code, "error_message": str(exc)})
     except subprocess.TimeoutExpired:

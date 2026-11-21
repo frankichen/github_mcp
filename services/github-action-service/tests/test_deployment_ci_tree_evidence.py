@@ -156,6 +156,16 @@ def test_deployment_plan_reports_tree_evidence_but_still_requires_current_main_s
     )
     monkeypatch.setattr(deployment, "_github_commit_tree_sha", lambda _repo, _sha: TREE_SHA)
     monkeypatch.setattr(deployment, "_status_snapshot", lambda _repository: {})
+    # A change-aware plan must have a verifiable deployed baseline; this test
+    # exercises CI tree evidence rather than the separate unknown-baseline guard.
+    monkeypatch.setattr(
+        deployment, "_release_snapshot",
+        lambda _snapshot: ({"release_id": "rel_old", "git_sha": "0" * 40}, []),
+    )
+    monkeypatch.setattr(
+        deployment, "_compare_changed_files",
+        lambda *_args: (["internal/device.go"], "complete"),
+    )
 
     current_main_plan = deployment.plan_test_deployment(
         REPOSITORY, "gongshi-test", MAIN_SHA, "ci-tree-job",
