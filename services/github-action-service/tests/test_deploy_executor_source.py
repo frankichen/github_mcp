@@ -179,7 +179,8 @@ def test_legacy_deploy_worker_uses_planned_components_and_ci():
     worker = Path(executor.__file__).parents[1] / "app" / "deploy_worker.py"
     source = worker.read_text(encoding="utf-8")
     assert 'frontend_included = bool(row["frontend_included"])' in source
-    assert 'icon_checks_required = bool(row.get("icon_checks_required", 0))' in source
+    assert 'icon_checks_required = bool(row["icon_checks_required"])' in source
     assert 'deploy_env["DEPLOYMENT_CI_VERIFIED"] = "1"' in source
     assert 'if icon_checks_required:' in source
     assert 'APP_ICON_CHECKS_VERIFIED=true' in source
+    assert 'ci_job_id = str(row["private_ci_job_id"] or "")' in source

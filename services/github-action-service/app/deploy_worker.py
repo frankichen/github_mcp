@@ -129,7 +129,7 @@ def process_once() -> bool:
         argv.insert(3, "--with-icon-checks")
     try:
         deploy_env = os.environ.copy()
-        ci_job_id = str(row.get("private_ci_job_id") or "")
+        ci_job_id = str(row["private_ci_job_id"] or "")
         if not ci_job_id or ci_job_id == "not_required":
             raise RuntimeError("SXT deployment is missing its validated private CI job")
         deploy_env["DEPLOYMENT_CI_VERIFIED"] = "1"
