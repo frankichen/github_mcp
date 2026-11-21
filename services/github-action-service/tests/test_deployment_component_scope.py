@@ -61,6 +61,51 @@ def test_openapi_contract_change_does_not_rebuild_unmodified_frontend(monkeypatc
     assert plan["change_classification"] == "backend_only"
 
 
+
+def test_bluegreen_overlay_only_preserves_web_with_infrastructure_approval(monkeypatch):
+    changed_files = [
+        "deploy/compose/docker-compose.bluegreen.override.yml",
+        "api/openapi/app.yaml",
+        "internal/modules/storage/service.go",
+    ]
+    blocked = _plan(monkeypatch, changed_files)
+    assert blocked["ready"] is False
+    assert blocked["change_classification"] == "backend_only"
+    assert blocked["frontend_included"] is False
+    assert blocked["icon_checks_required"] is False
+    assert blocked["deploy_infrastructure_changed"] is True
+    assert "DEPLOY_INFRASTRUCTURE_CHANGE_REQUIRES_EXPLICIT_ALLOW" in blocked["reasons"]
+
+    approved = _plan(monkeypatch, changed_files, allow_infra=True)
+    assert approved["ready"] is True
+    assert approved["change_classification"] == "backend_only"
+    assert approved["frontend_included"] is False
+    assert approved["frontend_components"] == []
+    assert approved["restart_services"] == ["api", "worker", "scheduler"]
+    assert approved["health_endpoints"] == ["/public/v1/health"]
+
+
+def test_bluegreen_overlay_with_actual_frontend_change_stays_fullstack(monkeypatch):
+    changed_files = [
+        "deploy/compose/docker-compose.bluegreen.override.yml",
+        "h5/lenshub-console-react/src/App.tsx",
+    ]
+    plan = _plan(monkeypatch, changed_files, allow_infra=True)
+    assert plan["ready"] is True
+    assert plan["frontend_included"] is True
+    assert plan["deploy_infrastructure_changed"] is True
+    assert plan["change_classification"] == "frontend"
+    assert "web" in plan["restart_services"]
+
+
+def test_other_frontend_compose_override_still_requires_web_rebuild(monkeypatch):
+    plan = _plan(monkeypatch, ["deploy/compose/docker-compose.https.override.yml"], allow_infra=True)
+    assert plan["ready"] is True
+    assert plan["frontend_included"] is True
+    assert plan["deploy_infrastructure_changed"] is True
+    assert "web" in plan["restart_services"]
+
+
 def test_icon_api_only_change_runs_icon_smoke_without_frontend_build(monkeypatch):
     plan = _plan(monkeypatch, ["internal/modules/appicons/catalog.go"])
     assert plan["frontend_included"] is False
