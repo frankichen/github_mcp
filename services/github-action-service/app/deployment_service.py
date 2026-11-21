@@ -31,7 +31,7 @@ SCOPE = "fullstack"
 PROFILE = "repo-auto-check"
 STATUSES = ("queued", "claimed", "running", "preparing", "validating_main", "testing", "building", "packaging", "checksum_verification", "uploading", "migrating", "switching", "restarting_services", "health_checking", "completed", "passed", "failed", "cancel_requested", "cancelled", "rolling_back", "rollback_failed", "rolled_back")
 INFRA_FILES = ("scripts/deploy_gongshi_test.sh", "deploy/", "scripts/sync_test_env.sh")
-FRONTEND_PATH_PREFIXES = ("h5/", "api/openapi/", "deploy/nginx/", "deploy/icon-assets/")
+FRONTEND_PATH_PREFIXES = ("h5/", "deploy/nginx/", "deploy/icon-assets/")
 FRONTEND_PATHS = {
     "deploy/compose/docker-compose.https.override.yml",
     "deploy/compose/docker-compose.bluegreen.override.yml",

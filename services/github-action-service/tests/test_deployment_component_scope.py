@@ -53,6 +53,14 @@ def test_icon_asset_change_includes_frontend_and_icon_smoke(monkeypatch):
     assert plan["change_classification"] == "frontend_and_icons"
 
 
+def test_openapi_contract_change_does_not_rebuild_unmodified_frontend(monkeypatch):
+    plan = _plan(monkeypatch, ["api/openapi/app.yaml", "internal/modules/storage/service.go"])
+    assert plan["ready"] is True
+    assert plan["frontend_included"] is False
+    assert plan["icon_checks_required"] is False
+    assert plan["change_classification"] == "backend_only"
+
+
 def test_icon_api_only_change_runs_icon_smoke_without_frontend_build(monkeypatch):
     plan = _plan(monkeypatch, ["internal/modules/appicons/catalog.go"])
     assert plan["frontend_included"] is False
