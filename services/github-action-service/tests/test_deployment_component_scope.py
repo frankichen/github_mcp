@@ -11,7 +11,7 @@ CURRENT_RELEASE = {
 }
 
 
-def _plan(monkeypatch, changed_files, *, compare_state="complete", allow_infra=False):
+def _plan(monkeypatch, changed_files, *, compare_state="complete", allow_infra=False, expected_release_id=""):
     monkeypatch.setattr(deployment, "_repo_state", lambda *_: (TARGET_SHA, ["internal/modules/example/service.go"]))
     monkeypatch.setattr(deployment, "_ci_gate", lambda *_: (None, {"status": "passed", "profile": "repo-auto-check"}))
     monkeypatch.setattr(deployment, "_status_snapshot", lambda _repository: {"current_release_id": "rel_old"})
@@ -23,6 +23,7 @@ def _plan(monkeypatch, changed_files, *, compare_state="complete", allow_infra=F
         TARGET_SHA,
         "ci-job-12345678",
         allow_deploy_infrastructure_changes=allow_infra,
+        expected_current_release_id=expected_release_id,
     )
 
 
@@ -155,3 +156,46 @@ def test_renamed_frontend_path_is_not_misclassified_as_backend(monkeypatch):
     assert "h5/lenshub-console/src/old.ts" in files
     assert "internal/modules/device/renamed.go" in files
     assert deployment._is_frontend_change(files[0]) or deployment._is_frontend_change(files[1])
+
+
+def test_deployment_plan_rejects_changed_current_release(monkeypatch):
+    plan = _plan(
+        monkeypatch,
+        ["internal/modules/device/service.go"],
+        expected_release_id="rel_changed_after_review",
+    )
+    assert plan["ready"] is False
+    assert "CURRENT_RELEASE_CHANGED" in plan["reasons"]
+
+
+def test_claimed_deployment_blocks_concurrent_queue(monkeypatch, tmp_path):
+    monkeypatch.setenv("DEPLOYMENT_DB_PATH", str(tmp_path / "claimed-deployments.db"))
+    monkeypatch.setenv("DEPLOY_STATUS_FILE", str(tmp_path / "claimed-status.json"))
+    deployment._local.db = None
+    deployment.init_deployment_db()
+    monkeypatch.setattr(
+        deployment,
+        "plan_test_deployment",
+        lambda *args, **kwargs: {
+            "ready": True,
+            "current_release_id": "rel_old",
+            "target_release_id": "rel_new",
+            "frontend_included": False,
+            "icon_checks_required": False,
+            "change_classification": "backend_only",
+        },
+    )
+    first = deployment.start_test_deployment(
+        REPOSITORY, ENVIRONMENT, TARGET_SHA, "ci-job-12345678", confirm=True
+    )
+    assert first["ok"] is True
+    db = deployment._get_deploy_db()
+    db.execute(
+        "UPDATE deployments SET status='claimed' WHERE deployment_id=?",
+        (first["deployment_id"],),
+    )
+    db.commit()
+    second = deployment.start_test_deployment(
+        REPOSITORY, ENVIRONMENT, TARGET_SHA, "ci-job-12345678", confirm=True
+    )
+    assert second["error"]["code"] == "DEPLOYMENT_ALREADY_ACTIVE"
