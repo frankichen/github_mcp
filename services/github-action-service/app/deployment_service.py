@@ -578,6 +578,8 @@ def plan_test_deployment(repository, environment, commit_sha, private_ci_job_id,
     if infra_changed and not allow_deploy_infrastructure_changes:
         reasons.append("DEPLOY_INFRASTRUCTURE_CHANGE_REQUIRES_EXPLICIT_ALLOW")
     current_release_id = (current_release or {}).get("release_id")
+    if expected_current_release_id and current_release_id != expected_current_release_id:
+        reasons.append("CURRENT_RELEASE_CHANGED")
     frontend_included = component_scope["frontend_included"]
     icon_checks_required = component_scope["icon_checks_required"]
     frontend_components = (
@@ -640,7 +642,7 @@ def start_test_deployment(repository, environment, commit_sha, private_ci_job_id
         private_ci_job_id = "not_required"
     init_deployment_db(); db = _get_deploy_db()
     with _lock:
-        active = db.execute("SELECT deployment_id FROM deployments WHERE environment=? AND status IN ('queued','preparing','building','uploading','migrating','switching','verifying','cancel_requested')", (environment,)).fetchone()
+        active = db.execute("SELECT deployment_id FROM deployments WHERE environment=? AND status IN ('queued','claimed','running','preparing','building','uploading','migrating','switching','verifying','cancel_requested')", (environment,)).fetchone()
         if active:
             return _error_response("DEPLOYMENT_ALREADY_ACTIVE", "another deployment is active", details={"deployment_id": active[0]})
         if not force_redeploy and db.execute("SELECT 1 FROM deployments WHERE environment=? AND commit_sha=? AND status='passed'", (environment, commit_sha)).fetchone():
